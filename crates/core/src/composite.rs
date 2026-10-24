@@ -171,3 +171,379 @@ impl Provider for Composite {
         Ok(swept)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Error;
+    use crate::config::parse_config;
+    use crate::types::{Action, Billing, RunState, VmState};
+    use std::sync::Mutex;
+
+    type Calls = Arc<Mutex<Vec<String>>>;
+
+    /// Records every call as `<name> <call> <argument>`; run ids and step ids carry `prefix`.
+    struct Member {
+        name: &'static str,
+        prefix: &'static str,
+        calls: Calls,
+        shared: BTreeMap<String, String>,
+        fail_sweep: bool,
+        started: Mutex<Vec<StartRequest>>,
+    }
+
+    impl Member {
+        fn new(name: &'static str, prefix: &'static str, calls: &Calls) -> Member {
+            Member {
+                name,
+                prefix,
+                calls: calls.clone(),
+                shared: BTreeMap::new(),
+                fail_sweep: false,
+                started: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn call(&self, call: &str, argument: &str) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("{} {call} {argument}", self.name));
+        }
+
+        fn run_id(&self) -> String {
+            format!("{}run-1", self.prefix)
+        }
+    }
+
+    #[async_trait]
+    impl Provider for Member {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                name: self.name.into(),
+                docker_daemon: true,
+                max_vcpu: 2,
+                max_memory_mib: 4096,
+                max_storage_mib: 10240,
+                max_duration_s: 3600,
+                archs: vec!["amd64".into()],
+                billing: Billing::PerHour,
+            }
+        }
+        async fn plan(&self, _rotate: &[Rotation]) -> Result<Vec<Step>> {
+            self.call("plan", "");
+            Ok(vec![Step::new(
+                format!("{}step", self.prefix),
+                Action::Create,
+                format!("{} resource", self.name),
+            )])
+        }
+        async fn apply(&self, steps: &[Step]) -> Result<Outputs> {
+            let ids: Vec<&str> = steps.iter().map(|s| s.id.as_str()).collect();
+            self.call("apply", &ids.join(","));
+            Ok(steps
+                .iter()
+                .map(|s| (format!("{}_OUT", s.id), self.name.to_string()))
+                .collect())
+        }
+        async fn destroy(&self) -> Result<()> {
+            self.call("destroy", "");
+            Ok(())
+        }
+        async fn start(&self, request: StartRequest) -> Result<String> {
+            self.call("start", &request.pool.tag);
+            self.started.lock().unwrap().push(request);
+            Ok(self.run_id())
+        }
+        async fn list(&self, pool: Option<&str>) -> Result<Vec<Run>> {
+            self.call("list", pool.unwrap_or("*"));
+            Ok(vec![Run {
+                run_id: self.run_id(),
+                pool: pool.unwrap_or("any").to_string(),
+                state: RunState::Running,
+                created_at: "0".into(),
+                labels: BTreeMap::new(),
+            }])
+        }
+        async fn stop(&self, run_id: &str) -> Result<()> {
+            self.call("stop", run_id);
+            Ok(())
+        }
+        async fn capacity(&self, pool: &str) -> Result<Option<Vec<VmCapacity>>> {
+            self.call("capacity", pool);
+            Ok(Some(vec![VmCapacity {
+                run_id: self.run_id(),
+                state: VmState::Idle,
+                free: 1,
+                seen: None,
+                created_at: 0,
+            }]))
+        }
+        async fn claim(&self, run_id: &str) -> Result<()> {
+            self.call("claim", run_id);
+            Ok(())
+        }
+        async fn report(&self, run_id: &str, _report: &VmReport, _now: u64) -> Result<()> {
+            self.call("report", run_id);
+            Ok(())
+        }
+        async fn shared_env(&self) -> Result<BTreeMap<String, String>> {
+            self.call("shared_env", "");
+            Ok(self.shared.clone())
+        }
+        async fn sweep(&self, now: u64) -> Result<Vec<String>> {
+            self.call("sweep", &now.to_string());
+            if self.fail_sweep {
+                return Err(Error::provider("api down"));
+            }
+            Ok(vec![format!("{}run-old", self.prefix)])
+        }
+    }
+
+    fn config() -> Arc<Config> {
+        Arc::new(
+            parse_config(
+                r#"{
+                  "name": "demo",
+                  "gitlab": { "url": "https://gitlab.example", "projectIds": [7] },
+                  "host": { "type": "fake" }, "provider": { "type": "fake" },
+                  "defaultPool": "vm",
+                  "pools": [
+                    { "tag": "vm", "image": "img/node", "runtime": "instances" },
+                    { "tag": "plain", "image": "img/node", "stages": ["lint"] },
+                    { "tag": "hz", "image": "img/node", "runtime": "hetzner", "stages": ["test"] },
+                    { "tag": "other", "image": "img/node", "runtime": "other", "stages": ["deploy"] }
+                  ],
+                  "providers": { "hetzner": { "location": "nbg1" } }
+                }"#,
+            )
+            .unwrap(),
+        )
+    }
+
+    struct Setup {
+        composite: Composite,
+        main: Arc<Member>,
+        extra: Arc<Member>,
+        calls: Calls,
+        lines: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Setup {
+        /// The calls since the last look.
+        fn calls(&self) -> Vec<String> {
+            std::mem::take(&mut *self.calls.lock().unwrap())
+        }
+    }
+
+    fn setup(fail_main_sweep: bool, fail_extra_sweep: bool) -> Setup {
+        let calls: Calls = Arc::default();
+        let mut main = Member::new("main", "", &calls);
+        main.shared = BTreeMap::from([
+            (
+                "CIBURST_AGENT_IMAGE".to_string(),
+                "registry.example/vm-agent:edge".to_string(),
+            ),
+            ("CACHE_TYPE".to_string(), "s3".to_string()),
+        ]);
+        main.fail_sweep = fail_main_sweep;
+        let mut extra = Member::new("hetzner", "hetzner:", &calls);
+        extra.fail_sweep = fail_extra_sweep;
+        let (main, extra) = (Arc::new(main), Arc::new(extra));
+        let (log, lines) = Log::memory();
+        let composite = Composite::new(
+            config(),
+            main.clone(),
+            vec![("hetzner".to_string(), extra.clone() as Arc<dyn Provider>)],
+            log,
+        );
+        Setup {
+            composite,
+            main,
+            extra,
+            calls,
+            lines,
+        }
+    }
+
+    fn request(tag: &str) -> StartRequest {
+        StartRequest {
+            pool: config().pool_by_tag(tag).unwrap().clone(),
+            env: BTreeMap::from([
+                ("RUNNER_TOKEN".to_string(), "glrt-x".to_string()),
+                ("CACHE_TYPE".to_string(), "mine".to_string()),
+            ]),
+            labels: BTreeMap::new(),
+            taken: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn start_goes_to_the_member_of_the_pools_runtime() {
+        let s = setup(false, false);
+        for tag in ["vm", "plain", "other"] {
+            assert_eq!(s.composite.start(request(tag)).await.unwrap(), "run-1");
+        }
+        assert_eq!(
+            s.calls(),
+            ["main start vm", "main start plain", "main start other"],
+            "the main member's own pools get no shared env"
+        );
+        assert!(
+            s.main
+                .started
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|r| r.env == request("vm").env && r.taken == 2)
+        );
+
+        assert_eq!(
+            s.composite.start(request("hz")).await.unwrap(),
+            "hetzner:run-1"
+        );
+        assert_eq!(s.calls(), ["main shared_env ", "hetzner start hz"]);
+        let started = s.extra.started.lock().unwrap();
+        assert_eq!(
+            started[0].env,
+            BTreeMap::from([
+                ("RUNNER_TOKEN".to_string(), "glrt-x".to_string()),
+                ("CACHE_TYPE".to_string(), "mine".to_string()),
+                (
+                    "CIBURST_AGENT_IMAGE".to_string(),
+                    "registry.example/vm-agent:edge".to_string()
+                ),
+            ]),
+            "keys already present win"
+        );
+        assert_eq!(started[0].taken, 2);
+    }
+
+    #[tokio::test]
+    async fn a_runtime_without_a_member_falls_to_main() {
+        let calls: Calls = Arc::default();
+        let main = Arc::new(Member::new("main", "", &calls));
+        let composite = Composite::new(config(), main, Vec::new(), Log::silent());
+        assert_eq!(composite.start(request("hz")).await.unwrap(), "run-1");
+        assert_eq!(*calls.lock().unwrap(), ["main start hz"]);
+    }
+
+    #[tokio::test]
+    async fn list_and_capacity_follow_the_pool_and_list_all_concatenates() {
+        let s = setup(false, false);
+        let ids = |runs: Vec<Run>| runs.into_iter().map(|r| r.run_id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(s.composite.list(Some("hz")).await.unwrap()),
+            ["hetzner:run-1"]
+        );
+        assert_eq!(ids(s.composite.list(Some("vm")).await.unwrap()), ["run-1"]);
+        assert_eq!(
+            ids(s.composite.list(None).await.unwrap()),
+            ["run-1", "hetzner:run-1"]
+        );
+        let capacity = s.composite.capacity("hz").await.unwrap().unwrap();
+        assert_eq!(capacity[0].run_id, "hetzner:run-1");
+        let capacity = s.composite.capacity("plain").await.unwrap().unwrap();
+        assert_eq!(capacity[0].run_id, "run-1");
+        assert_eq!(
+            s.calls(),
+            [
+                "hetzner list hz",
+                "main list vm",
+                "main list *",
+                "hetzner list *",
+                "hetzner capacity hz",
+                "main capacity plain",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_ids_route_stop_claim_and_report() {
+        let s = setup(false, false);
+        let report = VmReport {
+            state: VmState::Idle,
+            free: 2,
+            slots: 2,
+        };
+        for (run, member) in [
+            ("hetzner:demo-vm-0a1b2c3d", "hetzner"),
+            ("hetzner:", "hetzner"),
+            ("hetzner-demo", "main"),
+            ("hetznerx", "main"),
+            ("x:hetzner:y", "main"),
+            ("0f6c1a52-7d1e-4b8e-9a43-2f1d5e0c9b11", "main"),
+            ("", "main"),
+        ] {
+            s.composite.stop(run).await.unwrap();
+            s.composite.claim(run).await.unwrap();
+            s.composite.report(run, &report, 5).await.unwrap();
+            assert_eq!(
+                s.calls(),
+                [
+                    format!("{member} stop {run}"),
+                    format!("{member} claim {run}"),
+                    format!("{member} report {run}"),
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_runs_every_member_and_survives_a_failing_one() {
+        let cases = [
+            (false, false, vec!["run-old", "hetzner:run-old"], vec![]),
+            (false, true, vec!["run-old"], vec!["hetzner"]),
+            (true, false, vec!["hetzner:run-old"], vec!["main"]),
+            (true, true, vec![], vec!["main", "hetzner"]),
+        ];
+        for (fail_main, fail_extra, expected, failed) in cases {
+            let s = setup(fail_main, fail_extra);
+            assert_eq!(s.composite.sweep(9).await.unwrap(), expected);
+            assert_eq!(s.calls(), ["main sweep 9", "hetzner sweep 9"]);
+            let warned: Vec<String> = failed
+                .iter()
+                .map(|member| format!(r#"warn sweep_failed provider="{member}" error="api down""#))
+                .collect();
+            assert_eq!(*s.lines.lock().unwrap(), warned);
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_apply_and_destroy_split_by_step_prefix() {
+        let s = setup(false, false);
+        let mut steps = s.composite.plan(&[]).await.unwrap();
+        let ids: Vec<&str> = steps.iter().map(|step| step.id.as_str()).collect();
+        assert_eq!(ids, ["step", "hetzner:step"]);
+        steps.push(Step::new("other:step", Action::Noop, "unowned"));
+        let outputs = s.composite.apply(&steps).await.unwrap();
+        assert_eq!(
+            outputs,
+            Outputs::from([
+                ("step_OUT".to_string(), "main".to_string()),
+                ("other:step_OUT".to_string(), "main".to_string()),
+                ("hetzner:step_OUT".to_string(), "hetzner".to_string()),
+            ])
+        );
+        s.composite.destroy().await.unwrap();
+        assert_eq!(
+            s.calls(),
+            [
+                "main plan ",
+                "hetzner plan ",
+                "main apply step,other:step",
+                "hetzner apply hetzner:step",
+                "hetzner destroy ",
+                "main destroy ",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn capabilities_and_shared_env_are_mains() {
+        let s = setup(false, false);
+        assert_eq!(s.composite.capabilities().name, "main");
+        assert_eq!(s.composite.shared_env().await.unwrap(), s.main.shared);
+        assert_eq!(s.calls(), ["main shared_env "]);
+    }
+}
