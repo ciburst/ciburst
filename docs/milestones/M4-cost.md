@@ -19,6 +19,7 @@ Scaleway bills a CPU Instance from creation, per started hour, 60 minutes minimu
 3. Composite provider in core (D35); provider `hetzner` (D34).
 4. Scaleway: the S3 ledger, `shared_env`, pools of other runtimes skipped, `taken` honoured, `HCLOUD_TOKEN` in the function.
 5. Drill: a cold burst on Scaleway; the same drill on Hetzner once the owner has a token.
+6. Added after the agents (D36): `defaultPool` is optional; without it unmapped stages start nothing.
 
 ## Rules
 

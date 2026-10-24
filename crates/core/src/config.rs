@@ -121,7 +121,9 @@ pub struct Config {
     pub gitlab: GitlabConfig,
     pub host: Section,
     pub provider: Section,
-    pub default_pool: String,
+    /// Pool of the stages no pool lists; without it such jobs start nothing (spec D36).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_pool: Option<String>,
     pub pools: Vec<Pool>,
     #[serde(default)]
     pub cache: CacheConfig,
@@ -135,15 +137,15 @@ impl Config {
         self.pools.iter().find(|pool| pool.tag == tag)
     }
 
-    /// The pool a stage is mapped to, or the default pool.
-    pub fn pool_for_stage(&self, stage: Option<&str>) -> &Pool {
+    /// The pool a stage is mapped to, else the default pool, else none.
+    pub fn pool_for_stage(&self, stage: Option<&str>) -> Option<&Pool> {
         stage
             .and_then(|s| {
                 self.pools
                     .iter()
                     .find(|pool| pool.stages.iter().any(|x| x == s))
             })
-            .unwrap_or_else(|| self.default_pool())
+            .or_else(|| self.default_pool())
     }
 
     /// The added provider a pool belongs to, `None` for the main provider.
@@ -153,9 +155,10 @@ impl Config {
             .filter(|runtime| self.providers.contains_key(*runtime))
     }
 
-    pub fn default_pool(&self) -> &Pool {
-        self.pool_by_tag(&self.default_pool)
-            .expect("validated config has its default pool")
+    pub fn default_pool(&self) -> Option<&Pool> {
+        self.default_pool
+            .as_deref()
+            .and_then(|tag| self.pool_by_tag(tag))
     }
 }
 
@@ -239,11 +242,10 @@ pub fn validate(mut config: Config) -> Result<Config> {
                 }
             }
         }
-        if !tags.contains(config.default_pool.as_str()) {
-            errors.push(format!(
-                "defaultPool: {} is not a pool",
-                config.default_pool
-            ));
+        if let Some(default) = &config.default_pool
+            && !tags.contains(default.as_str())
+        {
+            errors.push(format!("defaultPool: {default} is not a pool"));
         }
     }
 
@@ -412,10 +414,24 @@ mod tests {
     #[test]
     fn routes_stages_with_default_fallback() {
         let config = parse_config(&valid().to_string()).unwrap();
-        assert_eq!(config.pool_for_stage(Some("build")).tag, "build");
-        assert_eq!(config.pool_for_stage(Some("test")).tag, "ci");
-        assert_eq!(config.pool_for_stage(Some("deploy")).tag, "ci");
-        assert_eq!(config.pool_for_stage(None).tag, "ci");
+        let tag = |stage| config.pool_for_stage(stage).map(|p| p.tag.as_str());
+        assert_eq!(tag(Some("build")), Some("build"));
+        assert_eq!(tag(Some("test")), Some("ci"));
+        assert_eq!(tag(Some("deploy")), Some("ci"));
+        assert_eq!(tag(None), Some("ci"));
+    }
+
+    #[test]
+    fn without_a_default_pool_unmapped_stages_have_none() {
+        let mut raw = valid();
+        raw.as_object_mut().unwrap().remove("defaultPool");
+        let config = parse_config(&raw.to_string()).unwrap();
+        assert_eq!(config.pool_for_stage(Some("deploy")), None);
+        assert_eq!(config.pool_for_stage(None), None);
+        assert_eq!(
+            config.pool_for_stage(Some("build")).map(|p| p.tag.as_str()),
+            Some("build")
+        );
     }
 
     #[test]

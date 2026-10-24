@@ -172,7 +172,9 @@ impl Dispatcher {
         }
 
         let stage = event.get("build_stage").and_then(Value::as_str);
-        let pool = self.config.pool_for_stage(stage).clone();
+        let Some(pool) = self.config.pool_for_stage(stage).cloned() else {
+            return ignored("unmapped_stage", json!({ "stage": stage.unwrap_or("") }));
+        };
         let labels = BTreeMap::from([
             ("project".to_string(), project_id.to_string()),
             ("pipeline".to_string(), number(&event, "pipeline_id")),
@@ -865,6 +867,31 @@ mod tests {
         let response = d.handle(&headers, &event("deploy", "pending", 7, 1)).await;
         assert_eq!(response.body["result"], "started");
         assert_eq!(response.body["pool"], "ci");
+    }
+
+    #[tokio::test]
+    async fn without_a_default_pool_unmapped_stages_start_nothing() {
+        let (d, recording, _) = setup(false).await;
+        let mut config = (*d.config).clone();
+        config.default_pool = None;
+        let d = Dispatcher::new(
+            Arc::new(config),
+            d.provider.clone(),
+            d.secrets.clone(),
+            Log::silent(),
+        );
+        let response = d
+            .handle(&headers("hook-secret"), &event("deploy", "pending", 7, 1))
+            .await;
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body["result"], "ignored");
+        assert_eq!(response.body["reason"], "unmapped_stage");
+        assert_eq!(response.body["stage"], "deploy");
+        assert!(recording.inner.list(None).await.unwrap().is_empty());
+        let mapped = d
+            .handle(&headers("hook-secret"), &event("build", "pending", 7, 2))
+            .await;
+        assert_eq!(mapped.body["result"], "started");
     }
 
     #[tokio::test]

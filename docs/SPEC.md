@@ -1,6 +1,6 @@
 # Spec: ciburst, serverless GitLab runners, Scaleway first
 
-Status: M3 done 2026-10-24 (drill in `docs/RUNBOOK.md`); M4 cost (D32 to D35, `docs/milestones/M4-cost.md`) in progress. Background: `SEED.md`.
+Status: M3 done 2026-10-24 (drill in `docs/RUNBOOK.md`); M4 cost (D32 to D36, `docs/milestones/M4-cost.md`) in progress. Background: `SEED.md`.
 
 ## 0. Decision log
 
@@ -15,7 +15,7 @@ Status: M3 done 2026-10-24 (drill in `docs/RUNBOOK.md`); M4 cost (D32 to D35, `d
 | D7 | 2026-10-23 | Pool images are built by the framework's CI and published to the framework project's GitLab registry, public pull. |
 | D8 | 2026-10-23 | Name `ciburst`. The config value `name` prefixes every cloud resource, so the code name stays stable. |
 | D9 | 2026-10-23 | Cache on a Scaleway Object Storage bucket, shared between runs, objects expire after 30 days. |
-| D10 | 2026-10-23 | The dispatcher never calls GitLab. It routes by the job's stage through a stage-to-pool map in config; unmapped stages go to the default pool. One runner (own token, own tag) per pool, so a job can only ever run in its pool's image. |
+| D10 | 2026-10-23 | The dispatcher never calls GitLab. It routes by the job's stage through a stage-to-pool map in config; unmapped stages go to the default pool, or start nothing without one (D36). One runner (own token, own tag) per pool, so a job can only ever run in its pool's image. |
 | D11 | 2026-10-23 | Runs use `--max-builds 0 --wait-timeout <pool.waitTimeoutS>`: a run keeps taking jobs while they arrive and exits after the idle window. A per-pool `maxRuns` caps parallel runs. |
 | D12 | 2026-10-23 | Delivery: M0 by the orchestrator, M1 by three Opus agents in worktrees, an explicit go per milestone, pushes only on confirmation. |
 | D13 | 2026-10-23 | License Apache-2.0. |
@@ -40,6 +40,7 @@ Status: M3 done 2026-10-24 (drill in `docs/RUNBOOK.md`); M4 cost (D32 to D35, `d
 | D33 | 2026-10-24 | Burst grouping without a lock. A pending job that finds no free slot records an intent (an empty object in the cache bucket), waits 2 s and reads the intents of the last 30 s. Ranked by time and job id, every `slots`-th job leads a group and starts one VM; the others ride on their leader's VM; leaders count toward `maxRuns` by rank. A cold pipeline with five VM jobs starts three VMs at two slots instead of five. Without a cache bucket the dispatcher starts one VM per job as in M3. Rules in `docs/milestones/M4-cost.md`. |
 | D34 | 2026-10-24 | Hetzner Cloud as a VM backend: pool `runtime: "hetzner"`, settings in `providers.hetzner`, default type `cx33` (4 vCPU, 8 GB, 80 GB, 0.0144 EUR/h with IPv4) with two slots, 0.0072 EUR per job slot-hour against 0.0136 on Scaleway DEV1-M and 0.0155 for RocketRunner's small runner. Same agent, cloud-init and lifecycle as section 6.1; labels instead of tags; a firewall without inbound rules. Dispatcher, cache, registry and Serverless Jobs stay on Scaleway. The owner provides a Hetzner project API token. |
 | D35 | 2026-10-24 | Per-pool backends through a composite provider in core: the config's `provider` serves its runtimes, each key of `providers` adds the provider of that runtime. Run ids of an added provider start with `<runtime>:`, so VM reports and termination route without a lookup. This realizes D30's per-pool provider as `pools[].runtime`. |
+| D36 | 2026-10-24 | `defaultPool` is optional. Without it a pending job whose stage no pool lists starts nothing (`200 ignored`, reason `unmapped_stage`), so a project whose pipelines mostly run on GitLab's hosted runners pays nothing for them; `ciburst check` then reports only jobs tagged for a pool whose stage maps elsewhere or nowhere. The include's model (every job tagged `vm`, the VM pool as default) keeps its `defaultPool`. |
 
 ## 1. Purpose and scope
 
@@ -95,7 +96,7 @@ Backlog, not v1: providers `fly-machines`, `aws-lambda-microvms` (amd64 support 
 ### 5.2 Runtime topology
 
 1. GitLab sends a job event (`X-Gitlab-Event: Job Hook`) to the dispatcher URL with the hook token.
-2. The dispatcher verifies the token, ignores every status except `pending`, maps `build_stage` to a pool through the config, falls back to the default pool, and answers `200 ignored` for projects not in the config.
+2. The dispatcher verifies the token, ignores every status except `pending`, maps `build_stage` to a pool through the config, falls back to the default pool, and answers `200 ignored` for projects not in the config and, without a default pool, for unmapped stages.
 3. The dispatcher counts the pool's live runs through the provider; at `maxRuns` it answers `200 at_capacity` and the live runs drain the queue. Otherwise it calls `Provider::start` with the pool, the pool's runner token, the cache settings and labels (project, pipeline, job).
 4. The run's entrypoint executes `gitlab-runner run-single --url <gitlab> --token <pool token> --executor shell --builds-dir /builds --max-builds 0 --wait-timeout <s>` with the S3 cache flags; it exits after the idle window, at the run timeout, or when the provider stops it.
 5. Duplicate events start spare runs, which exit after the idle window; cost is bounded by `maxRuns` and `timeoutS`.

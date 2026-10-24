@@ -598,7 +598,7 @@ async fn invalid_settings_and_pools_are_config_errors_naming_the_key() {
         c.pools[0].tag = "ci-".into();
         c.pools[1].tag = "b".repeat(46);
         c.pools[1].instance_types = vec!["CX33".into()];
-        c.default_pool = "ci-".into();
+        c.default_pool = Some("ci-".into());
     });
     let provider = provider(bad.clone(), &fake, Log::silent());
     let errors = match provider.plan(&[]).await {

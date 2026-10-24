@@ -28,7 +28,7 @@ pub fn check_jobs(config: &Config, jobs: &[LintJob]) -> Vec<Problem> {
     let mut problems = Vec::new();
     for job in jobs {
         let stage = job.stage.as_deref().unwrap_or(DEFAULT_STAGE);
-        let expected = config.pool_for_stage(Some(stage));
+        let expected = config.pool_for_stage(Some(stage)).map(|p| p.tag.as_str());
         let chosen: Vec<&str> = job
             .tag_list
             .iter()
@@ -37,15 +37,22 @@ pub fn check_jobs(config: &Config, jobs: &[LintJob]) -> Vec<Problem> {
             .collect();
         let problem = if chosen.len() > 1 {
             Some(format!("tagged for several pools: {}", chosen.join(", ")))
-        } else if chosen.len() == 1 && chosen[0] != expected.tag {
+        } else if chosen.len() == 1 && Some(chosen[0]) != expected {
+            Some(match expected {
+                Some(pool) => format!(
+                    "stage {stage} maps to pool {pool} but the job is tagged {}",
+                    chosen[0]
+                ),
+                None => format!(
+                    "stage {stage} maps to no pool but the job is tagged {}",
+                    chosen[0]
+                ),
+            })
+        } else if job.tag_list.is_empty()
+            && let Some(pool) = expected
+        {
             Some(format!(
-                "stage {stage} maps to pool {} but the job is tagged {}",
-                expected.tag, chosen[0]
-            ))
-        } else if job.tag_list.is_empty() {
-            Some(format!(
-                "untagged: add tags [{}] or a hosted runner tag",
-                expected.tag
+                "untagged: add tags [{pool}] or a hosted runner tag"
             ))
         } else {
             None
@@ -55,7 +62,7 @@ pub fn check_jobs(config: &Config, jobs: &[LintJob]) -> Vec<Problem> {
                 job: job.name.clone(),
                 stage: stage.to_string(),
                 tags: job.tag_list.clone(),
-                pool: expected.tag.clone(),
+                pool: expected.unwrap_or("").to_string(),
                 problem,
             });
         }
@@ -90,6 +97,32 @@ mod tests {
             stage: stage.map(String::from),
             tag_list: tags.iter().map(|t| t.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn without_a_default_pool_untagged_jobs_are_fine_and_pool_tags_need_a_stage() {
+        let mut config = config();
+        config.default_pool = None;
+        let problems = check_jobs(
+            &config,
+            &[
+                job("hosted", Some("deploy"), &[]),
+                job("unit", Some("test"), &["ci"]),
+                job("lost", Some("deploy"), &["ci"]),
+            ],
+        );
+        let summary: Vec<(&str, &str, &str)> = problems
+            .iter()
+            .map(|p| (p.job.as_str(), p.pool.as_str(), p.problem.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![(
+                "lost",
+                "",
+                "stage deploy maps to no pool but the job is tagged ci"
+            )]
+        );
     }
 
     #[test]
