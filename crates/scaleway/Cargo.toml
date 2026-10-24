@@ -15,7 +15,14 @@ md-5 = "0.10"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["time"] }
+
+[build-dependencies]
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(ciburst_embedded_code)"] }
