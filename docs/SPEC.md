@@ -199,7 +199,7 @@ Drain protocol, which keeps every job served:
 3. After the grace the supervisor sends `SIGQUIT`. A job taken in the last request still runs to its end.
 4. When all slots have exited, no request can reach GitLab, so no job can be assigned to the VM. Only then does it post `/terminate`; the dispatcher checks the token and terminates the server.
 
-Scheduling, on a pending job event: `free` is the sum of `ciburst-free` over the pool's VMs in state `idle` or `busy`; `starting` and `draining` VMs do not count. If `free > 0`, the dispatcher claims one slot by lowering that VM's `ciburst-free` and starts nothing. Otherwise it starts a VM, unless the pool already has `maxRuns` VMs that are not draining; then the job waits for the next slot that frees up. A burst of pending jobs on an empty pool therefore starts one VM per job up to `maxRuns`, and warm VMs within their paid hour are used first.
+Scheduling, on a pending job event: `free` is the sum of `ciburst-free` over the pool's VMs in state `idle` or `busy` that reported within the last 21 minutes (two heartbeats and a minute); `starting`, `draining` and silent VMs do not count. If `free > 0`, the dispatcher claims one slot by lowering that VM's `ciburst-free` and starts nothing; if the claim fails, it starts a VM instead. Otherwise it starts a VM, unless the pool already has `maxRuns` VMs that are not draining; then the job waits for the next slot that frees up. A burst of pending jobs on an empty pool therefore starts one VM per job up to `maxRuns`, and warm VMs within their paid hour are used first.
 
 Races and their effect:
 
@@ -210,7 +210,7 @@ Races and their effect:
 | A VM boots for a job another VM already took | the new VM idles until minute 55 of its hour and drains; one VM-hour |
 | A VM hangs or loses its network | its jobs fail on GitLab's side when the runner stops updating them; the sweep removes it |
 
-Sweep, a cron trigger every 30 minutes: terminates VMs in `starting` for more than 10 minutes, VMs in `draining` for more than 15 minutes, VMs whose `ciburst-seen` is older than 30 minutes, and any VM older than 24 hours. It never touches a VM that reports, so it cannot race the scheduler or a running job. A job longer than the VM's report interval keeps the VM alive because the supervisor reports every 10 minutes independently of the job.
+Sweep, a cron trigger every 30 minutes, authenticated by its own sweep token (not the hook token, which would sit readable in the cron's arguments): terminates VMs in `starting` for more than 10 minutes, VMs in `draining` for more than 15 minutes, VMs whose `ciburst-seen` is older than 30 minutes, and any VM older than 24 hours. It never touches a VM that reports, so it cannot race the scheduler or a running job. A job longer than the VM's report interval keeps the VM alive because the supervisor reports every 10 minutes independently of the job.
 
 Host `scaleway-function` (API `functions/v1beta1`):
 
@@ -238,7 +238,8 @@ Secrets inventory:
 | Owner Scaleway key, access and secret key (IAMManager, ProjectManager, ServerlessJobsFullAccess, FunctionsFullAccess, ObjectStorageFullAccess, ContainerRegistryFullAccess) | `.local/scaleway.env` | owner chosen | delete after M2 |
 | Owner GitLab token, scopes `api` and `create_runner` | `.local/gitlab.env` | owner chosen | delete after M2, recreate for `check` and `rotate` |
 | Dispatch IAM key (`ServerlessJobsFullAccess`, `ContainerRegistryReadOnly`, `InstancesFullAccess` on the project) | function secret env, `.local/outputs.env` | none | `ciburst rotate key` |
-| VM termination secret | function secret env | none | `ciburst rotate hook` |
+| VM secret (signs the VM tokens) | function secret env, `.local/outputs.env` | none | `ciburst rotate vm`, refused while VMs run, because their tokens would stop working |
+| Sweep token | function secret env, the cron's arguments | none | `ciburst rotate hook` |
 | VM capability token | the VM's user data, readable by root jobs | the VM's life | ends with the VM; can only terminate that VM |
 | Cache IAM key | function secret env, run env override, `.local/outputs.env` | none | `ciburst rotate cache` |
 | Runner tokens `glrt-`, one per pool | function secret env, run env override | until the runner is deleted | `ciburst rotate runner` |
