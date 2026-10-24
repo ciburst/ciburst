@@ -729,7 +729,8 @@ async fn jobs_pending_during_a_drain_are_served() {
     );
 
     // Pending one second before SIGQUIT and taken by the last request: the job runs to its end,
-    // then the VM terminates.
+    // then the VM terminates. It outlasts the sweep's draining limit, so the 12600 s sweep sees
+    // a VM draining for longer than that which still reports, and must keep it.
     let drain = drain_at(2 * HOUR);
     let quit = drain + vm::DRAIN_GRACE_S;
     sim.run_to(quit - 1).await;
@@ -737,20 +738,22 @@ async fn jobs_pending_during_a_drain_are_served() {
     assert_eq!(sim.vms[ia].phase, Phase::Grace(drain));
     sim.vms[ia].slots[0].next_poll = quit;
     sim.vms[ia].next_detect = quit + 1;
-    let last = sim.pending(10 * MIN).await;
+    let last = sim.pending(40 * MIN).await;
     assert_eq!(sim.decisions[last].result, "started");
     let c = sim.run_of(last).to_string();
     sim.run_to(quit).await;
     assert_eq!(sim.jobs[last].started, Some((quit, a.clone())));
     assert_eq!(sim.vms[ia].phase, Phase::Quitting);
+    let sweep = 7 * SWEEP_EVERY_S;
+    assert!(sweep > drain + vm::SWEEP_DRAINING_S && sweep < quit + 40 * MIN);
     sim.run_to(4 * HOUR).await;
     assert_eq!(
         sim.vm(&a).ended,
-        Some((quit + 10 * MIN, End::Terminated)),
+        Some((quit + 40 * MIN, End::Terminated)),
         "ends when its last slot exits"
     );
 
-    sim.check(bound(10 * MIN), &[]).await;
+    sim.check(bound(40 * MIN), &[]).await;
     for extra in [&b, &c] {
         let vm = sim.vm(extra);
         assert_eq!(vm.jobs_taken, 0);
