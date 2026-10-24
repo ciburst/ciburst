@@ -21,8 +21,8 @@ const TERMINATE_FOR: Duration = Duration::from_secs(600);
 const BACKOFF_FIRST: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
+/// `run-single` reads its config file only with `--runner`, so the path is never created.
 pub fn slot_command(config: &Config, slot: u32) -> SlotCommand {
-    let config_dir = format!("{SLOT_ROOT}/slot-{slot}");
     let mut args: Vec<String> = [
         "run-single",
         "--url",
@@ -44,7 +44,7 @@ pub fn slot_command(config: &Config, slot: u32) -> SlotCommand {
         "--wait-timeout",
         "0",
         "--config",
-        &format!("{config_dir}/config.toml"),
+        &format!("{SLOT_ROOT}/slot-{slot}/config.toml"),
     ]
     .into_iter()
     .map(String::from)
@@ -69,7 +69,6 @@ pub fn slot_command(config: &Config, slot: u32) -> SlotCommand {
         slot,
         program: RUNNER.to_string(),
         args,
-        config_dir,
     }
 }
 
@@ -748,7 +747,6 @@ mod tests {
         let command = slot_command(&config, 2);
         assert_eq!(command.slot, 2);
         assert_eq!(command.program, "gitlab-runner");
-        assert_eq!(command.config_dir, "/var/lib/ciburst/slot-2");
         assert_eq!(
             command.args,
             [

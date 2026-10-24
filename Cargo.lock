@@ -257,6 +257,7 @@ dependencies = [
  "ciburst-core",
  "nix",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

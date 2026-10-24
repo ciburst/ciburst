@@ -5,6 +5,9 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 status=0
 while read -r ref; do
+  if [ "$ref" = "scratch" ]; then
+    continue
+  fi
   if docker manifest inspect "$ref" > /dev/null 2>&1; then
     echo "ok      $ref"
   else

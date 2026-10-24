@@ -45,7 +45,6 @@ pub struct SlotCommand {
     pub slot: u32,
     pub program: String,
     pub args: Vec<String>,
-    pub config_dir: String,
 }
 
 pub struct System {
@@ -137,7 +136,6 @@ pub struct ProcessSlots {
 
 impl Slots for ProcessSlots {
     fn spawn(&mut self, command: &SlotCommand) -> io::Result<()> {
-        std::fs::create_dir_all(&command.config_dir)?;
         let mut process = Command::new(&command.program);
         // The runner reads many settings from its environment; the flags are the only source.
         process.args(&command.args).env_clear().stdin(Stdio::null());
@@ -200,6 +198,70 @@ mod tests {
         assert_eq!(parse_uptime("42 1").unwrap(), 42);
         assert!(parse_uptime("").is_err());
         assert!(parse_uptime("abc 1").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reads_the_kernel_uptime() {
+        assert!(ProcUptime.seconds().unwrap() > 0);
+    }
+
+    #[cfg(unix)]
+    fn wait_exit(slots: &mut ProcessSlots, slot: u32) -> i32 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(code) = slots.try_exit(slot).unwrap() {
+                return code;
+            }
+            assert!(Instant::now() < deadline, "slot {slot} did not exit");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slot_processes_get_sigquit_and_a_clean_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        let env = dir.path().join("env");
+        let script = "env > \"$2\"; trap 'exit 3' QUIT; : > \"$1\"; while :; do sleep 0.05; done";
+        let mut slots = ProcessSlots::default();
+        slots
+            .spawn(&SlotCommand {
+                slot: 1,
+                program: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    script.to_string(),
+                    "sh".to_string(),
+                    ready.to_string_lossy().into_owned(),
+                    env.to_string_lossy().into_owned(),
+                ],
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "slot never became ready");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(slots.try_exit(1).unwrap(), None);
+        slots.quit(1).unwrap();
+        assert_eq!(wait_exit(&mut slots, 1), 3);
+        assert!(slots.try_exit(1).is_err());
+
+        let env = std::fs::read_to_string(env).unwrap();
+        let keys: Vec<&str> = env
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(key, _)| key))
+            .collect();
+        assert!(keys.contains(&"PATH"), "{env}");
+        for key in keys {
+            // Only what the agent passes on, plus what the shell sets itself.
+            assert!(
+                ["PATH", "HOME", "PWD", "OLDPWD", "SHLVL", "_"].contains(&key),
+                "{env}"
+            );
+        }
     }
 
     #[test]
