@@ -2,7 +2,7 @@
 //! embeds. Scaleway compiles the uploaded source, so the zip is a self-contained Cargo package:
 //!
 //! ```text
-//! Cargo.toml              ciburst-dispatch-scaleway, own [workspace], deps on vendor/
+//! Cargo.toml              ciburst-dispatch-scaleway, bare [workspace], no inheritance, deps on vendor/
 //! Cargo.lock              the workspace lock
 //! src/                    crates/dispatch-scaleway/src
 //! vendor/core/            crates/core (Cargo.toml, src)
@@ -13,7 +13,7 @@
 //! packing does not recurse. Entries are sorted and carry fixed timestamps and permissions, so
 //! the same sources give the same bytes, and therefore the same digest, on every platform.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::{Cursor, Write};
@@ -47,23 +47,27 @@ fn main() {
         println!("cargo::rerun-if-changed={}", path.display());
     }
 
+    let workspace = read_text(&root.join("Cargo.toml"));
+    let inherited = Inherited::parse(&workspace);
     let mut files: Vec<(String, Vec<u8>)> = vec![
         (
             "Cargo.toml".to_string(),
             root_manifest(
-                &read_text(&dispatch.join("Cargo.toml")),
-                &read_text(&root.join("Cargo.toml")),
+                &inherited.resolve(&read_text(&dispatch.join("Cargo.toml"))),
+                &workspace,
             )
             .into_bytes(),
         ),
         ("Cargo.lock".to_string(), read(&root.join("Cargo.lock"))),
         (
             "vendor/core/Cargo.toml".to_string(),
-            vendored_manifest(&read_text(&core.join("Cargo.toml"))).into_bytes(),
+            vendored_manifest(&inherited.resolve(&read_text(&core.join("Cargo.toml"))))
+                .into_bytes(),
         ),
         (
             "vendor/scaleway/Cargo.toml".to_string(),
-            vendored_manifest(&read_text(&scaleway.join("Cargo.toml"))).into_bytes(),
+            vendored_manifest(&inherited.resolve(&read_text(&scaleway.join("Cargo.toml"))))
+                .into_bytes(),
         ),
     ];
     collect(&dispatch.join("src"), "src", &mut files);
@@ -136,10 +140,153 @@ fn pack(files: &[(String, Vec<u8>)]) -> Vec<u8> {
     writer.finish().expect("zip finish").into_inner()
 }
 
+/// Values of `[workspace.package]` and `[workspace.dependencies]`, written into each manifest
+/// because Scaleway's Rust builder fails on workspace inheritance (probed 2026-10-24).
+struct Inherited {
+    package: BTreeMap<String, String>,
+    dependencies: BTreeMap<String, String>,
+}
+
+impl Inherited {
+    fn parse(workspace: &str) -> Inherited {
+        let mut package = BTreeMap::new();
+        let mut dependencies = BTreeMap::new();
+        let mut table = String::new();
+        for line in workspace.lines() {
+            if let Some(name) = table_name(line) {
+                table = name.to_string();
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let (key, value) = (key.trim().to_string(), value.trim().to_string());
+            match table.as_str() {
+                "workspace.package" => {
+                    package.insert(key, value);
+                }
+                "workspace.dependencies" => {
+                    dependencies.insert(key, value);
+                }
+                _ => {}
+            }
+        }
+        Inherited {
+            package,
+            dependencies,
+        }
+    }
+
+    /// The manifest with every `key.workspace = true` and `{ workspace = true, ... }` replaced
+    /// by the workspace's value; dependency features are merged.
+    fn resolve(&self, manifest: &str) -> String {
+        let mut out = String::new();
+        let mut table = String::new();
+        for line in manifest.lines() {
+            if let Some(name) = table_name(line) {
+                table = name.to_string();
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+            out.push_str(&self.resolve_line(&table, line));
+            out.push('\n');
+        }
+        assert!(
+            !out.contains("workspace = true") && !out.contains(".workspace"),
+            "unresolved workspace inheritance left in a function manifest"
+        );
+        out
+    }
+
+    fn resolve_line(&self, table: &str, line: &str) -> String {
+        let Some((key, value)) = line.split_once('=') else {
+            return line.to_string();
+        };
+        let (key, value) = (key.trim(), value.trim());
+        if let Some(name) = key.strip_suffix(".workspace") {
+            assert_eq!(value, "true", "{line}");
+            let source = if table == "package" {
+                &self.package
+            } else {
+                &self.dependencies
+            };
+            let inherited = source
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} is not in the workspace tables"));
+            return format!("{name} = {inherited}");
+        }
+        if value.starts_with('{') && value.contains("workspace = true") {
+            let base = self
+                .dependencies
+                .get(key)
+                .unwrap_or_else(|| panic!("{key} is not in [workspace.dependencies]"));
+            let base = if base.starts_with('"') {
+                format!("version = {base}")
+            } else {
+                inner(base).to_string()
+            };
+            let local: Vec<&str> = split_items(inner(value))
+                .into_iter()
+                .filter(|item| item.replace(' ', "") != "workspace=true")
+                .collect();
+            let mut features = BTreeSet::new();
+            let mut items = Vec::new();
+            for item in split_items(&base).into_iter().chain(local) {
+                match item.split_once('=') {
+                    Some((k, v)) if k.trim() == "features" => {
+                        for feature in v.trim().trim_matches(|c| c == '[' || c == ']').split(',') {
+                            let feature = feature.trim();
+                            if !feature.is_empty() {
+                                features.insert(feature.to_string());
+                            }
+                        }
+                    }
+                    _ => items.push(item.to_string()),
+                }
+            }
+            if !features.is_empty() {
+                let list: Vec<String> = features.into_iter().collect();
+                items.push(format!("features = [{}]", list.join(", ")));
+            }
+            return format!("{key} = {{ {} }}", items.join(", "));
+        }
+        line.to_string()
+    }
+}
+
+/// The content of an inline table without its braces.
+fn inner(table: &str) -> &str {
+    table
+        .trim()
+        .trim_start_matches('{')
+        .trim_end_matches('}')
+        .trim()
+}
+
+/// Top-level `key = value` items of an inline table body, keeping arrays whole.
+fn split_items(body: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (index, c) in body.char_indices() {
+        match c {
+            '[' | '{' => depth += 1,
+            ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                items.push(body[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    items.push(body[start..].trim());
+    items.into_iter().filter(|item| !item.is_empty()).collect()
+}
+
 /// The function package's manifest: path dependencies point into `vendor/`, dev and build
-/// dependencies are dropped, and the workspace tables are copied without `members`, so the
-/// package detaches from any parent and its vendored crates still inherit versions and
-/// dependency specs.
+/// dependencies are dropped, and a bare `[workspace]` with the release profile detaches the
+/// package from any parent.
 fn root_manifest(package: &str, workspace: &str) -> String {
     let mut text = strip_tables(package, &["dev-dependencies", "build-dependencies"]);
     for (from, to) in [
@@ -198,8 +345,8 @@ fn strip_tables(manifest: &str, names: &[&str]) -> String {
     out
 }
 
-/// `[workspace]` without `members`, `default-members` and `exclude`, plus
-/// `[workspace.package]`, `[workspace.dependencies]` and the `[profile.*]` tables.
+/// `[workspace]` without `members`, `default-members` and `exclude`, plus the `[profile.*]`
+/// tables; the inheritance tables are resolved into the manifests instead.
 fn detached_workspace(workspace: &str) -> String {
     let mut out = String::new();
     let mut table = String::new();
@@ -212,10 +359,7 @@ fn detached_workspace(workspace: &str) -> String {
         if let Some(name) = table_name(line) {
             table = name.to_string();
         }
-        let keep = table == "workspace"
-            || table == "workspace.package"
-            || table == "workspace.dependencies"
-            || table.starts_with("profile.");
+        let keep = table == "workspace" || table.starts_with("profile.");
         if !keep {
             continue;
         }

@@ -382,10 +382,9 @@ fn the_embedded_zip_is_the_function_package() {
     assert!(!root.contains("build.rs"));
     assert!(!root.contains("members"));
     assert!(root.contains("\n[workspace]\n"));
-    assert!(root.contains("[workspace.package]"));
     assert!(root.contains("rust-version = \"1.96\""));
-    assert!(root.contains("rust-version.workspace = true"));
-    assert!(root.contains("[workspace.dependencies]"));
+    assert!(!root.contains("[workspace.package]"));
+    assert!(!root.contains("[workspace.dependencies]"));
     assert!(!root.contains("[dev-dependencies]"));
 
     let scaleway = read("vendor/scaleway/Cargo.toml");
@@ -395,6 +394,11 @@ fn the_embedded_zip_is_the_function_package() {
     assert!(!scaleway.contains("zip"));
     let core = read("vendor/core/Cargo.toml");
     assert!(!core.contains("[dev-dependencies]"));
+    for manifest in [&root, &scaleway, &core] {
+        assert!(!manifest.contains(".workspace"), "{manifest}");
+        assert!(!manifest.contains("workspace = true"), "{manifest}");
+    }
+    assert!(scaleway.contains("\"time\""), "tokio features merged");
 
     assert!(read("src/lib.rs").contains("pub async fn handle("));
     assert!(read("Cargo.lock").contains("name = \"ciburst-dispatch-scaleway\""));
