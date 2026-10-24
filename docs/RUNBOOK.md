@@ -277,7 +277,7 @@ Date: 2026-10-24. Config: as the M3 drill, VMs in `nl-ams-1`, `slots` 2, `maxRun
 3. Swap: `/proc/swaps` read by a drill job.
    Result: passed. `/swapfile  file  4194300  268  -2` on the VM that ran the node job.
 4. Cost of runs 1 and 2 on the consumption page.
-   Result: ____ EUR (read after the VMs ended)
+   Result: 0.09 EUR for both: three DEV1-M hours 0.06, three IPv4 hours 0.02, 240 GB-hours of local SSD 0.01 (two clock hours per VM, created at minute 58). The three VMs drained at minute 55 and were gone within 90 s. The cold pipeline of the M3 drill started five VMs, about 0.15 EUR.
 5. Without `defaultPool` (D36): a pending event of an unmapped stage.
    Result: passed. `200 {"reason":"unmapped_stage","result":"ignored","stage":"deploy"}`, nothing started; the drill consumer's own pipelines on hosted runners no longer start runs.
 6. Hetzner, once `.local/hetzner.env` exists: the `vm` pool on `runtime: "hetzner"`, `apply`, a cold pipeline.
