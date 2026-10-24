@@ -5,12 +5,13 @@
 | Item | Value |
 |---|---|
 | Region | `fr-par` (provider and host) |
-| Resources | project `<name>`, IAM applications `<name>-dispatch` and `<name>-cache`, bucket `<name>-cache-<project id>`, job definitions `<name>-<tag>`, namespace `<name>`, function `<name>-dispatch` |
+| Resources | project `<name>`, IAM applications `<name>-dispatch` and `<name>-cache`, bucket `<name>-cache-<project id>`, job definitions `<name>-<tag>`, namespace `<name>`, function `<name>-dispatch`; for VM pools security group `<name>-vm` and servers `<name>-<tag>-<8 hex>` |
 | Pool images | `registry.gitlab.com/<namespace>/ciburst/{base,node,rust,playwright}` |
+| VM agent image | `registry.gitlab.com/<namespace>/ciburst/vm-agent`, also pushed to `<registry endpoint>/vm-agent`; `FROM scratch` with the static binary `/ciburst-vm-agent` |
 | Image tags | `edge` from the default branch; `X.Y.Z`, `X.Y`, `X`, `latest` from a tag `vX.Y.Z` |
 | Binary | `ciburst-x86_64-unknown-linux-musl` in the framework project's generic package registry, linked from each release |
-| Runner | `gitlab-runner` 18.11.4, `run-single`, shell executor, one run per pending job, exits after `waitTimeoutS` idle seconds |
-| Run limits | 6 vCPU, 16 GB, 24 h per run, 400 parallel runs per organization, `linux/amd64`, images under 2 GB recommended; `/tmp` counts against the run's memory |
+| Runner | `gitlab-runner` 18.11.4, `run-single`. Serverless Jobs pools: shell executor, one run per pending job, exits after `waitTimeoutS` idle seconds. VM pools: Docker executor, `slots` processes per VM |
+| Serverless Jobs limits | 6 vCPU, 16 GB, 24 h per run, 400 parallel runs per organization, `linux/amd64`, images under 2 GB recommended; `/tmp` counts against the run's memory |
 
 ## Owner setup
 
@@ -56,10 +57,10 @@ Gitignored. Never committed.
        ref: v1
        file: ci/ciburst.yml
    ```
-2. Jobs in `lint` and `test` need nothing: `default: tags: [ci]`.
-3. Jobs of another pool extend `.ciburst-rust` (stage `rust`) or `.ciburst-playwright` (stage `e2e`); image builds extend `.ciburst-image-build` (stage `build`, hosted runner with Docker). Declare these stages in `stages:`.
-4. Jobs that need a Docker daemon set `tags: [saas-linux-small-amd64]` and keep `image:` and `services:`.
-5. The `image:` keyword is ignored in every pool; the playwright pool ships browsers for Playwright 1.64.1, so pin `@playwright/test` to 1.64.1.
+2. Jobs need nothing: `default: tags: [vm]` runs them on the VM pool with their `image:` and `services:`; Docker-in-Docker works with `docker:27-dind` and `DOCKER_TLS_CERTDIR: "/certs"`.
+3. Image builds extend `.ciburst-image-build` (stage `build`, `docker:27` with `docker:27-dind` on the VM pool).
+4. Fast lanes on Serverless Jobs extend `.ciburst-rust` (stage `rust`) or `.ciburst-playwright` (stage `e2e`). They ignore `image:` and have no Docker daemon; the playwright pool ships browsers for Playwright 1.64.1, so pin `@playwright/test` to 1.64.1. Declare the stages in `stages:`.
+5. The job's stage selects the pool: VM jobs use stages no fast lane lists. A job for GitLab's hosted runners (`tags: [saas-linux-small-amd64]`) belongs in a fast-lane stage, so its pending event starts a cheap run instead of a VM.
 Check: `ciburst check` reports no problem; a pipeline shows each job on a runner named `<name>-<tag>`.
 
 ## Pool images
@@ -84,6 +85,37 @@ Add a toolchain:
 4. Add a pool with the image and its stages to `.local/config.json`; `ciburst apply`.
    Check: `ciburst check` reports no problem.
 
+## VM runtime
+
+A pool with `runtime: instances` runs jobs on Scaleway Instances (spec section 6.1). The dispatcher starts a VM for a pending job when no VM of the pool has a free slot. cloud-init writes `/etc/ciburst/vm.env`, installs `gitlab-runner` 18.11.4, copies `/ciburst-vm-agent` out of `<registry endpoint>/vm-agent:edge` and starts `ciburst-vm-agent.service`. The agent:
+
+- runs `slots` processes of `gitlab-runner run-single --executor docker` (flags in the verification table below) and restarts one that exits while the VM is not draining;
+- counts busy slots every 5 s as distinct `com.gitlab.gitlab-runner.job.id` labels over `docker ps`;
+- posts `{state, free, slots}` to the dispatcher's `/vm` on every change and every 10 minutes, with headers `X-Ciburst-Run` and `X-Ciburst-Token`;
+- drains when idle at minute 55 of the VM's hour (uptime), then posts `/terminate`; failed posts are retried for 10 minutes (2 s doubling to 60 s), then the agent exits 1 and systemd restarts it;
+- logs one line per transition to its journal: `state from=... to=...`, `slot started`, `slot exited`, `report failed`, `terminate accepted`, `terminate failed`, `terminate gave up`. No token appears in the log.
+
+| State | Meaning | Next |
+|---|---|---|
+| `starting` | created, no report accepted yet | `idle` or `busy` on the first accepted report |
+| `idle` | every slot polls GitLab, no job | `busy`; `draining` at minute 55 |
+| `busy` | at least one job runs | `idle` when no job container runs |
+| `draining` | reported at minute 55, `free` 0; slots poll for 30 s more, then get `SIGQUIT` and finish their job | `busy` if a slot takes a job in the 30 s; terminated once every slot exited |
+
+The state lives in the server's tags: `ciburst-state:<state>`, `ciburst-free:<n>`, `ciburst-seen:<unix time>` and, once draining, `ciburst-drain:<unix time>`, beside `ciburst`, `<name>`, `pool:<tag>`, `job:<id>`. See them in the console (Instances, the server, Tags) or with `GET https://api.scaleway.com/instance/v1/zones/<zone>/servers?tags=<name>` and header `X-Auth-Token: <secret key>`. The VM accepts no inbound connection.
+
+The cron `<name>-sweep` (every 30 minutes) terminates a VM in `starting` for more than 10 minutes, in `draining` for more than 15 minutes, silent for more than 30 minutes, or older than 24 hours.
+
+End a VM by hand, when the sweep does not:
+
+1. Find the server: console Instances filtered by the tag `<name>`, or the `GET` above.
+   Check: its `ciburst-seen` is older than 30 minutes, or no job of the pool runs on it in GitLab.
+2. Terminate it: console, the server, Delete with its volumes; or `POST https://api.scaleway.com/instance/v1/zones/<zone>/servers/<server id>/action` with body `{"action": "terminate"}`. Never `poweroff` from inside the VM: standby is billed as running.
+   Check: the server is gone from the list and no IP of it remains under Flexible IPs.
+3. A job that ran on it fails once GitLab stops receiving its updates; re-run it.
+
+Cost (scaleway.com/en/pricing/virtual-instances, 2026-10-24): billed per hour with a 60 minute minimum. DEV1-M (3 vCPU, 4 GB, local SSD) 0.0202 EUR/h plus the dynamic IPv4 0.005 EUR/h: 0.0252 EUR per VM-hour. PLAY2-NANO (2 vCPU, 4 GB) 0.02754 EUR/h plus the IPv4 and a block volume, as it has no local storage.
+
 ## Failure modes
 
 | Symptom | Cause | Action |
@@ -97,12 +129,15 @@ Add a toolchain:
 | Run ends `out of memory` | files in `/tmp` count against memory | raise `memoryMiB` or write to the builds dir |
 | Costs beyond the free tier | free tier exceeded | consumption page; per-second prices apply |
 | Function deploy fails with an unknown runtime | Scaleway retired `rust196` | runtime bump below |
+| VMs stay `starting` until the sweep ends them | cloud-init failed: runner download, agent image pull (`registryPublic`), or `vm.env` incomplete (the agent exits 64 naming the key) | fix the image or the config, `ciburst apply`, re-run the job |
+| A `vm` job stays pending while VMs of the pool idle | the job's stage maps to a fast lane | move the job to a stage of the VM pool, `ciburst check` |
+| A draining VM takes minutes to end | a slot cut off from GitLab waits 300 s between job requests, and `SIGQUIT` does not shorten that wait | none; the VM keeps reporting `draining` until its slots exit |
 
 ## Rotation and updates
 
-1. Secrets: `ciburst rotate runner`, `hook`, `key` or `cache`.
+1. Secrets: `ciburst rotate runner`, `hook`, `key` or `cache`. `rotate hook` also replaces the VM secret: running VMs can no longer report or end themselves, and the sweep removes them within an hour, with any job still running there; rotate it while the VM pools are idle.
    Check: `ciburst plan` prints only `noop`; a test pipeline passes.
-2. Yearly runtime bump: set the new Rust version in `rust-toolchain.toml`, the host runtime in `crates/scaleway`, `.gitlab-ci.yml` and `images/rust/Dockerfile`; tag a release; `ciburst apply`.
+2. Yearly runtime bump: set the new Rust version in `rust-toolchain.toml`, the host runtime in `crates/scaleway`, `.gitlab-ci.yml`, `images/rust/Dockerfile` and `images/vm-agent/Dockerfile`; tag a release; `ciburst apply`.
    Check: the function is `ready` and a test pipeline passes.
 3. Upstream images: bump the tags in `images/*/Dockerfile`.
    Check: `images/test/check-tags.sh` and the `images` stage are green.
@@ -144,6 +179,36 @@ Fixes found by the drill, all in the code since 2026-10-24:
 | A failed apply lost the IAM secrets Scaleway shows once | outputs are saved after every provider step |
 | Starting a job with a private registry image needs registry read | the dispatch policy grants `ContainerRegistryReadOnly`; older policies are repaired |
 
+## M3 drill
+
+Date: ____. Config: default pool `vm` (`runtime: instances`), fast lane `ci` (`runtime: jobs`) for stage `test`, `provider.registryPublic: true`. Pipeline `test/drill/gitlab-ci.yml` as `.gitlab-ci.yml` of the drill consumer branch `ciburst-drill`.
+
+1. Default-branch pipeline of the framework project with `CIBURST_SCW_REGISTRY` and `CIBURST_SCW_REGISTRY_KEY` set.
+   Check: `image:vm-agent` passes; `<registry endpoint>/vm-agent:edge` pulls without login.
+   Result: ____
+2. `ciburst apply`, then `ciburst plan`.
+   Check: the plan prints only `noop`; the security group `<name>-vm` and the cron `<name>-sweep` exist.
+   Result: ____
+3. `ciburst check` on the drill consumer project.
+   Check: no problem line.
+   Result: ____
+4. Run the drill pipeline.
+   Check: `node`, `rust`, `postgres`, `dind`, `docker-build` pass on runner `<name>-vm`; `fast-lane` on `<name>-ci`; `hosted` on a GitLab runner; `$CI_REGISTRY_IMAGE/ciburst-drill:<short sha>` exists.
+   Result: ____
+5. VM start: job pending to running for the first VM job (create, boot, cloud-init, first poll).
+   Result: ____ s
+6. Tags while the pipeline runs: `starting`, then `idle` or `busy` with `ciburst-free`, `ciburst-seen` refreshed.
+   Result: ____
+7. Longest wait of a drill job against one job duration plus one VM boot.
+   Result: ____
+8. End by callback: each VM reports `draining` and is gone between minute 55 and 60 of its hour.
+   Result: ____
+9. Sweep: start a VM, then block its reports with `ciburst rotate hook`.
+   Check: the sweep terminates it within an hour of its last report.
+   Result: ____
+10. Cost per drill pipeline on the consumption page (Instances, IPs, Serverless Jobs).
+    Result: ____ EUR
+
 ## `run-single` flag verification
 
 Date: 2026-10-24. Source: `gitlab-runner run-single --help` in `gitlab/gitlab-runner:v18.11.4` (`images/test/runner-help.sh`), and `commands/single.go` at `v18.11.4`.
@@ -168,6 +233,22 @@ Date: 2026-10-24. Source: `gitlab-runner run-single --help` in `gitlab/gitlab-ru
 
 Smoke result 2026-10-24: every image starts `run-single` as its user against an unreachable URL and exits with `has not received a job` after `RUNNER_WAIT_TIMEOUT=2`.
 
+Docker executor flags of the VM slots, date 2026-10-24, same sources; cache flags as above:
+
+| Flag | Help text (env) | Result |
+|---|---|---|
+| `--executor docker` | (`RUNNER_EXECUTOR`) | present |
+| `--docker-image` | Docker image to be used (`DOCKER_IMAGE`) | present; the pool's `image` for jobs without `image:` |
+| `--docker-privileged` | Give extended privileges to container (`DOCKER_PRIVILEGED`) | present |
+| `--docker-volumes` | Bind-mount a volume and create it if it doesn't exist prior to mounting, repeatable (`DOCKER_VOLUMES`) | present; `/cache` and `/certs/client` |
+| `--max-builds 0` | How many builds to process before exiting, default 0 | present; 0 runs forever |
+| `--wait-timeout 0` | How long to wait in seconds before receiving the first job, default 0 | present; 0 never exits for idleness (`checkFinishedConditions` tests `WaitTimeout > 0`) |
+| `--config` | Config file (`CONFIG_FILE`) | present; read only with `--runner`, so every slot of a VM gets the system id derived from the machine id (`configfile.GenerateUniqueSystemID`), as one `gitlab-runner run` with `concurrent` slots does |
+
+Job containers: the Docker executor labels build and service containers with `com.gitlab.gitlab-runner.job.id` (`executors/docker/internal/labels/labels.go`, applied in `executors/docker/docker.go`, v18.11.4).
+
+Slot smoke 2026-10-24 (`images/test/run-single-slot.sh`): the pinned runner with the slot flags requests a job every 2 to 3 s from a stub GitLab answering 204 (5 requests in 12 s) and exits with code 0 three seconds after `SIGQUIT`, logging `Requested quit, waiting for builds to finish`. A runner whose requests fail is unhealthy and waits `NotHealthyCheckInterval` (300 s) between requests (`common/consts.go`).
+
 ## Decisions
 
 | Date | Decision |
@@ -178,3 +259,8 @@ Smoke result 2026-10-24: every image starts `run-single` as its user against an 
 | 2026-10-24 | The shell executor runs job steps in a bash login shell: every image writes its `PATH` to `/etc/profile.d/ciburst-path.sh` and the `runner` user has no `.bash_logout`. |
 | 2026-10-24 | Releases use `glab release create` in `registry.gitlab.com/gitlab-org/cli:v1.124.0` with `GLAB_ENABLE_CI_AUTOLOGIN`; `release-cli` is deprecated since GitLab 18.0. |
 | 2026-10-24 | Image builds use `docker:27.5.1` with `docker:27.5.1-dind`. |
+| 2026-10-24 | Consumer image builds run on the VM pool (`.ciburst-image-build`: `docker:27`, `docker:27-dind`); the VM's runner is privileged. |
+| 2026-10-24 | VM slots mount `/certs/client` besides `/cache`, so Docker-in-Docker with TLS (`DOCKER_TLS_CERTDIR: "/certs"`) works as on GitLab's hosted runners (GitLab docs, Docker-in-Docker with TLS in the Docker executor). |
+| 2026-10-24 | The agent starts slots with only `PATH` and `HOME` in their environment: the runner reads `CI_SERVER_URL`, `CACHE_*` and `DOCKER_*` from its environment, and the flags stay the only source. |
+| 2026-10-24 | `free` counts running slots without a job; a draining VM reports `free` 0. The 30 s grace starts when the dispatcher accepted the `draining` report. |
+| 2026-10-24 | The VM agent image is `FROM scratch` with the static `x86_64-unknown-linux-musl` binary (rustls, no OpenSSL), built in `rust:1.96.0-bookworm` with `musl-tools` by `images/vm-agent/build.sh`. |
