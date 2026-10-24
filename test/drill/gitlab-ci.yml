@@ -1,0 +1,91 @@
+# M3 drill pipeline for the drill consumer branch `ciburst-drill` (docs/RUNBOOK.md, M3 drill).
+# Drill config: `vm` is the default pool (Scaleway Instances, Docker executor); `ci` is a
+# Serverless Jobs fast lane for stage `test`. The dispatcher maps a job's stage to a pool, so
+# every VM job uses stage `vm`, which no other pool lists. The hosted-runner job sits in stage
+# `test` so its pending event starts a cheap fast-lane run, not a VM.
+
+stages: [vm, test]
+
+default:
+  interruptible: true
+
+node:
+  stage: vm
+  tags: [vm]
+  image: node:24
+  script:
+    - node --version
+    - node --version | grep -q '^v24\.'
+
+rust:
+  stage: vm
+  tags: [vm]
+  image: rust:1.96
+  script:
+    - cargo --version
+    - rustc --version | grep -q '^rustc 1\.96\.'
+
+postgres:
+  stage: vm
+  tags: [vm]
+  image: postgres:16
+  services: [postgres:16]
+  variables:
+    POSTGRES_DB: drill
+    POSTGRES_USER: drill
+    POSTGRES_PASSWORD: drill
+    PGPASSWORD: drill
+  script:
+    - for attempt in $(seq 1 30); do pg_isready -h postgres -U drill && break; echo "waiting $attempt"; sleep 1; done
+    - test "$(psql -h postgres -U drill -d drill -tAc 'select 1')" = 1
+
+dind:
+  stage: vm
+  tags: [vm]
+  image: docker:27
+  services: [docker:27-dind]
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  script:
+    - docker run --rm hello-world
+
+docker-build:
+  stage: vm
+  tags: [vm]
+  image: docker:27
+  services: [docker:27-dind]
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+    DRILL_IMAGE: $CI_REGISTRY_IMAGE/ciburst-drill:$CI_COMMIT_SHORT_SHA
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login --username "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - mkdir -p drill-image
+    - echo "$CI_COMMIT_SHA" > drill-image/commit.txt
+    - |
+      cat > drill-image/Dockerfile <<'EOF'
+      FROM alpine:3.22 AS build
+      COPY commit.txt /drill/commit.txt
+      RUN adduser -D drill && chown -R drill /drill
+      FROM alpine:3.22
+      COPY --from=build /drill /drill
+      CMD ["cat", "/drill/commit.txt"]
+      EOF
+    - docker build -t "$DRILL_IMAGE" drill-image
+    - test "$(docker run --rm "$DRILL_IMAGE")" = "$CI_COMMIT_SHA"
+    - docker push "$DRILL_IMAGE"
+
+fast-lane:
+  stage: test
+  tags: [ci]
+  needs: []
+  script:
+    - echo "pool ci, runner $CI_RUNNER_DESCRIPTION"
+    - node --version
+
+hosted:
+  stage: test
+  tags: [saas-linux-small-amd64]
+  needs: []
+  image: alpine:3.22
+  script:
+    - echo "hosted runner $CI_RUNNER_DESCRIPTION"

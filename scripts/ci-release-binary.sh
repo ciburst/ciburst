@@ -33,5 +33,7 @@ done
   for image in base node rust playwright; do
     echo "- \`${CI_REGISTRY_IMAGE}/$image:$version\`"
   done
+  echo
+  echo "VM agent: \`${CI_REGISTRY_IMAGE}/vm-agent:$version\` (\`/ciburst-vm-agent\` in a scratch image)."
 } > release-notes.md
 cat release-notes.md

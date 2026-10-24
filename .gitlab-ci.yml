@@ -82,6 +82,18 @@ image:playwright:
   variables:
     IMAGE: playwright
 
+image:vm-agent:
+  extends: .image
+  variables:
+    IMAGE: vm-agent
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: [images/**/*, .gitlab-ci.yml, Cargo.lock, crates/core/**/*, crates/vm-agent/**/*]
+  script:
+    - images/vm-agent/build.sh "ciburst-ci/$IMAGE:$CI_COMMIT_SHORT_SHA"
+    - scripts/ci-push-image.sh "ciburst-ci/$IMAGE:$CI_COMMIT_SHORT_SHA" "$IMAGE"
+
 .release:
   stage: release
   rules:
@@ -98,7 +110,7 @@ release:binary:
 release:
   extends: .release
   image: registry.gitlab.com/gitlab-org/cli:v1.124.0
-  needs: [release:binary, image:base, image:node, image:rust, image:playwright]
+  needs: [release:binary, image:base, image:node, image:rust, image:playwright, image:vm-agent]
   variables:
     GLAB_ENABLE_CI_AUTOLOGIN: "true"
     BINARY: ciburst-x86_64-unknown-linux-musl
