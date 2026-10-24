@@ -209,6 +209,7 @@ Races and their effect:
 | A job goes pending while a VM starts draining | taken in the grace, or the dispatcher already saw `draining` and started a VM; at worst one extra VM-hour (0.025 EUR) |
 | A VM boots for a job another VM already took | the new VM idles until minute 55 of its hour and drains; one VM-hour |
 | A VM hangs or loses its network | its jobs fail on GitLab's side when the runner stops updating them; the sweep removes it |
+| Pending events of one pool arrive in parallel | each dispatcher call counts the VMs before the others' creates land, so a burst can pass `maxRuns` by up to the function's `max_scale` minus one (M3 drill: 5 VMs at `maxRuns` 4); the extra VMs idle out their hour |
 
 Sweep, a cron trigger every 30 minutes, authenticated by its own sweep token (not the hook token, which would sit readable in the cron's arguments): terminates VMs in `starting` for more than 10 minutes, VMs in `draining` for more than 15 minutes, VMs whose `ciburst-seen` is older than 30 minutes, and any VM older than 24 hours. It never touches a VM that reports, so it cannot race the scheduler or a running job. A job longer than the VM's report interval keeps the VM alive because the supervisor reports every 10 minutes independently of the job.
 

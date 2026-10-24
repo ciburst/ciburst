@@ -21,6 +21,9 @@ rust:
   stage: vm
   tags: [vm]
   image: rust:1.96
+  variables:
+    # The drill consumer checkout pins another toolchain in rust-toolchain.toml.
+    RUSTUP_TOOLCHAIN: "1.96.0"
   script:
     - cargo --version
     - rustc --version | grep -q '^rustc 1\.96\.'

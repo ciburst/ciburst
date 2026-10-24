@@ -131,7 +131,7 @@ Cost (scaleway.com/en/pricing/virtual-instances, 2026-10-24): billed per hour wi
 | Costs beyond the free tier | free tier exceeded | consumption page; per-second prices apply |
 | Function deploy fails with an unknown runtime | Scaleway retired `rust196` | runtime bump below |
 | VMs stay `starting` until the sweep ends them | cloud-init failed: runner download, agent image pull (`registryPublic`), or `vm.env` incomplete (the agent exits 64 naming the key) | fix the image or the config, `ciburst apply`, re-run the job |
-| VM jobs stay pending, no server appears, the function log shows `instance type unavailable` with `quota(s) exceeded` | the zone's quota for every type of the pool is 0 | set `provider.zone` to a zone with quota (Facts, Instance quotas) or ask Scaleway support to raise it, `ciburst apply`, re-run the jobs |
+| VM jobs stay pending, no server appears, the function log shows `instance type unavailable` with `quota(s) exceeded` | the zone's quota for every type of the pool is 0 | set `provider.zone` to a zone with quota (Facts, Instance quotas) or ask Scaleway support to raise it, `ciburst apply`, delete the security group `<name>-vm` of the old zone (console, Instances, Security groups), re-run the jobs |
 | A `vm` job stays pending while VMs of the pool idle | the job's stage maps to a fast lane | move the job to a stage of the VM pool, `ciburst check` |
 | A draining VM takes minutes to end | a slot cut off from GitLab waits 300 s between job requests, and `SIGQUIT` does not shorten that wait | none; the VM keeps reporting `draining` until its slots exit |
 
