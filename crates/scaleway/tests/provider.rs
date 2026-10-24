@@ -489,7 +489,15 @@ async fn s3_errors_carry_the_s3_code() {
             "scaleway s3 HEAD /contract-cache-{project_id}: 403 InvalidAccessKeyId signature check failed"
         )
     );
-    let missing = ScalewayJobs::new(contract_config(), backend.client(), Log::silent());
+    let missing = with_credentials(
+        contract_config(),
+        &backend,
+        Credentials {
+            access_key: None,
+            ..ScalewayFake::credentials()
+        },
+        Log::silent(),
+    );
     let error = missing.plan(&[]).await.unwrap_err().to_string();
     assert_eq!(
         error,

@@ -88,11 +88,12 @@ pub struct ScalewayJobs {
 
 impl ScalewayJobs {
     pub fn new(config: Arc<Config>, client: Arc<ScalewayClient>, log: Log) -> ScalewayJobs {
+        let s3_access_key = client.access_key().map(String::from);
         ScalewayJobs {
             config,
             client,
             log,
-            s3_access_key: client.access_key().map(String::from),
+            s3_access_key,
         }
     }
 

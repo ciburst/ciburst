@@ -208,6 +208,7 @@ impl ScalewayFake {
     pub fn credentials() -> Credentials {
         Credentials {
             secret_key: FAKE_SECRET_KEY.to_string(),
+            access_key: Some(FAKE_ACCESS_KEY.to_string()),
             organization_id: FAKE_ORGANIZATION_ID.to_string(),
             default_project_id: None,
         }
