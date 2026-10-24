@@ -525,6 +525,9 @@ impl Provider for ScalewayJobs {
                 }
             }
         }
+        if let Some(project_id) = project {
+            outputs.insert("CIBURST_PROJECT_ID".to_string(), project_id);
+        }
         Ok(outputs)
     }
 
