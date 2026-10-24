@@ -23,6 +23,14 @@ pub struct S3 {
     pub secret_key: String,
 }
 
+/// One page of a ListObjectsV2 answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListPage {
+    pub keys: Vec<String>,
+    /// `NextContinuationToken` of a truncated listing.
+    pub next: Option<String>,
+}
+
 impl S3 {
     async fn send(
         &self,
@@ -33,6 +41,7 @@ impl S3 {
         body: Vec<u8>,
         extra_headers: &[(&str, String)],
     ) -> Result<(String, Response)> {
+        let length = body.len();
         let host = host(&self.region);
         let mut path = format!("/{}", sigv4::uri_encode(bucket, true));
         if let Some(key) = key {
@@ -68,6 +77,11 @@ impl S3 {
         let mut request = Request::new(method, url).header("authorization", authorization);
         for (name, value) in headers {
             request = request.header(&name, value);
+        }
+        // S3 answers 411 to an object PUT without a length, and the HTTP client sends none for
+        // an empty body.
+        if method == "PUT" && key.is_some() {
+            request = request.header("content-length", length.to_string());
         }
         if !body.is_empty() {
             request.body = Some(body);
@@ -142,6 +156,34 @@ impl S3 {
         Ok(xml_values(&response.text(), "Key"))
     }
 
+    pub async fn put_object(&self, bucket: &str, key: &str, body: Vec<u8>) -> Result<()> {
+        self.expect_ok("PUT", bucket, Some(key), &[], body, &[])
+            .await
+            .map(drop)
+    }
+
+    /// One page of ListObjectsV2 below `prefix`, after the key `start_after`, continued at
+    /// `token`. The page size is the endpoint's default.
+    pub async fn list_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        start_after: Option<&str>,
+        token: Option<&str>,
+    ) -> Result<ListPage> {
+        let mut query = vec![("list-type", "2"), ("prefix", prefix)];
+        if let Some(start_after) = start_after {
+            query.push(("start-after", start_after));
+        }
+        if let Some(token) = token {
+            query.push(("continuation-token", token));
+        }
+        let response = self
+            .expect_ok("GET", bucket, None, &query, Vec::new(), &[])
+            .await?;
+        parse_list_page(&response.text())
+    }
+
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
         self.expect_ok("DELETE", bucket, Some(key), &[], Vec::new(), &[])
             .await
@@ -210,6 +252,32 @@ pub fn parse_lifecycle_days(xml: &str) -> Option<u32> {
             .parse()
             .ok()
     })
+}
+
+/// Keys and continuation of a `ListBucketResult` document (ListObjectsV2).
+pub fn parse_list_page(xml: &str) -> Result<ListPage> {
+    if !xml.contains("<ListBucketResult") {
+        return Err(Error::provider(
+            "scaleway s3 list: answer without ListBucketResult",
+        ));
+    }
+    let keys = xml_values(xml, "Contents")
+        .iter()
+        .filter_map(|contents| xml_values(contents, "Key").into_iter().next())
+        .collect();
+    let truncated = xml_values(xml, "IsTruncated").first().map(String::as_str) == Some("true");
+    if !truncated {
+        return Ok(ListPage { keys, next: None });
+    }
+    match xml_values(xml, "NextContinuationToken").into_iter().next() {
+        Some(token) if !token.is_empty() => Ok(ListPage {
+            keys,
+            next: Some(token),
+        }),
+        _ => Err(Error::provider(
+            "scaleway s3 list: truncated answer without NextContinuationToken",
+        )),
+    }
 }
 
 /// Text of every `<tag>...</tag>` element (no attributes, no nesting of the same tag), unescaped.
@@ -316,6 +384,38 @@ mod tests {
         assert_eq!(base64(b"f"), "Zg==");
         assert_eq!(base64(b"fo"), "Zm8=");
         assert_eq!(base64(b"foo"), "Zm9v");
+    }
+
+    #[test]
+    fn reads_list_pages() {
+        let page = parse_list_page(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <Name>b</Name><Prefix>p/</Prefix><NextContinuationToken>t+/=</NextContinuationToken>\
+             <KeyCount>2</KeyCount><MaxKeys>2</MaxKeys><IsTruncated>true</IsTruncated>\
+             <Contents><Key>p/a&amp;b</Key><Size>0</Size></Contents>\
+             <Contents><Key>p/c</Key><Size>0</Size></Contents></ListBucketResult>",
+        )
+        .unwrap();
+        assert_eq!(page.keys, ["p/a&b", "p/c"]);
+        assert_eq!(page.next.as_deref(), Some("t+/="));
+        let last = parse_list_page(
+            "<ListBucketResult><ContinuationToken>t</ContinuationToken><KeyCount>0</KeyCount>\
+             <IsTruncated>false</IsTruncated></ListBucketResult>",
+        )
+        .unwrap();
+        assert_eq!(
+            last,
+            ListPage {
+                keys: Vec::new(),
+                next: None
+            }
+        );
+        assert!(
+            parse_list_page("<ListBucketResult><IsTruncated>true</IsTruncated></ListBucketResult>")
+                .is_err()
+        );
+        assert!(parse_list_page("<Error><Code>x</Code></Error>").is_err());
     }
 
     #[test]

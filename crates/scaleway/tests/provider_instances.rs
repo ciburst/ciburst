@@ -352,6 +352,38 @@ async fn start_creates_the_server_of_rule_four_then_user_data_then_poweron() {
 }
 
 #[tokio::test]
+async fn a_server_starts_with_the_slots_the_dispatcher_already_took() {
+    let config = config(|c| c.pools[0].slots = 3);
+    let (backend, provider, _) = provisioned(config.clone(), Log::silent()).await;
+    let free = |id: &str| {
+        tags(&backend.instance.server(id).unwrap())
+            .into_iter()
+            .find(|t| t.starts_with("ciburst-free:"))
+            .unwrap()
+    };
+    for (slots, taken, expected) in [
+        (3, 2, "ciburst-free:1"),
+        (2, 2, "ciburst-free:0"),
+        (3, 3, "ciburst-free:0"),
+        (2, 5, "ciburst-free:0"),
+        (2, 0, "ciburst-free:1"),
+        (3, 1, "ciburst-free:2"),
+    ] {
+        let mut start = request(&config, "ci");
+        start.pool.slots = slots;
+        start.taken = taken;
+        let id = provider.start(start).await.unwrap();
+        assert_eq!(free(&id), expected, "slots {slots}, taken {taken}");
+        let user_data = backend.instance.user_data(&id, "cloud-init").unwrap();
+        assert_eq!(
+            vm_env(&parse(&user_data))["CIBURST_SLOTS"],
+            slots.to_string(),
+            "the agent still runs every slot"
+        );
+    }
+}
+
+#[tokio::test]
 async fn start_falls_back_to_the_next_type_when_out_of_stock() {
     let config = config(|c| {
         c.pools[0].instance_types = strings(&["DEV1-M", "DEV1-L"]);

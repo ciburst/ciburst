@@ -1,7 +1,12 @@
 //! Fake of the Object Storage S3 endpoint (`s3.<region>.scw.cloud`), path-style: bucket create,
-//! head, lifecycle, list, object and bucket delete. Verifies the SigV4 authorization header
-//! against the owner key and answers `403 SignatureDoesNotMatch` otherwise; lifecycle writes
-//! need `Content-MD5` as Scaleway documents.
+//! head, lifecycle, ListObjectsV2, object put, object and bucket delete. Verifies the SigV4
+//! authorization header against the owner key and the keys added with [`FakeS3::add_key`] and
+//! answers `403 SignatureDoesNotMatch` otherwise; lifecycle writes need `Content-MD5` as
+//! Scaleway documents, object writes a `Content-Length` as S3 does.
+//!
+//! ListObjectsV2 pages hold [`DEFAULT_PAGE`] keys unless `max-keys` asks for another size (at
+//! most 1000, as on S3), so every caller meets pagination. The answer has the element order and
+//! names of the AWS documentation; continuation tokens are opaque.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -11,8 +16,17 @@ use ciburst_core::Result;
 use ciburst_core::http::{HttpClient, Request, Response};
 
 use super::scaleway_fake::{Call, FAKE_ACCESS_KEY, FAKE_SECRET_KEY, Url, call_of, percent_decode};
-use crate::provider::s3::{content_md5, xml_escape};
+use crate::provider::s3::{base64, content_md5, xml_escape};
 use crate::provider::sigv4;
+
+/// Keys per ListObjectsV2 page without `max-keys`; S3 answers 1000.
+pub const DEFAULT_PAGE: usize = 3;
+/// The largest page S3 answers, whatever `max-keys` asks for.
+pub const MAX_PAGE: usize = 1000;
+/// The longest object key S3 accepts, in bytes.
+pub const MAX_KEY_BYTES: usize = 1024;
+
+const TOKEN_PREFIX: &str = "fake-token:";
 
 #[derive(Debug, Clone, Default)]
 struct Bucket {
@@ -24,6 +38,9 @@ struct Bucket {
 struct Inner {
     buckets: BTreeMap<String, Bucket>,
     calls: Vec<Call>,
+    /// Further access keys and their secrets, besides the owner key.
+    keys: BTreeMap<String, String>,
+    page: Option<usize>,
 }
 
 #[derive(Default)]
@@ -48,6 +65,49 @@ fn s3_error(status: u16, code: &str, message: &str) -> Response {
     )
 }
 
+/// An opaque continuation token naming the last key of the page before.
+fn token_for(last_key: &str) -> String {
+    base64(format!("{TOKEN_PREFIX}{last_key}").as_bytes())
+}
+
+fn key_of_token(token: &str) -> Option<String> {
+    let bytes = base64_decode(token)?;
+    String::from_utf8(bytes)
+        .ok()?
+        .strip_prefix(TOKEN_PREFIX)
+        .map(String::from)
+}
+
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if text.is_empty() || !text.len().is_multiple_of(4) {
+        return None;
+    }
+    let chunks: Vec<&[u8]> = text.as_bytes().chunks(4).collect();
+    let mut out = Vec::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        let mut n = 0u32;
+        let mut padding = 0;
+        for &byte in *chunk {
+            let value = if byte == b'=' {
+                padding += 1;
+                0
+            } else if padding > 0 {
+                return None;
+            } else {
+                ALPHABET.iter().position(|&c| c == byte)? as u32
+            };
+            n = (n << 6) | value;
+        }
+        if padding > 2 || (padding > 0 && index + 1 != chunks.len()) {
+            return None;
+        }
+        let bytes = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
+        out.extend_from_slice(&bytes[..3 - padding]);
+    }
+    Some(out)
+}
+
 impl FakeS3 {
     pub fn new() -> FakeS3 {
         FakeS3::default()
@@ -55,6 +115,20 @@ impl FakeS3 {
 
     pub fn calls(&self) -> Vec<Call> {
         self.inner.lock().expect("fake s3").calls.clone()
+    }
+
+    /// Accepts requests signed with this key pair too, as the cache key's.
+    pub fn add_key(&self, access_key: &str, secret_key: &str) {
+        self.inner
+            .lock()
+            .expect("fake s3")
+            .keys
+            .insert(access_key.to_string(), secret_key.to_string());
+    }
+
+    /// Keys per ListObjectsV2 page without `max-keys`, [`DEFAULT_PAGE`] unless set.
+    pub fn set_page_size(&self, keys: usize) {
+        self.inner.lock().expect("fake s3").page = Some(keys.clamp(1, MAX_PAGE));
     }
 
     pub fn buckets(&self) -> Vec<String> {
@@ -88,8 +162,24 @@ impl FakeS3 {
         }
     }
 
+    /// Every object of `bucket` as key and content, sorted by key.
+    pub fn objects(&self, bucket: &str) -> Vec<(String, Vec<u8>)> {
+        self.inner
+            .lock()
+            .expect("fake s3")
+            .buckets
+            .get(bucket)
+            .map(|b| {
+                b.objects
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// `None` when the request is signed correctly, else the error response.
-    fn verify(request: &Request, url: &Url) -> Option<Response> {
+    fn verify(keys: &BTreeMap<String, String>, request: &Request, url: &Url) -> Option<Response> {
         let denied = |code: &str| Some(s3_error(403, code, "signature check failed"));
         let Some(authorization) = request.header_value("authorization") else {
             return denied("AccessDenied");
@@ -99,9 +189,13 @@ impl FakeS3 {
         else {
             return denied("AuthorizationHeaderMalformed");
         };
-        if access_key != FAKE_ACCESS_KEY {
+        let secret_key = if access_key == FAKE_ACCESS_KEY {
+            FAKE_SECRET_KEY
+        } else if let Some(secret_key) = keys.get(&access_key) {
+            secret_key.as_str()
+        } else {
             return denied("InvalidAccessKeyId");
-        }
+        };
         let Some(amz_date) = request.header_value("x-amz-date") else {
             return denied("AccessDenied");
         };
@@ -140,12 +234,114 @@ impl FakeS3 {
             &headers,
             &payload_hash,
         );
-        let expected = sigv4::signature(FAKE_SECRET_KEY, amz_date, region, &canonical);
+        let expected = sigv4::signature(secret_key, amz_date, region, &canonical);
         if expected != signature {
             return denied("SignatureDoesNotMatch");
         }
         None
     }
+}
+
+/// `PUT /<bucket>/<key>`: a length is required; the HTTP client derives it from a non-empty
+/// body and sends none for an empty one.
+fn put_object(bucket: &mut Bucket, key: String, request: &Request) -> Response {
+    let body = request.body.clone().unwrap_or_default();
+    match request.header_value("content-length") {
+        None if body.is_empty() => {
+            return s3_error(
+                411,
+                "MissingContentLength",
+                "You must provide the Content-Length HTTP header.",
+            );
+        }
+        Some(length) if length.parse::<usize>().ok() != Some(body.len()) => {
+            return s3_error(
+                400,
+                "IncompleteBody",
+                "You did not provide the number of bytes specified by the Content-Length HTTP header",
+            );
+        }
+        _ => {}
+    }
+    if key.len() > MAX_KEY_BYTES {
+        return s3_error(400, "KeyTooLongError", "Your key is too long");
+    }
+    bucket.objects.insert(key, body);
+    Response::empty(200)
+}
+
+/// `GET /<bucket>?list-type=2`: keys below `prefix`, after `start-after` or, when given, after
+/// the key the `continuation-token` names, ascending, `max-keys` per page.
+fn list_objects(name: &str, bucket: &Bucket, url: &Url, default_page: usize) -> Response {
+    let invalid = |message: &str| s3_error(400, "InvalidArgument", message);
+    if url.get("delimiter").is_some() || url.get("encoding-type").is_some() {
+        return s3_error(501, "NotImplemented", "not supported by the fake");
+    }
+    let prefix = url.get("prefix").unwrap_or_default();
+    let start_after = url.get("start-after");
+    let token = url.get("continuation-token");
+    let max_keys = match url.get("max-keys") {
+        None => default_page,
+        Some(value) => match value.parse::<usize>() {
+            Ok(n) => n.min(MAX_PAGE),
+            Err(_) => return invalid("Provided max-keys not an integer or within integer range"),
+        },
+    };
+    let after = match token {
+        Some(token) => match key_of_token(token) {
+            Some(key) => Some(key),
+            None => return invalid("The continuation token provided is incorrect"),
+        },
+        None => start_after.map(String::from),
+    };
+    let mut matching = bucket
+        .objects
+        .iter()
+        .filter(|(key, _)| key.starts_with(prefix))
+        .filter(|(key, _)| after.as_deref().is_none_or(|after| key.as_str() > after));
+    let page: Vec<(&String, &Vec<u8>)> = matching.by_ref().take(max_keys).collect();
+    let truncated = max_keys > 0 && matching.next().is_some();
+    let mut out = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Name>{}</Name><Prefix>{}</Prefix>",
+        xml_escape(name),
+        xml_escape(prefix)
+    );
+    if let Some(start_after) = start_after {
+        out.push_str(&format!(
+            "<StartAfter>{}</StartAfter>",
+            xml_escape(start_after)
+        ));
+    }
+    if let Some(token) = token {
+        out.push_str(&format!(
+            "<ContinuationToken>{}</ContinuationToken>",
+            xml_escape(token)
+        ));
+    }
+    if truncated && let Some((last, _)) = page.last() {
+        out.push_str(&format!(
+            "<NextContinuationToken>{}</NextContinuationToken>",
+            xml_escape(&token_for(last))
+        ));
+    }
+    out.push_str(&format!(
+        "<KeyCount>{}</KeyCount><MaxKeys>{max_keys}</MaxKeys><IsTruncated>{truncated}</IsTruncated>",
+        page.len()
+    ));
+    for (key, data) in &page {
+        out.push_str(&format!(
+            "<Contents><Key>{}</Key><LastModified>2026-10-24T00:00:00.000Z</LastModified>\
+             <ETag>&quot;{}&quot;</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass>\
+             </Contents>",
+            xml_escape(key),
+            sigv4::sha256_hex(data).get(..32).unwrap_or_default(),
+            data.len()
+        ));
+    }
+    out.push_str("</ListBucketResult>");
+    xml(200, out)
 }
 
 #[async_trait]
@@ -154,7 +350,7 @@ impl HttpClient for FakeS3 {
         let url = Url::parse(&request.url);
         let mut inner = self.inner.lock().expect("fake s3");
         inner.calls.push(call_of(&request, &url));
-        if let Some(denied) = FakeS3::verify(&request, &url) {
+        if let Some(denied) = FakeS3::verify(&inner.keys, &request, &url) {
             return Ok(denied);
         }
         let path = url.path.trim_start_matches('/');
@@ -170,6 +366,7 @@ impl HttpClient for FakeS3 {
         let has = |name: &str| url.query.iter().any(|(k, _)| k == name);
         let method = request.method.as_str();
         let no_bucket = || s3_error(404, "NoSuchBucket", "The specified bucket does not exist");
+        let page = inner.page.unwrap_or(DEFAULT_PAGE);
         match (method, key) {
             ("PUT", None) if has("lifecycle") => {
                 let body = request.body.clone().unwrap_or_default();
@@ -193,6 +390,10 @@ impl HttpClient for FakeS3 {
                 inner.buckets.insert(bucket, Bucket::default());
                 Ok(Response::empty(200))
             }
+            ("PUT", Some(key)) if url.query.is_empty() => match inner.buckets.get_mut(&bucket) {
+                None => Ok(no_bucket()),
+                Some(b) => Ok(put_object(b, key, &request)),
+            },
             ("HEAD", None) => Ok(if inner.buckets.contains_key(&bucket) {
                 Response::empty(200)
             } else {
@@ -211,31 +412,10 @@ impl HttpClient for FakeS3 {
                 )),
             },
             ("GET", None) if url.get("list-type") == Some("2") => {
-                let Some(b) = inner.buckets.get(&bucket) else {
-                    return Ok(no_bucket());
-                };
-                let contents: String = b
-                    .objects
-                    .iter()
-                    .take(1000)
-                    .map(|(k, v)| {
-                        format!(
-                            "<Contents><Key>{}</Key><Size>{}</Size></Contents>",
-                            xml_escape(k),
-                            v.len()
-                        )
-                    })
-                    .collect();
-                Ok(xml(
-                    200,
-                    format!(
-                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult>\
-                         <Name>{bucket}</Name><KeyCount>{}</KeyCount>\
-                         <IsTruncated>{}</IsTruncated>{contents}</ListBucketResult>",
-                        b.objects.len().min(1000),
-                        b.objects.len() > 1000
-                    ),
-                ))
+                match inner.buckets.get(&bucket) {
+                    None => Ok(no_bucket()),
+                    Some(b) => Ok(list_objects(&bucket, b, &url, page)),
+                }
             }
             ("DELETE", None) => match inner.buckets.get(&bucket) {
                 None => Ok(no_bucket()),
@@ -261,6 +441,26 @@ impl HttpClient for FakeS3 {
                 "MethodNotAllowed",
                 "not supported by the fake",
             )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokens_round_trip_and_reject_garbage() {
+        for key in [
+            "a",
+            "ab",
+            "abc",
+            "ciburst/intents/vm/0000000001-00000000000000000001",
+        ] {
+            assert_eq!(key_of_token(&token_for(key)).as_deref(), Some(key));
+        }
+        for token in ["", "abc", "a===", "####", &base64(b"other")] {
+            assert_eq!(key_of_token(token), None, "{token}");
         }
     }
 }
