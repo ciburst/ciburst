@@ -1,0 +1,18 @@
+[package]
+name = "ciburst-dispatch-scaleway"
+description = "The ciburst dispatcher as a Scaleway Serverless Function"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+axum.workspace = true
+ciburst-core = { path = "../core", version = "0.1.0" }
+ciburst-scaleway = { path = "../scaleway", version = "0.1.0" }
+http.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

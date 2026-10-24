@@ -9,7 +9,6 @@ license.workspace = true
 [features]
 default = ["reqwest"]
 reqwest = ["dep:reqwest"]
-testing = []
 
 [dependencies]
 async-trait.workspace = true

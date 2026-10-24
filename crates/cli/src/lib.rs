@@ -14,10 +14,14 @@ use ciburst_core::provision::Provisioner;
 use ciburst_core::store::FileStore;
 use ciburst_core::types::{Host, Provider, Rotation};
 use ciburst_core::{Error, Result};
+use ciburst_scaleway::client::{Credentials, DEFAULT_REGION, ScalewayClient};
+use ciburst_scaleway::host::{HOST_NAME as SCALEWAY_HOST, ScalewayFunction};
+use ciburst_scaleway::provider::{PROVIDER_NAME as SCALEWAY_PROVIDER, ScalewayJobs};
 use clap::{Parser, Subcommand};
+use serde_json::Value;
 
-pub const PROVIDERS: &[&str] = &["fake"];
-pub const HOSTS: &[&str] = &["fake"];
+pub const PROVIDERS: &[&str] = &["fake", SCALEWAY_PROVIDER];
+pub const HOSTS: &[&str] = &["fake", SCALEWAY_HOST];
 
 #[derive(Parser)]
 #[command(name = "ciburst", version, about = "Serverless per-job GitLab runners")]
@@ -55,6 +59,86 @@ enum Command {
     Rotate { kind: String },
 }
 
+/// Modules selected by the config, built once per command.
+struct Modules {
+    config: Arc<Config>,
+    local: PathBuf,
+    log: Log,
+    scaleway: Option<Arc<ScalewayClient>>,
+}
+
+impl Modules {
+    async fn scaleway(&mut self) -> Result<Arc<ScalewayClient>> {
+        if let Some(client) = &self.scaleway {
+            return Ok(client.clone());
+        }
+        let env = read_env_file(&self.local.join("scaleway.env")).await?;
+        let credentials = Credentials::from_env(&env)?;
+        let region = self
+            .config
+            .provider
+            .extra
+            .get("region")
+            .or_else(|| self.config.host.extra.get("region"))
+            .and_then(Value::as_str)
+            .unwrap_or(DEFAULT_REGION)
+            .to_string();
+        let client = Arc::new(ScalewayClient::new(
+            Arc::new(ReqwestClient::new()?),
+            credentials,
+            &region,
+        ));
+        self.scaleway = Some(client.clone());
+        Ok(client)
+    }
+
+    fn store(&self, slot: &str) -> Arc<FileStore> {
+        Arc::new(FileStore::new(self.local.join("state.json"), slot))
+    }
+
+    async fn provider(&mut self) -> Result<Arc<dyn Provider>> {
+        match self.config.provider.kind.as_str() {
+            "fake" => Ok(Arc::new(FakeProvider::new(
+                self.config.clone(),
+                self.store("provider"),
+            ))),
+            SCALEWAY_PROVIDER => {
+                let client = self.scaleway().await?;
+                Ok(Arc::new(ScalewayJobs::new(
+                    self.config.clone(),
+                    client,
+                    self.log.clone(),
+                )))
+            }
+            other => Err(Error::other(format!(
+                "no provider named {other}; available: {}",
+                PROVIDERS.join(", ")
+            ))),
+        }
+    }
+
+    async fn host(&mut self) -> Result<Arc<dyn Host>> {
+        match self.config.host.kind.as_str() {
+            "fake" => Ok(Arc::new(FakeHost::new(
+                self.config.clone(),
+                self.store("host"),
+            ))),
+            SCALEWAY_HOST => {
+                let client = self.scaleway().await?;
+                Ok(Arc::new(ScalewayFunction::new(
+                    self.config.clone(),
+                    client,
+                    self.log.clone(),
+                )))
+            }
+            other => Err(Error::other(format!(
+                "no host named {other}; available: {}",
+                HOSTS.join(", ")
+            ))),
+        }
+    }
+}
+
 pub async fn run(args: Vec<String>, out: &mut dyn Write) -> Result<i32> {
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
@@ -71,37 +155,25 @@ pub async fn run(args: Vec<String>, out: &mut dyn Write) -> Result<i32> {
 
     let log = Log::stderr();
     let config = Arc::new(load_config(&cli.config).await?);
-    let local = cli.local.as_path();
-    let provider = make_provider(config.clone(), local)?;
+    let mut modules = Modules {
+        config: config.clone(),
+        local: cli.local.clone(),
+        log: log.clone(),
+        scaleway: None,
+    };
+    let provider = modules.provider().await?;
     let capability_errors = check_capabilities(&config, &provider.capabilities());
     if !capability_errors.is_empty() {
         return Err(Error::Config(capability_errors));
     }
-    let host = make_host(config.clone(), local)?;
-
+    let host = modules.host().await?;
     let gitlab = if cli.skip_gitlab {
         None
     } else {
-        let token = match std::env::var("GITLAB_TOKEN") {
-            Ok(token) if !token.is_empty() => token,
-            _ => read_env_file(&local.join("gitlab.env"))
-                .await?
-                .remove("GITLAB_TOKEN")
-                .ok_or_else(|| {
-                    Error::other(format!(
-                        "GITLAB_TOKEN missing in {}; pass --skip-gitlab to leave GitLab untouched",
-                        local.join("gitlab.env").display()
-                    ))
-                })?,
-        };
-        Some(Arc::new(Gitlab::new(
-            &config.gitlab.url,
-            token,
-            Arc::new(ReqwestClient::new()?),
-        )))
+        Some(Arc::new(gitlab_client(&config, &cli.local).await?))
     };
 
-    let outputs = Arc::new(FileOutputs::new(local.join("outputs.env")));
+    let outputs = Arc::new(FileOutputs::new(cli.local.join("outputs.env")));
     let outputs_path = outputs.path().to_path_buf();
     let provisioner = Provisioner::new(config.clone(), provider, host, gitlab, outputs, log);
 
@@ -206,28 +278,22 @@ pub async fn run(args: Vec<String>, out: &mut dyn Write) -> Result<i32> {
     }
 }
 
-fn make_provider(config: Arc<Config>, local: &Path) -> Result<Arc<dyn Provider>> {
-    match config.provider.kind.as_str() {
-        "fake" => Ok(Arc::new(FakeProvider::new(
-            config,
-            Arc::new(FileStore::new(local.join("state.json"), "provider")),
-        ))),
-        other => Err(Error::other(format!(
-            "no provider named {other}; available: {}",
-            PROVIDERS.join(", ")
-        ))),
-    }
-}
-
-fn make_host(config: Arc<Config>, local: &Path) -> Result<Arc<dyn Host>> {
-    match config.host.kind.as_str() {
-        "fake" => Ok(Arc::new(FakeHost::new(
-            config,
-            Arc::new(FileStore::new(local.join("state.json"), "host")),
-        ))),
-        other => Err(Error::other(format!(
-            "no host named {other}; available: {}",
-            HOSTS.join(", ")
-        ))),
-    }
+async fn gitlab_client(config: &Config, local: &Path) -> Result<Gitlab> {
+    let token = match std::env::var("GITLAB_TOKEN") {
+        Ok(token) if !token.is_empty() => token,
+        _ => read_env_file(&local.join("gitlab.env"))
+            .await?
+            .remove("GITLAB_TOKEN")
+            .ok_or_else(|| {
+                Error::other(format!(
+                    "GITLAB_TOKEN missing in {}; pass --skip-gitlab to leave GitLab untouched",
+                    local.join("gitlab.env").display()
+                ))
+            })?,
+    };
+    Ok(Gitlab::new(
+        &config.gitlab.url,
+        token,
+        Arc::new(ReqwestClient::new()?),
+    ))
 }

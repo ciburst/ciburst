@@ -1,0 +1,20 @@
+[package]
+name = "ciburst-scaleway"
+description = "Scaleway implementation of the ciburst ports: Serverless Jobs provider and Serverless Function host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+ciburst-core = { path = "../core", version = "0.1.0" }
+hex.workspace = true
+hmac.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
