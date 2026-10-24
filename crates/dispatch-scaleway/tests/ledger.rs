@@ -188,7 +188,6 @@ async fn a_pending_vm_job_without_a_free_slot_starts_a_vm_with_one_slot_taken() 
 }
 
 #[tokio::test]
-#[ignore = "needs the M4 dispatcher rules R3 and R4 of crates/core (agent A)"]
 async fn a_pending_vm_job_without_a_free_slot_records_its_intent() {
     let (backend, vars) = deployed("s3").await;
     let (status, body) = pending_job(&backend, &env(&vars)).await;
