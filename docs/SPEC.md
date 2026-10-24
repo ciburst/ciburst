@@ -165,14 +165,14 @@ Provider `scaleway-jobs` (API `serverless-jobs/v1alpha1`, region from config):
 | list | `GET job-runs?job_definition_id=<id>` states `queued, scheduled, running` map to live | | |
 | stop | `POST job-runs/<id>/stop` | | |
 
-Provider `scaleway-instances` (API `instance/v1`, zone `<region>-1` by default), the default pool's provider:
+Provider `scaleway`, runtime `instances` (API `instance/v1`, zone `<region>-1` unless `provider.zone` is set), the default for pools without `runtime`; the type `scaleway-jobs` keeps `jobs` as its default so M2 configs do not change:
 
 | Step | Resource |
 |---|---|
 | 1 | Project, dispatch key and cache bucket shared with `scaleway-jobs`; the dispatch policy adds `InstancesFullAccess` |
-| 2 | Security group `<name>-vm`: inbound drop, outbound accept |
-| 3 | Image `<name>-vm`: Ubuntu 24.04 with Docker CE and `gitlab-runner` baked by a builder VM from cloud-init, snapshotted, the builder deleted; rebuilt when its recipe digest changes |
-| start | `POST servers` with `commercial_type` from a fallback list (default `DEV1-M`, then `PLAY2-NANO`), the baked image, local root volume, `dynamic_ip_required`, tags `ciburst`, `<name>`, `pool:<tag>`, `job:<id>`; user data `cloud-init` with the pool's runner token, cache settings, the dispatcher URL and the VM's capability token; then `poweron` |
+| 2 | Security group `<name>-vm`: inbound drop, outbound accept, stateful; step id `vm:security-group` |
+| 3 | Image: Scaleway's marketplace image labelled `docker` (Ubuntu with Docker), its `instance_local` variant for the type; fallback `ubuntu_noble` with Docker installed by cloud-init. A baked image is backlog. |
+| start | `POST servers` with `commercial_type` from a fallback list (default `DEV1-M`, then `DEV1-L`; only types with a local root volume, because terminate deletes local volumes but only detaches block volumes, which keep billing; PLAY2 types have no local volume), the baked image, local root volume, `dynamic_ip_required`, tags `ciburst`, `<name>`, `pool:<tag>`, `job:<id>`; user data `cloud-init` with the pool's runner token, cache settings, the dispatcher URL and the VM's capability token; then `poweron` |
 | run | cloud-init starts the supervisor with `concurrent` slots of `gitlab-runner run-single --executor docker --docker-privileged`; lifecycle in section 6.1 |
 | list | `GET servers?tags=<name>` with states `starting`, `running` as live |
 | stop | `terminate` (deletes the local volume, releases the dynamic IP) |
@@ -230,6 +230,7 @@ Cost per run: 0.00001 EUR per vCPU-second plus 0.000002 EUR per GB-second after 
 - The dispatcher's IAM key can only start, list and stop Serverless Jobs in the dedicated project. The dispatcher holds no GitLab token.
 - A job can read its run's environment (its pool's runner token, the cache key), as on any runner. The dispatch IAM key never enters a run. The cache key can only read and write the cache bucket.
 - Images run as the non-root user `runner`.
+- A VM runs jobs privileged (Docker-in-Docker), so every job can read the VM's user data: its pool's runner token, the cache key and the VM's own token. This equals GitLab's own privileged runners; the VM token can only report for and end its own VM, and the dispatch key never reaches a VM.
 
 Secrets inventory:
 
