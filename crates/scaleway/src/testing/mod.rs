@@ -7,3 +7,4 @@ pub mod functions_api;
 pub mod iam_api;
 pub mod jobs_api;
 pub mod s3_api;
+pub mod scaleway_fake;
