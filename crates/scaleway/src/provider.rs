@@ -35,6 +35,9 @@ use registry::NamespaceState;
 
 pub const PROVIDER_NAME: &str = "scaleway";
 
+/// The provider type of M2, which only had Serverless Jobs.
+pub const LEGACY_JOBS_TYPE: &str = "scaleway-jobs";
+
 /// Commercial types tried in order when a pool names none.
 pub const DEFAULT_INSTANCE_TYPES: [&str; 2] = ["DEV1-M", "PLAY2-NANO"];
 
@@ -218,9 +221,13 @@ impl ScalewayJobs {
             .unwrap_or(false)
     }
 
-    /// `provider.runtime`, the runtime of pools that name none: `instances` unless set.
+    /// `provider.runtime`, the runtime of pools that name none: `instances` unless set. A config
+    /// still typed `scaleway-jobs` keeps its job definitions, so upgrading changes nothing.
     fn default_runtime(&self) -> Result<Runtime> {
         match self.config.provider.extra.get("runtime") {
+            None | Some(Value::Null) if self.config.provider.kind == LEGACY_JOBS_TYPE => {
+                Ok(Runtime::Jobs)
+            }
             None | Some(Value::Null) => Ok(Runtime::Instances),
             Some(value) => value.as_str().and_then(Runtime::parse).ok_or_else(|| {
                 Error::provider(format!(
@@ -832,14 +839,18 @@ impl ScalewayJobs {
             .collect())
     }
 
+    fn foreign(&self, run_id: &str) -> Error {
+        Error::provider(format!(
+            "{PROVIDER_NAME}: server {run_id} does not belong to {}",
+            self.name()
+        ))
+    }
+
     /// The server `run_id` of this deployment.
     async fn own_server(&self, api: &InstanceApi<'_>, run_id: &str) -> Result<Value> {
         match api.get_server(run_id).await? {
             Some(server) if vm::is_deployment(&server, self.name()) => Ok(server),
-            Some(_) => Err(Error::provider(format!(
-                "{PROVIDER_NAME}: server {run_id} does not belong to {}",
-                self.name()
-            ))),
+            Some(_) => Err(self.foreign(run_id)),
             None => Err(Error::provider(format!(
                 "{PROVIDER_NAME}: server {run_id} not found"
             ))),
@@ -1015,6 +1026,16 @@ impl Provider for ScalewayJobs {
         }
         let group_resource = format!("security group {}", self.security_group_name());
         if runtimes.iter().any(|(_, r)| *r == Runtime::Instances) {
+            if !self.registry_on() || !self.registry_public() {
+                self.log.warn(
+                    "vm pools cannot start",
+                    &[(
+                        "reason",
+                        "VMs pull their agent from a public registry namespace: set \
+                         provider.registry and provider.registryPublic",
+                    )],
+                );
+            }
             let action = if observed.security_group.is_some() {
                 Action::Noop
             } else {
@@ -1241,28 +1262,23 @@ impl Provider for ScalewayJobs {
         Ok(runs)
     }
 
+    /// A run id is a server id or a job run id; servers are looked up first, so a VM that
+    /// outlived its pool's switch to `jobs` still ends.
     async fn stop(&self, run_id: &str) -> Result<()> {
-        let jobs = !self.pools_on(Runtime::Jobs)?.is_empty();
-        let instances = !self.pools_on(Runtime::Instances)?.is_empty();
-        if instances || !jobs {
-            let api = self.instances();
-            if let Some(server) = api.get_server(run_id).await? {
-                if !vm::is_deployment(&server, self.name()) {
-                    return Err(Error::provider(format!(
-                        "{PROVIDER_NAME}: server {run_id} does not belong to {}",
-                        self.name()
-                    )));
-                }
-                if self.remove_server(&api, &server).await? {
-                    self.log.info("terminated server", &[("id", run_id)]);
-                }
-                return Ok(());
+        let api = self.instances();
+        if let Some(server) = api.get_server(run_id).await? {
+            if !vm::is_deployment(&server, self.name()) {
+                return Err(self.foreign(run_id));
             }
-            if !jobs {
-                return Err(Error::provider(format!(
-                    "{PROVIDER_NAME}: server {run_id} not found"
-                )));
+            if self.remove_server(&api, &server).await? {
+                self.log.info("terminated server", &[("id", run_id)]);
             }
+            return Ok(());
+        }
+        if self.pools_on(Runtime::Jobs)?.is_empty() {
+            return Err(Error::provider(format!(
+                "{PROVIDER_NAME}: server {run_id} not found"
+            )));
         }
         jobs::stop(&self.client, run_id).await
     }

@@ -344,7 +344,7 @@ pub fn compatible(images: &[(String, Vec<String>)], commercial_type: &str) -> Op
     let wanted = commercial_type.to_uppercase();
     images
         .iter()
-        .find(|(_, types)| types.iter().any(|t| *t == wanted))
+        .find(|(_, types)| types.contains(&wanted))
         .map(|(id, _)| id.clone())
 }
 
