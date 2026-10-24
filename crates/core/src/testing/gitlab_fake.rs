@@ -127,6 +127,16 @@ impl FakeGitlab {
     }
 }
 
+/// A query parameter of `url`, as GitLab's list filters read it.
+fn query_value(url: &str, key: &str) -> Option<String> {
+    let query = url.split_once('?')?.1;
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| v.to_string())
+}
+
 fn json(status: u16, value: Value) -> Response {
     Response::json_body(status, &value)
 }
@@ -164,11 +174,13 @@ impl HttpClient for FakeGitlab {
         match (method, seg.as_slice()) {
             ("GET", ["projects", p, "runners"]) => {
                 let project = id(p).unwrap_or(0);
+                let wanted = query_value(&request.url, "tag_list");
                 let list: Vec<Value> = inner
                     .runners
                     .iter()
                     .filter(|r| r.projects.contains(&project))
-                    .map(|r| json!({ "id": r.id, "description": r.description, "tag_list": r.tag_list }))
+                    .filter(|r| wanted.as_ref().is_none_or(|t| r.tag_list.contains(t)))
+                    .map(|r| json!({ "id": r.id, "description": r.description }))
                     .collect();
                 Ok(json(200, Value::Array(list)))
             }

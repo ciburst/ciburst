@@ -108,6 +108,19 @@ impl Gitlab {
         .await
     }
 
+    /// Project runners carrying `tag`; GitLab's list responses omit `tag_list`, the filter does not.
+    pub async fn list_runners_tagged(&self, project_id: u64, tag: &str) -> Result<Vec<Runner>> {
+        self.get(
+            &format!("/projects/{project_id}/runners"),
+            &[
+                ("type", "project_type".into()),
+                ("tag_list", tag.to_string()),
+                ("per_page", "100".into()),
+            ],
+        )
+        .await
+    }
+
     pub async fn create_runner(
         &self,
         project_id: u64,
@@ -227,7 +240,15 @@ mod tests {
         let listed = gitlab.list_runners(7).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].description, "demo-ci");
-        assert_eq!(listed[0].tag_list, ["ci"]);
+        assert!(listed[0].tag_list.is_empty(), "GitLab lists omit tag_list");
+        assert_eq!(gitlab.list_runners_tagged(7, "ci").await.unwrap().len(), 1);
+        assert!(
+            gitlab
+                .list_runners_tagged(7, "rust")
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(gitlab.list_runners(8).await.unwrap().is_empty());
         gitlab.enable_runner(8, created.id).await.unwrap();
         assert_eq!(gitlab.list_runners(8).await.unwrap().len(), 1);

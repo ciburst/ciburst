@@ -154,7 +154,7 @@ impl Provisioner {
             }
             steps.push(step);
         }
-        for tag in self.orphan_runner_tags(&runners) {
+        for tag in self.orphan_runner_tags(gitlab, &runners).await? {
             steps.push(Step::new(
                 format!("runner:{tag}"),
                 Action::Delete,
@@ -181,18 +181,29 @@ impl Provisioner {
     }
 
     /// Tags of runners this deployment created for pools gone from the config: described
-    /// `<name>-<tag>` and tagged exactly `[<tag>]`, so another deployment's runners never match.
-    fn orphan_runner_tags(&self, runners: &[crate::gitlab::Runner]) -> Vec<String> {
+    /// `<name>-<tag>` and carrying the tag `<tag>`, so another deployment's runners never match.
+    async fn orphan_runner_tags(
+        &self,
+        gitlab: &Gitlab,
+        runners: &[crate::gitlab::Runner],
+    ) -> Result<Vec<String>> {
         let prefix = format!("{}-", self.config.name);
-        runners
-            .iter()
-            .filter_map(|r| {
-                let tag = r.description.strip_prefix(&prefix)?;
-                (r.tag_list.len() == 1 && r.tag_list[0] == tag).then_some(tag)
-            })
-            .filter(|tag| self.config.pool_by_tag(tag).is_none())
-            .map(String::from)
-            .collect()
+        let mut tags = Vec::new();
+        for runner in runners {
+            let Some(tag) = runner.description.strip_prefix(&prefix) else {
+                continue;
+            };
+            if tag.is_empty() || self.config.pool_by_tag(tag).is_some() {
+                continue;
+            }
+            let tagged = gitlab
+                .list_runners_tagged(self.primary_project(), tag)
+                .await?;
+            if tagged.iter().any(|r| r.id == runner.id) {
+                tags.push(tag.to_string());
+            }
+        }
+        Ok(tags)
     }
 
     async fn hook_steps(&self, rotate: bool) -> Result<Vec<Step>> {
