@@ -32,8 +32,19 @@ impl ProviderFactory for Factory {
     }
 }
 
+/// The config with `provider.runtime: jobs`: the contract and these tests cover Serverless
+/// Jobs; `provider_instances.rs` covers the default runtime.
+fn jobs(config: Arc<Config>) -> Arc<Config> {
+    let mut config = (*config).clone();
+    config
+        .provider
+        .extra
+        .insert("runtime".into(), json!("jobs"));
+    Arc::new(config)
+}
+
 fn provider(config: Arc<Config>, backend: &Arc<ScalewayFake>, log: Log) -> ScalewayJobs {
-    ScalewayJobs::new(config, backend.client(), log).with_s3_access_key(FAKE_ACCESS_KEY)
+    ScalewayJobs::new(jobs(config), backend.client(), log).with_s3_access_key(FAKE_ACCESS_KEY)
 }
 
 fn with_credentials(
@@ -43,7 +54,7 @@ fn with_credentials(
     log: Log,
 ) -> ScalewayJobs {
     let client = ScalewayClient::new(backend.clone(), credentials, FAKE_REGION);
-    ScalewayJobs::new(config, Arc::new(client), log)
+    ScalewayJobs::new(jobs(config), Arc::new(client), log)
 }
 
 fn cache_off() -> Arc<Config> {
@@ -137,7 +148,7 @@ async fn apply_creates_the_resources_of_the_spec() {
         [
             (
                 json!("contract-dispatch"),
-                json!([{ "permission_set_names": ["ServerlessJobsFullAccess", "ContainerRegistryReadOnly"], "project_ids": [project_id] }])
+                json!([{ "permission_set_names": ["ServerlessJobsFullAccess", "ContainerRegistryReadOnly", "InstancesFullAccess"], "project_ids": [project_id] }])
             ),
             (
                 json!("contract-cache"),
@@ -454,11 +465,11 @@ async fn start_refuses_without_token_or_definition() {
     let mut request = start_request(0);
     request.env.clear();
     let error = provider.start(request).await.unwrap_err().to_string();
-    assert_eq!(error, "scaleway-jobs: RUNNER_TOKEN missing");
+    assert_eq!(error, "scaleway: RUNNER_TOKEN missing");
     let mut request = start_request(0);
     request.pool.tag = "gone".into();
     let error = provider.start(request).await.unwrap_err().to_string();
-    assert_eq!(error, "scaleway-jobs: pool gone is not provisioned");
+    assert_eq!(error, "scaleway: pool gone is not provisioned");
 }
 
 #[tokio::test]
@@ -480,7 +491,7 @@ async fn api_errors_carry_method_path_status_and_message() {
 async fn s3_errors_carry_the_s3_code() {
     let (backend, _, outputs) = provisioned(Log::silent()).await;
     let project_id = &outputs["CIBURST_PROJECT_ID"];
-    let wrong = ScalewayJobs::new(contract_config(), backend.client(), Log::silent())
+    let wrong = ScalewayJobs::new(jobs(contract_config()), backend.client(), Log::silent())
         .with_s3_access_key("SCWWRONGACCESSKEY000");
     let error = wrong.plan(&[]).await.unwrap_err().to_string();
     assert_eq!(
@@ -501,9 +512,9 @@ async fn s3_errors_carry_the_s3_code() {
     let error = missing.plan(&[]).await.unwrap_err().to_string();
     assert_eq!(
         error,
-        "scaleway-jobs: the cache bucket needs the access key of SCW_SECRET_KEY"
+        "scaleway: the cache bucket needs the access key of SCW_SECRET_KEY"
     );
-    let no_cache = ScalewayJobs::new(cache_off(), backend.client(), Log::silent());
+    let no_cache = ScalewayJobs::new(jobs(cache_off()), backend.client(), Log::silent());
     assert!(no_cache.plan(&[]).await.is_ok(), "no S3 without the cache");
 }
 
@@ -573,6 +584,7 @@ async fn fakes_reject_unauthenticated_requests() {
         "https://api.scaleway.com/account/v3/projects",
         "https://api.scaleway.com/iam/v1alpha1/applications",
         "https://api.scaleway.com/serverless-jobs/v1alpha1/regions/fr-par/job-runs",
+        "https://api.scaleway.com/instance/v1/zones/fr-par-1/servers",
     ] {
         let response = fake.send(Request::new("GET", url)).await.unwrap();
         assert_eq!(response.status, 401, "{url}");
@@ -602,7 +614,11 @@ async fn a_dispatch_policy_without_registry_read_is_repaired() {
     assert_eq!(dispatch.len(), 1);
     assert_eq!(
         dispatch[0]["rules"][0]["permission_set_names"],
-        json!(["ServerlessJobsFullAccess", "ContainerRegistryReadOnly"])
+        json!([
+            "ServerlessJobsFullAccess",
+            "ContainerRegistryReadOnly",
+            "InstancesFullAccess"
+        ])
     );
     let again = provider.plan(&[]).await.unwrap();
     assert!(again.iter().all(|s| s.action == Action::Noop), "{again:?}");

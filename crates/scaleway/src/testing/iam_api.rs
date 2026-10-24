@@ -15,11 +15,12 @@ use super::scaleway_fake::{
     unauthorized,
 };
 
-/// Permission sets the fake accepts; the provider uses the first two.
-pub const PERMISSION_SETS: [&str; 5] = [
+/// Permission sets the fake accepts; the provider uses the first four.
+pub const PERMISSION_SETS: [&str; 6] = [
     "ContainerRegistryReadOnly",
     "ServerlessJobsFullAccess",
     "ObjectStorageFullAccess",
+    "InstancesFullAccess",
     "ServerlessJobsReadOnly",
     "ObjectStorageReadOnly",
 ];

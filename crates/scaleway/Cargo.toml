@@ -1,6 +1,6 @@
 [package]
 name = "ciburst-scaleway"
-description = "Scaleway implementation of the ciburst ports: Serverless Jobs provider and Serverless Function host"
+description = "Scaleway implementation of the ciburst ports: Instances and Serverless Jobs provider, Serverless Function host"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -22,6 +22,7 @@ zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+yaml-rust2 = { version = "0.13.0", default-features = false }
 zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 
 [lints.rust]

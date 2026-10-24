@@ -1,0 +1,29 @@
+#cloud-config
+write_files:
+  - path: /etc/ciburst/vm.env
+    owner: root:root
+    permissions: '0600'
+    content: |
+{{VM_ENV}}
+  - path: /etc/systemd/system/ciburst-vm-agent.service
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=ciburst VM agent
+      Wants=network-online.target
+      After=network-online.target docker.service
+      Requires=docker.service
+
+      [Service]
+      EnvironmentFile=/etc/ciburst/vm.env
+      ExecStart=/usr/local/bin/ciburst-vm-agent
+      Restart=on-failure
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+runcmd:
+{{INSTALL_DOCKER}}  - 'curl -fsSL -o /tmp/gitlab-runner {{RUNNER_URL}} && echo "{{RUNNER_SHA256}}  /tmp/gitlab-runner" | sha256sum -c - && install -m 0755 /tmp/gitlab-runner /usr/local/bin/gitlab-runner && rm -f /tmp/gitlab-runner'
+  - 'systemctl start docker && id=$(docker create {{AGENT_IMAGE}} /ciburst-vm-agent) && docker cp "$id:/ciburst-vm-agent" /usr/local/bin/ciburst-vm-agent && docker rm "$id"'
+  - 'systemctl daemon-reload && systemctl enable --now ciburst-vm-agent.service'
