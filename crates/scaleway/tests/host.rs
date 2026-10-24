@@ -297,6 +297,108 @@ async fn a_removed_pool_removes_its_secret() {
 }
 
 #[tokio::test]
+async fn provider_credentials_are_secret_variables_that_drift_like_the_others() {
+    let fake = Arc::new(FakeFunctions::new());
+    let host = host(two_pools(), &fake);
+    let mut with_token = secrets();
+    with_token
+        .provider_env
+        .insert("HCLOUD_TOKEN".into(), "hcloud-secret".into());
+    host.apply(&host.plan(&with_token).await.unwrap(), &with_token)
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.secret(FUNCTION, "HCLOUD_TOKEN").as_deref(),
+        Some("hcloud-secret")
+    );
+    let function = fake.function(FUNCTION).unwrap();
+    assert!(
+        function["environment_variables"]
+            .get("HCLOUD_TOKEN")
+            .is_none()
+    );
+    assert!(!function.to_string().contains("hcloud-secret"));
+    assert!(
+        host.plan(&with_token)
+            .await
+            .unwrap()
+            .iter()
+            .all(Step::is_noop)
+    );
+
+    let mut rotated = with_token.clone();
+    rotated
+        .provider_env
+        .insert("HCLOUD_TOKEN".into(), "hcloud-rotated".into());
+    let plan = host.plan(&rotated).await.unwrap();
+    assert_eq!(
+        actions(&plan),
+        [
+            ("namespace", Action::Noop),
+            ("function", Action::Update),
+            ("code", Action::Noop),
+            ("cron", Action::Noop)
+        ]
+    );
+    assert!(!format!("{plan:?}").contains("hcloud-rotated"));
+    host.apply(&plan, &rotated).await.unwrap();
+    assert_eq!(
+        fake.secret(FUNCTION, "HCLOUD_TOKEN").as_deref(),
+        Some("hcloud-rotated")
+    );
+    assert!(host.plan(&rotated).await.unwrap().iter().all(Step::is_noop));
+
+    let plan = host.plan(&secrets()).await.unwrap();
+    assert_eq!(plan[1].action, Action::Update);
+    host.apply(&plan, &secrets()).await.unwrap();
+    assert!(
+        !fake
+            .secret_keys(FUNCTION)
+            .contains(&"HCLOUD_TOKEN".to_string())
+    );
+    assert!(
+        host.plan(&secrets())
+            .await
+            .unwrap()
+            .iter()
+            .all(Step::is_noop)
+    );
+}
+
+#[tokio::test]
+async fn provider_credentials_cannot_take_the_functions_own_names() {
+    let fake = Arc::new(FakeFunctions::new());
+    let host = host(two_pools(), &fake);
+    for name in [
+        "HOOK_TOKEN",
+        "CACHE_S3_SECRET_KEY",
+        "RUNNER_TOKEN_CI",
+        "CIBURST_DISPATCH_KEY",
+        "SCW_SECRET_KEY",
+        "hcloud_token",
+    ] {
+        let mut bad = secrets();
+        bad.provider_env.insert(name.into(), "value".into());
+        let error = host.plan(&bad).await.unwrap_err().to_string();
+        assert_eq!(
+            error,
+            format!(
+                "scaleway-function: provider variable {name} is reserved or not an upper-case name"
+            )
+        );
+        let steps = [Step::new(
+            "namespace",
+            Action::Create,
+            "function namespace demo",
+        )];
+        let error = host.apply(&steps, &bad).await.unwrap_err().to_string();
+        assert!(error.contains(name), "{error}");
+    }
+    assert_eq!(fake.namespace_count(), 0, "refused before any write");
+    assert_eq!(fake.function_count(), 0);
+}
+
+#[tokio::test]
 async fn new_code_and_failed_builds_redeploy() {
     let fake = Arc::new(FakeFunctions::new());
     let host = host(two_pools(), &fake);

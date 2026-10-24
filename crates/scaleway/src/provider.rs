@@ -4,6 +4,10 @@
 //! applications and keys, cache bucket with lifecycle, registry namespace; per runtime the VM
 //! security group or the job definitions. Every resource is looked up by name or tag; nothing
 //! is stored locally.
+//!
+//! Pools whose runtime is a key of the config's `providers` belong to another provider (spec
+//! D35): this one plans, starts and lists nothing for them and answers their runs with the agent
+//! image and cache location of [`Provider::shared_env`].
 
 mod cloud_init;
 mod iam;
@@ -32,6 +36,8 @@ use crate::client::ScalewayClient;
 use iam::AppState;
 use instance::{ApiError, DOCKER_IMAGE_LABEL, FALLBACK_IMAGE_LABEL, InstanceApi};
 use registry::NamespaceState;
+
+pub use jobs::bucket_name;
 
 pub const PROVIDER_NAME: &str = "scaleway";
 
@@ -331,9 +337,24 @@ impl ScalewayJobs {
         }
     }
 
+    /// The pools this provider serves: every pool not handed to another provider.
+    fn own_pools(&self) -> impl Iterator<Item = &Pool> {
+        self.config
+            .pools
+            .iter()
+            .filter(|pool| self.config.extra_provider_of(pool).is_none())
+    }
+
+    /// The other provider the pool `tag` belongs to, `None` for a pool of this one.
+    fn other_provider(&self, tag: &str) -> Option<&str> {
+        self.config
+            .pool_by_tag(tag)
+            .and_then(|pool| self.config.extra_provider_of(pool))
+    }
+
     fn pools_on(&self, runtime: Runtime) -> Result<Vec<&Pool>> {
         let mut pools = Vec::new();
-        for pool in &self.config.pools {
+        for pool in self.own_pools() {
             if self.runtime(pool)? == runtime {
                 pools.push(pool);
             }
@@ -1034,9 +1055,11 @@ impl Provider for ScalewayJobs {
     async fn plan(&self, rotate: &[Rotation]) -> Result<Vec<Step>> {
         self.default_runtime()?;
         let mut runtimes = Vec::new();
-        for pool in &self.config.pools {
+        for pool in self.own_pools() {
             runtimes.push((pool, self.runtime(pool)?));
         }
+        // Pools of other providers run VMs that pull the agent from this registry too.
+        let other_pools = runtimes.len() < self.config.pools.len();
         let observed = self.observe().await?;
         let name = self.name();
         let mut steps = vec![Step::new(
@@ -1093,17 +1116,18 @@ impl Provider for ScalewayJobs {
             steps.push(Step::new("registry", Action::Delete, registry_resource));
         }
         let group_resource = format!("security group {}", self.security_group_name());
-        if runtimes.iter().any(|(_, r)| *r == Runtime::Instances) {
-            if !self.registry_on() || !self.registry_public() {
-                self.log.warn(
-                    "vm pools cannot start",
-                    &[(
-                        "reason",
-                        "VMs pull their agent from a public registry namespace: set \
-                         provider.registry and provider.registryPublic",
-                    )],
-                );
-            }
+        let own_vms = runtimes.iter().any(|(_, r)| *r == Runtime::Instances);
+        if (own_vms || other_pools) && (!self.registry_on() || !self.registry_public()) {
+            self.log.warn(
+                "vm pools cannot start",
+                &[(
+                    "reason",
+                    "VMs pull their agent from a public registry namespace: set \
+                     provider.registry and provider.registryPublic",
+                )],
+            );
+        }
+        if own_vms {
             self.warn_without_quota(&runtimes).await;
             let action = if observed.security_group.is_some() {
                 Action::Noop
@@ -1296,6 +1320,12 @@ impl Provider for ScalewayJobs {
     }
 
     async fn start(&self, request: StartRequest) -> Result<String> {
+        if let Some(other) = self.config.extra_provider_of(&request.pool) {
+            return Err(Error::provider(format!(
+                "{PROVIDER_NAME}: pool {} belongs to provider {other}",
+                request.pool.tag
+            )));
+        }
         if request.env.get("RUNNER_TOKEN").is_none_or(|t| t.is_empty()) {
             return Err(Error::provider(format!(
                 "{PROVIDER_NAME}: RUNNER_TOKEN missing"
@@ -1307,7 +1337,12 @@ impl Provider for ScalewayJobs {
         }
     }
 
+    /// A pool of another provider has no runs here. Servers left from a pool that moved to
+    /// another provider stay in `list(None)` and in the sweep: they run here until they end.
     async fn list(&self, pool: Option<&str>) -> Result<Vec<Run>> {
+        if pool.is_some_and(|tag| self.other_provider(tag).is_some()) {
+            return Ok(Vec::new());
+        }
         let Some(project_id) = self.client.find_project(self.name()).await? else {
             return Ok(Vec::new());
         };
@@ -1353,6 +1388,9 @@ impl Provider for ScalewayJobs {
     }
 
     async fn capacity(&self, pool: &str) -> Result<Option<Vec<VmCapacity>>> {
+        if self.other_provider(pool).is_some() {
+            return Ok(Some(Vec::new()));
+        }
         if self.runtime_of(pool)? != Runtime::Instances {
             return Ok(None);
         }
@@ -1382,6 +1420,46 @@ impl Provider for ScalewayJobs {
         let server = self.own_server(&api, run_id).await?;
         api.set_tags(run_id, &vm::reported(&vm::tags_of(&server), report, now))
             .await
+    }
+
+    /// M4 rule R11: the agent image in the registry namespace, which VMs of every provider pull
+    /// without credentials, and with an S3 cache the bucket's location. No secret.
+    async fn shared_env(&self) -> Result<BTreeMap<String, String>> {
+        let unusable = |reason: String| {
+            Error::provider(format!("{PROVIDER_NAME}: shared environment: {reason}"))
+        };
+        if !self.registry_on() {
+            return Err(unusable(
+                "VMs pull their agent from the registry namespace; set provider.registry".into(),
+            ));
+        }
+        let project_id = self
+            .client
+            .find_project(self.name())
+            .await?
+            .ok_or_else(|| unusable(format!("project {} does not exist", self.name())))?;
+        let namespace = registry::find_namespace(&self.client, &project_id, self.name())
+            .await?
+            .ok_or_else(|| {
+                unusable(format!("registry namespace {} does not exist", self.name()))
+            })?;
+        if !namespace.is_public {
+            return Err(unusable(
+                "VMs pull the agent image without credentials; set provider.registryPublic".into(),
+            ));
+        }
+        let mut env = BTreeMap::from([(
+            cloud_init::AGENT_IMAGE_KEY.to_string(),
+            cloud_init::agent_image(&namespace.endpoint)?,
+        )]);
+        if self.cache_on() {
+            env.extend(cloud_init::cache_location(
+                &self.config,
+                self.client.region(),
+                &project_id,
+            ));
+        }
+        Ok(env)
     }
 
     async fn sweep(&self, now: u64) -> Result<Vec<String>> {

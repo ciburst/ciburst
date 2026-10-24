@@ -10,7 +10,8 @@
 //!   `CIBURST_REGION` (Scaleway reserves the `SCW_` prefix);
 //! - secret: `HOOK_TOKEN`, `CIBURST_DISPATCH_KEY` (the dispatch key), `RUNNER_TOKEN_<TAG>` per pool,
 //!   `CACHE_S3_ACCESS_KEY` and `CACHE_S3_SECRET_KEY` when a cache key exists, `CIBURST_VM_SECRET`
-//!   when the provisioner made one.
+//!   and `CIBURST_SWEEP_TOKEN` when the provisioner made them, and every credential of an added
+//!   provider (`Secrets::provider_env`, for example `HCLOUD_TOKEN`) under its own name.
 //!
 //! On top, the plain variable `CIBURST_CODE_DIGEST` records the sha256 of the deployed zip for
 //! this host's plan; the function does not read it. The sha256 of the settings and both
@@ -73,6 +74,22 @@ pub mod vars {
     pub const VM_SECRET: &str = "CIBURST_VM_SECRET";
     pub const SWEEP_TOKEN: &str = "CIBURST_SWEEP_TOKEN";
     pub const CODE_DIGEST: &str = "CIBURST_CODE_DIGEST";
+
+    /// Whether `name` can carry a credential of an added provider (`Secrets::provider_env`,
+    /// for example `HCLOUD_TOKEN`): upper-case letters, digits and `_`, not starting with a
+    /// digit, outside the names and prefixes of this module and outside Scaleway's reserved
+    /// `SCW_`.
+    pub fn provider_name_ok(name: &str) -> bool {
+        let shaped = name.starts_with(|c: char| c.is_ascii_uppercase())
+            && name
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+        let taken = [HOOK_TOKEN, CACHE_ACCESS_KEY, CACHE_SECRET_KEY].contains(&name)
+            || ["CIBURST_", "RUNNER_TOKEN_", "SCW_"]
+                .iter()
+                .any(|prefix| name.starts_with(prefix));
+        shaped && !taken
+    }
 
     /// `RUNNER_TOKEN_<TAG>`: tag upper-cased, every other character than ASCII letters and
     /// digits replaced by `_`, the rule of `ciburst_core::provision::keys`.
@@ -231,6 +248,10 @@ impl ScalewayFunction {
         }
         if let Some(sweep_token) = &secrets.sweep_token {
             secret.insert(vars::SWEEP_TOKEN.to_string(), sweep_token.clone());
+        }
+        check_provider_env(secrets)?;
+        for (name, value) in &secrets.provider_env {
+            secret.insert(name.clone(), value.clone());
         }
         Ok(Settings {
             runtime: RUNTIME,
@@ -458,6 +479,7 @@ impl ScalewayFunction {
 #[async_trait]
 impl Host for ScalewayFunction {
     async fn plan(&self, secrets: &Secrets) -> Result<Vec<Step>> {
+        check_provider_env(secrets)?;
         let found = self.find().await?;
         let function_name = self.function_name();
         let namespace = Step::new(
@@ -521,6 +543,7 @@ impl Host for ScalewayFunction {
     }
 
     async fn apply(&self, steps: &[Step], secrets: &Secrets) -> Result<Outputs> {
+        check_provider_env(secrets)?;
         if let Some(step) = steps.iter().find(|s| {
             ![STEP_NAMESPACE, STEP_FUNCTION, STEP_CODE, STEP_CRON].contains(&s.id.as_str())
         }) {
@@ -659,6 +682,21 @@ impl Host for ScalewayFunction {
     }
 }
 
+/// Refuses a provider credential that would shadow one of the function's own variables, before
+/// anything is read or written.
+fn check_provider_env(secrets: &Secrets) -> Result<()> {
+    match secrets
+        .provider_env
+        .keys()
+        .find(|name| !vars::provider_name_ok(name))
+    {
+        Some(name) => Err(Error::provider(format!(
+            "{HOST_NAME}: provider variable {name} is reserved or not an upper-case name"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// The cron's arguments, which the function receives as its JSON body.
 fn sweep_args(secrets: &Secrets) -> Value {
     json!({ SWEEP_ARG: secrets.sweep_token.as_deref().unwrap_or("") })
@@ -747,6 +785,31 @@ mod tests {
             ciburst_core::provision::keys::runner_token("rust-1.96"),
             format!("CIBURST_{}", vars::runner_token("rust-1.96"))
         );
+    }
+
+    #[test]
+    fn provider_variables_keep_out_of_the_functions_own_names() {
+        for name in ["HCLOUD_TOKEN", "A", "X1_Y"] {
+            assert!(vars::provider_name_ok(name), "{name}");
+        }
+        for name in [
+            "",
+            "hcloud_token",
+            "1TOKEN",
+            "_TOKEN",
+            "HCLOUD-TOKEN",
+            "SCW_SECRET_KEY",
+            vars::HOOK_TOKEN,
+            vars::CACHE_ACCESS_KEY,
+            vars::CACHE_SECRET_KEY,
+            vars::SECRET_KEY,
+            vars::CONFIG,
+            vars::CODE_DIGEST,
+            "CIBURST_DISPATCH_URL",
+            &vars::runner_token("ci"),
+        ] {
+            assert!(!vars::provider_name_ok(name), "{name}");
+        }
     }
 
     #[test]

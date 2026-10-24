@@ -1,7 +1,8 @@
 //! Scaleway Serverless Function entry: `handle` receives the GitLab webhook, the VM agents'
 //! `POST /vm` and `POST /terminate`, and the sweep cron, and hands method, path, headers, body
 //! and the current time to `ciburst_core::dispatch::Dispatcher::handle_request` with a
-//! `ScalewayJobs` provider built from the function's environment. The variable names are
+//! `ScalewayJobs` provider and, with an S3 cache, the burst ledger in the cache bucket, both
+//! built from the function's environment. The variable names are
 //! `ciburst_scaleway::host::vars`, the ones the host sets.
 //!
 //! A cron trigger arrives as `POST /` with its arguments as the JSON body (Scaleway docs, "Add a
@@ -10,18 +11,20 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use ciburst_core::composite::Composite;
-use ciburst_core::config::{Config, parse_config};
+use ciburst_core::config::{CacheType, Config, parse_config};
 use ciburst_core::dispatch::Dispatcher;
-use ciburst_core::http::ReqwestClient;
+use ciburst_core::http::{HttpClient, ReqwestClient};
+use ciburst_core::ledger::{GROUP_WAIT_S, Ledger};
 use ciburst_core::log::Log;
 use ciburst_core::types::{KeyPair, Provider, Secrets};
 use ciburst_hetzner::Hetzner;
 use ciburst_scaleway::client::{Credentials, ScalewayClient};
 use ciburst_scaleway::host::vars;
+use ciburst_scaleway::ledger::ScalewayLedger;
 use ciburst_scaleway::provider::ScalewayJobs;
 use http::{Request, Response, StatusCode};
 
@@ -38,6 +41,30 @@ pub struct Env {
     pub dispatch_url: Option<String>,
     /// `HCLOUD_TOKEN`, required when the config adds the `hetzner` provider.
     pub hetzner_token: Option<String>,
+    /// Pause between recording a burst intent and reading the burst (M4 rule R3); not read from
+    /// the environment.
+    pub group_wait: Duration,
+}
+
+/// What the dispatcher works on besides the environment.
+pub struct Backends {
+    pub provider: Arc<dyn Provider>,
+    /// The burst ledger in the cache bucket (M4 rule R13); `None` without an S3 cache key.
+    pub ledger: Option<Arc<dyn Ledger>>,
+}
+
+impl Backends {
+    pub fn new(provider: Arc<dyn Provider>) -> Backends {
+        Backends {
+            provider,
+            ledger: None,
+        }
+    }
+
+    pub fn with_ledger(mut self, ledger: Option<Arc<dyn Ledger>>) -> Backends {
+        self.ledger = ledger;
+        self
+    }
 }
 
 /// A variable that is missing or unusable. Carries the name only, never a value.
@@ -114,6 +141,7 @@ impl Env {
             } else {
                 None
             },
+            group_wait: Duration::from_secs(GROUP_WAIT_S),
         })
     }
 
@@ -121,20 +149,26 @@ impl Env {
         Env::from_lookup(|name| std::env::var(name).ok())
     }
 
-    /// The `ScalewayJobs` provider on the real HTTP client, in a [`Composite`] with Hetzner
-    /// when the config adds it (spec D35).
-    pub fn provider(&self, log: Log) -> Result<Arc<dyn Provider>, EnvError> {
-        let http: Arc<ReqwestClient> = Arc::new(
+    /// Provider and ledger on the real HTTP client.
+    pub fn backends(&self, log: Log) -> Result<Backends, EnvError> {
+        let http: Arc<dyn HttpClient> = Arc::new(
             ReqwestClient::new().map_err(|_| EnvError::Invalid("http client".to_string()))?,
         );
+        Ok(self.backends_on(http, log))
+    }
+
+    /// The `ScalewayJobs` provider, in a [`Composite`] with Hetzner when the config adds it
+    /// (spec D35), and the ledger, both on `http`.
+    pub fn backends_on(&self, http: Arc<dyn HttpClient>, log: Log) -> Backends {
         let client = ScalewayClient::new(http.clone(), self.credentials.clone(), &self.region);
         let main: Arc<dyn Provider> = Arc::new(ScalewayJobs::new(
             self.config.clone(),
             Arc::new(client),
             log.clone(),
         ));
+        let ledger = self.ledger_on(http.clone());
         let Some(token) = &self.hetzner_token else {
-            return Ok(main);
+            return Backends::new(main).with_ledger(ledger);
         };
         let hetzner: Arc<dyn Provider> = Arc::new(Hetzner::new(
             self.config.clone(),
@@ -142,11 +176,30 @@ impl Env {
             http,
             log.clone(),
         ));
-        Ok(Arc::new(Composite::new(
+        let composite = Composite::new(
             self.config.clone(),
             main,
             vec![(ciburst_hetzner::RUNTIME.to_string(), hetzner)],
             log,
+        );
+        Backends::new(Arc::new(composite)).with_ledger(ledger)
+    }
+
+    /// The burst ledger in the cache bucket `<name>-cache-<CIBURST_PROJECT_ID>` of
+    /// `CIBURST_REGION`, signed with the cache key; `None` unless the cache is S3 and both cache
+    /// keys are set.
+    pub fn ledger_on(&self, http: Arc<dyn HttpClient>) -> Option<Arc<dyn Ledger>> {
+        if self.config.cache.kind != CacheType::S3 {
+            return None;
+        }
+        let key = self.secrets.cache.as_ref()?;
+        let project_id = self.credentials.default_project_id.as_deref()?;
+        Some(Arc::new(ScalewayLedger::in_cache_bucket(
+            http,
+            &self.config,
+            project_id,
+            &self.region,
+            key,
         )))
     }
 }
@@ -164,12 +217,19 @@ pub struct Incoming<'a> {
 /// Runs the dispatcher on one request; answers its status and JSON body, empty for none.
 pub async fn respond(
     env: &Env,
-    provider: Arc<dyn Provider>,
+    backends: &Backends,
     log: Log,
     request: &Incoming<'_>,
 ) -> (u16, Vec<u8>) {
-    let dispatcher = Dispatcher::new(env.config.clone(), provider, env.secrets.clone(), log)
-        .with_dispatch_url(env.dispatch_url.clone());
+    let dispatcher = Dispatcher::new(
+        env.config.clone(),
+        backends.provider.clone(),
+        env.secrets.clone(),
+        log,
+    )
+    .with_dispatch_url(env.dispatch_url.clone())
+    .with_ledger(backends.ledger.clone())
+    .with_group_wait(env.group_wait);
     let response = dispatcher
         .handle_request(
             request.method,
@@ -190,7 +250,7 @@ pub async fn respond(
 /// Reads method, URI path, headers and body of an HTTP request and answers it.
 pub async fn serve(
     env: &Env,
-    provider: Arc<dyn Provider>,
+    backends: &Backends,
     log: Log,
     req: Request<Body>,
     now: u64,
@@ -215,7 +275,7 @@ pub async fn serve(
                 body: &bytes,
                 now,
             };
-            respond(env, provider, log, &request).await
+            respond(env, backends, log, &request).await
         }
         Err(_) => (400, br#"{"result":"bad_request"}"#.to_vec()),
     };
@@ -234,15 +294,15 @@ fn error_body() -> (u16, Vec<u8>) {
 
 struct State {
     env: Env,
-    provider: Arc<dyn Provider>,
+    backends: Backends,
 }
 
 fn state() -> &'static Result<State, EnvError> {
     static STATE: OnceLock<Result<State, EnvError>> = OnceLock::new();
     STATE.get_or_init(|| {
         let env = Env::from_process()?;
-        let provider = env.provider(Log::stderr())?;
-        Ok(State { env, provider })
+        let backends = env.backends(Log::stderr())?;
+        Ok(State { env, backends })
     })
 }
 
@@ -253,7 +313,7 @@ pub async fn handle(req: Request<Body>) -> Response<Body> {
             let (status, body) = env_error(error, &log);
             http_response(status, body)
         }
-        Ok(state) => serve(&state.env, state.provider.clone(), log, req, now_seconds()).await,
+        Ok(state) => serve(&state.env, &state.backends, log, req, now_seconds()).await,
     }
 }
 
@@ -355,7 +415,7 @@ mod tests {
             body,
             now: NOW,
         };
-        respond(env, provider, log, &request).await
+        respond(env, &Backends::new(provider), log, &request).await
     }
 
     /// Status, content type and body of `serve` on one HTTP request.
@@ -373,7 +433,7 @@ mod tests {
             builder = builder.header(*name, *value);
         }
         let req = builder.body(Body::from(body.to_vec())).unwrap();
-        let response = serve(env, provider, Log::silent(), req, now).await;
+        let response = serve(env, &Backends::new(provider), Log::silent(), req, now).await;
         let status = response.status().as_u16();
         let content_type = response
             .headers()

@@ -9,7 +9,7 @@ use ciburst_core::{Error, Result};
 
 use super::{PROVIDER_NAME, jobs, s3};
 
-pub use ciburst_core::cloud_init::{AGENT_IMAGE, DISPATCH_URL, RUN_ID, VM_TOKEN};
+pub use ciburst_core::cloud_init::{AGENT_IMAGE, AGENT_IMAGE_KEY, DISPATCH_URL, RUN_ID, VM_TOKEN};
 
 /// `vm.env` without the run id and token, which exist only once the server does. Fails before
 /// anything is created when the request lacks a value the VM needs.
@@ -39,22 +39,40 @@ pub fn base_env(
         ("CIBURST_TIMEOUT_S".to_string(), pool.timeout_s.to_string()),
     ]);
     if config.cache.kind == CacheType::S3 {
-        for (key, value) in [
-            ("CACHE_TYPE", "s3".to_string()),
-            ("CACHE_S3_SERVER_ADDRESS", s3::host(region)),
-            (
-                "CACHE_S3_BUCKET_NAME",
-                jobs::bucket_name(config, project_id),
-            ),
-            ("CACHE_S3_BUCKET_LOCATION", region.to_string()),
-            ("CACHE_S3_ACCESS_KEY", required("CACHE_S3_ACCESS_KEY")?),
-            ("CACHE_S3_SECRET_KEY", required("CACHE_S3_SECRET_KEY")?),
-            ("CACHE_SHARED", "true".to_string()),
-        ] {
-            env.insert(key.to_string(), value);
+        env.extend(cache_location(config, region, project_id));
+        for key in ["CACHE_S3_ACCESS_KEY", "CACHE_S3_SECRET_KEY"] {
+            env.insert(key.to_string(), required(key)?);
         }
     }
     Ok(env)
+}
+
+/// Where the S3 cache lives, without its key: the part of `vm.env` that VMs of other providers
+/// get through `shared_env` (M4 rule R11).
+pub fn cache_location(config: &Config, region: &str, project_id: &str) -> BTreeMap<String, String> {
+    [
+        ("CACHE_TYPE", "s3".to_string()),
+        ("CACHE_S3_SERVER_ADDRESS", s3::host(region)),
+        (
+            "CACHE_S3_BUCKET_NAME",
+            jobs::bucket_name(config, project_id),
+        ),
+        ("CACHE_S3_BUCKET_LOCATION", region.to_string()),
+        ("CACHE_SHARED", "true".to_string()),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value))
+    .collect()
+}
+
+/// The full reference of the agent image below `registry_endpoint`.
+pub fn agent_image(registry_endpoint: &str) -> Result<String> {
+    if registry_endpoint.is_empty() {
+        return Err(Error::provider(format!(
+            "{PROVIDER_NAME}: no registry endpoint for the agent image"
+        )));
+    }
+    Ok(format!("{registry_endpoint}/{AGENT_IMAGE}"))
 }
 
 /// The cloud-config document with the agent image below `registry_endpoint`.
@@ -64,16 +82,7 @@ pub fn render(
     registry_endpoint: &str,
     install_docker: bool,
 ) -> Result<String> {
-    if registry_endpoint.is_empty() {
-        return Err(Error::provider(format!(
-            "{PROVIDER_NAME}: no registry endpoint for the agent image"
-        )));
-    }
-    ciburst_core::cloud_init::render(
-        env,
-        &format!("{registry_endpoint}/{AGENT_IMAGE}"),
-        install_docker,
-    )
+    ciburst_core::cloud_init::render(env, &agent_image(registry_endpoint)?, install_docker)
 }
 
 #[cfg(test)]
