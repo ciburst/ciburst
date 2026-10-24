@@ -109,6 +109,7 @@ async fn plans_everything_applies_then_plans_nothing() {
     assert!(all(&applied, Action::Create), "{applied:?}");
     let values = s.outputs.read().await.unwrap();
     assert!(values.contains_key(keys::HOOK_TOKEN));
+    assert!(values.contains_key(keys::VM_SECRET));
     assert!(values[&keys::runner_token("ci")].starts_with("glrt-"));
     assert!(values[&keys::runner_token("build")].starts_with("glrt-"));
     assert!(values.contains_key(&keys::runner_id("ci")));
@@ -181,6 +182,56 @@ async fn secrets_reach_the_dispatcher_and_status_counts_runs() {
     );
     assert_eq!(status.runs.len(), 1);
     let _ = &s.host;
+}
+
+#[tokio::test]
+async fn the_vm_secret_is_written_once_and_rotates_with_the_hook() {
+    let s = setup(config(&[7]), false);
+    s.provisioner.apply(&[]).await.unwrap();
+    let first = s.outputs.read().await.unwrap();
+    let secret = first[keys::VM_SECRET].clone();
+    assert_eq!(secret.len(), 32);
+    assert!(secret.chars().all(|c| c.is_ascii_alphanumeric()));
+    assert_ne!(secret, first[keys::HOOK_TOKEN]);
+    let secrets = secrets_from_outputs(&s.config, &first);
+    assert_eq!(secrets.vm_secret.as_deref(), Some(secret.as_str()));
+    assert!(
+        s.host
+            .plan(&secrets)
+            .await
+            .unwrap()
+            .iter()
+            .all(Step::is_noop),
+        "the host got the same secrets, VM secret included"
+    );
+
+    s.provisioner.apply(&[]).await.unwrap();
+    s.provisioner
+        .apply(&[Rotation::Key, Rotation::Cache, Rotation::Runner])
+        .await
+        .unwrap();
+    assert_eq!(s.outputs.read().await.unwrap()[keys::VM_SECRET], secret);
+
+    s.provisioner.apply(&[Rotation::Hook]).await.unwrap();
+    let rotated = s.outputs.read().await.unwrap();
+    assert_ne!(rotated[keys::VM_SECRET], secret);
+    assert_ne!(rotated[keys::HOOK_TOKEN], first[keys::HOOK_TOKEN]);
+    let secrets = secrets_from_outputs(&s.config, &rotated);
+    assert!(
+        s.host
+            .plan(&secrets)
+            .await
+            .unwrap()
+            .iter()
+            .all(Step::is_noop)
+    );
+    assert!(
+        !s.lines
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains(&secret) || l.contains(&rotated[keys::VM_SECRET]))
+    );
 }
 
 #[tokio::test]

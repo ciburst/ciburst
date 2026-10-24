@@ -358,9 +358,10 @@ impl Provisioner {
         Ok(())
     }
 
-    async fn ensure_hook_token(&self, rotate: bool) -> Result<String> {
+    /// A random secret of 32 alphanumerics under `key`, written once and replaced on rotation.
+    async fn ensure_secret(&self, key: &str, rotate: bool) -> Result<String> {
         let current = self.outputs.read().await?;
-        if let Some(token) = current.get(keys::HOOK_TOKEN).filter(|_| !rotate) {
+        if let Some(token) = current.get(key).filter(|_| !rotate) {
             return Ok(token.clone());
         }
         let token: String = rand::rng()
@@ -369,10 +370,7 @@ impl Provisioner {
             .map(char::from)
             .collect();
         self.outputs
-            .write(
-                &Outputs::from([(keys::HOOK_TOKEN.to_string(), token.clone())]),
-                true,
-            )
+            .write(&Outputs::from([(key.to_string(), token.clone())]), true)
             .await?;
         Ok(token)
     }
@@ -393,9 +391,10 @@ impl Provisioner {
     /// Applies in phases so that later phases see the outputs of earlier ones.
     pub async fn apply(&self, rotate: &[Rotation]) -> Result<Vec<Step>> {
         let mut applied = Vec::new();
-        let hook_token = self
-            .ensure_hook_token(rotate.contains(&Rotation::Hook))
-            .await?;
+        let rotate_hook = rotate.contains(&Rotation::Hook);
+        let hook_token = self.ensure_secret(keys::HOOK_TOKEN, rotate_hook).await?;
+        // Rotating it invalidates the tokens of running VMs; they are swept once silent.
+        let vm_secret = self.ensure_secret(keys::VM_SECRET, rotate_hook).await?;
 
         let provider_rotate = provider_rotations(rotate);
         let provider_steps = self.provider.plan(&provider_rotate).await?;
@@ -421,6 +420,7 @@ impl Provisioner {
 
         let mut secrets = secrets_from_outputs(&self.config, &self.outputs.read().await?);
         secrets.hook_token = Some(hook_token.clone());
+        secrets.vm_secret = Some(vm_secret);
         let host_steps = self.host.plan(&secrets).await?;
         let host_outputs = self.host.apply(&host_steps, &secrets).await?;
         self.outputs.write(&host_outputs, true).await?;
