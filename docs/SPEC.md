@@ -29,6 +29,11 @@ Status: M1 done 2026-10-24 (provider, host and function, images, CI, runbook); w
 | D21 | 2026-10-24 | Every image writes its PATH to `/etc/profile.d/ciburst-path.sh` and removes `~/.bash_logout`, because the shell executor runs job steps in a login shell. |
 | D22 | 2026-10-24 | Releases on tags `vX.Y.Z` publish the five images as `X.Y.Z`, `X.Y`, `X` and `latest` (`edge` on `main`) and the Linux x86_64 musl binary through `glab`. Configs reference images by major tag (`node:1`), or `edge` before the first release. macOS and Windows binaries are backlog. |
 | D23 | 2026-10-24 | Adopters set up through their own pipeline, not from a workstation: a manual `ciburst-setup` job from the include runs the `ciburst` binary on a GitLab hosted runner (free 400 minutes per month), takes the Scaleway key and a project access token from four masked CI variables, and stores the outputs as masked project variables instead of `.local/outputs.env`. The local CLI with `.local/` stays the developer path; the owner's personal token is used only for the M2 drill. |
+| D24 | 2026-10-24 | Hosting: canonical on GitLab.com in the group `ciburst`, project `ciburst/ciburst`, private until v1.0.0, then public with a read-only push mirror to the GitHub organization `ciburst`. Issues and merge requests stay on GitLab. |
+| D25 | 2026-10-24 | No GitLab for Open Source program, so a commercial service stays possible. The framework's CI runs on the Free tier's 400 minutes per month; path rules and merge-request pipelines keep it there. |
+| D26 | 2026-10-24 | Project domain `ciburst.zwa.la`: the docs site on GitLab Pages at v1.0.0. It is the one real hostname allowed in the repository. |
+| D27 | 2026-10-24 | Contributions under the Developer Certificate of Origin (`Signed-off-by`), copyright "The ciburst Authors", commit authors unchanged. Policy files (`CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `NOTICE`) land with v1.0.0. |
+| D28 | 2026-10-24 | Pool images: during the private phase CI pushes them into a Scaleway Container Registry namespace of the ciburst project (private, intra-region pulls free, storage 0.027 EUR per GB per month), created by the provider's optional `registry` step; Serverless Jobs pull from it without credentials. From v1.0.0 the public GitLab registry is canonical for adopters and the Scaleway mirror stays an option (public images free up to 75 GB). |
 
 ## 1. Purpose and scope
 
@@ -154,6 +159,7 @@ Provider `scaleway-jobs` (API `serverless-jobs/v1alpha1`, region from config):
 | 3 | IAM application `<name>-cache`, policy on the project with `ObjectStorageFullAccess`, one API key | by name | secret key written once to `.local/outputs.env` |
 | 4 | Bucket `<name>-cache-<project id>` in the region, lifecycle rule `ciburst-expire` expiring objects after `cache.expireDays` | by name, drift by the rule's days | S3 API with SigV4 (access and secret key of the owner); destroy empties the bucket first |
 | 5 | Job definition `<name>-<pool.tag>` per pool: `cpu_limit` = vcpu x 1000, `memory_limit`, `local_storage_capacity`, `image_uri`, `job_timeout`, `environment_variables` (`CIBURST_POOL`, `CI_SERVER_URL`, `RUNNER_WAIT_TIMEOUT`, cache address, bucket and region) | by name | create or update when any field differs |
+| 6 | Registry namespace `<name>` (optional, `images.registry: true`): Container Registry API `registry/v1/regions/<region>/namespaces`, private by default; CI pushes the five images there while the project is private | by name | create; outputs `CIBURST_REGISTRY_ENDPOINT` |
 | start | `POST job-definitions/<id>/start` with `environment_variables` override (`RUNNER_TOKEN`, `CACHE_S3_ACCESS_KEY`, `CACHE_S3_SECRET_KEY`, labels) | | |
 | list | `GET job-runs?job_definition_id=<id>` states `queued, scheduled, running` map to live | | |
 | stop | `POST job-runs/<id>/stop` | | |
@@ -181,18 +187,21 @@ Secrets inventory:
 
 | Secret | Where | Lifetime | Rotation |
 |---|---|---|---|
-| Owner Scaleway key, access and secret key (IAMManager, ProjectManager, ServerlessJobsFullAccess, FunctionsFullAccess, ObjectStorageFullAccess) | `.local/scaleway.env` | owner chosen | delete after M2 |
+| Owner Scaleway key, access and secret key (IAMManager, ProjectManager, ServerlessJobsFullAccess, FunctionsFullAccess, ObjectStorageFullAccess, ContainerRegistryFullAccess) | `.local/scaleway.env` | owner chosen | delete after M2 |
 | Owner GitLab token, scope `api` | `.local/gitlab.env` | owner chosen | delete after M2, recreate for `check` and `rotate` |
 | Dispatch IAM key | function secret env, `.local/outputs.env` | none | `ciburst rotate key` |
 | Cache IAM key | function secret env, run env override, `.local/outputs.env` | none | `ciburst rotate cache` |
 | Runner tokens `glrt-`, one per pool | function secret env, run env override | until the runner is deleted | `ciburst rotate runner` |
 | Hook token | GitLab hook, function secret env | none | `ciburst rotate hook` |
+| Registry push key (private phase) | CI variables of the framework project | none | console, then update the variable |
 
 Privacy: the dispatcher logs project id, job id, pipeline id, stage, pool and run id. No payload is stored.
 
 ## 8. Automation
 
 Framework CI (`.gitlab-ci.yml`, hosted runners, image `rust:1.96.0-bookworm`): `lint` (`cargo fmt --check`, `cargo clippy -D warnings`, shellcheck over every script), `deny` (`cargo deny check` with a checksum-pinned binary), `test` (`cargo test --workspace --all-features`), `images` (build and push the five images with dind; on `main` when `images/**` changes and on tags), `release` (tags `vX.Y.Z` retag images, build the `ciburst` binary for Linux x86_64 musl, publish a GitLab release through `glab`). Branch mapping: `main` builds images tagged `edge`, tags build `X.Y.Z`, `X.Y`, `X` and `latest`.
+
+While the project is private, `scripts/ci-push-image.sh` also pushes every image to the Scaleway registry when the CI variables `CIBURST_SCW_REGISTRY` (endpoint and namespace) and `CIBURST_SCW_REGISTRY_KEY` are set; the drill config references those images. Merge-request pipelines run lint and test only.
 
 Consumer side: `include: project: <namespace>/ciburst, ref: v1, file: ci/ciburst.yml` sets `default: tags: [ci]`; jobs in a non-default pool set `tags: [<pool>]`; jobs that need a Docker daemon set `tags: [saas-linux-small-amd64]`; image builds use the `build` pool and `/kaniko/executor`. `ciburst check` runs against every configured project after `apply`.
 
@@ -231,9 +240,9 @@ A provider is a crate implementing `ciburst_core::types::Provider` with a `capab
 |---|---|---|
 | M0, orchestrator, done | workspace, LICENSE, README, `crates/core`, `crates/cli` with the fake modules, contract harness, GitLab fake, CI lint, deny and test, `docs/PROVIDERS.md` | `cargo test` green, `ciburst plan` against the fake modules prints every step, second `apply` plans nothing |
 | M1, three agents, done | A: `crates/scaleway` provider (jobs, IAM, bucket, lifecycle) with an in-process fake of the Jobs, IAM and S3 APIs, passing the contract. B: `crates/scaleway` host (namespace, function, secrets, zip, upload, deploy) with a Functions fake, and `crates/dispatch-scaleway` (axum handler on `Dispatcher`, builds on Rust 1.96). C: `images/*` (five images, entrypoint with cache flags verified), CI `images` and `release` stages, `ci/ciburst.yml`, `docs/RUNBOOK.md` | all tests green on CI, image smoke green, plan and apply idempotent against the fakes |
-| M2, orchestrator with owner keys | drill: `ciburst apply` on an empty project, `check` on the drill consumer project, a pipeline with node, rust, playwright and kaniko jobs plus one hosted-runner job; start latency; kaniko verdict; cache hit on the second run; cost on the consumption page; API behaviour assumed by the fakes checked live (stop sets a run to `canceled`, a run's environment merges the definition's with the overrides, deleting an IAM application does not cascade to its policies and keys, a PATCH of a deployed function does not redeploy by itself); fixes | runbook section "Drill" filled with dates and numbers |
+| M2, orchestrator with owner keys | provider step `registry`, CI push of the images into it, group and private project on GitLab.com, first push and pipeline; drill: `ciburst apply` on an empty project, `check` on the drill consumer project, a pipeline with node, rust, playwright and kaniko jobs plus one hosted-runner job; start latency; kaniko verdict; cache hit on the second run; cost on the consumption page; API behaviour assumed by the fakes checked live (stop sets a run to `canceled`, a run's environment merges the definition's with the overrides, deleting an IAM application does not cascade to its policies and keys, a PATCH of a deployed function does not redeploy by itself); fixes | runbook section "Drill" filled with dates and numbers |
 | M3, pipeline setup | `OutputsStore` on GitLab project variables (masked where allowed), `apply --no-wait`, config defaults from the job environment, `images/cli` with the binary, `ciburst-setup`, `ciburst-check` and `ciburst-destroy` jobs in the include, README "adopt in ten minutes" | a fresh consumer project is provisioned by its own pipeline from the four variables; the second run of `ciburst-setup` plans only `noop`; hosted-runner minutes per setup under three |
-| M4 | hardening from M2 and M3, GitHub mirror, `v1.0.0` tag with binaries and images | release pipeline green |
+| M4, go public | hardening from M2 and M3, policy files (D27), project visibility public, GitHub mirror, Pages site at `ciburst.zwa.la`, crates.io publication of `ciburst-core`, `ciburst-scaleway` and `ciburst`, `v1.0.0` tag with binaries and images | release pipeline green, the images pull anonymously from the GitLab registry, the docs site answers |
 
 Definition of done per milestone: tests green locally and on CI, `cargo fmt`, `clippy -D warnings` and `cargo deny` clean, docs updated, no secret and no identifying value in the repo, no em or en dash, summary to the owner with the go question for the next milestone.
 
@@ -258,8 +267,8 @@ Glossary: pool (tag, image, resources, stages), run (one serverless container ex
 ## 14. Owner inputs
 
 1. The go for M1.
-2. For M2: `.local/scaleway.env` with a setup key holding `IAMManager`, `ProjectManager`, `ServerlessJobsFullAccess`, `FunctionsFullAccess`, `ObjectStorageFullAccess` on the organization; `.local/gitlab.env` with a personal access token, scope `api`, expiry chosen, and the drill consumer project id.
-3. The GitLab project `<namespace>/ciburst`, public, with hosted runners enabled for its own CI; created by me through the API on your push confirmation or by you.
+2. For M2: `.local/scaleway.env` with a setup key holding `IAMManager`, `ProjectManager`, `ServerlessJobsFullAccess`, `FunctionsFullAccess`, `ObjectStorageFullAccess`, `ContainerRegistryFullAccess` on the organization; `.local/gitlab.env` with a personal access token, scope `api`, expiry chosen, and the drill consumer project id.
+3. The GitLab group `ciburst` and the private project `ciburst/ciburst` with hosted runners enabled, created through the API with the token on the push confirmation. At v1.0.0: DNS for `ciburst.zwa.la` (CNAME to GitLab Pages plus the verification TXT record) and the GitHub organization `ciburst`.
 
 ## 15. Sources, checked 2026-10-23 and 2026-10-24
 
