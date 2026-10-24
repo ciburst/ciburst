@@ -344,7 +344,7 @@ async fn works_without_gitlab() {
     assert!(!values.contains_key(&keys::runner_token("ci")));
     assert!(
         s.provisioner
-            .check()
+            .check(None)
             .await
             .unwrap_err()
             .to_string()
@@ -363,7 +363,7 @@ async fn checks_pipelines_against_the_stage_map() {
     s.fake.set_jobs(7, vec![job("unit", "test", &["ci"])]);
     s.fake.set_jobs(8, vec![job("image", "build", &["ci"])]);
     s.fake.set_lint_errors(9, vec!["invalid yaml".into()]);
-    let report = s.provisioner.check().await.unwrap();
+    let report = s.provisioner.check(None).await.unwrap();
     let summary: Vec<(u64, bool, usize, usize)> = report
         .iter()
         .map(|r| (r.project_id, r.valid, r.problems.len(), r.errors.len()))

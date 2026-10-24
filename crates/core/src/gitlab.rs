@@ -203,12 +203,15 @@ impl Gitlab {
         Ok(())
     }
 
-    pub async fn lint_jobs(&self, project_id: u64) -> Result<Lint> {
-        self.get(
-            &format!("/projects/{project_id}/ci/lint"),
-            &[("include_jobs", "true".into())],
-        )
-        .await
+    /// Lints the pipeline at `content_ref` (branch, tag or commit), the default branch when
+    /// `None`.
+    pub async fn lint_jobs(&self, project_id: u64, content_ref: Option<&str>) -> Result<Lint> {
+        let mut query = vec![("include_jobs", "true".to_string())];
+        if let Some(content_ref) = content_ref {
+            query.push(("content_ref", content_ref.to_string()));
+        }
+        self.get(&format!("/projects/{project_id}/ci/lint"), &query)
+            .await
     }
 }
 
@@ -303,10 +306,20 @@ mod tests {
         );
         fake.set_lint_errors(8, vec!["invalid yaml".into()]);
         let gitlab = client(&fake);
-        let ok = gitlab.lint_jobs(7).await.unwrap();
+        let ok = gitlab.lint_jobs(7, None).await.unwrap();
         assert!(ok.valid);
         assert_eq!(ok.jobs.len(), 1);
-        let bad = gitlab.lint_jobs(8).await.unwrap();
+        fake.set_jobs_at(7, "drill", Vec::new());
+        assert!(
+            gitlab
+                .lint_jobs(7, Some("drill"))
+                .await
+                .unwrap()
+                .jobs
+                .is_empty()
+        );
+        assert!(!gitlab.lint_jobs(7, Some("gone")).await.unwrap().valid);
+        let bad = gitlab.lint_jobs(8, None).await.unwrap();
         assert!(!bad.valid);
         assert_eq!(bad.errors, ["invalid yaml"]);
 

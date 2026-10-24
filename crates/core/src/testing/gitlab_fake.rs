@@ -42,6 +42,7 @@ struct Inner {
     next_id: u64,
     calls: Vec<Call>,
     jobs: BTreeMap<u64, Vec<LintJob>>,
+    ref_jobs: BTreeMap<(u64, String), Vec<LintJob>>,
     lint_errors: BTreeMap<u64, Vec<String>>,
 }
 
@@ -116,6 +117,15 @@ impl FakeGitlab {
             .expect("fake gitlab")
             .jobs
             .insert(project_id, jobs);
+    }
+
+    /// Jobs of the pipeline at `content_ref`; a ref without jobs set does not exist.
+    pub fn set_jobs_at(&self, project_id: u64, content_ref: &str, jobs: Vec<LintJob>) {
+        self.inner
+            .lock()
+            .expect("fake gitlab")
+            .ref_jobs
+            .insert((project_id, content_ref.to_string()), jobs);
     }
 
     pub fn set_lint_errors(&self, project_id: u64, errors: Vec<String>) {
@@ -285,12 +295,19 @@ impl HttpClient for FakeGitlab {
             }
             ("GET", ["projects", p, "ci", "lint"]) => {
                 let project = id(p).unwrap_or(0);
-                let errors = inner.lint_errors.get(&project).cloned().unwrap_or_default();
+                let content_ref = query_value(&request.url, "content_ref");
+                let at_ref = content_ref
+                    .as_ref()
+                    .map(|r| inner.ref_jobs.get(&(project, r.clone())).cloned());
+                let errors = match &at_ref {
+                    Some(None) => vec!["Reference not found".to_string()],
+                    _ => inner.lint_errors.get(&project).cloned().unwrap_or_default(),
+                };
                 let valid = errors.is_empty();
-                let jobs = if valid {
-                    inner.jobs.get(&project).cloned().unwrap_or_default()
-                } else {
-                    Vec::new()
+                let jobs = match at_ref {
+                    _ if !valid => Vec::new(),
+                    Some(jobs) => jobs.unwrap_or_default(),
+                    None => inner.jobs.get(&project).cloned().unwrap_or_default(),
                 };
                 Ok(json(
                     200,

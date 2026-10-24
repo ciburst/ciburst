@@ -54,7 +54,11 @@ enum Command {
     /// Live runs per pool
     Status,
     /// Compare every project's pipeline with the stage map
-    Check,
+    Check {
+        /// Branch, tag or commit to lint instead of the default branch
+        #[arg(long = "ref")]
+        content_ref: Option<String>,
+    },
     /// Replace a secret and redeploy: runner, hook, key or cache
     Rotate { kind: String },
 }
@@ -242,8 +246,8 @@ pub async fn run(args: Vec<String>, out: &mut dyn Write) -> Result<i32> {
             }
             Ok(0)
         }
-        Command::Check => {
-            let report = provisioner.check().await?;
+        Command::Check { content_ref } => {
+            let report = provisioner.check(content_ref.as_deref()).await?;
             let mut failed = false;
             for project in &report {
                 if !project.valid {

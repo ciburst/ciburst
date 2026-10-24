@@ -513,14 +513,16 @@ impl Provisioner {
         })
     }
 
-    pub async fn check(&self) -> Result<Vec<ProjectReport>> {
+    /// Lints every project's pipeline at `content_ref` (the default branch when `None`) and
+    /// compares its jobs with the stage map.
+    pub async fn check(&self, content_ref: Option<&str>) -> Result<Vec<ProjectReport>> {
         let gitlab = self
             .gitlab
             .as_ref()
             .ok_or_else(|| Error::other("check needs a GitLab token"))?;
         let mut report = Vec::new();
         for &project_id in &self.config.gitlab.project_ids {
-            let lint = gitlab.lint_jobs(project_id).await?;
+            let lint = gitlab.lint_jobs(project_id, content_ref).await?;
             let problems = if lint.valid {
                 check_jobs(&self.config, &lint.jobs)
             } else {

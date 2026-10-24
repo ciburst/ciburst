@@ -62,7 +62,7 @@ Gitignored. Never committed.
 3. Image builds extend `.ciburst-image-build` (stage `build`, `docker:27` with `docker:27-dind` on the VM pool).
 4. Fast lanes on Serverless Jobs extend `.ciburst-rust` (stage `rust`) or `.ciburst-playwright` (stage `e2e`). They ignore `image:` and have no Docker daemon; the playwright pool ships browsers for Playwright 1.64.1, so pin `@playwright/test` to 1.64.1. Declare the stages in `stages:`.
 5. The job's stage selects the pool: VM jobs use stages no fast lane lists. A job for GitLab's hosted runners (`tags: [saas-linux-small-amd64]`) belongs in a fast-lane stage, so its pending event starts a cheap run instead of a VM.
-Check: `ciburst check` reports no problem; a pipeline shows each job on a runner named `<name>-<tag>`.
+Check: `ciburst check` reports no problem (`--ref <branch>` lints a branch before it is merged); a pipeline shows each job on a runner named `<name>-<tag>`.
 
 ## Pool images
 
@@ -191,7 +191,7 @@ Date: ____. Config: default pool `vm` (`runtime: instances`), fast lane `ci` (`r
 2. `ciburst apply`, then `ciburst plan`.
    Check: the plan prints only `noop`; the security group `<name>-vm` and the cron `<name>-sweep` exist.
    Result: ____
-3. `ciburst check` on the drill consumer project.
+3. `ciburst check --ref ciburst-drill` on the drill consumer project.
    Check: no problem line.
    Result: ____
 4. Run the drill pipeline.
@@ -205,8 +205,8 @@ Date: ____. Config: default pool `vm` (`runtime: instances`), fast lane `ci` (`r
    Result: ____
 8. End by callback: each VM reports `draining` and is gone between minute 55 and 60 of its hour.
    Result: ____
-9. Sweep: start a VM, then block its reports with `ciburst rotate hook`.
-   Check: the sweep terminates it within an hour of its last report.
+9. Sweep: create a powered-on server in the VM zone that never reports, tagged `ciburst`, `<name>`, `pool:<tag>`, `ciburst-state:starting` (no user data).
+   Check: the first sweep after its tenth minute terminates it; VMs that report stay.
    Result: ____
 10. Cost per drill pipeline on the consumption page (Instances, IPs, Serverless Jobs).
     Result: ____ EUR
