@@ -92,7 +92,7 @@ impl ScalewayJobs {
             config,
             client,
             log,
-            s3_access_key: None,
+            s3_access_key: client.access_key().map(String::from),
         }
     }
 
