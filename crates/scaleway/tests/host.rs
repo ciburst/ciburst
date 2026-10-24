@@ -8,8 +8,10 @@ use ciburst_core::types::{Action, Host, KeyPair, Secrets, Step};
 use ciburst_scaleway::client::{Credentials, ScalewayClient};
 use ciburst_scaleway::host::{ScalewayFunction, embedded_code, embedded_code_digest, vars};
 use ciburst_scaleway::testing::functions_api::FakeFunctions;
+use serde_json::json;
 
 const FUNCTION: &str = "demo-dispatch";
+const CRON: &str = "demo-sweep";
 const PROJECT: &str = "11111111-1111-4111-8111-111111111111";
 
 fn config(pools: &str) -> Arc<Config> {
@@ -51,7 +53,7 @@ fn secrets() -> Secrets {
             access_key: "SCWCACHE".into(),
             secret_key: "cache-secret".into(),
         }),
-        vm_secret: None,
+        vm_secret: Some("vm-secret".into()),
     }
 }
 
@@ -88,7 +90,8 @@ async fn plans_applies_and_converges() {
         [
             ("namespace", Action::Create),
             ("function", Action::Create),
-            ("code", Action::Create)
+            ("code", Action::Create),
+            ("cron", Action::Create)
         ]
     );
     assert_eq!(fake.namespace_count(), 0, "plan is pure");
@@ -139,6 +142,7 @@ async fn plans_applies_and_converges() {
             "CACHE_S3_ACCESS_KEY",
             "CACHE_S3_SECRET_KEY",
             "CIBURST_DISPATCH_KEY",
+            "CIBURST_VM_SECRET",
             "HOOK_TOKEN",
             "RUNNER_TOKEN_BUILD_X",
             "RUNNER_TOKEN_CI"
@@ -148,6 +152,15 @@ async fn plans_applies_and_converges() {
         fake.secret(FUNCTION, "CIBURST_DISPATCH_KEY").as_deref(),
         Some("dispatch-secret")
     );
+    assert_eq!(
+        fake.secret(FUNCTION, vars::VM_SECRET).as_deref(),
+        Some("vm-secret")
+    );
+    let cron = fake.cron(CRON).unwrap();
+    assert_eq!(cron["function_id"], function["id"]);
+    assert_eq!(cron["schedule"], "*/30 * * * *");
+    assert_eq!(cron["args"], json!({ "ciburst_sweep": "hook-secret" }));
+    assert_eq!(cron["status"], "ready", "apply waits for the cron");
     assert!(
         !function.to_string().contains("glrt-"),
         "secrets come back hashed"
@@ -176,14 +189,43 @@ async fn plans_applies_and_converges() {
     );
     assert_eq!(fake.namespace_count(), 1);
     assert_eq!(fake.function_count(), 1);
+    assert_eq!(fake.cron_count(), 1);
 }
 
 #[tokio::test]
-async fn a_changed_secret_updates_the_function_only() {
+async fn a_changed_vm_secret_updates_the_function_only() {
+    let fake = Arc::new(FakeFunctions::new());
+    let host = host(two_pools(), &fake);
+    host.apply(&host.plan(&secrets()).await.unwrap(), &secrets())
+        .await
+        .unwrap();
+    let mut rotated = secrets();
+    rotated.vm_secret = Some("vm-rotated".into());
+    let plan = host.plan(&rotated).await.unwrap();
+    assert_eq!(
+        actions(&plan),
+        [
+            ("namespace", Action::Noop),
+            ("function", Action::Update),
+            ("code", Action::Noop),
+            ("cron", Action::Noop)
+        ]
+    );
+    host.apply(&plan, &rotated).await.unwrap();
+    assert_eq!(
+        fake.secret(FUNCTION, vars::VM_SECRET).as_deref(),
+        Some("vm-rotated")
+    );
+    assert!(host.plan(&rotated).await.unwrap().iter().all(Step::is_noop));
+}
+
+#[tokio::test]
+async fn a_rotated_hook_token_updates_the_function_and_the_cron() {
     let fake = Arc::new(FakeFunctions::new());
     let host = host(two_pools(), &fake);
     let plan = host.plan(&secrets()).await.unwrap();
     host.apply(&plan, &secrets()).await.unwrap();
+    let cron_id = fake.cron(CRON).unwrap()["id"].clone();
 
     let mut rotated = secrets();
     rotated.hook_token = Some("hook-rotated".into());
@@ -193,14 +235,27 @@ async fn a_changed_secret_updates_the_function_only() {
         [
             ("namespace", Action::Noop),
             ("function", Action::Update),
-            ("code", Action::Noop)
+            ("code", Action::Noop),
+            ("cron", Action::Update)
         ]
+    );
+    assert_eq!(
+        plan[3].detail.as_deref(),
+        Some("schedule or arguments changed")
+    );
+    assert!(
+        !format!("{plan:?}").contains("hook-rotated"),
+        "the plan shows no token"
     );
     host.apply(&plan, &rotated).await.unwrap();
     assert_eq!(
         fake.secret(FUNCTION, "HOOK_TOKEN").as_deref(),
         Some("hook-rotated")
     );
+    let cron = fake.cron(CRON).unwrap();
+    assert_eq!(cron["id"], cron_id, "updated in place");
+    assert_eq!(cron["args"], json!({ "ciburst_sweep": "hook-rotated" }));
+    assert_eq!(cron["status"], "ready");
     assert_eq!(
         fake.function(FUNCTION).unwrap()["environment_variables"][vars::CODE_DIGEST],
         embedded_code_digest(),
@@ -252,7 +307,8 @@ async fn new_code_and_failed_builds_redeploy() {
         [
             ("namespace", Action::Noop),
             ("function", Action::Noop),
-            ("code", Action::Update)
+            ("code", Action::Update),
+            ("cron", Action::Noop)
         ]
     );
     fake.fail_next_build();
@@ -274,6 +330,61 @@ async fn new_code_and_failed_builds_redeploy() {
 }
 
 #[tokio::test]
+async fn a_cron_changed_or_removed_outside_is_repaired() {
+    let fake = Arc::new(FakeFunctions::new());
+    let host = host(two_pools(), &fake);
+    host.apply(&host.plan(&secrets()).await.unwrap(), &secrets())
+        .await
+        .unwrap();
+    let deploys = fake.deploy_count(FUNCTION);
+
+    for (field, value) in [
+        ("schedule", json!("0 * * * *")),
+        ("args", json!({ "ciburst_sweep": "stale" })),
+        ("args", json!({})),
+    ] {
+        fake.set_cron(CRON, field, value);
+        let plan = host.plan(&secrets()).await.unwrap();
+        assert_eq!(
+            actions(&plan)[1..],
+            [
+                ("function", Action::Noop),
+                ("code", Action::Noop),
+                ("cron", Action::Update)
+            ],
+            "{field}"
+        );
+        host.apply(&plan, &secrets()).await.unwrap();
+        let cron = fake.cron(CRON).unwrap();
+        assert_eq!(cron["schedule"], "*/30 * * * *");
+        assert_eq!(cron["args"], json!({ "ciburst_sweep": "hook-secret" }));
+    }
+
+    let id = fake.cron(CRON).unwrap()["id"].as_str().unwrap().to_string();
+    let path = format!("/functions/v1beta1/regions/fr-par/crons/{id}");
+    let client = client(&fake, Some(PROJECT));
+    client.delete(&path).await.unwrap();
+    assert_eq!(fake.cron_count(), 0);
+    let plan = host.plan(&secrets()).await.unwrap();
+    assert_eq!(plan[3].id, "cron");
+    assert_eq!(plan[3].action, Action::Create);
+    host.apply(&plan, &secrets()).await.unwrap();
+    assert_eq!(fake.cron_count(), 1);
+    assert!(
+        host.plan(&secrets())
+            .await
+            .unwrap()
+            .iter()
+            .all(Step::is_noop)
+    );
+    assert_eq!(
+        fake.deploy_count(FUNCTION),
+        deploys,
+        "a cron change redeploys nothing"
+    );
+}
+
+#[tokio::test]
 async fn destroy_empties_the_api() {
     let fake = Arc::new(FakeFunctions::new());
     let host = host(two_pools(), &fake);
@@ -282,9 +393,18 @@ async fn destroy_empties_the_api() {
         .await
         .unwrap();
     assert!(host.url().await.unwrap().is_some());
+    assert_eq!(fake.cron_count(), 1);
+    let cron_id = fake.cron(CRON).unwrap()["id"].as_str().unwrap().to_string();
     host.destroy().await.unwrap();
     assert_eq!(fake.namespace_count(), 0);
     assert_eq!(fake.function_count(), 0);
+    assert_eq!(fake.cron_count(), 0);
+    assert!(
+        fake.calls()
+            .iter()
+            .any(|c| c.method == "DELETE" && c.path.ends_with(&format!("/crons/{cron_id}"))),
+        "the cron is deleted explicitly"
+    );
     assert_eq!(host.url().await.unwrap(), None);
     host.destroy().await.unwrap();
 }

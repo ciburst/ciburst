@@ -1,5 +1,5 @@
 //! Fake of the Serverless Functions API (`/functions/v1beta1/regions/<region>`): namespaces,
-//! functions, upload URL and the presigned `PUT`, deploy, status transitions. Shapes follow
+//! functions, upload URL and the presigned `PUT`, deploy, crons, status transitions. Shapes follow
 //! `scaleway-sdk-go/api/function/v1beta1`. Also serves `GET /account/v3/projects` for projects
 //! registered with [`FakeFunctions::add_project`], so host tests can run without a default
 //! project id.
@@ -7,7 +7,8 @@
 //! Transitions: a namespace is `pending` after create and `ready` on the next `GET`; a function
 //! is `created` until its first deploy, `pending` after a deploy (or an update of a deployed
 //! function) and `ready` on the next `GET`, or `error` when [`FakeFunctions::fail_next_build`]
-//! was called.
+//! was called. A cron is `creating` after create, `pending` after an update and `ready` on the
+//! next `GET`; deleting a function or namespace deletes its crons.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -43,6 +44,7 @@ struct Inner {
     projects: Vec<(String, String)>,
     namespaces: Vec<Value>,
     functions: Vec<FunctionRecord>,
+    crons: Vec<Value>,
     calls: Vec<Call>,
     next_id: u64,
     fail_next_build: bool,
@@ -150,6 +152,26 @@ impl FakeFunctions {
     pub fn fail_next_build(&self) {
         self.lock().fail_next_build = true;
     }
+
+    pub fn cron_count(&self) -> usize {
+        self.lock().crons.len()
+    }
+
+    /// The cron as the API returns it.
+    pub fn cron(&self, name: &str) -> Option<Value> {
+        self.lock()
+            .crons
+            .iter()
+            .find(|c| c["name"] == name)
+            .cloned()
+    }
+
+    /// Sets a cron field, as a change made outside ciburst would.
+    pub fn set_cron(&self, name: &str, field: &str, value: Value) {
+        if let Some(cron) = self.lock().crons.iter_mut().find(|c| c["name"] == name) {
+            cron[field] = value;
+        }
+    }
 }
 
 fn reply(status: u16, value: Value) -> Response {
@@ -253,6 +275,20 @@ fn apply_secrets(
     Ok(())
 }
 
+/// Five whitespace-separated cron fields when a schedule is given; `args` a JSON object.
+fn check_cron(body: &Value) -> std::result::Result<(), String> {
+    if let Some(schedule) = body.get("schedule") {
+        let fields = schedule.as_str().map(|s| s.split_whitespace().count());
+        if fields != Some(5) {
+            return Err("schedule: five cron fields".into());
+        }
+    }
+    if body.get("args").is_some_and(|args| !args.is_object()) {
+        return Err("args: JSON object".into());
+    }
+    Ok(())
+}
+
 const FUNCTION_FIELDS: [&str; 11] = [
     "runtime",
     "handler",
@@ -329,7 +365,15 @@ impl Inner {
                     return not_found("namespace");
                 };
                 let mut namespace = self.namespaces.remove(index);
+                let functions: Vec<Value> = self
+                    .functions
+                    .iter()
+                    .filter(|f| f.value["namespace_id"] == *id)
+                    .map(|f| f.value["id"].clone())
+                    .collect();
                 self.functions.retain(|f| f.value["namespace_id"] != *id);
+                self.crons
+                    .retain(|c| !functions.contains(&c["function_id"]));
                 namespace["status"] = json!("deleting");
                 reply(200, namespace)
             }
@@ -397,8 +441,56 @@ impl Inner {
                     return not_found("function");
                 };
                 let mut record = self.functions.remove(index);
+                self.crons.retain(|c| c["function_id"] != *id);
                 record.value["status"] = json!("deleting");
                 reply(200, record.value)
+            }
+            ("GET", ["crons"]) => {
+                let Some(function_id) = param(query, "function_id").filter(|f| !f.is_empty())
+                else {
+                    return invalid("function_id required");
+                };
+                let list: Vec<Value> = self
+                    .crons
+                    .iter()
+                    .filter(|c| c["function_id"] == function_id)
+                    .cloned()
+                    .collect();
+                let total = list.len();
+                reply(200, json!({ "crons": list, "total_count": total }))
+            }
+            ("POST", ["crons"]) => self.create_cron(body),
+            ("GET", ["crons", id]) => match self.crons.iter_mut().find(|c| c["id"] == *id) {
+                Some(cron) => {
+                    if cron["status"] == "creating" || cron["status"] == "pending" {
+                        cron["status"] = json!("ready");
+                    }
+                    reply(200, cron.clone())
+                }
+                None => not_found("cron"),
+            },
+            ("PATCH", ["crons", id]) => {
+                if let Err(message) = check_cron(&body) {
+                    return invalid(&message);
+                }
+                let Some(cron) = self.crons.iter_mut().find(|c| c["id"] == *id) else {
+                    return not_found("cron");
+                };
+                for field in ["function_id", "schedule", "args", "name"] {
+                    if let Some(value) = body.get(field) {
+                        cron[field] = value.clone();
+                    }
+                }
+                cron["status"] = json!("pending");
+                reply(200, cron.clone())
+            }
+            ("DELETE", ["crons", id]) => {
+                let Some(index) = self.crons.iter().position(|c| c["id"] == *id) else {
+                    return not_found("cron");
+                };
+                let mut cron = self.crons.remove(index);
+                cron["status"] = json!("deleting");
+                reply(200, cron)
             }
             ("GET", ["functions", id, "upload-url"]) => {
                 let Some(length) = param(query, "content_length").and_then(|l| l.parse().ok())
@@ -514,6 +606,37 @@ impl Inner {
             building: false,
         });
         reply(200, value)
+    }
+
+    /// `CreateCronRequest`: `function_id` and `schedule` required, `args` and `name` optional.
+    fn create_cron(&mut self, body: Value) -> Response {
+        let Some(function_id) = body["function_id"].as_str() else {
+            return invalid("function_id required");
+        };
+        if body["schedule"].as_str().is_none() {
+            return invalid("schedule required");
+        }
+        if let Err(message) = check_cron(&body) {
+            return invalid(&message);
+        }
+        if !self.functions.iter().any(|f| f.value["id"] == function_id) {
+            return not_found("function");
+        }
+        let id = self.id("0003");
+        let name = body["name"]
+            .as_str()
+            .map(String::from)
+            .unwrap_or_else(|| format!("cron-{id}"));
+        let cron = json!({
+            "id": id,
+            "function_id": function_id,
+            "schedule": body["schedule"],
+            "args": body.get("args").cloned().unwrap_or_else(|| json!({})),
+            "status": "creating",
+            "name": name,
+        });
+        self.crons.push(cron.clone());
+        reply(200, cron)
     }
 
     fn upload(&mut self, path: &str, request: &Request) -> Response {
