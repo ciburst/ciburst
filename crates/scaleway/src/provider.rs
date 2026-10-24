@@ -38,7 +38,8 @@ pub const PROVIDER_NAME: &str = "scaleway";
 /// The provider type of M2, which only had Serverless Jobs.
 pub const LEGACY_JOBS_TYPE: &str = "scaleway-jobs";
 
-/// Commercial types tried in order when a pool names none.
+/// Commercial types tried in order when a pool names none (rule 4 of M3). PLAY2 types have no
+/// local storage, so no local image fits them and start skips them.
 pub const DEFAULT_INSTANCE_TYPES: [&str; 2] = ["DEV1-M", "PLAY2-NANO"];
 
 /// The user data key cloud-init reads on Scaleway Instances.
