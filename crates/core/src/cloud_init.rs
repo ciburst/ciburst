@@ -86,7 +86,7 @@ mod tests {
         assert!(render(&env, "/vm-agent:edge", false).is_err());
         let text = render(&env, IMAGE, true).unwrap();
         assert!(!text.contains("{{"), "{text}");
-        assert!(text.starts_with("#cloud-config\n"));
+        assert!(text.starts_with("#cloud-config\nssh_pwauth: false\n"));
     }
 
     #[test]

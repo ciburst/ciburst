@@ -1,4 +1,5 @@
 #cloud-config
+ssh_pwauth: false
 write_files:
   - path: /etc/ciburst/vm.env
     owner: root:root
