@@ -92,6 +92,7 @@ fn start_request(tag: usize) -> StartRequest {
         pool: contract_config().pools[tag].clone(),
         env: BTreeMap::from([("RUNNER_TOKEN".to_string(), "glrt-test".to_string())]),
         labels: labels(),
+        taken: 1,
     }
 }
 

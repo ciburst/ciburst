@@ -1,6 +1,6 @@
 //! The user data `cloud-init` of a VM, the contract between provider and agent (rule 6 of M3):
 //! `/etc/ciburst/vm.env`, the pinned `gitlab-runner`, the agent copied out of its image, and
-//! the agent's systemd unit. The template is `cloud-init.yaml` next to this file.
+//! the agent's systemd unit. The template and rendering live in `ciburst_core::cloud_init`.
 
 use std::collections::BTreeMap;
 
@@ -9,21 +9,7 @@ use ciburst_core::{Error, Result};
 
 use super::{PROVIDER_NAME, jobs, s3};
 
-pub const RUNNER_URL: &str =
-    "https://gitlab-runner-downloads.s3.amazonaws.com/v18.11.4/binaries/gitlab-runner-linux-amd64";
-/// From `v18.11.4/release.sha256`, matched against the downloaded binary on 2026-10-24.
-pub const RUNNER_SHA256: &str = "bed4af01315780cf27d259b9d7a74d20cc0a6fc0d34c9952205b59c244639fd1";
-/// The agent image below the registry endpoint, built by CI.
-pub const AGENT_IMAGE: &str = "vm-agent:edge";
-
-pub const RUN_ID: &str = "CIBURST_RUN_ID";
-pub const VM_TOKEN: &str = "CIBURST_VM_TOKEN";
-pub const DISPATCH_URL: &str = "CIBURST_DISPATCH_URL";
-
-const TEMPLATE: &str = include_str!("cloud-init.yaml");
-
-/// Ubuntu without the marketplace Docker image needs the daemon first.
-const INSTALL_DOCKER: &str = "  - 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io && systemctl enable --now docker'\n";
+pub use ciburst_core::cloud_init::{AGENT_IMAGE, DISPATCH_URL, RUN_ID, VM_TOKEN};
 
 /// `vm.env` without the run id and token, which exist only once the server does. Fails before
 /// anything is created when the request lacks a value the VM needs.
@@ -71,43 +57,23 @@ pub fn base_env(
     Ok(env)
 }
 
-/// The cloud-config document. `install_docker` is for the plain Ubuntu fallback image.
+/// The cloud-config document with the agent image below `registry_endpoint`.
+/// `install_docker` is for the plain Ubuntu fallback image.
 pub fn render(
     env: &BTreeMap<String, String>,
     registry_endpoint: &str,
     install_docker: bool,
 ) -> Result<String> {
-    for (key, value) in env {
-        let key_ok = !key.is_empty()
-            && key
-                .chars()
-                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-        if !key_ok || value.chars().any(char::is_control) {
-            return Err(Error::provider(format!(
-                "{PROVIDER_NAME}: {key} cannot be written to vm.env"
-            )));
-        }
-    }
-    let image = format!("{registry_endpoint}/{AGENT_IMAGE}");
-    let image_ok = !registry_endpoint.is_empty()
-        && image
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "./:_-".contains(c));
-    if !image_ok {
+    if registry_endpoint.is_empty() {
         return Err(Error::provider(format!(
-            "{PROVIDER_NAME}: registry endpoint {registry_endpoint} is not an image reference"
+            "{PROVIDER_NAME}: no registry endpoint for the agent image"
         )));
     }
-    let vm_env: Vec<String> = env.iter().map(|(k, v)| format!("      {k}={v}")).collect();
-    Ok(TEMPLATE
-        .replace("{{VM_ENV}}", &vm_env.join("\n"))
-        .replace(
-            "{{INSTALL_DOCKER}}",
-            if install_docker { INSTALL_DOCKER } else { "" },
-        )
-        .replace("{{RUNNER_URL}}", RUNNER_URL)
-        .replace("{{RUNNER_SHA256}}", RUNNER_SHA256)
-        .replace("{{AGENT_IMAGE}}", &image))
+    ciburst_core::cloud_init::render(
+        env,
+        &format!("{registry_endpoint}/{AGENT_IMAGE}"),
+        install_docker,
+    )
 }
 
 #[cfg(test)]

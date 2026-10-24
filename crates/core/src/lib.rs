@@ -3,12 +3,15 @@
 //! [`types::Provider`] and [`types::Host`].
 
 pub mod check;
+pub mod cloud_init;
+pub mod composite;
 pub mod config;
 pub mod dispatch;
 pub mod error;
 pub mod fake;
 pub mod gitlab;
 pub mod http;
+pub mod ledger;
 pub mod log;
 pub mod plan;
 pub mod provision;

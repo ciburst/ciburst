@@ -7,6 +7,8 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
+use crate::types::{VmCapacity, VmState};
+
 /// Header carrying the run id on `/vm` and `/terminate`.
 pub const HEADER_RUN: &str = "X-Ciburst-Run";
 /// Header carrying the capability token on `/vm` and `/terminate`.
@@ -29,6 +31,32 @@ pub const SWEEP_STARTING_S: u64 = 600;
 pub const SWEEP_DRAINING_S: u64 = 900;
 pub const SWEEP_SILENT_S: u64 = 1800;
 pub const SWEEP_MAX_AGE_S: u64 = 86_400;
+
+/// Rule 10 of M3, shared by every VM provider: why the sweep ends this VM at `now`, or `None` to keep it. A VM that
+/// reported within `SWEEP_SILENT_S` is kept unless it is past the maximum age.
+pub fn sweep_reason(vm: &VmCapacity, drain_since: Option<u64>, now: u64) -> Option<&'static str> {
+    let age = now.saturating_sub(vm.created_at);
+    if age > SWEEP_MAX_AGE_S {
+        return Some("max_age");
+    }
+    let silent_for = vm.seen.map(|seen| now.saturating_sub(seen));
+    if silent_for.is_some_and(|s| s <= SWEEP_SILENT_S) {
+        return None;
+    }
+    if vm.state == VmState::Starting && age > SWEEP_STARTING_S {
+        return Some("starting");
+    }
+    if vm.state == VmState::Draining
+        && drain_since.is_some_and(|since| now.saturating_sub(since) > SWEEP_DRAINING_S)
+    {
+        return Some("draining");
+    }
+    match silent_for {
+        Some(_) => Some("silent"),
+        None if age > SWEEP_SILENT_S => Some("silent"),
+        None => None,
+    }
+}
 
 pub fn token(secret: &str, run_id: &str) -> String {
     let mut mac =

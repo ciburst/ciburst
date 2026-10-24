@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use ciburst_core::composite::Composite;
 use ciburst_core::config::{Config, check_capabilities, load_config};
 use ciburst_core::fake::{FakeHost, FakeProvider};
 use ciburst_core::gitlab::Gitlab;
@@ -14,6 +15,7 @@ use ciburst_core::provision::Provisioner;
 use ciburst_core::store::FileStore;
 use ciburst_core::types::{Host, Provider, Rotation};
 use ciburst_core::{Error, Result};
+use ciburst_hetzner::Hetzner;
 use ciburst_scaleway::client::{Credentials, DEFAULT_REGION, ScalewayClient};
 use ciburst_scaleway::host::{HOST_NAME as SCALEWAY_HOST, ScalewayFunction};
 use ciburst_scaleway::provider::ScalewayJobs;
@@ -100,7 +102,56 @@ impl Modules {
         Arc::new(FileStore::new(self.local.join("state.json"), slot))
     }
 
+    /// The config's provider, wrapped in a [`Composite`] with the added providers of
+    /// `providers` (spec D35).
     async fn provider(&mut self) -> Result<Arc<dyn Provider>> {
+        let main = self.main_provider().await?;
+        let mut extras: Vec<(String, Arc<dyn Provider>)> = Vec::new();
+        for runtime in self.config.providers.keys() {
+            match runtime.as_str() {
+                ciburst_hetzner::RUNTIME => {
+                    let env = read_env_file(&self.local.join("hetzner.env")).await?;
+                    let token = env
+                        .get(ciburst_hetzner::TOKEN_VAR)
+                        .filter(|t| !t.is_empty())
+                        .cloned()
+                        .ok_or_else(|| {
+                            Error::other(format!(
+                                "{}: {} missing",
+                                self.local.join("hetzner.env").display(),
+                                ciburst_hetzner::TOKEN_VAR
+                            ))
+                        })?;
+                    extras.push((
+                        runtime.clone(),
+                        Arc::new(Hetzner::new(
+                            self.config.clone(),
+                            token,
+                            Arc::new(ReqwestClient::new()?),
+                            self.log.clone(),
+                        )),
+                    ));
+                }
+                other => {
+                    return Err(Error::other(format!(
+                        "providers.{other}: no provider named {other}; available: {}",
+                        ciburst_hetzner::RUNTIME
+                    )));
+                }
+            }
+        }
+        if extras.is_empty() {
+            return Ok(main);
+        }
+        Ok(Arc::new(Composite::new(
+            self.config.clone(),
+            main,
+            extras,
+            self.log.clone(),
+        )))
+    }
+
+    async fn main_provider(&mut self) -> Result<Arc<dyn Provider>> {
         match self.config.provider.kind.as_str() {
             "fake" => Ok(Arc::new(FakeProvider::new(
                 self.config.clone(),

@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 
 use crate::config::{CacheType, Config, Pool};
+use crate::ledger::{GROUP_WAIT_S, Ledger};
 use crate::log::Log;
 use crate::provision::keys;
 use crate::types::{Provider, Secrets, StartRequest, VmCapacity, VmReport, VmState};
@@ -60,6 +62,12 @@ pub struct Dispatcher {
     secrets: Arc<Secrets>,
     log: Log,
     dispatch_url: Option<String>,
+    /// Burst intents (M4 rule R3); `None` keeps the M3 rule.
+    #[allow(dead_code)]
+    ledger: Option<Arc<dyn Ledger>>,
+    /// Pause between recording an intent and reading the burst.
+    #[allow(dead_code)]
+    group_wait: Duration,
 }
 
 impl Dispatcher {
@@ -75,7 +83,21 @@ impl Dispatcher {
             secrets,
             log,
             dispatch_url: None,
+            ledger: None,
+            group_wait: Duration::from_secs(GROUP_WAIT_S),
         }
+    }
+
+    /// The burst ledger (M4 rule R7).
+    pub fn with_ledger(mut self, ledger: Option<Arc<dyn Ledger>>) -> Dispatcher {
+        self.ledger = ledger;
+        self
+    }
+
+    /// The pause between recording an intent and reading the burst; zero in tests.
+    pub fn with_group_wait(mut self, wait: Duration) -> Dispatcher {
+        self.group_wait = wait;
+        self
     }
 
     /// Entry of every request. `POST /vm` and `POST /terminate` come from VMs with their
@@ -271,6 +293,7 @@ impl Dispatcher {
                 pool: pool.clone(),
                 env,
                 labels,
+                taken: 1,
             })
             .await?;
         Ok(Decision::Started(run_id))
@@ -503,6 +526,7 @@ mod tests {
             }),
             vm_secret: None,
             sweep_token: None,
+            provider_env: BTreeMap::new(),
         })
     }
 
@@ -830,6 +854,7 @@ mod tests {
             cache: None,
             vm_secret: Some(VM_SECRET.into()),
             sweep_token: Some("sweep-secret".into()),
+            provider_env: BTreeMap::new(),
         }
     }
 

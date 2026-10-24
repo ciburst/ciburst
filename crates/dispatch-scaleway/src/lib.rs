@@ -13,11 +13,13 @@ use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
+use ciburst_core::composite::Composite;
 use ciburst_core::config::{Config, parse_config};
 use ciburst_core::dispatch::Dispatcher;
 use ciburst_core::http::ReqwestClient;
 use ciburst_core::log::Log;
 use ciburst_core::types::{KeyPair, Provider, Secrets};
+use ciburst_hetzner::Hetzner;
 use ciburst_scaleway::client::{Credentials, ScalewayClient};
 use ciburst_scaleway::host::vars;
 use ciburst_scaleway::provider::ScalewayJobs;
@@ -34,6 +36,8 @@ pub struct Env {
     pub region: String,
     /// Optional override of the callback URL VMs use; by default the webhook's Host header.
     pub dispatch_url: Option<String>,
+    /// `HCLOUD_TOKEN`, required when the config adds the `hetzner` provider.
+    pub hetzner_token: Option<String>,
 }
 
 /// A variable that is missing or unusable. Carries the name only, never a value.
@@ -69,6 +73,7 @@ impl Env {
 
         let config = parse_config(&required(vars::CONFIG)?)
             .map_err(|_| EnvError::Invalid(vars::CONFIG.to_string()))?;
+        let config_has_hetzner = config.providers.contains_key(ciburst_hetzner::RUNTIME);
         let mut runner_tokens = BTreeMap::new();
         for pool in &config.pools {
             runner_tokens.insert(pool.tag.clone(), required(&vars::runner_token(&pool.tag))?);
@@ -90,6 +95,7 @@ impl Env {
             cache,
             vm_secret: optional(vars::VM_SECRET),
             sweep_token: optional(vars::SWEEP_TOKEN),
+            provider_env: BTreeMap::new(),
         };
         let credentials = Credentials {
             secret_key: required(vars::SECRET_KEY)?,
@@ -103,6 +109,11 @@ impl Env {
             credentials,
             region: required(vars::REGION)?,
             dispatch_url: optional("CIBURST_DISPATCH_URL"),
+            hetzner_token: if config_has_hetzner {
+                Some(required(ciburst_hetzner::TOKEN_VAR)?)
+            } else {
+                None
+            },
         })
     }
 
@@ -110,14 +121,31 @@ impl Env {
         Env::from_lookup(|name| std::env::var(name).ok())
     }
 
-    /// The `ScalewayJobs` provider on the real HTTP client.
+    /// The `ScalewayJobs` provider on the real HTTP client, in a [`Composite`] with Hetzner
+    /// when the config adds it (spec D35).
     pub fn provider(&self, log: Log) -> Result<Arc<dyn Provider>, EnvError> {
-        let http =
-            ReqwestClient::new().map_err(|_| EnvError::Invalid("http client".to_string()))?;
-        let client = ScalewayClient::new(Arc::new(http), self.credentials.clone(), &self.region);
-        Ok(Arc::new(ScalewayJobs::new(
+        let http: Arc<ReqwestClient> = Arc::new(
+            ReqwestClient::new().map_err(|_| EnvError::Invalid("http client".to_string()))?,
+        );
+        let client = ScalewayClient::new(http.clone(), self.credentials.clone(), &self.region);
+        let main: Arc<dyn Provider> = Arc::new(ScalewayJobs::new(
             self.config.clone(),
             Arc::new(client),
+            log.clone(),
+        ));
+        let Some(token) = &self.hetzner_token else {
+            return Ok(main);
+        };
+        let hetzner: Arc<dyn Provider> = Arc::new(Hetzner::new(
+            self.config.clone(),
+            token.clone(),
+            http,
+            log.clone(),
+        ));
+        Ok(Arc::new(Composite::new(
+            self.config.clone(),
+            main,
+            vec![(ciburst_hetzner::RUNTIME.to_string(), hetzner)],
             log,
         )))
     }

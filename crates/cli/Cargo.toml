@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 ciburst-core = { path = "../core", version = "0.1.0" }
+ciburst-hetzner = { path = "../hetzner", version = "0.1.0" }
 ciburst-scaleway = { path = "../scaleway", version = "0.1.0" }
 clap.workspace = true
 serde_json.workspace = true

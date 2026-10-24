@@ -219,6 +219,7 @@ impl Sim {
             cache: None,
             vm_secret: Some(VM_SECRET.into()),
             sweep_token: Some(SWEEP.into()),
+            provider_env: BTreeMap::new(),
         };
         let (log, lines) = Log::memory();
         Sim {

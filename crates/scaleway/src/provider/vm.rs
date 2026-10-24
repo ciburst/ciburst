@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ciburst_core::types::{RunState, VmCapacity, VmReport, VmState};
-use ciburst_core::vm::{SWEEP_DRAINING_S, SWEEP_MAX_AGE_S, SWEEP_SILENT_S, SWEEP_STARTING_S};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -50,8 +49,8 @@ pub fn is_deployment(server: &Value, name: &str) -> bool {
 }
 
 /// Rule 4: `ciburst`, `<name>`, `pool:<tag>`, `job:<job>`, `ciburst-state:starting`,
-/// `ciburst-free:<slots>`.
-pub fn initial_tags(name: &str, pool: &str, job: Option<&str>, slots: u32) -> Vec<String> {
+/// `ciburst-free:<free>` (slots minus those taken at start, M4 rule R6).
+pub fn initial_tags(name: &str, pool: &str, job: Option<&str>, free: u32) -> Vec<String> {
     let mut tags = vec![
         TAG_CIBURST.to_string(),
         name.to_string(),
@@ -61,7 +60,7 @@ pub fn initial_tags(name: &str, pool: &str, job: Option<&str>, slots: u32) -> Ve
         tags.push(format!("{TAG_JOB}:{job}"));
     }
     tags.push(format!("{TAG_STATE}:{}", VmState::Starting.as_str()));
-    tags.push(format!("{TAG_FREE}:{slots}"));
+    tags.push(format!("{TAG_FREE}:{free}"));
     tags
 }
 
@@ -135,31 +134,7 @@ pub fn drain_since(server: &Value) -> Option<u64> {
     tag_value(&tags_of(server), TAG_DRAIN).and_then(|v| v.parse().ok())
 }
 
-/// Rule 10 of M3: why the sweep ends this VM at `now`, or `None` to keep it. A VM that
-/// reported within `SWEEP_SILENT_S` is kept unless it is past the maximum age.
-pub fn sweep_reason(vm: &VmCapacity, drain_since: Option<u64>, now: u64) -> Option<&'static str> {
-    let age = now.saturating_sub(vm.created_at);
-    if age > SWEEP_MAX_AGE_S {
-        return Some("max_age");
-    }
-    let silent_for = vm.seen.map(|seen| now.saturating_sub(seen));
-    if silent_for.is_some_and(|s| s <= SWEEP_SILENT_S) {
-        return None;
-    }
-    if vm.state == VmState::Starting && age > SWEEP_STARTING_S {
-        return Some("starting");
-    }
-    if vm.state == VmState::Draining
-        && drain_since.is_some_and(|since| now.saturating_sub(since) > SWEEP_DRAINING_S)
-    {
-        return Some("draining");
-    }
-    match silent_for {
-        Some(_) => Some("silent"),
-        None if age > SWEEP_SILENT_S => Some("silent"),
-        None => None,
-    }
-}
+pub use ciburst_core::vm::sweep_reason;
 
 /// Server states of `instance/v1` (`ServerState`): `starting` and `running` are live.
 pub fn run_state(state: &str) -> RunState {
@@ -269,6 +244,7 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ciburst_core::vm::{SWEEP_DRAINING_S, SWEEP_MAX_AGE_S, SWEEP_SILENT_S, SWEEP_STARTING_S};
     use serde_json::json;
 
     const T0: u64 = 1_792_800_000;

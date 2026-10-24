@@ -200,6 +200,7 @@ name = "ciburst"
 version = "0.1.0"
 dependencies = [
  "ciburst-core",
+ "ciburst-hetzner",
  "ciburst-scaleway",
  "clap",
  "serde_json",
@@ -232,8 +233,20 @@ dependencies = [
  "async-trait",
  "axum",
  "ciburst-core",
+ "ciburst-hetzner",
  "ciburst-scaleway",
  "http",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "ciburst-hetzner"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ciburst-core",
+ "serde",
  "serde_json",
  "tokio",
 ]

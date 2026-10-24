@@ -55,6 +55,7 @@ fn secrets() -> Secrets {
         }),
         vm_secret: Some("vm-secret".into()),
         sweep_token: Some("sweep-secret".into()),
+        provider_env: BTreeMap::new(),
     }
 }
 
@@ -475,6 +476,8 @@ fn the_embedded_zip_is_the_function_package() {
         "vendor/scaleway/Cargo.toml",
         "vendor/scaleway/src/lib.rs",
         "vendor/scaleway/src/host.rs",
+        "vendor/hetzner/Cargo.toml",
+        "vendor/hetzner/src/lib.rs",
     ] {
         assert!(
             names.iter().any(|n| n == required),
@@ -502,6 +505,7 @@ fn the_embedded_zip_is_the_function_package() {
     assert!(root.contains("name = \"ciburst-dispatch-scaleway\""));
     assert!(root.contains("path = \"vendor/core\""));
     assert!(root.contains("path = \"vendor/scaleway\""));
+    assert!(root.contains("path = \"vendor/hetzner\""));
     assert!(!root.contains("../"));
     assert!(!root.contains("build.rs"));
     assert!(!root.contains("members"));
@@ -518,7 +522,10 @@ fn the_embedded_zip_is_the_function_package() {
     assert!(!scaleway.contains("zip"));
     let core = read("vendor/core/Cargo.toml");
     assert!(!core.contains("[dev-dependencies]"));
-    for manifest in [&root, &scaleway, &core] {
+    let hetzner = read("vendor/hetzner/Cargo.toml");
+    assert!(hetzner.contains("path = \"../core\""));
+    assert!(!hetzner.contains("[dev-dependencies]"));
+    for manifest in [&root, &scaleway, &core, &hetzner] {
         assert!(!manifest.contains(".workspace"), "{manifest}");
         assert!(!manifest.contains("workspace = true"), "{manifest}");
     }

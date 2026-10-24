@@ -7,6 +7,7 @@
 //! src/                    crates/dispatch-scaleway/src
 //! vendor/core/            crates/core (Cargo.toml, src)
 //! vendor/scaleway/        crates/scaleway (Cargo.toml, src), without this build script
+//! vendor/hetzner/         crates/hetzner (Cargo.toml, src)
 //! ```
 //!
 //! The vendored copy of this crate has no build script, so it embeds an empty zip and the
@@ -31,6 +32,7 @@ fn main() {
         .expect("crates/scaleway lives two levels below the workspace root")
         .to_path_buf();
     let core = root.join("crates").join("core");
+    let hetzner = root.join("crates").join("hetzner");
     let dispatch = root.join("crates").join("dispatch-scaleway");
     let scaleway = manifest_dir;
 
@@ -41,6 +43,8 @@ fn main() {
         core.join("src"),
         scaleway.join("Cargo.toml"),
         scaleway.join("src"),
+        hetzner.join("Cargo.toml"),
+        hetzner.join("src"),
         dispatch.join("Cargo.toml"),
         dispatch.join("src"),
     ] {
@@ -69,10 +73,16 @@ fn main() {
             vendored_manifest(&inherited.resolve(&read_text(&scaleway.join("Cargo.toml"))))
                 .into_bytes(),
         ),
+        (
+            "vendor/hetzner/Cargo.toml".to_string(),
+            vendored_manifest(&inherited.resolve(&read_text(&hetzner.join("Cargo.toml"))))
+                .into_bytes(),
+        ),
     ];
     collect(&dispatch.join("src"), "src", &mut files);
     collect(&core.join("src"), "vendor/core/src", &mut files);
     collect(&scaleway.join("src"), "vendor/scaleway/src", &mut files);
+    collect(&hetzner.join("src"), "vendor/hetzner/src", &mut files);
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR")).join("function.zip");
@@ -292,6 +302,7 @@ fn root_manifest(package: &str, workspace: &str) -> String {
     for (from, to) in [
         ("path = \"../core\"", "path = \"vendor/core\""),
         ("path = \"../scaleway\"", "path = \"vendor/scaleway\""),
+        ("path = \"../hetzner\"", "path = \"vendor/hetzner\""),
     ] {
         assert!(
             text.contains(from),

@@ -14,7 +14,7 @@ pub const DEFAULT_TIMEOUT_S: u32 = 3600;
 pub const DEFAULT_WAIT_TIMEOUT_S: u32 = 60;
 pub const DEFAULT_MAX_RUNS: u32 = 10;
 pub const DEFAULT_EXPIRE_DAYS: u32 = 30;
-pub const DEFAULT_SLOTS: u32 = 1;
+pub const DEFAULT_SLOTS: u32 = 2;
 
 const fn d_vcpu() -> u32 {
     DEFAULT_VCPU
@@ -60,7 +60,8 @@ pub struct Pool {
     pub wait_timeout_s: u32,
     #[serde(default = "d_max_runs")]
     pub max_runs: u32,
-    /// Provider-specific kind of run, for `scaleway`: `instances` (default) or `jobs`.
+    /// Kind of run: for `scaleway` `instances` (default) or `jobs`; a key of `providers`
+    /// hands the pool to that provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
     /// Jobs one run takes in parallel (VM runtimes); one-job runtimes ignore it.
@@ -124,6 +125,9 @@ pub struct Config {
     pub pools: Vec<Pool>,
     #[serde(default)]
     pub cache: CacheConfig,
+    /// Further providers by runtime name (spec D35); their pools set `runtime` to the key.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, Map<String, Value>>,
 }
 
 impl Config {
@@ -140,6 +144,13 @@ impl Config {
                     .find(|pool| pool.stages.iter().any(|x| x == s))
             })
             .unwrap_or_else(|| self.default_pool())
+    }
+
+    /// The added provider a pool belongs to, `None` for the main provider.
+    pub fn extra_provider_of<'a>(&self, pool: &'a Pool) -> Option<&'a str> {
+        pool.runtime
+            .as_deref()
+            .filter(|runtime| self.providers.contains_key(*runtime))
     }
 
     pub fn default_pool(&self) -> &Pool {
@@ -232,6 +243,14 @@ pub fn validate(mut config: Config) -> Result<Config> {
             errors.push(format!(
                 "defaultPool: {} is not a pool",
                 config.default_pool
+            ));
+        }
+    }
+
+    for runtime in config.providers.keys() {
+        if !valid_type(runtime) {
+            errors.push(format!(
+                "providers.{runtime}: lowercase letters, digits and hyphens"
             ));
         }
     }

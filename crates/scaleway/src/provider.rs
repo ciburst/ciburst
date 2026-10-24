@@ -675,6 +675,7 @@ impl ScalewayJobs {
     async fn start_vm(&self, request: StartRequest) -> Result<String> {
         let pool = &request.pool;
         let tag = &pool.tag;
+        let taken = request.taken.max(1);
         let secret = request
             .env
             .get(keys::VM_SECRET)
@@ -759,7 +760,7 @@ impl ScalewayJobs {
                 "dynamic_ip_required": true,
                 "routed_ip_enabled": true,
                 "security_group": security_group,
-                "tags": vm::initial_tags(self.name(), tag, job, pool.slots),
+                "tags": vm::initial_tags(self.name(), tag, job, pool.slots.saturating_sub(taken)),
             });
             let server = match api.create_server(&body).await? {
                 Ok(server) => server,

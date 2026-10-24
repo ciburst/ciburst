@@ -539,6 +539,7 @@ mod tests {
             pool: config.pool_by_tag(tag).unwrap().clone(),
             env,
             labels: BTreeMap::new(),
+            taken: 1,
         }
     }
 

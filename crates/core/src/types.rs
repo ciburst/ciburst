@@ -126,6 +126,10 @@ pub struct Secrets {
     /// Authenticates the cron trigger's sweep, so the hook token never sits in the cron's args.
     #[serde(default)]
     pub sweep_token: Option<String>,
+    /// Credentials of added providers the dispatcher needs, by variable name (`HCLOUD_TOKEN`);
+    /// the host stores them as secret environment variables.
+    #[serde(default)]
+    pub provider_env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +182,9 @@ pub struct StartRequest {
     pub pool: Pool,
     pub env: BTreeMap<String, String>,
     pub labels: BTreeMap<String, String>,
+    /// Slots of the new VM the dispatcher already assigned (M4 R6), at least 1; a VM provider
+    /// creates the VM with `free = slots - taken`. One-job runtimes ignore it.
+    pub taken: u32,
 }
 
 /// Where runs execute. See `docs/PROVIDERS.md` for the contract.
@@ -205,6 +212,12 @@ pub trait Provider: Send + Sync {
     /// Stores a VM's own report (state, free slots) together with `now` as last seen.
     async fn report(&self, _run_id: &str, _report: &VmReport, _now: u64) -> Result<()> {
         Ok(())
+    }
+
+    /// Environment a run of another provider needs from this one (M4 R11): the agent image and
+    /// the cache location. Secrets travel in the start request instead.
+    async fn shared_env(&self) -> Result<BTreeMap<String, String>> {
+        Ok(BTreeMap::new())
     }
 
     /// Ends runs that stopped behaving (spec section 6.1, sweep) and returns their ids.

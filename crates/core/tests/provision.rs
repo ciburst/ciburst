@@ -540,6 +540,7 @@ async fn the_vm_secret_is_not_rotated_while_a_vm_runs() {
                 ("CIBURST_VM_SECRET".to_string(), before.clone()),
             ]),
             labels: BTreeMap::new(),
+            taken: 1,
         })
         .await
         .unwrap();

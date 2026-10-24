@@ -159,6 +159,7 @@ pub async fn run_provider_contract<F: ProviderFactory>(factory: &F) {
             pool: config.pools[0].clone(),
             env: env(),
             labels: labels(),
+            taken: 1,
         };
         assert!(
             provider.start(request.clone()).await.is_err(),
@@ -187,6 +188,7 @@ pub async fn run_provider_contract<F: ProviderFactory>(factory: &F) {
                 pool: config.pools[0].clone(),
                 env: env(),
                 labels: labels(),
+                taken: 1,
             })
             .await
             .expect("start");

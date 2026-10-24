@@ -1,6 +1,6 @@
 # Spec: ciburst, serverless GitLab runners, Scaleway first
 
-Status: M2 done 2026-10-24; M3 (VM provider, D30, D31) next. Background: `SEED.md`.
+Status: M3 done 2026-10-24 (drill in `docs/RUNBOOK.md`); M4 cost (D32 to D35, `docs/milestones/M4-cost.md`) in progress. Background: `SEED.md`.
 
 ## 0. Decision log
 
@@ -36,6 +36,10 @@ Status: M2 done 2026-10-24; M3 (VM provider, D30, D31) next. Background: `SEED.m
 | D30 | 2026-10-24 | Pools choose their provider (`pools[].provider`, default the config's `provider`). The default provider becomes `scaleway-instances`: one VM per run with a local Docker daemon and GitLab's Docker executor, so per-job `image:`, `services:`, Docker-in-Docker, image builds and testcontainers work as on GitLab's own runners. Serverless Jobs pools stay as optional fast lanes for jobs without a daemon. Other providers (Fly Machines, Lambda MicroVMs, spot VMs, remote builders) are backlog. |
 | D31 | 2026-10-24 | A VM ends itself through the dispatcher, never with a cloud key: Scaleway bills a guest `poweroff` as standby, and IAM cannot limit a key to one Instance. Each VM gets a capability token (HMAC of its server id with a secret only the function holds) that can only report its own state and end its own VM. Lifecycle, detection and scheduling in section 6.1. A cron trigger every 30 minutes sweeps VMs that stopped reporting. GitLab's job events cannot do this: they name the pool's runner, not the VM. |
 | D29 | 2026-10-24 | No build pool. The M2 drill showed kaniko cannot unpack any base image in Scaleway's Serverless Jobs sandbox (`chown` denied), for RUN and COPY alike. Image builds run on GitLab's hosted runners through the include's `.ciburst-image-build` template; D5's fallback becomes the rule and D20 is withdrawn. |
+| D32 | 2026-10-24 | Cost first (owner: "Optimize for costs"). Scaleway bills a CPU Instance from creation per started hour with a 60 minute minimum, Hetzner every started hour, so the dispatcher must not create a VM it does not need and should fill every VM it pays for: burst grouping (D33), `starting` VMs count as capacity, claims spread over VMs, `maxRuns` holds under parallel events, two slots per VM by default with a 4 GiB swap file, and Hetzner as a second VM backend (D34). The drain at minute 55 stays. |
+| D33 | 2026-10-24 | Burst grouping without a lock. A pending job that finds no free slot records an intent (an empty object in the cache bucket), waits 2 s and reads the intents of the last 30 s. Ranked by time and job id, every `slots`-th job leads a group and starts one VM; the others ride on their leader's VM; leaders count toward `maxRuns` by rank. A cold pipeline with five VM jobs starts three VMs at two slots instead of five. Without a cache bucket the dispatcher starts one VM per job as in M3. Rules in `docs/milestones/M4-cost.md`. |
+| D34 | 2026-10-24 | Hetzner Cloud as a VM backend: pool `runtime: "hetzner"`, settings in `providers.hetzner`, default type `cx33` (4 vCPU, 8 GB, 80 GB, 0.0144 EUR/h with IPv4) with two slots, 0.0072 EUR per job slot-hour against 0.0136 on Scaleway DEV1-M and 0.0155 for RocketRunner's small runner. Same agent, cloud-init and lifecycle as section 6.1; labels instead of tags; a firewall without inbound rules. Dispatcher, cache, registry and Serverless Jobs stay on Scaleway. The owner provides a Hetzner project API token. |
+| D35 | 2026-10-24 | Per-pool backends through a composite provider in core: the config's `provider` serves its runtimes, each key of `providers` adds the provider of that runtime. Run ids of an added provider start with `<runtime>:`, so VM reports and termination route without a lookup. This realizes D30's per-pool provider as `pools[].runtime`. |
 
 ## 1. Purpose and scope
 
@@ -44,11 +48,11 @@ ciburst gives GitLab projects CI runners that exist only while a job runs. A Git
 v1:
 
 1. Core crate: config validation, dispatcher, GitLab client, plan and apply engine, provider and host traits, contract test harness, fake provider and host.
-2. Crates `scaleway` (provider `scaleway-jobs`, host `scaleway-function`) and `dispatch-scaleway` (the function).
+2. Crates `scaleway` (provider `scaleway` with runtimes `instances` and `jobs`, host `scaleway-function`), `hetzner` (provider `hetzner`, M4) and `dispatch-scaleway` (the function).
 3. Pool images: `base`, `node`, `rust`, `playwright`.
 4. Binary `ciburst` with `plan`, `apply`, `destroy`, `status`, `check`, `rotate`.
 5. Consumer include `ci/ciburst.yml`, runbook, provider authoring guide.
-6. Setup pipeline for adopters: `ciburst-setup`, `ciburst-check` and `ciburst-destroy` jobs in the include, a `cli` image with the binary, outputs in project variables (M4).
+6. Setup pipeline for adopters: `ciburst-setup`, `ciburst-check` and `ciburst-destroy` jobs in the include, a `cli` image with the binary, outputs in project variables (M5).
 
 Backlog, not v1: providers `fly-machines`, `aws-lambda-microvms` (amd64 support pending), spot VMs on other clouds, remote build services; a scheduled sweep that polls pending jobs; routing by job name patterns; a self-hosted dispatcher binary; providers for other clouds; group-level webhooks; a hosted dispatcher as a service; GitHub Actions support.
 
@@ -113,6 +117,8 @@ Backlog, not v1: providers `fly-machines`, `aws-lambda-microvms` (amd64 support 
 
 Core modules: `config` (schema, defaults, validation reporting every error), `dispatch` (pure apart from provider calls), `gitlab` (runners, hooks, CI lint), `http` (the one HTTP seam, `ReqwestClient` in production), `plan` (formatting, env-file outputs), `provision` (phases: provider, runners, host, hooks), `check`, `store`, `log` (one line per action, never a secret), `fake`, `testing` (contract harness, GitLab fake).
 
+Since M4: `Provider::shared_env()` gives other providers the main provider's cache location and agent image; `composite::Composite` routes per pool runtime (D35); the `Ledger` port (`record`, `since`) stores burst intents (D33), implemented over the cache bucket by the Scaleway crate.
+
 ### 5.4 Configuration (`config.json`, validated at start)
 
 ```json
@@ -131,7 +137,7 @@ Core modules: `config` (schema, defaults, validation reporting every error), `di
 }
 ```
 
-Secrets come from `.local/scaleway.env` (`SCW_ACCESS_KEY`, `SCW_SECRET_KEY`, `SCW_DEFAULT_ORGANIZATION_ID`, `SCW_DEFAULT_PROJECT_ID` optional) and `.local/gitlab.env` (`GITLAB_TOKEN`, scopes `api` and `create_runner`). Validation rejects a pool above the provider's capabilities, a tag or a stage used twice, and a `defaultPool` that is not a pool. `name` is 2 to 20 characters, so the bucket name `<name>-cache-<project id>` stays within the S3 limit of 63.
+`providers` (default empty) adds providers per runtime, for example `"providers": { "hetzner": { "location": "nbg1" } }` with pools of `"runtime": "hetzner"`; `slots` defaults to 2. Secrets come from `.local/scaleway.env` (`SCW_ACCESS_KEY`, `SCW_SECRET_KEY`, `SCW_DEFAULT_ORGANIZATION_ID`, `SCW_DEFAULT_PROJECT_ID` optional) `.local/gitlab.env` (`GITLAB_TOKEN`, scopes `api` and `create_runner`) and, with Hetzner pools, `.local/hetzner.env` (`HCLOUD_TOKEN`). Validation rejects a pool above the provider's capabilities, a tag or a stage used twice, and a `defaultPool` that is not a pool. `name` is 2 to 20 characters, so the bucket name `<name>-cache-<project id>` stays within the S3 limit of 63.
 
 ### 5.5 Repository layout
 
@@ -140,8 +146,9 @@ Cargo.toml  rust-toolchain.toml  deny.toml  LICENSE  README.md  config.example.j
 crates/core/                 ciburst-core: config, dispatch, gitlab, http, plan, provision, check, store, log, types, fake, testing
 crates/cli/                  binary ciburst: plan | apply | destroy | status | check | rotate; registry of providers and hosts
 crates/scaleway/             provider scaleway-jobs (jobs, iam, s3, sigv4), host scaleway-function, build.rs embedding the function zip, API fakes
+crates/hetzner/              provider hetzner (servers, firewall, labels) with an in-process API fake
 crates/dispatch-scaleway/    the function: `handle` and the testable `respond`
-images/base/ node/ rust/ playwright/ cli/ test/   Dockerfiles, shared entrypoint, smoke tests; `cli` holds the binary for the setup job (M4)
+images/base/ node/ rust/ playwright/ cli/ test/   Dockerfiles, shared entrypoint, smoke tests; `cli` holds the binary for the setup job (M5)
 ci/ciburst.yml               consumer include with the pool templates
 scripts/                     ci-install-cargo-deny.sh ci-push-image.sh ci-release-binary.sh shellcheck.sh
 test/config.fake.json        dry-run config
@@ -199,7 +206,7 @@ Drain protocol, which keeps every job served:
 3. After the grace the supervisor sends `SIGQUIT`. A job taken in the last request still runs to its end.
 4. When all slots have exited, no request can reach GitLab, so no job can be assigned to the VM. Only then does it post `/terminate`; the dispatcher checks the token and terminates the server.
 
-Scheduling, on a pending job event: `free` is the sum of `ciburst-free` over the pool's VMs in state `idle` or `busy` that reported within the last 21 minutes (two heartbeats and a minute); `starting`, `draining` and silent VMs do not count. If `free > 0`, the dispatcher claims one slot by lowering that VM's `ciburst-free` and starts nothing; if the claim fails, it starts a VM instead. Otherwise it starts a VM, unless the pool already has `maxRuns` VMs that are not draining; then the job waits for the next slot that frees up. A burst of pending jobs on an empty pool therefore starts one VM per job up to `maxRuns`, and warm VMs within their paid hour are used first.
+Scheduling, on a pending job event (M4 rules R1 to R7): a free slot is claimed on a VM created more than 30 s ago that is `idle` or `busy` and reported within 21 minutes, or is `starting` and younger than 10 minutes; among the VMs with the most free slots the job id picks one, so parallel claims spread. Otherwise the job joins the burst ledger (D33): every `slots`-th job of the last 30 s starts a VM with that many slots already taken, the others ride on it, and leaders count toward `maxRuns` by rank. A failed claim or ledger falls back to starting a VM. Warm VMs within their paid hour are used first.
 
 Races and their effect:
 
@@ -209,7 +216,7 @@ Races and their effect:
 | A job goes pending while a VM starts draining | taken in the grace, or the dispatcher already saw `draining` and started a VM; at worst one extra VM-hour (0.027 EUR) |
 | A VM boots for a job another VM already took | the new VM idles until minute 55 of its hour and drains; one VM-hour |
 | A VM hangs or loses its network | its jobs fail on GitLab's side when the runner stops updating them; the sweep removes it |
-| Pending events of one pool arrive in parallel | each dispatcher call counts the VMs before the others' creates land, so a burst can pass `maxRuns` by up to the function's `max_scale` minus one (M3 drill: 5 VMs at `maxRuns` 4); the extra VMs idle out their hour |
+| Pending events of one pool arrive in parallel | M3 passed `maxRuns` (5 VMs at 4); since M4 the ledger ranks them, so a burst starts `ceil(N / slots)` VMs up to `maxRuns`. An intent written later than the 2 s wait of an earlier caller can cost one extra VM-hour |
 
 Sweep, a cron trigger every 30 minutes, authenticated by its own sweep token (not the hook token, which would sit readable in the cron's arguments): terminates VMs in `starting` for more than 10 minutes, VMs in `draining` for more than 15 minutes, VMs whose `ciburst-seen` is older than 30 minutes, and any VM older than 24 hours. It never touches a VM that reports, so it cannot race the scheduler or a running job. A job longer than the VM's report interval keeps the VM alive because the supervisor reports every 10 minutes independently of the job.
 
@@ -225,13 +232,27 @@ GitLab steps (`crates/core/src/gitlab.rs`), per project id: one runner per pool 
 
 Cost per run: 0.00001 EUR per vCPU-second plus 0.000002 EUR per GB-second after the free tier. A 10 minute job at 2 vCPU, 4 GB costs 0.017 EUR beyond the free tier and 0 inside it. The seed workload (30 pipelines of 45 minutes) stays inside the free tier.
 
+### 6.2 Hetzner implementation (M4, D34)
+
+Provider `hetzner`, runtime `hetzner`, API `https://api.hetzner.cloud/v1` with `Authorization: Bearer <HCLOUD_TOKEN>`, settings `providers.hetzner` (`location` default `nbg1`, `image` default `docker-ce`, Ubuntu 24.04 with Docker):
+
+| Step | Resource |
+|---|---|
+| `hetzner:firewall` | firewall `<name>-vm` without rules, applied to the label selector `ciburst-name==<name>`: no inbound traffic |
+| start | server `<name>-<tag>-<8 hex>`, type from `instanceTypes` (default `cx33`, then `cx43`), the location and image above, IPv4 and IPv6, labels `ciburst`, `ciburst-name`, `ciburst-pool`, `ciburst-job`, `ciburst-state`, `ciburst-free`; user data from the shared cloud-init with the run id `hetzner:<server name>` and its token, known before create |
+| capacity, claim, report, sweep | as section 6.1 with labels `ciburst-state`, `ciburst-free`, `ciburst-seen`, `ciburst-drain` |
+| stop | `DELETE /servers/{id}` (IPv4 included in the price, nothing left behind) |
+
+Cost: CX33 0.0144 EUR per hour with IPv4 and disk, every started hour billed; the cache and agent image come from Scaleway over the internet.
+
 ## 7. Security
 
 - Access control: the dispatcher URL is public (GitLab cannot sign requests with IAM); every request must carry the hook token, compared in constant time; anything else gets `401` without a body.
-- The dispatcher's IAM key can only start, list and stop Serverless Jobs in the dedicated project. The dispatcher holds no GitLab token.
+- The dispatcher's IAM key can only start, list and stop Serverless Jobs and Instances in the dedicated project. The dispatcher holds no GitLab token. With Hetzner pools it holds a Hetzner project token, which Hetzner cannot narrow further: use a Hetzner project for ciburst alone.
 - A job can read its run's environment (its pool's runner token, the cache key), as on any runner. The dispatch IAM key never enters a run. The cache key can only read and write the cache bucket.
 - Images run as the non-root user `runner`.
 - A VM runs jobs privileged (Docker-in-Docker), so every job can read the VM's user data: its pool's runner token, the cache key and the VM's own token. This equals GitLab's own privileged runners; the VM token can only report for and end its own VM, and the dispatch key never reaches a VM.
+- Burst intents live in the cache bucket, which every job can write with the cache key. A forged intent can at most cost one VM-hour or delay one job until a slot frees.
 
 Secrets inventory:
 
@@ -247,6 +268,7 @@ Secrets inventory:
 | Runner tokens `glrt-`, one per pool | function secret env, run env override | until the runner is deleted | `ciburst rotate runner` |
 | Hook token | GitLab hook, function secret env | none | `ciburst rotate hook` |
 | Registry push key (private phase) | CI variables of the framework project | none | console, then update the variable |
+| Hetzner project token, read and write (M4) | `.local/hetzner.env`, function secret env | owner chosen | console, then `ciburst apply` |
 
 Privacy: the dispatcher logs project id, job id, pipeline id, stage, pool and run id. No payload is stored.
 
@@ -258,13 +280,13 @@ The `image:vm-agent` job builds the static musl agent into a `FROM scratch` imag
 
 Consumer side: `include: project: <namespace>/ciburst, ref: v1, file: ci/ciburst.yml` sets `default: tags: [vm]`, so every job runs on the VM pool with `image:`, `services:` and Docker-in-Docker; fast-lane jobs extend `.ciburst-rust` or `.ciburst-playwright`, whose stages only those pools list. `ciburst check` runs against every configured project after `apply`.
 
-Adoption pipeline (M4): the include also carries `ciburst-setup` (manual, stage `.pre`, `tags: [saas-linux-small-amd64]`, image `registry.gitlab.com/<namespace>/ciburst/cli:1`), `ciburst-check` (automatic, same runner, reports jobs whose tags disagree with the stage map) and `ciburst-destroy` (manual). Inputs are four masked CI variables: `SCW_ACCESS_KEY`, `SCW_SECRET_KEY`, `SCW_DEFAULT_ORGANIZATION_ID`, `CIBURST_GITLAB_TOKEN` (a personal access token of a project Owner with the scopes `api` and `create_runner`: runner creation needs `create_runner` and the Owner role, hooks and variables need `api`; the job token can create none of them, and project access tokens are a Premium feature on GitLab.com; an adopter who wants the token separate from a person creates a dedicated GitLab user with the Owner role). The config comes from `ciburst.json` in the consumer repo, or from defaults when the file is absent: `name` `ci-<project id>`, `projectIds` `[CI_PROJECT_ID]`, the pools of `config.example.json` on the framework images. Outputs (`CIBURST_*`) are written as masked project variables through the API and read back from the job environment on the next run, so a second run plans only `noop`. `apply --no-wait` skips the readiness poll: the hook URL is known at function creation, the deploy continues on Scaleway, and the job ends in about two minutes, so a setup costs about two hosted-runner minutes. One owner step remains per adopter: creating the two tokens.
+Adoption pipeline (M5): the include also carries `ciburst-setup` (manual, stage `.pre`, `tags: [saas-linux-small-amd64]`, image `registry.gitlab.com/<namespace>/ciburst/cli:1`), `ciburst-check` (automatic, same runner, reports jobs whose tags disagree with the stage map) and `ciburst-destroy` (manual). Inputs are four masked CI variables: `SCW_ACCESS_KEY`, `SCW_SECRET_KEY`, `SCW_DEFAULT_ORGANIZATION_ID`, `CIBURST_GITLAB_TOKEN` (a personal access token of a project Owner with the scopes `api` and `create_runner`: runner creation needs `create_runner` and the Owner role, hooks and variables need `api`; the job token can create none of them, and project access tokens are a Premium feature on GitLab.com; an adopter who wants the token separate from a person creates a dedicated GitLab user with the Owner role). The config comes from `ciburst.json` in the consumer repo, or from defaults when the file is absent: `name` `ci-<project id>`, `projectIds` `[CI_PROJECT_ID]`, the pools of `config.example.json` on the framework images. Outputs (`CIBURST_*`) are written as masked project variables through the API and read back from the job environment on the next run, so a second run plans only `noop`. `apply --no-wait` skips the readiness poll: the hook URL is known at function creation, the deploy continues on Scaleway, and the job ends in about two minutes, so a setup costs about two hosted-runner minutes. One owner step remains per adopter: creating the two tokens.
 
 ## 9. Testing
 
 | Level | What | Where |
 |---|---|---|
-| Unit | dispatch decisions (status filter, stage map, default pool, capacity, token), config validation errors, plan diffing, env outputs, stores, log format | `#[cfg(test)]` modules in `crates/core` |
+| Unit | dispatch decisions (status filter, stage map, default pool, capacity, burst ledger, claim spread, token, composite routing), config validation errors, plan diffing, env outputs, stores, log format | `#[cfg(test)]` modules in `crates/core` |
 | Contract | every provider against `testing::contract::run_provider_contract`: plan on empty backend lists every resource, plan after apply is empty, changed pool updates, removed pool deletes, rotation returns new secrets, start then list shows the run, stop ends it, destroy empties the backend | `crates/core/tests/contract_fake.rs`; `crates/scaleway` against an in-process fake of the Jobs, IAM and S3 APIs |
 | GitLab client | runners, hooks, lint and check against `testing::gitlab_fake::FakeGitlab` | `crates/core/src/gitlab.rs`, `crates/core/tests/provision.rs` |
 | CLI | plan, apply, plan, status, destroy in a temp dir with the fake modules; usage and config errors | `crates/cli/tests/cli.rs` |
@@ -294,9 +316,10 @@ A provider is a crate implementing `ciburst_core::types::Provider` with a `capab
 | M0, orchestrator, done | workspace, LICENSE, README, `crates/core`, `crates/cli` with the fake modules, contract harness, GitLab fake, CI lint, deny and test, `docs/PROVIDERS.md` | `cargo test` green, `ciburst plan` against the fake modules prints every step, second `apply` plans nothing |
 | M1, three agents, done | A: `crates/scaleway` provider (jobs, IAM, bucket, lifecycle) with an in-process fake of the Jobs, IAM and S3 APIs, passing the contract. B: `crates/scaleway` host (namespace, function, secrets, zip, upload, deploy) with a Functions fake, and `crates/dispatch-scaleway` (axum handler on `Dispatcher`, builds on Rust 1.96). C: `images/*` (five images, entrypoint with cache flags verified), CI `images` and `release` stages, `ci/ciburst.yml`, `docs/RUNBOOK.md` | all tests green on CI, image smoke green, plan and apply idempotent against the fakes |
 | M2, orchestrator with owner keys | provider step `registry`, CI push of the images into it, group and private project on GitLab.com, first push and pipeline; drill: `ciburst apply` on an empty project, `check` on the drill consumer project, a pipeline with node, rust, playwright and kaniko jobs plus one hosted-runner job; start latency; kaniko verdict; cache hit on the second run; cost on the consumption page; API behaviour assumed by the fakes checked live (stop sets a run to `canceled`, a run's environment merges the definition's with the overrides, deleting an IAM application does not cascade to its policies and keys, a PATCH of a deployed function does not redeploy by itself); fixes | runbook section "Drill" filled with dates and numbers |
-| M3, VM provider | per-pool `provider`, provider `scaleway-instances` with fake Instance API and contract tests, baked image recipe, VM supervisor (slots, state reports, drain protocol), dispatcher routes `/vm` and `/terminate`, slot claims and the 30-minute cron sweep, a simulation test of the races in section 6.1 against the fakes, include without the shell-executor caveats, drill on the drill consumer project with `image:`, `services:` (postgres), dind and a `docker build` | the drill pipeline passes on the VM pool; a VM ends by callback within minute 55 to 60 of its hour; a VM whose reports are blocked ends by the sweep; no job of the drill waits longer than one job duration plus a VM boot; cost per pipeline recorded |
-| M4, pipeline setup | `OutputsStore` on GitLab project variables (masked where allowed), `apply --no-wait`, config defaults from the job environment, `images/cli` with the binary, `ciburst-setup`, `ciburst-check` and `ciburst-destroy` jobs in the include, README "adopt in ten minutes" | a fresh consumer project is provisioned by its own pipeline from the four variables; the second run of `ciburst-setup` plans only `noop`; hosted-runner minutes per setup under three |
-| M5, go public | hardening from M2 to M4, policy files (D27), project visibility public, GitHub mirror, Pages site at `ciburst.zwa.la`, crates.io publication of `ciburst-core`, `ciburst-scaleway` and `ciburst`, `v1.0.0` tag with binaries and images | release pipeline green, the images pull anonymously from the GitLab registry, the docs site answers |
+| M3, VM provider, done | per-pool `provider`, provider `scaleway-instances` with fake Instance API and contract tests, baked image recipe, VM supervisor (slots, state reports, drain protocol), dispatcher routes `/vm` and `/terminate`, slot claims and the 30-minute cron sweep, a simulation test of the races in section 6.1 against the fakes, include without the shell-executor caveats, drill on the drill consumer project with `image:`, `services:` (postgres), dind and a `docker build` | the drill pipeline passes on the VM pool; a VM ends by callback within minute 55 to 60 of its hour; a VM whose reports are blocked ends by the sweep; no job of the drill waits longer than one job duration plus a VM boot; cost per pipeline recorded |
+| M4, cost, three agents | A core: burst ledger, claim spread, hard `maxRuns`, composite provider, race simulation. B Scaleway: S3 ledger, `shared_env`, `taken`, Hetzner token in the function. C Hetzner: provider with API fake and contract tests. Orchestrator: contract (config `providers`, `slots` 2, swap, `taken`, shared cloud-init), CLI wiring, drills | a cold pipeline with five VM jobs starts three VMs and passes on Scaleway; the same on Hetzner once the token exists; per-pipeline cost recorded |
+| M5, pipeline setup | `OutputsStore` on GitLab project variables (masked where allowed), `apply --no-wait`, config defaults from the job environment, `images/cli` with the binary, `ciburst-setup`, `ciburst-check` and `ciburst-destroy` jobs in the include, README "adopt in ten minutes" | a fresh consumer project is provisioned by its own pipeline from the four variables; the second run of `ciburst-setup` plans only `noop`; hosted-runner minutes per setup under three |
+| M6, go public | hardening from M2 to M5, policy files (D27), project visibility public, GitHub mirror, Pages site at `ciburst.zwa.la`, crates.io publication of `ciburst-core`, `ciburst-scaleway` and `ciburst`, `v1.0.0` tag with binaries and images | release pipeline green, the images pull anonymously from the GitLab registry, the docs site answers |
 
 Definition of done per milestone: tests green locally and on CI, `cargo fmt`, `clippy -D warnings` and `cargo deny` clean, docs updated, no secret and no identifying value in the repo, no em or en dash, summary to the owner with the go question for the next milestone.
 
@@ -321,7 +344,10 @@ Glossary: pool (tag, image, resources, stages), run (one serverless container ex
 1. The go for M1.
 2. For M2: `.local/scaleway.env` with a setup key holding `IAMManager`, `ProjectManager`, `ServerlessJobsFullAccess`, `FunctionsFullAccess`, `ObjectStorageFullAccess`, `ContainerRegistryFullAccess` on the organization; `.local/gitlab.env` with a personal access token of a project Owner, scopes `api` and `create_runner`, expiry chosen, and the drill consumer project id.
 3. The GitLab group `ciburst` and the private project `ciburst/ciburst` with hosted runners enabled, created through the API with the token on the push confirmation. At v1.0.0: DNS for `ciburst.zwa.la` (CNAME to GitLab Pages plus the verification TXT record) and the GitHub organization `ciburst`.
+4. For the Hetzner drill (M4): a Hetzner Cloud account, a project used only by ciburst, an API token with read and write permission in `.local/hetzner.env` as `HCLOUD_TOKEN=...`, and the project's server limit checked under Limits (three servers suffice).
 
 ## 15. Sources, checked 2026-10-23 and 2026-10-24
 
 Scaleway Jobs API shapes: pkg.go.dev scaleway-sdk-go api/jobs/v1alpha1. Functions API and runtimes: pkg.go.dev scaleway-sdk-go api/function/v1beta1, docs serverless-functions/reference-content/functions-runtimes (Rust 1.96 available, 1.85 end of support), the `cors-rust` example in github.com/scaleway/serverless-examples (axum 0.8 handler, source compiled on upload). Jobs limits: docs serverless-jobs/reference-content/jobs-limitations. Prices: scaleway.com/en/pricing/serverless, scaleway.com/en/pricing/storage. IAM permission sets: docs iam/policies-permissions/permission-sets. GitLab: docs runner/commands (run-single), user/project/integrations/webhook_events (job events carry stage and name, no tags), user/project/integrations/webhooks (templates, auto-disable). Precedent: Yandex Cloud tutorial serverless-gitlab-runner.
+
+M4, 2026-10-24: Scaleway Instance billing (docs instances/reference-content/understanding-instance-pricing: from creation, per hour, 60 minute minimum), prices from the public product catalog API; Hetzner billing FAQ (docs.hetzner.com/cloud/billing/faq: every started hour, servers bill until deleted, IPv6 free) and hetzner.com/cloud/cost-optimized (CX23 0.0096, CX33 0.0144 EUR/h with IPv4); the `docker-ce` app (docs.hetzner.com/cloud/apps/list/docker-ce).

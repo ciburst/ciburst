@@ -80,6 +80,7 @@ fn request(config: &Config, tag: &str) -> StartRequest {
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect(),
+        taken: 1,
     }
 }
 
@@ -266,7 +267,7 @@ async fn start_creates_the_server_of_rule_four_then_user_data_then_poweron() {
         ("CI_SERVER_URL", "https://gitlab.example"),
         ("RUNNER_TOKEN", RUNNER_TOKEN),
         ("CIBURST_POOL", "ci"),
-        ("CIBURST_SLOTS", "1"),
+        ("CIBURST_SLOTS", "2"),
         ("CIBURST_DEFAULT_IMAGE", "example.invalid/node:24"),
         ("CIBURST_TIMEOUT_S", "3600"),
         ("CACHE_TYPE", "s3"),
@@ -293,7 +294,9 @@ async fn start_creates_the_server_of_rule_four_then_user_data_then_poweron() {
     ));
 
     let commands = runcmd(&document);
-    assert_eq!(commands.len(), 3, "{commands:?}");
+    assert_eq!(commands.len(), 4, "{commands:?}");
+    assert!(commands[0].starts_with("test -f /swapfile || (fallocate -l 4G /swapfile"));
+    let commands = &commands[1..];
     assert!(commands[0].starts_with(
         "curl -fsSL -o /tmp/gitlab-runner https://gitlab-runner-downloads.s3.amazonaws.com/v18.11.4/binaries/gitlab-runner-linux-amd64 && "
     ));
@@ -360,7 +363,7 @@ async fn start_falls_back_to_the_next_type_when_out_of_stock() {
     let id = provider.start(request(&config, "ci")).await.unwrap();
     let server = backend.instance.server(&id).unwrap();
     assert_eq!(server["commercial_type"], "DEV1-L");
-    assert!(tags(&server).contains(&"ciburst-free:3".to_string()));
+    assert!(tags(&server).contains(&"ciburst-free:2".to_string()));
     assert_eq!(backend.instance.servers().len(), 1);
     assert!(
         lines
@@ -440,12 +443,13 @@ async fn without_the_docker_image_ubuntu_installs_docker_first() {
     assert_eq!(server["image"]["name"], "ubuntu_noble");
     let document = parse(&backend.instance.user_data(&id, "cloud-init").unwrap());
     let commands = runcmd(&document);
-    assert_eq!(commands.len(), 4, "{commands:?}");
+    assert_eq!(commands.len(), 5, "{commands:?}");
+    assert!(commands[0].starts_with("test -f /swapfile"));
     assert_eq!(
-        commands[0],
+        commands[1],
         "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io && systemctl enable --now docker"
     );
-    assert!(commands[1].starts_with("curl -fsSL -o /tmp/gitlab-runner "));
+    assert!(commands[2].starts_with("curl -fsSL -o /tmp/gitlab-runner "));
 }
 
 #[tokio::test]
@@ -558,7 +562,7 @@ async fn capacity_reads_the_pool_servers_and_ignores_other_deployments() {
     assert_eq!(ci[0].created_at, FAKE_CLOCK);
     assert_eq!(ci[1].run_id, second);
     assert_eq!(ci[1].state, VmState::Starting);
-    assert_eq!(ci[1].free, 2);
+    assert_eq!(ci[1].free, 1);
     assert_eq!(ci[1].seen, None);
     assert_eq!(ci[1].created_at, FAKE_CLOCK + 60);
     let build_capacity = provider.capacity("build").await.unwrap().unwrap();
@@ -585,10 +589,10 @@ async fn claim_lowers_free_slots_down_to_zero() {
     let (backend, provider, _) = provisioned(config.clone(), Log::silent()).await;
     let id = provider.start(request(&config, "ci")).await.unwrap();
     let before = tags(&backend.instance.server(&id).unwrap());
-    provider.claim(&id).await.unwrap();
     let free = || provider_free(&tags(&backend.instance.server(&id).unwrap()));
-    assert_eq!(free(), Some(1));
+    assert_eq!(free(), Some(1), "the starting job's slot is taken");
     provider.claim(&id).await.unwrap();
+    assert_eq!(free(), Some(0));
     provider.claim(&id).await.unwrap();
     assert_eq!(free(), Some(0));
     let after = tags(&backend.instance.server(&id).unwrap());
