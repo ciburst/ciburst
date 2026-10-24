@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use super::account_api::FakeAccount;
 use super::iam_api::FakeIam;
 use super::jobs_api::FakeJobs;
+use super::registry_api::FakeRegistry;
 use super::s3_api::FakeS3;
 use crate::client::{Credentials, ScalewayClient};
 
@@ -186,6 +187,7 @@ pub struct ScalewayFake {
     pub account: FakeAccount,
     pub iam: FakeIam,
     pub jobs: FakeJobs,
+    pub registry: FakeRegistry,
     pub s3: FakeS3,
 }
 
@@ -201,6 +203,7 @@ impl ScalewayFake {
             account: FakeAccount::new(),
             iam: FakeIam::new(),
             jobs: FakeJobs::new(),
+            registry: FakeRegistry::new(),
             s3: FakeS3::new(),
         }
     }
@@ -229,6 +232,7 @@ impl ScalewayFake {
             .into_iter()
             .chain(self.iam.calls())
             .chain(self.jobs.calls())
+            .chain(self.registry.calls())
             .chain(self.s3.calls())
             .filter(|c| c.method != "GET" && c.method != "HEAD")
             .collect()
@@ -248,6 +252,9 @@ impl HttpClient for ScalewayFake {
             }
             if url.path.starts_with("/serverless-jobs/") {
                 return self.jobs.send(request).await;
+            }
+            if url.path.starts_with("/registry/") {
+                return self.registry.send(request).await;
             }
         } else if url.host.starts_with("s3.") && url.host.ends_with(".scw.cloud") {
             return self.s3.send(request).await;

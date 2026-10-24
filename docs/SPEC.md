@@ -159,7 +159,7 @@ Provider `scaleway-jobs` (API `serverless-jobs/v1alpha1`, region from config):
 | 3 | IAM application `<name>-cache`, policy on the project with `ObjectStorageFullAccess`, one API key | by name | secret key written once to `.local/outputs.env` |
 | 4 | Bucket `<name>-cache-<project id>` in the region, lifecycle rule `ciburst-expire` expiring objects after `cache.expireDays` | by name, drift by the rule's days | S3 API with SigV4 (access and secret key of the owner); destroy empties the bucket first |
 | 5 | Job definition `<name>-<pool.tag>` per pool: `cpu_limit` = vcpu x 1000, `memory_limit`, `local_storage_capacity`, `image_uri`, `job_timeout`, `environment_variables` (`CIBURST_POOL`, `CI_SERVER_URL`, `RUNNER_WAIT_TIMEOUT`, cache address, bucket and region) | by name | create or update when any field differs |
-| 6 | Registry namespace `<name>` (optional, `images.registry: true`): Container Registry API `registry/v1/regions/<region>/namespaces`, private by default; CI pushes the five images there while the project is private | by name | create; outputs `CIBURST_REGISTRY_ENDPOINT` |
+| 6 | Registry namespace `<name>` (optional, `provider.registry: true`; `provider.registryPublic: true` for public images): Container Registry API `registry/v1/regions/<region>/namespaces`, private by default; CI pushes the five images there while the project is private | by name | create; outputs `CIBURST_REGISTRY_ENDPOINT` |
 | start | `POST job-definitions/<id>/start` with `environment_variables` override (`RUNNER_TOKEN`, `CACHE_S3_ACCESS_KEY`, `CACHE_S3_SECRET_KEY`, labels) | | |
 | list | `GET job-runs?job_definition_id=<id>` states `queued, scheduled, running` map to live | | |
 | stop | `POST job-runs/<id>/stop` | | |

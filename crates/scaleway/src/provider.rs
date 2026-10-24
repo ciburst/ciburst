@@ -4,6 +4,7 @@
 
 mod iam;
 mod jobs;
+mod registry;
 pub mod s3;
 pub mod sigv4;
 
@@ -20,6 +21,7 @@ use serde_json::{Value, json};
 
 use crate::client::ScalewayClient;
 use iam::AppState;
+use registry::NamespaceState;
 
 pub const PROVIDER_NAME: &str = "scaleway-jobs";
 
@@ -76,6 +78,7 @@ struct Observed {
     dispatch: Option<AppState>,
     cache: Option<AppState>,
     bucket: BucketState,
+    registry: Option<NamespaceState>,
     definitions: Vec<Value>,
 }
 
@@ -128,6 +131,25 @@ impl ScalewayJobs {
         self.config.cache.kind == CacheType::S3
     }
 
+    /// `provider.registry: true` keeps a Container Registry namespace for the pool images.
+    fn registry_on(&self) -> bool {
+        self.config
+            .provider
+            .extra
+            .get("registry")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    fn registry_public(&self) -> bool {
+        self.config
+            .provider
+            .extra
+            .get("registryPublic")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
     fn s3(&self) -> Result<s3::S3> {
         let access_key = self.s3_access_key.clone().ok_or_else(|| {
             Error::provider(format!(
@@ -152,6 +174,7 @@ impl ScalewayJobs {
             iam::find_application(&self.client, &self.app_name(KeyKind::Dispatch)).await?;
         let cache = iam::find_application(&self.client, &self.app_name(KeyKind::Cache)).await?;
         let mut bucket = None;
+        let mut namespace = None;
         let mut definitions = Vec::new();
         if let Some(project_id) = &project {
             if self.cache_on() || self.s3_access_key.is_some() {
@@ -161,6 +184,7 @@ impl ScalewayJobs {
                     bucket = Some(s3.lifecycle_days(&name).await?);
                 }
             }
+            namespace = registry::find_namespace(&self.client, project_id, self.name()).await?;
             definitions = jobs::list_definitions(&self.client, project_id)
                 .await?
                 .into_iter()
@@ -172,6 +196,7 @@ impl ScalewayJobs {
             dispatch,
             cache,
             bucket,
+            registry: namespace,
             definitions,
         })
     }
@@ -305,6 +330,52 @@ impl ScalewayJobs {
         if s3.bucket_exists(&name).await? {
             s3.empty_and_delete(&name).await?;
             self.log.info("deleted bucket", &[("name", &name)]);
+        }
+        Ok(())
+    }
+
+    async fn ensure_registry(&self, project_id: &str) -> Result<NamespaceState> {
+        let name = self.name();
+        let public = self.registry_public();
+        let mut namespace = match registry::find_namespace(&self.client, project_id, name).await? {
+            Some(namespace) => namespace,
+            None => {
+                let namespace =
+                    registry::create_namespace(&self.client, project_id, name, public).await?;
+                self.log.info(
+                    "created registry namespace",
+                    &[
+                        ("name", name),
+                        ("id", &namespace.id),
+                        ("endpoint", &namespace.endpoint),
+                    ],
+                );
+                namespace
+            }
+        };
+        if namespace.is_public != public {
+            registry::update_namespace(&self.client, &namespace.id, public).await?;
+            namespace.is_public = public;
+            self.log.info(
+                "updated registry namespace",
+                &[("name", name), ("public", &public.to_string())],
+            );
+        }
+        Ok(namespace)
+    }
+
+    async fn delete_registry(&self, project: &Option<String>) -> Result<()> {
+        let Some(project_id) = project else {
+            return Ok(());
+        };
+        if let Some(namespace) =
+            registry::find_namespace(&self.client, project_id, self.name()).await?
+        {
+            registry::delete_namespace(&self.client, &namespace.id).await?;
+            self.log.info(
+                "deleted registry namespace",
+                &[("name", self.name()), ("id", &namespace.id)],
+            );
         }
         Ok(())
     }
@@ -444,6 +515,21 @@ impl Provider for ScalewayJobs {
                 steps.push(Step::new("bucket", Action::Delete, bucket_resource));
             }
         }
+        let registry_resource = format!("registry namespace {name}");
+        if self.registry_on() {
+            let public = self.registry_public();
+            let step = match &observed.registry {
+                None => Step::new("registry", Action::Create, registry_resource),
+                Some(namespace) if namespace.is_public == public => {
+                    Step::new("registry", Action::Noop, registry_resource)
+                }
+                Some(_) => Step::new("registry", Action::Update, registry_resource)
+                    .with_detail(if public { "public" } else { "private" }),
+            };
+            steps.push(step);
+        } else if observed.registry.is_some() {
+            steps.push(Step::new("registry", Action::Delete, registry_resource));
+        }
         let region = self.client.region();
         for pool in &self.config.pools {
             let resource = format!("job definition {}", self.definition_name(&pool.tag));
@@ -510,6 +596,15 @@ impl Provider for ScalewayJobs {
                     }
                 }
                 "bucket" => self.apply_bucket(step.action, &project).await?,
+                "registry" => {
+                    if step.action == Action::Delete {
+                        self.delete_registry(&project).await?;
+                    } else {
+                        let project_id = self.require_project(&project)?;
+                        let namespace = self.ensure_registry(project_id).await?;
+                        outputs.insert("CIBURST_REGISTRY_ENDPOINT".to_string(), namespace.endpoint);
+                    }
+                }
                 id => {
                     let tag = id.strip_prefix("definition:").ok_or_else(|| {
                         Error::provider(format!("{PROVIDER_NAME}: unknown step {id}"))
@@ -550,6 +645,7 @@ impl Provider for ScalewayJobs {
                 self.delete_bucket(project_id).await?;
             }
         }
+        self.delete_registry(&project).await?;
         for kind in [KeyKind::Dispatch, KeyKind::Cache] {
             self.delete_key(kind).await?;
         }
