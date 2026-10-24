@@ -1,4 +1,5 @@
 .local/
+/config.json
 target/
 .claude/
 *.log

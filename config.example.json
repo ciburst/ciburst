@@ -7,7 +7,7 @@
   "pools": [
     {
       "tag": "ci",
-      "image": "registry.gitlab.com/<namespace>/ciburst/node:24",
+      "image": "registry.gitlab.com/<namespace>/ciburst/node:1",
       "stages": ["lint", "test"],
       "vcpu": 2,
       "memoryMiB": 4096,

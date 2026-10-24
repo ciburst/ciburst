@@ -1,6 +1,6 @@
 # Spec: ciburst, serverless GitLab runners, Scaleway first
 
-Status: M1 agents A (provider) and B (host, function) merged 2026-10-24, agent C (images, ops) pending. Background: `SEED.md`.
+Status: M1 done 2026-10-24 (provider, host and function, images, CI, runbook); waiting for the owner's push confirmation and the go for M2. Background: `SEED.md`.
 
 ## 0. Decision log
 
@@ -24,6 +24,10 @@ Status: M1 agents A (provider) and B (host, function) merged 2026-10-24, agent C
 | D16 | 2026-10-23 | Region `fr-par`. Drill consumer: the drill consumer project, its id in `.local/` only. |
 | D17 | 2026-10-24 | The dispatcher is a Scaleway Serverless Function on runtime `rust196`. Scaleway compiles the uploaded source, so the workspace is pinned to Rust 1.96.0 (`rust-toolchain.toml`) and CI builds with the same version. A runtime bump is a one-line change plus a redeploy. |
 | D18 | 2026-10-24 | Few audited dependencies instead of none: tokio, reqwest with rustls, serde, clap, async-trait, sha2, subtle, rand, thiserror. `cargo deny` gates licenses, advisories and sources in CI. The HTTP seam is one trait, so every API client is tested against in-memory fakes. |
+| D19 | 2026-10-24 | Pool images pin `gitlab/gitlab-runner:v18.11.4`; every `run-single` flag was verified against its help text. A move to 19.x follows the M2 drill. |
+| D20 | 2026-10-24 | The `build` pool is the osscontainertools kaniko fork, alpine variant (ships git), with builds dir `/kaniko/builds`: kaniko wipes the filesystem between stages but never `/kaniko`. |
+| D21 | 2026-10-24 | Every image writes its PATH to `/etc/profile.d/ciburst-path.sh` and removes `~/.bash_logout`, because the shell executor runs job steps in a login shell. |
+| D22 | 2026-10-24 | Releases on tags `vX.Y.Z` publish the five images as `X.Y.Z`, `X.Y`, `X` and `latest` (`edge` on `main`) and the Linux x86_64 musl binary through `glab`. Configs reference images by major tag (`node:1`), or `edge` before the first release. macOS and Windows binaries are backlog. |
 
 ## 1. Purpose and scope
 
@@ -110,7 +114,7 @@ Core modules: `config` (schema, defaults, validation reporting every error), `di
   "provider": { "type": "scaleway-jobs", "region": "fr-par" },
   "defaultPool": "ci",
   "pools": [
-    { "tag": "ci", "image": "registry.gitlab.com/<namespace>/ciburst/node:24", "stages": ["lint", "test"], "vcpu": 2, "memoryMiB": 4096, "storageMiB": 10240, "timeoutS": 3600, "waitTimeoutS": 60, "maxRuns": 10 },
+    { "tag": "ci", "image": "registry.gitlab.com/<namespace>/ciburst/node:1", "stages": ["lint", "test"], "vcpu": 2, "memoryMiB": 4096, "storageMiB": 10240, "timeoutS": 3600, "waitTimeoutS": 60, "maxRuns": 10 },
     { "tag": "rust", "image": "registry.gitlab.com/<namespace>/ciburst/rust:1", "stages": ["rust"], "vcpu": 4, "memoryMiB": 8192, "storageMiB": 10240, "timeoutS": 3600, "waitTimeoutS": 60, "maxRuns": 4 },
     { "tag": "playwright", "image": "registry.gitlab.com/<namespace>/ciburst/playwright:1", "stages": ["e2e"], "vcpu": 4, "memoryMiB": 8192, "storageMiB": 10240, "timeoutS": 3600, "waitTimeoutS": 60, "maxRuns": 4 },
     { "tag": "build", "image": "registry.gitlab.com/<namespace>/ciburst/kaniko:1", "stages": ["build", "image"], "vcpu": 2, "memoryMiB": 4096, "storageMiB": 10240, "timeoutS": 1800, "waitTimeoutS": 30, "maxRuns": 4 }
@@ -127,11 +131,11 @@ Secrets come from `.local/scaleway.env` (`SCW_ACCESS_KEY`, `SCW_SECRET_KEY`, `SC
 Cargo.toml  rust-toolchain.toml  deny.toml  LICENSE  README.md  config.example.json
 crates/core/                 ciburst-core: config, dispatch, gitlab, http, plan, provision, check, store, log, types, fake, testing
 crates/cli/                  binary ciburst: plan | apply | destroy | status | check | rotate; registry of providers and hosts
-crates/scaleway/             provider scaleway-jobs and host scaleway-function (M1)
-crates/dispatch-scaleway/    the function: lib with `handle`, zipped with core for Scaleway's builder (M1)
-images/base/ node/ rust/ playwright/ kaniko/   Dockerfiles and entrypoint (M1)
-ci/ciburst.yml               consumer include (M1)
-scripts/                     ci-install-cargo-deny.sh
+crates/scaleway/             provider scaleway-jobs (jobs, iam, s3, sigv4), host scaleway-function, build.rs embedding the function zip, API fakes
+crates/dispatch-scaleway/    the function: `handle` and the testable `respond`
+images/base/ node/ rust/ playwright/ kaniko/ test/   Dockerfiles, shared entrypoint, smoke tests
+ci/ciburst.yml               consumer include with the pool templates
+scripts/                     ci-install-cargo-deny.sh ci-push-image.sh ci-release-binary.sh shellcheck.sh
 test/config.fake.json        dry-run config
 docs/                        SPEC.md RUNBOOK.md PROVIDERS.md
 .gitlab-ci.yml  .local/ (gitignored)
@@ -186,7 +190,7 @@ Privacy: the dispatcher logs project id, job id, pipeline id, stage, pool and ru
 
 ## 8. Automation
 
-Framework CI (`.gitlab-ci.yml`, hosted runners, image `rust:1.96.0-bookworm`): `lint` (`cargo fmt --check`, `cargo clippy -D warnings`), `deny` (`cargo deny check` with a checksum-pinned binary), `test` (`cargo test --workspace --all-features`), `images` (build and push the five images with dind; on `main` when `images/**` changes and on tags), `release` (tags `vX.Y.Z` retag images, build the `ciburst` binary for Linux, macOS and Windows, publish a release). Branch mapping: `main` builds images tagged `edge`, tags build `X.Y.Z`, `X.Y`, `X` and `latest`.
+Framework CI (`.gitlab-ci.yml`, hosted runners, image `rust:1.96.0-bookworm`): `lint` (`cargo fmt --check`, `cargo clippy -D warnings`, shellcheck over every script), `deny` (`cargo deny check` with a checksum-pinned binary), `test` (`cargo test --workspace --all-features`), `images` (build and push the five images with dind; on `main` when `images/**` changes and on tags), `release` (tags `vX.Y.Z` retag images, build the `ciburst` binary for Linux x86_64 musl, publish a GitLab release through `glab`). Branch mapping: `main` builds images tagged `edge`, tags build `X.Y.Z`, `X.Y`, `X` and `latest`.
 
 Consumer side: `include: project: <namespace>/ciburst, ref: v1, file: ci/ciburst.yml` sets `default: tags: [ci]`; jobs in a non-default pool set `tags: [<pool>]`; jobs that need a Docker daemon set `tags: [saas-linux-small-amd64]`; image builds use the `build` pool and `/kaniko/executor`. `ciburst check` runs against every configured project after `apply`.
 
@@ -198,7 +202,7 @@ Consumer side: `include: project: <namespace>/ciburst, ref: v1, file: ci/ciburst
 | Contract | every provider against `testing::contract::run_provider_contract`: plan on empty backend lists every resource, plan after apply is empty, changed pool updates, removed pool deletes, rotation returns new secrets, start then list shows the run, stop ends it, destroy empties the backend | `crates/core/tests/contract_fake.rs`; `crates/scaleway` against an in-process fake of the Jobs, IAM and S3 APIs |
 | GitLab client | runners, hooks, lint and check against `testing::gitlab_fake::FakeGitlab` | `crates/core/src/gitlab.rs`, `crates/core/tests/provision.rs` |
 | CLI | plan, apply, plan, status, destroy in a temp dir with the fake modules; usage and config errors | `crates/cli/tests/cli.rs` |
-| Images | build, `gitlab-runner --version`, entrypoint with a fake GitLab that serves one job and expects the script output | CI `images` stage |
+| Images | `images/test/smoke.sh` per image: build, `gitlab-runner --version`, the toolchain's version, the entrypoint dry run, an idle-exit run against an unreachable URL, a multi-stage kaniko build; shellcheck over every script | CI `images` stage, locally with Docker |
 | Drill | real Scaleway and GitLab, section 13 M2 | manual, runbook |
 
 ## 10. Operations
@@ -222,7 +226,7 @@ A provider is a crate implementing `ciburst_core::types::Provider` with a `capab
 | Milestone | Deliverables | Verification |
 |---|---|---|
 | M0, orchestrator, done | workspace, LICENSE, README, `crates/core`, `crates/cli` with the fake modules, contract harness, GitLab fake, CI lint, deny and test, `docs/PROVIDERS.md` | `cargo test` green, `ciburst plan` against the fake modules prints every step, second `apply` plans nothing |
-| M1, three agents | A: `crates/scaleway` provider (jobs, IAM, bucket, lifecycle) with an in-process fake of the Jobs, IAM and S3 APIs, passing the contract. B: `crates/scaleway` host (namespace, function, secrets, zip, upload, deploy) with a Functions fake, and `crates/dispatch-scaleway` (axum handler on `Dispatcher`, builds on Rust 1.96). C: `images/*` (five images, entrypoint with cache flags verified), CI `images` and `release` stages, `ci/ciburst.yml`, `docs/RUNBOOK.md` | all tests green on CI, image smoke green, plan and apply idempotent against the fakes |
+| M1, three agents, done | A: `crates/scaleway` provider (jobs, IAM, bucket, lifecycle) with an in-process fake of the Jobs, IAM and S3 APIs, passing the contract. B: `crates/scaleway` host (namespace, function, secrets, zip, upload, deploy) with a Functions fake, and `crates/dispatch-scaleway` (axum handler on `Dispatcher`, builds on Rust 1.96). C: `images/*` (five images, entrypoint with cache flags verified), CI `images` and `release` stages, `ci/ciburst.yml`, `docs/RUNBOOK.md` | all tests green on CI, image smoke green, plan and apply idempotent against the fakes |
 | M2, orchestrator with owner keys | drill: `ciburst apply` on an empty project, `check` on the drill consumer project, a pipeline with node, rust, playwright and kaniko jobs plus one hosted-runner job; start latency; kaniko verdict; cache hit on the second run; cost on the consumption page; API behaviour assumed by the fakes checked live (stop sets a run to `canceled`, a run's environment merges the definition's with the overrides, deleting an IAM application does not cascade to its policies and keys, a PATCH of a deployed function does not redeploy by itself); fixes | runbook section "Drill" filled with dates and numbers |
 | M3 | hardening from M2, GitHub mirror, `v1.0.0` tag with binaries | release pipeline green |
 
@@ -233,6 +237,8 @@ Risks:
 | Risk | Mitigation |
 |---|---|
 | kaniko cannot extract layers without capabilities | `build` pool documented as experimental until M2; fallback hosted runners for builds |
+| Scaleway runs jobs under gVisor and counts `/tmp` against memory; kaniko's container detection may need `--force` | drill item in the runbook; fallback hosted runners for builds |
+| the kaniko fork stops publishing images | pin by digest; the Chainguard fork publishes source to build from |
 | run start latency too high for short jobs | measured in M2; `waitTimeoutS` keeps a run alive for consecutive jobs |
 | stage map and tags disagree | `ciburst check` after every apply; runbook failure mode |
 | GitLab disables a hook after failures | dispatcher answers within 30 s; manual resend documented; sweep in backlog |

@@ -2,7 +2,7 @@
 
 Serverless per-job GitLab runners with pluggable providers. A GitLab job webhook reaches a small dispatcher; the dispatcher starts one serverless container per pending job; the container runs the job with `gitlab-runner run-single` and exits. Nothing runs or is reserved between jobs.
 
-Status: M0, core and fake provider. The Scaleway provider and host, the pool images and the runbook are M1. See `docs/SPEC.md`.
+Status: M1 done. Core, the Scaleway Serverless Jobs provider, the Scaleway Function host with the dispatcher, five pool images, CI and runbook exist and are tested against in-memory fakes. M2 is the first real deployment. See `docs/SPEC.md` and `docs/RUNBOOK.md`.
 
 ## How it works
 
@@ -13,11 +13,11 @@ Status: M0, core and fake provider. The Scaleway provider and host, the pool ima
 
 ## Quick start
 
-1. Copy `config.example.json` to `config.json`; set `name`, `gitlab.projectIds`, pools and stages.
+1. Copy `config.example.json` to `config.json` (gitignored); set `name`, `gitlab.projectIds`, pools and stages. Image tags: `1` after the first release, `edge` before.
 2. Put credentials into `.local/scaleway.env` (`SCW_ACCESS_KEY`, `SCW_SECRET_KEY`, `SCW_DEFAULT_ORGANIZATION_ID`) and `.local/gitlab.env` (`GITLAB_TOKEN` with scope `api`).
-3. `ciburst plan`, then `ciburst apply`. Outputs land in `.local/outputs.env` (mode 600).
+3. `ciburst plan`, then `ciburst apply`. Outputs land in `.local/outputs.env` (mode 600). The first apply compiles the dispatcher on Scaleway and takes several minutes.
 4. `ciburst check` compares every project's pipeline with the stage map.
-5. In the consumer pipeline: `default: tags: [<default pool>]`; jobs of other pools set `tags: [<pool>]`; jobs that need a Docker daemon keep a hosted runner tag.
+5. In the consumer pipeline include `ci/ciburst.yml`: `default: tags: [ci]`; jobs of other pools extend the `.ciburst-rust`, `.ciburst-playwright` or `.ciburst-build` templates; jobs that need a Docker daemon keep a hosted runner tag.
 
 ## Commands
 
@@ -44,7 +44,7 @@ The second plan prints only `noop` lines. State lives in `.local/state.json`.
 
 ## Development
 
-Rust 1.96 (`rust-toolchain.toml`). `cargo test --workspace --all-features`, `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo deny check`. Providers and hosts: `docs/PROVIDERS.md`.
+Rust 1.96 (`rust-toolchain.toml`). `cargo test --workspace --all-features`, `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo deny check`, `scripts/shellcheck.sh`. Images: `images/test/smoke.sh <image>` with Docker. Providers and hosts: `docs/PROVIDERS.md`.
 
 ## License
 
