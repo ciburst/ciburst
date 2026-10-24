@@ -1,10 +1,16 @@
-//! Scaleway Serverless Function entry: `handle` receives the GitLab webhook and hands it to
-//! `ciburst_core::dispatch::Dispatcher` with a `ScalewayJobs` provider built from the function's
-//! environment. The variable names are `ciburst_scaleway::host::vars`, the ones the host sets.
+//! Scaleway Serverless Function entry: `handle` receives the GitLab webhook, the VM agents'
+//! `POST /vm` and `POST /terminate`, and the sweep cron, and hands method, path, headers, body
+//! and the current time to `ciburst_core::dispatch::Dispatcher::handle_request` with a
+//! `ScalewayJobs` provider built from the function's environment. The variable names are
+//! `ciburst_scaleway::host::vars`, the ones the host sets.
+//!
+//! A cron trigger arrives as `POST /` with its arguments as the JSON body (Scaleway docs, "Add a
+//! trigger to a function"), so the sweep is recognized by its body, not by its path.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use ciburst_core::config::{Config, parse_config};
@@ -17,7 +23,7 @@ use ciburst_scaleway::host::vars;
 use ciburst_scaleway::provider::ScalewayJobs;
 use http::{Request, Response, StatusCode};
 
-/// GitLab job events are a few kilobytes.
+/// GitLab job events are a few kilobytes, VM reports and cron arguments less.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// What the function reads from its environment.
@@ -80,7 +86,7 @@ impl Env {
             runner_tokens,
             dispatch: None,
             cache,
-            vm_secret: None,
+            vm_secret: optional(vars::VM_SECRET),
         };
         let credentials = Credentials {
             secret_key: required(vars::SECRET_KEY)?,
@@ -113,17 +119,74 @@ impl Env {
     }
 }
 
-/// Runs the dispatcher on one request; answers its status and JSON body.
+/// One request as the dispatcher sees it.
+pub struct Incoming<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    pub headers: &'a [(String, String)],
+    pub body: &'a [u8],
+    /// Unix seconds.
+    pub now: u64,
+}
+
+/// Runs the dispatcher on one request; answers its status and JSON body, empty for none.
 pub async fn respond(
     env: &Env,
     provider: Arc<dyn Provider>,
     log: Log,
-    headers: &[(String, String)],
-    body: &[u8],
+    request: &Incoming<'_>,
 ) -> (u16, Vec<u8>) {
     let dispatcher = Dispatcher::new(env.config.clone(), provider, env.secrets.clone(), log);
-    let response = dispatcher.handle(headers, body).await;
-    (response.status, response.body.to_string().into_bytes())
+    let response = dispatcher
+        .handle_request(
+            request.method,
+            request.path,
+            request.headers,
+            request.body,
+            request.now,
+        )
+        .await;
+    let body = if response.body.is_null() {
+        Vec::new()
+    } else {
+        response.body.to_string().into_bytes()
+    };
+    (response.status, body)
+}
+
+/// Reads method, URI path, headers and body of an HTTP request and answers it.
+pub async fn serve(
+    env: &Env,
+    provider: Arc<dyn Provider>,
+    log: Log,
+    req: Request<Body>,
+    now: u64,
+) -> Response<Body> {
+    let (parts, body) = req.into_parts();
+    let headers: Vec<(String, String)> = parts
+        .headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.as_str().to_string(), v.to_string()))
+        })
+        .collect();
+    let (status, body) = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
+        Ok(bytes) => {
+            let request = Incoming {
+                method: parts.method.as_str(),
+                path: parts.uri.path(),
+                headers: &headers,
+                body: &bytes,
+                now,
+            };
+            respond(env, provider, log, &request).await
+        }
+        Err(_) => (400, br#"{"result":"bad_request"}"#.to_vec()),
+    };
+    http_response(status, body)
 }
 
 /// The answer when the environment is unusable: 500, logged with the variable name only.
@@ -152,38 +215,34 @@ fn state() -> &'static Result<State, EnvError> {
 
 pub async fn handle(req: Request<Body>) -> Response<Body> {
     let log = Log::stderr();
-    let (status, body) = match state() {
-        Err(error) => env_error(error, &log),
-        Ok(state) => {
-            let (parts, body) = req.into_parts();
-            let headers: Vec<(String, String)> = parts
-                .headers
-                .iter()
-                .filter_map(|(name, value)| {
-                    value
-                        .to_str()
-                        .ok()
-                        .map(|v| (name.as_str().to_string(), v.to_string()))
-                })
-                .collect();
-            match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
-                Ok(bytes) => {
-                    respond(&state.env, state.provider.clone(), log, &headers, &bytes).await
-                }
-                Err(_) => (400, br#"{"result":"bad_request"}"#.to_vec()),
-            }
+    match state() {
+        Err(error) => {
+            let (status, body) = env_error(error, &log);
+            http_response(status, body)
         }
-    };
-    Response::builder()
-        .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
-        .header("content-type", "application/json")
-        .body(Body::from(body))
-        .unwrap_or_else(|_| {
-            let (_, body) = error_body();
-            let mut response = Response::new(Body::from(body));
-            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-            response
-        })
+        Ok(state) => serve(&state.env, state.provider.clone(), log, req, now_seconds()).await,
+    }
+}
+
+fn now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn http_response(status: u16, body: Vec<u8>) -> Response<Body> {
+    let mut builder = Response::builder()
+        .status(StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
+    if !body.is_empty() {
+        builder = builder.header("content-type", "application/json");
+    }
+    builder.body(Body::from(body)).unwrap_or_else(|_| {
+        let (_, body) = error_body();
+        let mut response = Response::new(Body::from(body));
+        *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+        response
+    })
 }
 
 #[cfg(test)]
@@ -203,17 +262,23 @@ mod tests {
       "defaultPool": "ci",
       "pools": [
         { "tag": "ci", "image": "img/node" },
-        { "tag": "build-x", "image": "img/kaniko", "stages": ["build"] }
+        { "tag": "build-x", "image": "img/kaniko", "stages": ["build"] },
+        { "tag": "vm", "image": "img/docker", "stages": ["vm"], "runtime": "instances", "slots": 2 }
       ],
       "cache": { "type": "s3" }
     }"#;
+
+    const NOW: u64 = 1_800_000_000;
+    const VM_SECRET: &str = "vm-secret";
 
     fn vars_map() -> BTreeMap<String, String> {
         [
             (vars::CONFIG, CONFIG),
             (vars::HOOK_TOKEN, "hook-secret"),
+            (vars::VM_SECRET, VM_SECRET),
             ("RUNNER_TOKEN_CI", "glrt-ci"),
             ("RUNNER_TOKEN_BUILD_X", "glrt-build"),
+            ("RUNNER_TOKEN_VM", "glrt-vm"),
             (vars::CACHE_ACCESS_KEY, "AK"),
             (vars::CACHE_SECRET_KEY, "SK"),
             (vars::SECRET_KEY, "dispatch-secret"),
@@ -231,15 +296,80 @@ mod tests {
     }
 
     async fn fake_provider(env: &Env) -> Arc<FakeProvider> {
-        let provider = Arc::new(FakeProvider::new(
-            env.config.clone(),
-            Arc::new(MemoryStore::new()),
-        ));
+        let provider = Arc::new(
+            FakeProvider::new(env.config.clone(), Arc::new(MemoryStore::new()))
+                .with_clock(Arc::new(|| NOW)),
+        );
         provider
             .apply(&provider.plan(&[]).await.unwrap())
             .await
             .unwrap();
         provider
+    }
+
+    async fn webhook(
+        env: &Env,
+        provider: Arc<dyn Provider>,
+        log: Log,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> (u16, Vec<u8>) {
+        let request = Incoming {
+            method: "POST",
+            path: "/",
+            headers,
+            body,
+            now: NOW,
+        };
+        respond(env, provider, log, &request).await
+    }
+
+    /// Status, content type and body of `serve` on one HTTP request.
+    async fn http(
+        env: &Env,
+        provider: Arc<dyn Provider>,
+        method: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+        now: u64,
+    ) -> (u16, Option<String>, Vec<u8>) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let req = builder.body(Body::from(body.to_vec())).unwrap();
+        let response = serve(env, provider, Log::silent(), req, now).await;
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap().to_string());
+        let bytes = axum::body::to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .unwrap();
+        (status, content_type, bytes.to_vec())
+    }
+
+    /// Starts a VM through the webhook and answers its run id and token.
+    async fn started_vm(env: &Env, provider: Arc<FakeProvider>) -> (String, String) {
+        let (status, _, body) = http(
+            env,
+            provider,
+            "POST",
+            "/",
+            &[("x-gitlab-token", "hook-secret")],
+            &event("pending", "vm"),
+            NOW,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let body = parse(&body);
+        assert_eq!(body["result"], "started", "{body}");
+        assert_eq!(body["pool"], "vm");
+        let run = body["runId"].as_str().unwrap().to_string();
+        let token = ciburst_core::vm::token(VM_SECRET, &run);
+        (run, token)
     }
 
     fn headers(token: &str) -> Vec<(String, String)> {
@@ -276,9 +406,14 @@ mod tests {
         );
         assert_eq!(env.region, "fr-par");
 
+        assert_eq!(env.secrets.vm_secret.as_deref(), Some(VM_SECRET));
+
         let mut no_cache = vars_map();
         no_cache.remove(vars::CACHE_SECRET_KEY);
         assert!(env_from(&no_cache).unwrap().secrets.cache.is_none());
+        let mut no_vm = vars_map();
+        no_vm.remove(vars::VM_SECRET);
+        assert!(env_from(&no_vm).unwrap().secrets.vm_secret.is_none());
     }
 
     #[test]
@@ -325,7 +460,7 @@ mod tests {
     async fn rejects_requests_without_the_token() {
         let env = env_from(&vars_map()).unwrap();
         let provider = fake_provider(&env).await;
-        let (status, _) = respond(
+        let (status, _) = webhook(
             &env,
             provider.clone(),
             Log::silent(),
@@ -334,7 +469,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, 401);
-        let (status, _) = respond(
+        let (status, _) = webhook(
             &env,
             provider.clone(),
             Log::silent(),
@@ -350,7 +485,7 @@ mod tests {
     async fn ignores_jobs_that_are_not_pending() {
         let env = env_from(&vars_map()).unwrap();
         let provider = fake_provider(&env).await;
-        let (status, body) = respond(
+        let (status, body) = webhook(
             &env,
             provider.clone(),
             Log::silent(),
@@ -371,7 +506,7 @@ mod tests {
         let env = env_from(&vars_map()).unwrap();
         let provider = fake_provider(&env).await;
         let (log, lines) = Log::memory();
-        let (status, body) = respond(
+        let (status, body) = webhook(
             &env,
             provider.clone(),
             log,
@@ -426,7 +561,7 @@ mod tests {
     async fn answers_500_when_the_provider_fails() {
         let env = env_from(&vars_map()).unwrap();
         let provider = Arc::new(Failing(fake_provider(&env).await));
-        let (status, body) = respond(
+        let (status, body) = webhook(
             &env,
             provider,
             Log::silent(),
@@ -454,5 +589,147 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(parse(&bytes), json!({ "result": "error" }));
+    }
+
+    #[tokio::test]
+    async fn a_vm_reports_by_path_with_its_token() {
+        let env = env_from(&vars_map()).unwrap();
+        let provider = fake_provider(&env).await;
+        let (run, token) = started_vm(&env, provider.clone()).await;
+        let report = br#"{"state":"idle","free":2,"slots":2}"#;
+
+        for headers in [
+            vec![],
+            vec![("x-ciburst-run", run.as_str())],
+            vec![("x-ciburst-run", run.as_str()), ("x-ciburst-token", "0")],
+            vec![("x-gitlab-token", "hook-secret")],
+        ] {
+            let (status, content_type, body) =
+                http(&env, provider.clone(), "POST", "/vm", &headers, report, NOW).await;
+            assert_eq!(status, 401, "{headers:?}");
+            assert_eq!(content_type, None);
+            assert!(body.is_empty(), "401 has no body");
+        }
+        let (status, _, _) = http(
+            &env,
+            provider.clone(),
+            "GET",
+            "/vm",
+            &[("X-Ciburst-Run", &run), ("X-Ciburst-Token", &token)],
+            b"",
+            NOW,
+        )
+        .await;
+        assert_eq!(status, 401, "only POST reaches the VM routes");
+
+        for uri in [
+            "/vm",
+            "https://demo-dispatch.functions.fnc.fr-par.scw.cloud/vm",
+        ] {
+            let (status, content_type, body) = http(
+                &env,
+                provider.clone(),
+                "POST",
+                uri,
+                &[("X-Ciburst-Run", &run), ("X-Ciburst-Token", &token)],
+                report,
+                NOW + 5,
+            )
+            .await;
+            assert_eq!(status, 200, "{uri}");
+            assert_eq!(content_type.as_deref(), Some("application/json"));
+            assert_eq!(parse(&body), json!({ "result": "reported" }));
+        }
+        let vms = provider.capacity("vm").await.unwrap().unwrap();
+        assert_eq!(vms[0].state, ciburst_core::types::VmState::Idle);
+        assert_eq!(vms[0].seen, Some(NOW + 5));
+    }
+
+    #[tokio::test]
+    async fn a_vm_terminates_itself_by_path() {
+        let env = env_from(&vars_map()).unwrap();
+        let provider = fake_provider(&env).await;
+        let (run, token) = started_vm(&env, provider.clone()).await;
+        let (other, _) = started_vm(&env, provider.clone()).await;
+        let other_token = ciburst_core::vm::token(VM_SECRET, &other);
+        let (status, _, body) = http(
+            &env,
+            provider.clone(),
+            "POST",
+            "/terminate",
+            &[("X-Ciburst-Run", &run), ("X-Ciburst-Token", &other_token)],
+            b"",
+            NOW,
+        )
+        .await;
+        assert_eq!((status, body.is_empty()), (401, true));
+        let (status, _, body) = http(
+            &env,
+            provider.clone(),
+            "POST",
+            "/terminate",
+            &[("X-Ciburst-Run", &run), ("X-Ciburst-Token", &token)],
+            b"",
+            NOW,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(parse(&body), json!({ "result": "terminated" }));
+        let vms = provider.capacity("vm").await.unwrap().unwrap();
+        assert_eq!(vms.len(), 1);
+        assert_eq!(vms[0].run_id, other);
+    }
+
+    #[tokio::test]
+    async fn the_cron_body_sweeps() {
+        let env = env_from(&vars_map()).unwrap();
+        let provider = fake_provider(&env).await;
+        let (run, _) = started_vm(&env, provider.clone()).await;
+        let stuck = NOW + ciburst_core::vm::SWEEP_STARTING_S + 1;
+        let (status, content_type, body) = http(
+            &env,
+            provider.clone(),
+            "POST",
+            "/",
+            &[],
+            br#"{"ciburst_sweep":"wrong"}"#,
+            stuck,
+        )
+        .await;
+        assert_eq!((status, content_type, body.is_empty()), (401, None, true));
+        assert_eq!(provider.capacity("vm").await.unwrap().unwrap().len(), 1);
+
+        let (status, _, body) = http(
+            &env,
+            provider.clone(),
+            "POST",
+            "/",
+            &[("content-type", "application/json")],
+            br#"{"ciburst_sweep":"hook-secret"}"#,
+            stuck,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(parse(&body), json!({ "result": "swept", "runs": [run] }));
+        assert!(provider.capacity("vm").await.unwrap().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_job_pools_keep_counting_runs() {
+        let env = env_from(&vars_map()).unwrap();
+        let provider = fake_provider(&env).await;
+        let (status, _, body) = http(
+            &env,
+            provider.clone(),
+            "POST",
+            "/",
+            &[("x-gitlab-token", "hook-secret")],
+            &event("pending", "build"),
+            NOW,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(parse(&body)["pool"], "build-x");
+        assert_eq!(provider.capacity("build-x").await.unwrap(), None);
     }
 }

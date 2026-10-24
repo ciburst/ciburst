@@ -1,18 +1,23 @@
 //! Host `scaleway-function`: the dispatcher as a Serverless Function (`functions/v1beta1`) built
 //! by Scaleway from a zip embedded in this crate by `build.rs`.
 //!
-//! Steps: `namespace` (`<name>`), `function` (`<name>-dispatch`), `code` (the embedded zip).
+//! Steps: `namespace` (`<name>`), `function` (`<name>-dispatch`), `code` (the embedded zip),
+//! `cron` (`<name>-sweep`, the sweep trigger of spec 6.1).
 //!
 //! The function environment is exactly what `ciburst_dispatch_scaleway::Env` reads, named in
 //! [`vars`]:
 //! - plain: `CIBURST_CONFIG` (config JSON), `CIBURST_ORGANIZATION_ID`, `CIBURST_PROJECT_ID`,
 //!   `CIBURST_REGION` (Scaleway reserves the `SCW_` prefix);
 //! - secret: `HOOK_TOKEN`, `CIBURST_DISPATCH_KEY` (the dispatch key), `RUNNER_TOKEN_<TAG>` per pool,
-//!   `CACHE_S3_ACCESS_KEY` and `CACHE_S3_SECRET_KEY` when a cache key exists.
+//!   `CACHE_S3_ACCESS_KEY` and `CACHE_S3_SECRET_KEY` when a cache key exists, `CIBURST_VM_SECRET`
+//!   when the provisioner made one.
 //!
 //! On top, the plain variable `CIBURST_CODE_DIGEST` records the sha256 of the deployed zip for
 //! this host's plan; the function does not read it. The sha256 of the settings and both
 //! environments is kept in the function's `description` as `ciburst:<hex>`.
+//!
+//! The cron posts `{"ciburst_sweep": "<hook token>"}` to the function every 30 minutes. The API
+//! returns a cron's `args` as stored, so the plan compares schedule and args directly.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
@@ -23,6 +28,7 @@ use ciburst_core::config::Config;
 use ciburst_core::http::Request;
 use ciburst_core::log::Log;
 use ciburst_core::types::{Action, Host, Outputs, Secrets, Step};
+use ciburst_core::vm::SWEEP_ARG;
 use ciburst_core::{Error, Result};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -42,10 +48,13 @@ pub const TIMEOUT: &str = "30s";
 pub const HTTP_OPTION: &str = "redirected";
 pub const SANDBOX: &str = "v2";
 pub const DESCRIPTION_PREFIX: &str = "ciburst:";
+/// Spec 6.1: the sweep runs every 30 minutes (UTC, standard five-field cron syntax).
+pub const SWEEP_SCHEDULE: &str = "*/30 * * * *";
 
 const STEP_NAMESPACE: &str = "namespace";
 const STEP_FUNCTION: &str = "function";
 const STEP_CODE: &str = "code";
+const STEP_CRON: &str = "cron";
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// A Rust build on Scaleway compiles the whole dependency set; 20 minutes at most.
@@ -61,6 +70,7 @@ pub mod vars {
     pub const SECRET_KEY: &str = "CIBURST_DISPATCH_KEY";
     pub const CACHE_ACCESS_KEY: &str = "CACHE_S3_ACCESS_KEY";
     pub const CACHE_SECRET_KEY: &str = "CACHE_S3_SECRET_KEY";
+    pub const VM_SECRET: &str = "CIBURST_VM_SECRET";
     pub const CODE_DIGEST: &str = "CIBURST_CODE_DIGEST";
 
     /// `RUNNER_TOKEN_<TAG>`: tag upper-cased, every other character than ASCII letters and
@@ -215,6 +225,9 @@ impl ScalewayFunction {
             secret.insert(vars::CACHE_ACCESS_KEY.to_string(), cache.access_key.clone());
             secret.insert(vars::CACHE_SECRET_KEY.to_string(), cache.secret_key.clone());
         }
+        if let Some(vm_secret) = &secrets.vm_secret {
+            secret.insert(vars::VM_SECRET.to_string(), vm_secret.clone());
+        }
         Ok(Settings {
             runtime: RUNTIME,
             handler: HANDLER,
@@ -258,6 +271,60 @@ impl ScalewayFunction {
             )
             .await?;
         Ok(find_named(&list["functions"], &name))
+    }
+
+    fn cron_name(&self) -> String {
+        format!("{}-sweep", self.config.name)
+    }
+
+    async fn find_cron(&self, function_id: &str) -> Result<Option<Value>> {
+        let list = self
+            .client
+            .get(
+                &format!("{}/crons", self.base()),
+                &[("function_id", function_id.to_string())],
+            )
+            .await?;
+        Ok(find_named(&list["crons"], &self.cron_name()))
+    }
+
+    /// Creates the sweep cron or brings its schedule and args up to date, then waits for it.
+    async fn ensure_cron(&self, function_id: &str, secrets: &Secrets) -> Result<()> {
+        let args = sweep_args(secrets);
+        let name = self.cron_name();
+        let id = match self.find_cron(function_id).await? {
+            None => {
+                let created = self
+                    .client
+                    .post(
+                        &format!("{}/crons", self.base()),
+                        &json!({
+                            "function_id": function_id,
+                            "schedule": SWEEP_SCHEDULE,
+                            "args": args,
+                            "name": name,
+                        }),
+                    )
+                    .await?;
+                self.log.info("cron_created", &[("name", &name)]);
+                id_of(&created)?.to_string()
+            }
+            Some(existing) if cron_differs(&existing, &args) => {
+                let id = id_of(&existing)?.to_string();
+                self.client
+                    .patch(
+                        &format!("{}/crons/{id}", self.base()),
+                        &json!({ "schedule": SWEEP_SCHEDULE, "args": args }),
+                    )
+                    .await?;
+                self.log.info("cron_updated", &[("name", &name)]);
+                id
+            }
+            Some(_) => return Ok(()),
+        };
+        self.wait(&format!("{}/crons/{id}", self.base()), &["ready"])
+            .await
+            .map(drop)
     }
 
     async fn find(&self) -> Result<Found> {
@@ -409,6 +476,22 @@ impl Host for ScalewayFunction {
             format!("function code {function_name}"),
         )
         .with_detail(format!("zip sha256 {}", embedded_code_digest()));
+        let mut cron = Step::new(
+            STEP_CRON,
+            Action::Create,
+            format!("function cron {}", self.cron_name()),
+        )
+        .with_detail(format!("sweep {SWEEP_SCHEDULE}"));
+        if let Some(existing) = &found.function {
+            cron.action = match self.find_cron(id_of(existing)?).await? {
+                None => Action::Create,
+                Some(current) if cron_differs(&current, &sweep_args(secrets)) => {
+                    cron.detail = Some("schedule or arguments changed".into());
+                    Action::Update
+                }
+                Some(_) => Action::Noop,
+            };
+        }
         if let (Some(project), Some(existing)) = (&found.project, &found.function) {
             let wanted = self.settings(project, secrets)?.description()?;
             if existing["description"].as_str() == Some(wanted.as_str()) {
@@ -430,14 +513,13 @@ impl Host for ScalewayFunction {
                 Some(_) => Action::Noop,
             };
         }
-        Ok(vec![namespace, function, code])
+        Ok(vec![namespace, function, code, cron])
     }
 
     async fn apply(&self, steps: &[Step], secrets: &Secrets) -> Result<Outputs> {
-        if let Some(step) = steps
-            .iter()
-            .find(|s| ![STEP_NAMESPACE, STEP_FUNCTION, STEP_CODE].contains(&s.id.as_str()))
-        {
+        if let Some(step) = steps.iter().find(|s| {
+            ![STEP_NAMESPACE, STEP_FUNCTION, STEP_CODE, STEP_CRON].contains(&s.id.as_str())
+        }) {
             return Err(Error::provider(format!(
                 "{HOST_NAME}: unknown step {}",
                 step.id
@@ -533,6 +615,7 @@ impl Host for ScalewayFunction {
             self.log
                 .info("function_deployed", &[("name", &function_name)]);
         }
+        self.ensure_cron(&function_id, secrets).await?;
         let url = function_url(&current).ok_or_else(|| {
             Error::provider(format!("{HOST_NAME}: {function_name} has no domain name"))
         })?;
@@ -545,7 +628,14 @@ impl Host for ScalewayFunction {
     async fn destroy(&self) -> Result<()> {
         let found = self.find().await?;
         if let Some(function) = &found.function {
-            let path = format!("{}/functions/{}", self.base(), id_of(function)?);
+            let function_id = id_of(function)?;
+            if let Some(cron) = self.find_cron(function_id).await? {
+                let path = format!("{}/crons/{}", self.base(), id_of(&cron)?);
+                tolerate_not_found(self.client.delete(&path).await)?;
+                self.log
+                    .info("cron_deleted", &[("name", &self.cron_name())]);
+            }
+            let path = format!("{}/functions/{function_id}", self.base());
             tolerate_not_found(self.client.delete(&path).await)?;
             self.log
                 .info("function_deleted", &[("name", &self.function_name())]);
@@ -563,6 +653,15 @@ impl Host for ScalewayFunction {
     async fn url(&self) -> Result<Option<String>> {
         Ok(self.find().await?.function.as_ref().and_then(function_url))
     }
+}
+
+/// The cron's arguments, which the function receives as its JSON body.
+fn sweep_args(secrets: &Secrets) -> Value {
+    json!({ SWEEP_ARG: secrets.hook_token.as_deref().unwrap_or("") })
+}
+
+fn cron_differs(cron: &Value, args: &Value) -> bool {
+    cron["schedule"].as_str() != Some(SWEEP_SCHEDULE) || cron["args"] != *args
 }
 
 fn find_named(list: &Value, name: &str) -> Option<Value> {
