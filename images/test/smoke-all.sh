@@ -5,7 +5,7 @@ set -uo pipefail
 dir="$(cd "$(dirname "$0")" && pwd)"
 summary=()
 status=0
-for image in base node rust playwright kaniko; do
+for image in base node rust playwright; do
   if output="$(SMOKE_QUIET=1 "$dir/smoke.sh" "$image" 2>&1)"; then
     result="passed"
   else

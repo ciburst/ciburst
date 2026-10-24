@@ -17,7 +17,7 @@ Status: M1 done. Core, the Scaleway Serverless Jobs provider, the Scaleway Funct
 2. Put credentials into `.local/scaleway.env` (`SCW_ACCESS_KEY`, `SCW_SECRET_KEY`, `SCW_DEFAULT_ORGANIZATION_ID`) and `.local/gitlab.env` (`GITLAB_TOKEN`, a personal access token of a project Owner with the scopes `api` and `create_runner`).
 3. `ciburst plan`, then `ciburst apply`. Outputs land in `.local/outputs.env` (mode 600). The first apply compiles the dispatcher on Scaleway and takes several minutes.
 4. `ciburst check` compares every project's pipeline with the stage map.
-5. In the consumer pipeline include `ci/ciburst.yml`: `default: tags: [ci]`; jobs of other pools extend the `.ciburst-rust`, `.ciburst-playwright` or `.ciburst-build` templates; jobs that need a Docker daemon keep a hosted runner tag.
+5. In the consumer pipeline include `ci/ciburst.yml`: `default: tags: [ci]`; jobs of other pools extend the `.ciburst-rust` or `.ciburst-playwright` templates; image builds extend `.ciburst-image-build`, which runs on GitLab's hosted runners.
 
 ## Commands
 

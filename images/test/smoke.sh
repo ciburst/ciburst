@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds one pool image and checks the runner, the toolchain and the entrypoint.
-# Usage: images/test/smoke.sh <base|node|rust|playwright|kaniko> [image reference]
+# Usage: images/test/smoke.sh <base|node|rust|playwright> [image reference]
 # SMOKE_NO_BUILD=1 skips the build and tests an existing reference.
 set -euo pipefail
 
@@ -21,7 +21,6 @@ case "$name" in
   node) toolchain=(node --version) expect_tool="v24." ;;
   rust) toolchain=(cargo --version) expect_tool="cargo 1.96.0" ;;
   playwright) toolchain=(npx --yes playwright@1.64.1 --version) expect_tool="Version 1.64.1" ;;
-  kaniko) toolchain=(/kaniko/executor version) expect_tool="Kaniko version" user="root" builds_dir="/kaniko/builds" ;;
   *) echo "unknown image: $name" >&2; exit 2 ;;
 esac
 
@@ -120,13 +119,6 @@ contains "missing CACHE_S3_SECRET_KEY is named" "$out" "missing environment vari
 out="$(docker run --rm -e CI_SERVER_URL=http://127.0.0.1:9 -e RUNNER_TOKEN=glrt-smoke-token -e RUNNER_WAIT_TIMEOUT=2 "$ref" 2>&1 || true)"
 contains "run-single starts and exits after the idle window" "$out" "has not received a job"
 
-if [ "$name" = "kaniko" ]; then
-  if docker run --rm -i "$ref" bash -s < "$root/images/test/kaniko-in-run.sh"; then
-    pass "multi-stage kaniko build keeps the context and the runner tools"
-  else
-    fail "multi-stage kaniko build"
-  fi
-fi
 
 if [ "$failures" -ne 0 ]; then
   echo "$failures check(s) failed for $name" >&2

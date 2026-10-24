@@ -82,11 +82,6 @@ image:playwright:
   variables:
     IMAGE: playwright
 
-image:kaniko:
-  extends: .image
-  variables:
-    IMAGE: kaniko
-
 .release:
   stage: release
   rules:
@@ -103,7 +98,7 @@ release:binary:
 release:
   extends: .release
   image: registry.gitlab.com/gitlab-org/cli:v1.124.0
-  needs: [release:binary, image:base, image:node, image:rust, image:playwright, image:kaniko]
+  needs: [release:binary, image:base, image:node, image:rust, image:playwright]
   variables:
     GLAB_ENABLE_CI_AUTOLOGIN: "true"
     BINARY: ciburst-x86_64-unknown-linux-musl

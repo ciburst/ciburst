@@ -6,7 +6,7 @@
 |---|---|
 | Region | `fr-par` (provider and host) |
 | Resources | project `<name>`, IAM applications `<name>-dispatch` and `<name>-cache`, bucket `<name>-cache-<project id>`, job definitions `<name>-<tag>`, namespace `<name>`, function `<name>-dispatch` |
-| Pool images | `registry.gitlab.com/<namespace>/ciburst/{base,node,rust,playwright,kaniko}` |
+| Pool images | `registry.gitlab.com/<namespace>/ciburst/{base,node,rust,playwright}` |
 | Image tags | `edge` from the default branch; `X.Y.Z`, `X.Y`, `X`, `latest` from a tag `vX.Y.Z` |
 | Binary | `ciburst-x86_64-unknown-linux-musl` in the framework project's generic package registry, linked from each release |
 | Runner | `gitlab-runner` 18.11.4, `run-single`, shell executor, one run per pending job, exits after `waitTimeoutS` idle seconds |
@@ -57,7 +57,7 @@ Gitignored. Never committed.
        file: ci/ciburst.yml
    ```
 2. Jobs in `lint` and `test` need nothing: `default: tags: [ci]`.
-3. Jobs of another pool extend `.ciburst-rust` (stage `rust`), `.ciburst-playwright` (stage `e2e`) or `.ciburst-build` (stage `build`, registry auth for kaniko). Declare these stages in `stages:`.
+3. Jobs of another pool extend `.ciburst-rust` (stage `rust`) or `.ciburst-playwright` (stage `e2e`); image builds extend `.ciburst-image-build` (stage `build`, hosted runner with Docker). Declare these stages in `stages:`.
 4. Jobs that need a Docker daemon set `tags: [saas-linux-small-amd64]` and keep `image:` and `services:`.
 5. The `image:` keyword is ignored in every pool; the playwright pool ships browsers for Playwright 1.64.1, so pin `@playwright/test` to 1.64.1.
 Check: `ciburst check` reports no problem; a pipeline shows each job on a runner named `<name>-<tag>`.
@@ -70,7 +70,6 @@ Check: `ciburst check` reports no problem; a pipeline shows each job on a runner
 | `node` | `node:24.22.1-bookworm-slim` | Node 24 | `runner` |
 | `rust` | `rust:1.96.0-bookworm` | Rust 1.96.0, rustfmt, clippy | `runner` |
 | `playwright` | `mcr.microsoft.com/playwright:v1.64.1-noble` | Node, Playwright 1.64.1 browsers | `runner` |
-| `kaniko` | `ghcr.io/osscontainertools/kaniko:v1.28.6-alpine` | `/kaniko/executor`, git, bash | `root` |
 
 Every image adds `gitlab-runner` from `gitlab/gitlab-runner:v18.11.4` and `images/base/entrypoint.sh` as `ciburst-entrypoint`. The entrypoint needs `CI_SERVER_URL` and `RUNNER_TOKEN`; with `CACHE_TYPE=s3` also `CACHE_S3_SERVER_ADDRESS`, `CACHE_S3_BUCKET_NAME`, `CACHE_S3_BUCKET_LOCATION`, `CACHE_S3_ACCESS_KEY`, `CACHE_S3_SECRET_KEY`. A missing one exits 64 and names it. `CIBURST_DRY_RUN=1` prints the command with the token and the cache keys masked. With arguments the entrypoint runs them instead.
 
@@ -117,15 +116,15 @@ Date: 2026-10-24. Region `fr-par`, config name `ciburst-dev`, images in the proj
    Result: done after five fixes below; second `plan` only `noop`: yes (17 unchanged).
 2. `ciburst check` on the drill consumer.
    Result: valid pipeline, 30 untagged jobs; every job needs a pool tag or a hosted runner tag.
-3. Pipeline with a node, a rust, a playwright and a kaniko job plus one `saas-linux-small-amd64` job.
-   Result: ____
+3. Pipeline with a node, a rust, a playwright and a kaniko job plus one `saas-linux-small-amd64` job (drill consumer branch `ciburst-drill`).
+   Result: node, rust, playwright pass; kaniko fails (item 5); hosted job ____.
 4. Start latency.
    Dispatcher answer: 0.1 to 0.4 s warm. Run queued to running: 14 s (`ci`, node image). Synthetic pending event, no job to take: run `succeeded` 111 s after running, of which 60 s idle window.
-   Per pool with a real job: ci ____ s, rust ____ s, playwright ____ s, build ____ s.
+   Per pool with a real job, queued then run: ci 3.5 to 6.9 s and 8 to 11 s; rust 27.5 to 28.5 s and 7.8 s; playwright 5.7 to 38.6 s and 9.6 to 17.9 s; first pulls of the larger images are the slow cases.
 5. Kaniko verdict: multi-stage build and push from the `build` pool under gVisor.
-   Result: ____ (works / needs `--force` / fails: ____)
+   Result: fails. Unpacking the base rootfs needs `chown`, which the sandbox denies (`chown /etc/shadow: operation not permitted`), for RUN and for COPY. The build pool is removed.
 6. Cache hit on the second run of the same job.
-   Result: ____ (`Successfully extracted cache`: yes / no)
+   Result: yes. First run uploads to the bucket in 4.7 s; the next pipeline restores it in 0.3 s (`Successfully extracted cache`).
 7. Cost on the Scaleway consumption page after the drill.
    Result: ____ EUR
 8. Logs.
@@ -174,8 +173,7 @@ Smoke result 2026-10-24: every image starts `run-single` as its user against an 
 | Date | Decision |
 |---|---|
 | 2026-10-24 | Runner pinned to `gitlab/gitlab-runner:v18.11.4`. |
-| 2026-10-24 | Build pool on `ghcr.io/osscontainertools/kaniko:v1.28.6-alpine`, the maintained fork of the archived kaniko; its alpine variant ships git and restores the filesystem after a build (`KANIKO_PRE_CLEANUP`, `KANIKO_CLEANUP`, `KANIKO_PRESERVE_CONTEXT`). |
-| 2026-10-24 | Build pool builds dir `/kaniko/builds`: kaniko never deletes `/kaniko`, so a multi-stage build keeps its context. |
+| 2026-10-24 | No build pool: kaniko fails in Scaleway's sandbox with `chown /etc/shadow: operation not permitted` while unpacking any base image (RUN and COPY alike); image builds run on hosted runners. |
 | 2026-10-24 | The entrypoint passes every value as a flag and unsets `RUNNER_TOKEN`, `CACHE_S3_ACCESS_KEY` and `CACHE_S3_SECRET_KEY` before `exec`, so job scripts do not inherit them. |
 | 2026-10-24 | The shell executor runs job steps in a bash login shell: every image writes its `PATH` to `/etc/profile.d/ciburst-path.sh` and the `runner` user has no `.bash_logout`. |
 | 2026-10-24 | Releases use `glab release create` in `registry.gitlab.com/gitlab-org/cli:v1.124.0` with `GLAB_ENABLE_CI_AUTOLOGIN`; `release-cli` is deprecated since GitLab 18.0. |

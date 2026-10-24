@@ -30,7 +30,7 @@ done
   echo
   echo "Pool images:"
   echo
-  for image in base node rust playwright kaniko; do
+  for image in base node rust playwright; do
     echo "- \`${CI_REGISTRY_IMAGE}/$image:$version\`"
   done
 } > release-notes.md
