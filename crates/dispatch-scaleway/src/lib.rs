@@ -80,6 +80,7 @@ impl Env {
             runner_tokens,
             dispatch: None,
             cache,
+            vm_secret: None,
         };
         let credentials = Credentials {
             secret_key: required(vars::SECRET_KEY)?,

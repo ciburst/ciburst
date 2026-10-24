@@ -241,6 +241,7 @@ mod tests {
                 access_key: "AK".into(),
                 secret_key: "SK".into(),
             }),
+            vm_secret: None,
         })
     }
 

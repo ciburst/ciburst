@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/cli", "crates/scaleway", "crates/dispatch-scaleway"]
+members = ["crates/core", "crates/cli", "crates/scaleway", "crates/dispatch-scaleway", "crates/vm-agent"]
 
 [workspace.package]
 version = "0.1.0"

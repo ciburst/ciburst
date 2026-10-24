@@ -14,6 +14,7 @@ use crate::{Error, Result};
 /// Keys of `.local/outputs.env`.
 pub mod keys {
     pub const HOOK_TOKEN: &str = "CIBURST_HOOK_TOKEN";
+    pub const VM_SECRET: &str = "CIBURST_VM_SECRET";
     pub const DISPATCH_URL: &str = "CIBURST_DISPATCH_URL";
     pub const DISPATCH_ACCESS_KEY: &str = "CIBURST_DISPATCH_ACCESS_KEY";
     pub const DISPATCH_SECRET_KEY: &str = "CIBURST_DISPATCH_SECRET_KEY";
@@ -59,6 +60,7 @@ pub fn secrets_from_outputs(config: &Config, outputs: &Outputs) -> Secrets {
     };
     Secrets {
         hook_token: outputs.get(keys::HOOK_TOKEN).cloned(),
+        vm_secret: outputs.get(keys::VM_SECRET).cloned(),
         runner_tokens,
         dispatch: pair(keys::DISPATCH_ACCESS_KEY, keys::DISPATCH_SECRET_KEY),
         cache: pair(keys::CACHE_ACCESS_KEY, keys::CACHE_SECRET_KEY),

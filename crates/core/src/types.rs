@@ -120,6 +120,9 @@ pub struct Secrets {
     pub runner_tokens: BTreeMap<String, String>,
     pub dispatch: Option<KeyPair>,
     pub cache: Option<KeyPair>,
+    /// Signs VM capability tokens (`crate::vm::token`); never leaves the dispatcher.
+    #[serde(default)]
+    pub vm_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +183,79 @@ pub trait Provider: Send + Sync {
     async fn start(&self, request: StartRequest) -> Result<String>;
     async fn list(&self, pool: Option<&str>) -> Result<Vec<Run>>;
     async fn stop(&self, run_id: &str) -> Result<()>;
+
+    /// Runs of `pool` that take several jobs (VMs), with their reported state; `None` for
+    /// one-job runs, where the dispatcher counts live runs instead. Spec section 6.1.
+    async fn capacity(&self, _pool: &str) -> Result<Option<Vec<VmCapacity>>> {
+        Ok(None)
+    }
+
+    /// Records that the dispatcher routed one pending job to `run_id`: its free slots drop by one.
+    async fn claim(&self, _run_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Stores a VM's own report (state, free slots) together with `now` as last seen.
+    async fn report(&self, _run_id: &str, _report: &VmReport, _now: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Ends runs that stopped behaving (spec section 6.1, sweep) and returns their ids.
+    async fn sweep(&self, _now: u64) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+}
+
+/// Lifecycle state of a VM run, spec section 6.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VmState {
+    Starting,
+    Idle,
+    Busy,
+    Draining,
+}
+
+impl VmState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VmState::Starting => "starting",
+            VmState::Idle => "idle",
+            VmState::Busy => "busy",
+            VmState::Draining => "draining",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<VmState> {
+        [
+            VmState::Starting,
+            VmState::Idle,
+            VmState::Busy,
+            VmState::Draining,
+        ]
+        .into_iter()
+        .find(|s| s.as_str() == value)
+    }
+}
+
+/// What a VM agent posts to the dispatcher's `/vm`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmReport {
+    pub state: VmState,
+    pub free: u32,
+    pub slots: u32,
+}
+
+/// A VM run as the scheduler sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmCapacity {
+    pub run_id: String,
+    pub state: VmState,
+    pub free: u32,
+    /// Unix seconds of the last report, `None` before the first one.
+    pub seen: Option<u64>,
+    /// Unix seconds of creation.
+    pub created_at: u64,
 }
 
 /// Where the dispatcher runs.

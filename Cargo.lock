@@ -206,6 +206,8 @@ name = "ciburst-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "hex",
+ "hmac",
  "rand 0.9.5",
  "reqwest",
  "serde",
@@ -245,6 +247,13 @@ dependencies = [
  "tempfile",
  "tokio",
  "zip",
+]
+
+[[package]]
+name = "ciburst-vm-agent"
+version = "0.1.0"
+dependencies = [
+ "ciburst-core",
 ]
 
 [[package]]

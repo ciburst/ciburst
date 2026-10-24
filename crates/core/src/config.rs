@@ -14,6 +14,7 @@ pub const DEFAULT_TIMEOUT_S: u32 = 3600;
 pub const DEFAULT_WAIT_TIMEOUT_S: u32 = 60;
 pub const DEFAULT_MAX_RUNS: u32 = 10;
 pub const DEFAULT_EXPIRE_DAYS: u32 = 30;
+pub const DEFAULT_SLOTS: u32 = 1;
 
 const fn d_vcpu() -> u32 {
     DEFAULT_VCPU
@@ -36,6 +37,9 @@ const fn d_max_runs() -> u32 {
 const fn d_expire() -> u32 {
     DEFAULT_EXPIRE_DAYS
 }
+const fn d_slots() -> u32 {
+    DEFAULT_SLOTS
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -56,6 +60,15 @@ pub struct Pool {
     pub wait_timeout_s: u32,
     #[serde(default = "d_max_runs")]
     pub max_runs: u32,
+    /// Provider-specific kind of run, for `scaleway`: `instances` (default) or `jobs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    /// Jobs one run takes in parallel (VM runtimes); one-job runtimes ignore it.
+    #[serde(default = "d_slots")]
+    pub slots: u32,
+    /// Machine types tried in order (VM runtimes); empty means the provider's default list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instance_types: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,6 +210,7 @@ pub fn validate(mut config: Config) -> Result<Config> {
                 ("timeoutS", pool.timeout_s),
                 ("waitTimeoutS", pool.wait_timeout_s),
                 ("maxRuns", pool.max_runs),
+                ("slots", pool.slots),
             ] {
                 if value == 0 {
                     errors.push(format!("{where_}.{field}: positive integer"));

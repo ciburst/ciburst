@@ -16,11 +16,11 @@ use ciburst_core::types::{Host, Provider, Rotation};
 use ciburst_core::{Error, Result};
 use ciburst_scaleway::client::{Credentials, DEFAULT_REGION, ScalewayClient};
 use ciburst_scaleway::host::{HOST_NAME as SCALEWAY_HOST, ScalewayFunction};
-use ciburst_scaleway::provider::{PROVIDER_NAME as SCALEWAY_PROVIDER, ScalewayJobs};
+use ciburst_scaleway::provider::ScalewayJobs;
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 
-pub const PROVIDERS: &[&str] = &["fake", SCALEWAY_PROVIDER];
+pub const PROVIDERS: &[&str] = &["fake", "scaleway", "scaleway-jobs"];
 pub const HOSTS: &[&str] = &["fake", SCALEWAY_HOST];
 
 #[derive(Parser)]
@@ -102,7 +102,7 @@ impl Modules {
                 self.config.clone(),
                 self.store("provider"),
             ))),
-            SCALEWAY_PROVIDER => {
+            "scaleway" | "scaleway-jobs" => {
                 let client = self.scaleway().await?;
                 Ok(Arc::new(ScalewayJobs::new(
                     self.config.clone(),

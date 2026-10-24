@@ -14,6 +14,7 @@ pub mod plan;
 pub mod provision;
 pub mod store;
 pub mod types;
+pub mod vm;
 
 pub mod testing;
 

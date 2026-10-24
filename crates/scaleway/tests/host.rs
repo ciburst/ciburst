@@ -51,6 +51,7 @@ fn secrets() -> Secrets {
             access_key: "SCWCACHE".into(),
             secret_key: "cache-secret".into(),
         }),
+        vm_secret: None,
     }
 }
 
