@@ -185,7 +185,7 @@ async fn secrets_reach_the_dispatcher_and_status_counts_runs() {
 }
 
 #[tokio::test]
-async fn the_vm_secret_is_written_once_and_rotates_with_the_hook() {
+async fn the_vm_secret_is_written_once_and_rotates_on_its_own() {
     let s = setup(config(&[7]), false);
     s.provisioner.apply(&[]).await.unwrap();
     let first = s.outputs.read().await.unwrap();
@@ -213,9 +213,18 @@ async fn the_vm_secret_is_written_once_and_rotates_with_the_hook() {
     assert_eq!(s.outputs.read().await.unwrap()[keys::VM_SECRET], secret);
 
     s.provisioner.apply(&[Rotation::Hook]).await.unwrap();
+    let hooked = s.outputs.read().await.unwrap();
+    assert_eq!(
+        hooked[keys::VM_SECRET],
+        secret,
+        "the hook leaves running VMs alone"
+    );
+    assert_ne!(hooked[keys::HOOK_TOKEN], first[keys::HOOK_TOKEN]);
+    assert_ne!(hooked[keys::SWEEP_TOKEN], first[keys::SWEEP_TOKEN]);
+
+    s.provisioner.apply(&[Rotation::Vm]).await.unwrap();
     let rotated = s.outputs.read().await.unwrap();
     assert_ne!(rotated[keys::VM_SECRET], secret);
-    assert_ne!(rotated[keys::HOOK_TOKEN], first[keys::HOOK_TOKEN]);
     let secrets = secrets_from_outputs(&s.config, &rotated);
     assert!(
         s.host
@@ -513,4 +522,28 @@ async fn a_removed_pool_deletes_its_runner() {
             .any(|s| s.action == Action::Delete && s.id.starts_with("runner:")),
         "runner demo-ci belongs to another deployment: {foreign:?}"
     );
+}
+
+#[tokio::test]
+async fn the_vm_secret_is_not_rotated_while_a_vm_runs() {
+    let mut vm_config = (*config(&[7])).clone();
+    vm_config.pools[0].runtime = Some("instances".into());
+    let s = setup(Arc::new(vm_config), false);
+    s.provisioner.apply(&[]).await.unwrap();
+    let before = s.outputs.read().await.unwrap()[keys::VM_SECRET].clone();
+    let pool = s.config.pools[0].clone();
+    s.provider
+        .start(ciburst_core::types::StartRequest {
+            pool,
+            env: BTreeMap::from([
+                ("RUNNER_TOKEN".to_string(), "glrt-ci".to_string()),
+                ("CIBURST_VM_SECRET".to_string(), before.clone()),
+            ]),
+            labels: BTreeMap::new(),
+        })
+        .await
+        .unwrap();
+    let error = s.provisioner.apply(&[Rotation::Vm]).await.unwrap_err();
+    assert!(error.to_string().contains("1 VMs are running"), "{error}");
+    assert_eq!(s.outputs.read().await.unwrap()[keys::VM_SECRET], before);
 }

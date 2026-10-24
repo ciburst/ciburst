@@ -15,6 +15,7 @@ use crate::{Error, Result};
 pub mod keys {
     pub const HOOK_TOKEN: &str = "CIBURST_HOOK_TOKEN";
     pub const VM_SECRET: &str = "CIBURST_VM_SECRET";
+    pub const SWEEP_TOKEN: &str = "CIBURST_SWEEP_TOKEN";
     pub const DISPATCH_URL: &str = "CIBURST_DISPATCH_URL";
     pub const DISPATCH_ACCESS_KEY: &str = "CIBURST_DISPATCH_ACCESS_KEY";
     pub const DISPATCH_SECRET_KEY: &str = "CIBURST_DISPATCH_SECRET_KEY";
@@ -61,6 +62,7 @@ pub fn secrets_from_outputs(config: &Config, outputs: &Outputs) -> Secrets {
     Secrets {
         hook_token: outputs.get(keys::HOOK_TOKEN).cloned(),
         vm_secret: outputs.get(keys::VM_SECRET).cloned(),
+        sweep_token: outputs.get(keys::SWEEP_TOKEN).cloned(),
         runner_tokens,
         dispatch: pair(keys::DISPATCH_ACCESS_KEY, keys::DISPATCH_SECRET_KEY),
         cache: pair(keys::CACHE_ACCESS_KEY, keys::CACHE_SECRET_KEY),
@@ -358,6 +360,23 @@ impl Provisioner {
         Ok(())
     }
 
+    /// A new VM secret would make every running VM's token invalid: its reports and its
+    /// `/terminate` fail, and the sweep ends it once silent, even mid-job.
+    async fn refuse_vm_rotation_while_running(&self) -> Result<()> {
+        let mut running = 0;
+        for pool in &self.config.pools {
+            if let Some(vms) = self.provider.capacity(&pool.tag).await? {
+                running += vms.len();
+            }
+        }
+        if running > 0 {
+            return Err(Error::other(format!(
+                "{running} VMs are running; rotate the VM secret when none runs"
+            )));
+        }
+        Ok(())
+    }
+
     /// A random secret of 32 alphanumerics under `key`, written once and replaced on rotation.
     async fn ensure_secret(&self, key: &str, rotate: bool) -> Result<String> {
         let current = self.outputs.read().await?;
@@ -393,8 +412,12 @@ impl Provisioner {
         let mut applied = Vec::new();
         let rotate_hook = rotate.contains(&Rotation::Hook);
         let hook_token = self.ensure_secret(keys::HOOK_TOKEN, rotate_hook).await?;
-        // Rotating it invalidates the tokens of running VMs; they are swept once silent.
-        let vm_secret = self.ensure_secret(keys::VM_SECRET, rotate_hook).await?;
+        let sweep_token = self.ensure_secret(keys::SWEEP_TOKEN, rotate_hook).await?;
+        let rotate_vm = rotate.contains(&Rotation::Vm);
+        if rotate_vm {
+            self.refuse_vm_rotation_while_running().await?;
+        }
+        let vm_secret = self.ensure_secret(keys::VM_SECRET, rotate_vm).await?;
 
         let provider_rotate = provider_rotations(rotate);
         let provider_steps = self.provider.plan(&provider_rotate).await?;
@@ -421,6 +444,7 @@ impl Provisioner {
         let mut secrets = secrets_from_outputs(&self.config, &self.outputs.read().await?);
         secrets.hook_token = Some(hook_token.clone());
         secrets.vm_secret = Some(vm_secret);
+        secrets.sweep_token = Some(sweep_token);
         let host_steps = self.host.plan(&secrets).await?;
         let host_outputs = self.host.apply(&host_steps, &secrets).await?;
         self.outputs.write(&host_outputs, true).await?;

@@ -16,7 +16,7 @@
 //! this host's plan; the function does not read it. The sha256 of the settings and both
 //! environments is kept in the function's `description` as `ciburst:<hex>`.
 //!
-//! The cron posts `{"ciburst_sweep": "<hook token>"}` to the function every 30 minutes. The API
+//! The cron posts `{"ciburst_sweep": "<sweep token>"}` to the function every 30 minutes. The API
 //! returns a cron's `args` as stored, so the plan compares schedule and args directly.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -71,6 +71,7 @@ pub mod vars {
     pub const CACHE_ACCESS_KEY: &str = "CACHE_S3_ACCESS_KEY";
     pub const CACHE_SECRET_KEY: &str = "CACHE_S3_SECRET_KEY";
     pub const VM_SECRET: &str = "CIBURST_VM_SECRET";
+    pub const SWEEP_TOKEN: &str = "CIBURST_SWEEP_TOKEN";
     pub const CODE_DIGEST: &str = "CIBURST_CODE_DIGEST";
 
     /// `RUNNER_TOKEN_<TAG>`: tag upper-cased, every other character than ASCII letters and
@@ -227,6 +228,9 @@ impl ScalewayFunction {
         }
         if let Some(vm_secret) = &secrets.vm_secret {
             secret.insert(vars::VM_SECRET.to_string(), vm_secret.clone());
+        }
+        if let Some(sweep_token) = &secrets.sweep_token {
+            secret.insert(vars::SWEEP_TOKEN.to_string(), sweep_token.clone());
         }
         Ok(Settings {
             runtime: RUNTIME,
@@ -657,7 +661,7 @@ impl Host for ScalewayFunction {
 
 /// The cron's arguments, which the function receives as its JSON body.
 fn sweep_args(secrets: &Secrets) -> Value {
-    json!({ SWEEP_ARG: secrets.hook_token.as_deref().unwrap_or("") })
+    json!({ SWEEP_ARG: secrets.sweep_token.as_deref().unwrap_or("") })
 }
 
 fn cron_differs(cron: &Value, args: &Value) -> bool {

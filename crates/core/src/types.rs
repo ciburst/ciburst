@@ -123,6 +123,9 @@ pub struct Secrets {
     /// Signs VM capability tokens (`crate::vm::token`); never leaves the dispatcher.
     #[serde(default)]
     pub vm_secret: Option<String>,
+    /// Authenticates the cron trigger's sweep, so the hook token never sits in the cron's args.
+    #[serde(default)]
+    pub sweep_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,14 +134,17 @@ pub enum Rotation {
     Hook,
     Key,
     Cache,
+    /// The VM capability secret; refused while VMs run, because their tokens would stop working.
+    Vm,
 }
 
 impl Rotation {
-    pub const ALL: [Rotation; 4] = [
+    pub const ALL: [Rotation; 5] = [
         Rotation::Runner,
         Rotation::Hook,
         Rotation::Key,
         Rotation::Cache,
+        Rotation::Vm,
     ];
 
     pub fn parse(value: &str) -> Option<Rotation> {
@@ -151,6 +157,7 @@ impl Rotation {
             Rotation::Hook => "hook",
             Rotation::Key => "key",
             Rotation::Cache => "cache",
+            Rotation::Vm => "vm",
         }
     }
 

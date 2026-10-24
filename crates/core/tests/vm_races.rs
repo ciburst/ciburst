@@ -34,6 +34,7 @@ const DETECT_S: u64 = 5;
 const KERNEL_S: u64 = 20;
 const SWEEP_EVERY_S: u64 = 1800;
 const HOOK: &str = "hook-token";
+const SWEEP: &str = "sweep-token";
 const VM_SECRET: &str = "vm-secret";
 
 /// Lets two dispatcher calls read capacity before either claims, the double-claim race.
@@ -217,6 +218,7 @@ impl Sim {
             dispatch: None,
             cache: None,
             vm_secret: Some(VM_SECRET.into()),
+            sweep_token: Some(SWEEP.into()),
         };
         let (log, lines) = Log::memory();
         Sim {
@@ -374,7 +376,7 @@ impl Sim {
     }
 
     async fn sweep(&mut self) {
-        let body = json!({ vm::SWEEP_ARG: HOOK }).to_string().into_bytes();
+        let body = json!({ vm::SWEEP_ARG: SWEEP }).to_string().into_bytes();
         let response = self.request("/", &[], &body).await;
         assert_eq!(response.status, 200, "{}", response.body);
         assert_eq!(response.body["result"], "swept");
@@ -854,9 +856,9 @@ async fn a_long_job_keeps_its_vm_through_every_sweep() {
 }
 
 #[tokio::test]
-async fn the_sweep_needs_the_hook_token() {
+async fn the_sweep_needs_the_sweep_token() {
     let sim = Sim::new(1, 1).await;
-    for given in [json!("wrong"), json!(""), Value::Null] {
+    for given in [json!("wrong"), json!(""), Value::Null, json!(HOOK)] {
         let body = json!({ vm::SWEEP_ARG: given }).to_string().into_bytes();
         assert_eq!(sim.request("/", &[], &body).await.status, 401);
     }

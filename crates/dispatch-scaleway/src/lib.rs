@@ -87,6 +87,7 @@ impl Env {
             dispatch: None,
             cache,
             vm_secret: optional(vars::VM_SECRET),
+            sweep_token: optional(vars::SWEEP_TOKEN),
         };
         let credentials = Credentials {
             secret_key: required(vars::SECRET_KEY)?,
@@ -276,6 +277,7 @@ mod tests {
             (vars::CONFIG, CONFIG),
             (vars::HOOK_TOKEN, "hook-secret"),
             (vars::VM_SECRET, VM_SECRET),
+            (vars::SWEEP_TOKEN, "sweep-secret"),
             ("RUNNER_TOKEN_CI", "glrt-ci"),
             ("RUNNER_TOKEN_BUILD_X", "glrt-build"),
             ("RUNNER_TOKEN_VM", "glrt-vm"),
@@ -705,7 +707,7 @@ mod tests {
             "POST",
             "/",
             &[("content-type", "application/json")],
-            br#"{"ciburst_sweep":"hook-secret"}"#,
+            br#"{"ciburst_sweep":"sweep-secret"}"#,
             stuck,
         )
         .await;

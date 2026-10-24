@@ -99,11 +99,24 @@ impl Dispatcher {
         if let Some(given) = sweep_arg(body) {
             return self.sweep(given.as_deref(), now).await;
         }
-        self.handle(headers, body).await
+        self.webhook(headers, body, now).await
     }
 
-    /// The GitLab webhook.
+    /// The GitLab webhook at the current time.
     pub async fn handle(&self, headers: &[(String, String)], body: &[u8]) -> DispatchResponse {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.webhook(headers, body, now).await
+    }
+
+    async fn webhook(
+        &self,
+        headers: &[(String, String)],
+        body: &[u8],
+        now: u64,
+    ) -> DispatchResponse {
         if !token_matches(
             header(headers, "x-gitlab-token"),
             self.secrets.hook_token.as_deref(),
@@ -141,7 +154,7 @@ impl Dispatcher {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         fields.push(("pool", &pool.tag));
-        match self.schedule(&pool, labels.clone()).await {
+        match self.schedule(&pool, labels.clone(), now).await {
             Ok(Decision::Claimed { run_id, free }) => {
                 let free = free.to_string();
                 fields.push(("run", &run_id));
@@ -172,7 +185,12 @@ impl Dispatcher {
     /// Spec 6.1, scheduling: a free slot of an `idle` or `busy` VM is claimed; otherwise a run
     /// starts unless `maxRuns` runs are live (VMs: not draining). Providers without VMs answer
     /// `None` from `capacity` and count live runs.
-    async fn schedule(&self, pool: &Pool, labels: BTreeMap<String, String>) -> Result<Decision> {
+    async fn schedule(
+        &self,
+        pool: &Pool,
+        labels: BTreeMap<String, String>,
+        now: u64,
+    ) -> Result<Decision> {
         let Some(vms) = self.provider.capacity(&pool.tag).await? else {
             let live = self
                 .provider
@@ -186,17 +204,29 @@ impl Dispatcher {
             }
             return self.start(pool, labels, false).await;
         };
-        if let Some(target) = best_slot(&vms) {
+        if let Some(target) = best_slot(&vms, now) {
             let free: u64 = vms
                 .iter()
-                .filter(|v| counts_as_capacity(v.state))
+                .filter(|v| counts_as_capacity(v, now))
                 .map(|v| u64::from(v.free))
                 .sum();
-            self.provider.claim(&target.run_id).await?;
-            return Ok(Decision::Claimed {
-                run_id: target.run_id.clone(),
-                free,
-            });
+            match self.provider.claim(&target.run_id).await {
+                Ok(()) => {
+                    return Ok(Decision::Claimed {
+                        run_id: target.run_id.clone(),
+                        free,
+                    });
+                }
+                Err(error) => {
+                    // A failed claim must not leave the job unserved; a new VM costs one hour.
+                    let message = error.to_string();
+                    self.log.warn(
+                        "claim_failed",
+                        &[("run", &target.run_id), ("error", &message)],
+                    );
+                    return self.start(pool, labels, true).await;
+                }
+            }
         }
         let live = vms.iter().filter(|v| v.state != VmState::Draining).count();
         if live >= pool.max_runs as usize {
@@ -297,7 +327,7 @@ impl Dispatcher {
     }
 
     async fn sweep(&self, given: Option<&str>, now: u64) -> DispatchResponse {
-        if !token_matches(given, self.secrets.hook_token.as_deref()) {
+        if !token_matches(given, self.secrets.sweep_token.as_deref()) {
             self.log.warn("unauthorized", &[("route", "sweep")]);
             return unauthorized();
         }
@@ -324,16 +354,24 @@ enum Decision {
     Started(String),
 }
 
-/// `starting` VMs do not poll yet and `draining` ones stop soon; neither takes a routed job.
-fn counts_as_capacity(state: VmState) -> bool {
-    matches!(state, VmState::Idle | VmState::Busy)
+/// Seconds after its last report that a VM still counts as capacity: two heartbeats and a
+/// minute, so one lost report does not matter but a hung VM stops absorbing claims.
+pub const CAPACITY_FRESH_S: u64 = 2 * vm::HEARTBEAT_S + 60;
+
+/// `starting` VMs do not poll yet, `draining` ones stop soon, and a VM silent for longer than
+/// [`CAPACITY_FRESH_S`] may hang; none of them takes a routed job.
+fn counts_as_capacity(vm: &VmCapacity, now: u64) -> bool {
+    matches!(vm.state, VmState::Idle | VmState::Busy)
+        && vm
+            .seen
+            .is_some_and(|seen| now.saturating_sub(seen) <= CAPACITY_FRESH_S)
 }
 
 /// The VM with the most free slots; on a tie the one seen longest ago, then by id, so the
 /// choice is deterministic.
-fn best_slot(vms: &[VmCapacity]) -> Option<&VmCapacity> {
+fn best_slot(vms: &[VmCapacity], now: u64) -> Option<&VmCapacity> {
     vms.iter()
-        .filter(|v| counts_as_capacity(v.state) && v.free > 0)
+        .filter(|v| counts_as_capacity(v, now) && v.free > 0)
         .min_by(|a, b| {
             b.free
                 .cmp(&a.free)
@@ -441,6 +479,7 @@ mod tests {
                 secret_key: "SK".into(),
             }),
             vm_secret: None,
+            sweep_token: None,
         })
     }
 
@@ -464,6 +503,7 @@ mod tests {
         inner: Arc<FakeProvider>,
         started: Mutex<Vec<StartRequest>>,
         fail: bool,
+        fail_claim: std::sync::atomic::AtomicBool,
     }
 
     use std::sync::Mutex;
@@ -499,6 +539,9 @@ mod tests {
             self.inner.capacity(pool).await
         }
         async fn claim(&self, run_id: &str) -> Result<()> {
+            if self.fail_claim.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(Error::provider("tag update refused"));
+            }
             self.inner.claim(run_id).await
         }
         async fn report(&self, run_id: &str, report: &VmReport, now: u64) -> Result<()> {
@@ -521,6 +564,7 @@ mod tests {
             inner,
             started: Mutex::new(Vec::new()),
             fail,
+            fail_claim: Default::default(),
         });
         let (log, lines) = Log::memory();
         let dispatcher = Dispatcher::new(config, recording.clone(), secrets(), log);
@@ -701,7 +745,7 @@ mod tests {
             seen,
             created_at: 0,
         };
-        let pick = |vms: &[VmCapacity]| best_slot(vms).map(|v| v.run_id.clone());
+        let pick = |vms: &[VmCapacity]| best_slot(vms, 10).map(|v| v.run_id.clone());
         assert_eq!(pick(&[]), None);
         assert_eq!(
             pick(&[
@@ -762,6 +806,7 @@ mod tests {
             dispatch: None,
             cache: None,
             vm_secret: Some(VM_SECRET.into()),
+            sweep_token: Some("sweep-secret".into()),
         }
     }
 
@@ -782,6 +827,7 @@ mod tests {
             inner,
             started: Mutex::new(Vec::new()),
             fail: false,
+            fail_claim: Default::default(),
         });
         let (log, lines) = Log::memory();
         VmSetup {
@@ -1075,7 +1121,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_cron_body_sweeps_with_the_hook_token() {
+    async fn the_cron_body_sweeps_with_the_sweep_token() {
         let s = vm_setup(vm_secrets()).await;
         let run = run_of(&s.pending("test", 1).await);
         let sweep = |token: Value| json!({ vm::SWEEP_ARG: token }).to_string().into_bytes();
@@ -1083,7 +1129,8 @@ mod tests {
             sweep(json!("wrong")),
             sweep(json!(7)),
             sweep(Value::Null),
-            sweep(json!("hook-secret-x")),
+            sweep(json!("sweep-secret-x")),
+            sweep(json!("hook-secret")),
         ] {
             let response = s.post("/", &[], &body).await;
             assert_eq!(response.status, 401);
@@ -1092,13 +1139,13 @@ mod tests {
         let late = T0 + vm::SWEEP_STARTING_S + 1;
         let early = s
             .dispatcher
-            .handle_request("POST", "/", &[], &sweep(json!("hook-secret")), T0 + 60)
+            .handle_request("POST", "/", &[], &sweep(json!("sweep-secret")), T0 + 60)
             .await;
         assert_eq!(early.status, 200);
         assert_eq!(early.body, json!({ "result": "swept", "runs": [] }));
         let response = s
             .dispatcher
-            .handle_request("POST", "/", &[], &sweep(json!("hook-secret")), late)
+            .handle_request("POST", "/", &[], &sweep(json!("sweep-secret")), late)
             .await;
         assert_eq!(response.status, 200);
         assert_eq!(response.body, json!({ "result": "swept", "runs": [run] }));
@@ -1109,17 +1156,17 @@ mod tests {
                 .iter()
                 .any(|l| l.starts_with("info swept") && l.contains("count=\"1\""))
         );
-        assert!(!lines.iter().any(|l| l.contains("hook-secret")));
+        assert!(!lines.iter().any(|l| l.contains("sweep-secret")));
         assert_eq!(
             lines
                 .iter()
                 .filter(|l| *l == r#"warn unauthorized route="sweep""#)
                 .count(),
-            4
+            5
         );
 
         let mut secrets = vm_secrets();
-        secrets.hook_token = None;
+        secrets.sweep_token = None;
         let no_hook = vm_setup(secrets).await;
         let response = no_hook.post("/", &[], &sweep(json!(""))).await;
         assert_eq!(response.status, 401);
@@ -1150,5 +1197,48 @@ mod tests {
         assert_eq!(unauthorized.status, 401);
         assert_eq!(unauthorized.body, Value::Null);
         assert_eq!(recording.started.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_silent_vm_is_not_capacity() {
+        let s = vm_setup(vm_secrets()).await;
+        let run = run_of(&s.pending("test", 1).await);
+        s.report(&run, VmState::Idle, 2).await;
+        let fresh = s
+            .dispatcher
+            .handle_request(
+                "POST",
+                "/",
+                &headers("hook-secret"),
+                &event("test", "pending", 7, 2),
+                T0 + 60,
+            )
+            .await;
+        assert_eq!(fresh.body["result"], "claimed");
+        let stale = s
+            .dispatcher
+            .handle_request(
+                "POST",
+                "/",
+                &headers("hook-secret"),
+                &event("test", "pending", 7, 3),
+                T0 + 60 + CAPACITY_FRESH_S + 1,
+            )
+            .await;
+        assert_eq!(stale.body["result"], "started", "{}", stale.body);
+    }
+
+    #[tokio::test]
+    async fn a_failed_claim_starts_a_vm() {
+        let s = vm_setup(vm_secrets()).await;
+        let run = run_of(&s.pending("test", 1).await);
+        s.report(&run, VmState::Idle, 2).await;
+        s.recording
+            .fail_claim
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let response = s.pending("test", 2).await;
+        assert_eq!(response.body["result"], "started", "{}", response.body);
+        assert_ne!(run_of(&response), run);
+        assert!(s.lines().iter().any(|l| l.starts_with("warn claim_failed")));
     }
 }

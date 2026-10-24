@@ -54,6 +54,7 @@ fn secrets() -> Secrets {
             secret_key: "cache-secret".into(),
         }),
         vm_secret: Some("vm-secret".into()),
+        sweep_token: Some("sweep-secret".into()),
     }
 }
 
@@ -142,6 +143,7 @@ async fn plans_applies_and_converges() {
             "CACHE_S3_ACCESS_KEY",
             "CACHE_S3_SECRET_KEY",
             "CIBURST_DISPATCH_KEY",
+            "CIBURST_SWEEP_TOKEN",
             "CIBURST_VM_SECRET",
             "HOOK_TOKEN",
             "RUNNER_TOKEN_BUILD_X",
@@ -159,7 +161,7 @@ async fn plans_applies_and_converges() {
     let cron = fake.cron(CRON).unwrap();
     assert_eq!(cron["function_id"], function["id"]);
     assert_eq!(cron["schedule"], "*/30 * * * *");
-    assert_eq!(cron["args"], json!({ "ciburst_sweep": "hook-secret" }));
+    assert_eq!(cron["args"], json!({ "ciburst_sweep": "sweep-secret" }));
     assert_eq!(cron["status"], "ready", "apply waits for the cron");
     assert!(
         !function.to_string().contains("glrt-"),
@@ -229,6 +231,7 @@ async fn a_rotated_hook_token_updates_the_function_and_the_cron() {
 
     let mut rotated = secrets();
     rotated.hook_token = Some("hook-rotated".into());
+    rotated.sweep_token = Some("sweep-rotated".into());
     let plan = host.plan(&rotated).await.unwrap();
     assert_eq!(
         actions(&plan),
@@ -254,7 +257,7 @@ async fn a_rotated_hook_token_updates_the_function_and_the_cron() {
     );
     let cron = fake.cron(CRON).unwrap();
     assert_eq!(cron["id"], cron_id, "updated in place");
-    assert_eq!(cron["args"], json!({ "ciburst_sweep": "hook-rotated" }));
+    assert_eq!(cron["args"], json!({ "ciburst_sweep": "sweep-rotated" }));
     assert_eq!(cron["status"], "ready");
     assert_eq!(
         fake.function(FUNCTION).unwrap()["environment_variables"][vars::CODE_DIGEST],
@@ -357,7 +360,7 @@ async fn a_cron_changed_or_removed_outside_is_repaired() {
         host.apply(&plan, &secrets()).await.unwrap();
         let cron = fake.cron(CRON).unwrap();
         assert_eq!(cron["schedule"], "*/30 * * * *");
-        assert_eq!(cron["args"], json!({ "ciburst_sweep": "hook-secret" }));
+        assert_eq!(cron["args"], json!({ "ciburst_sweep": "sweep-secret" }));
     }
 
     let id = fake.cron(CRON).unwrap()["id"].as_str().unwrap().to_string();
