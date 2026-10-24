@@ -28,7 +28,7 @@ Status: M1 done 2026-10-24 (provider, host and function, images, CI, runbook); w
 | D20 | 2026-10-24 | The `build` pool is the osscontainertools kaniko fork, alpine variant (ships git), with builds dir `/kaniko/builds`: kaniko wipes the filesystem between stages but never `/kaniko`. |
 | D21 | 2026-10-24 | Every image writes its PATH to `/etc/profile.d/ciburst-path.sh` and removes `~/.bash_logout`, because the shell executor runs job steps in a login shell. |
 | D22 | 2026-10-24 | Releases on tags `vX.Y.Z` publish the five images as `X.Y.Z`, `X.Y`, `X` and `latest` (`edge` on `main`) and the Linux x86_64 musl binary through `glab`. Configs reference images by major tag (`node:1`), or `edge` before the first release. macOS and Windows binaries are backlog. |
-| D23 | 2026-10-24 | Adopters set up through their own pipeline, not from a workstation: a manual `ciburst-setup` job from the include runs the `ciburst` binary on a GitLab hosted runner (free 400 minutes per month), takes the Scaleway key and a project access token from four masked CI variables, and stores the outputs as masked project variables instead of `.local/outputs.env`. The local CLI with `.local/` stays the developer path; the owner's personal token is used only for the M2 drill. |
+| D23 | 2026-10-24 | Adopters set up through their own pipeline, not from a workstation: a manual `ciburst-setup` job from the include runs the `ciburst` binary on a GitLab hosted runner (free 400 minutes per month), takes the Scaleway key and a personal access token from four masked CI variables, and stores the outputs as masked project variables instead of `.local/outputs.env`. The local CLI with `.local/` stays the developer path; the owner's personal token is used only for the M2 drill. |
 | D24 | 2026-10-24 | Hosting: canonical on GitLab.com in the group `ciburst`, project `ciburst/ciburst`, private until v1.0.0, then public with a read-only push mirror to the GitHub organization `ciburst`. Issues and merge requests stay on GitLab. |
 | D25 | 2026-10-24 | No GitLab for Open Source program, so a commercial service stays possible. The framework's CI runs on the Free tier's 400 minutes per month; path rules and merge-request pipelines keep it there. |
 | D26 | 2026-10-24 | Project domain `ciburst.zwa.la`: the docs site on GitLab Pages at v1.0.0. It is the one real hostname allowed in the repository. |
@@ -67,7 +67,7 @@ Backlog, not v1: a scheduled sweep that polls pending jobs; routing by job name 
 
 | Persona | Journey | Steps |
 |---|---|---|
-| Project owner | Give a GitLab project serverless runners | 1 create a Scaleway API key and a project access token, 2 set four masked CI variables, 3 include `ci/ciburst.yml` and run the manual `ciburst-setup` job; tag jobs of non-default pools |
+| Project owner | Give a GitLab project serverless runners | 1 create a Scaleway API key and a personal access token (scopes `api`, `create_runner`), 2 set four masked CI variables, 3 include `ci/ciburst.yml` and run the manual `ciburst-setup` job; tag jobs of non-default pools |
 | Project owner | Add a toolchain | 1 add a pool with an image and its stages, 2 `ciburst apply`, 3 `ciburst check` |
 | Provider author | Add a cloud | 1 implement the `Provider` trait in a crate, 2 pass the contract tests, 3 register the name, 4 document it |
 | Operator | See what runs and what it costs | `ciburst status` and the provider's consumption page |
@@ -130,7 +130,7 @@ Core modules: `config` (schema, defaults, validation reporting every error), `di
 }
 ```
 
-Secrets come from `.local/scaleway.env` (`SCW_ACCESS_KEY`, `SCW_SECRET_KEY`, `SCW_DEFAULT_ORGANIZATION_ID`, `SCW_DEFAULT_PROJECT_ID` optional) and `.local/gitlab.env` (`GITLAB_TOKEN`, scope `api`). Validation rejects a pool above the provider's capabilities, a tag or a stage used twice, and a `defaultPool` that is not a pool. `name` is 2 to 20 characters, so the bucket name `<name>-cache-<project id>` stays within the S3 limit of 63.
+Secrets come from `.local/scaleway.env` (`SCW_ACCESS_KEY`, `SCW_SECRET_KEY`, `SCW_DEFAULT_ORGANIZATION_ID`, `SCW_DEFAULT_PROJECT_ID` optional) and `.local/gitlab.env` (`GITLAB_TOKEN`, scopes `api` and `create_runner`). Validation rejects a pool above the provider's capabilities, a tag or a stage used twice, and a `defaultPool` that is not a pool. `name` is 2 to 20 characters, so the bucket name `<name>-cache-<project id>` stays within the S3 limit of 63.
 
 ### 5.5 Repository layout
 
@@ -188,7 +188,7 @@ Secrets inventory:
 | Secret | Where | Lifetime | Rotation |
 |---|---|---|---|
 | Owner Scaleway key, access and secret key (IAMManager, ProjectManager, ServerlessJobsFullAccess, FunctionsFullAccess, ObjectStorageFullAccess, ContainerRegistryFullAccess) | `.local/scaleway.env` | owner chosen | delete after M2 |
-| Owner GitLab token, scope `api` | `.local/gitlab.env` | owner chosen | delete after M2, recreate for `check` and `rotate` |
+| Owner GitLab token, scopes `api` and `create_runner` | `.local/gitlab.env` | owner chosen | delete after M2, recreate for `check` and `rotate` |
 | Dispatch IAM key | function secret env, `.local/outputs.env` | none | `ciburst rotate key` |
 | Cache IAM key | function secret env, run env override, `.local/outputs.env` | none | `ciburst rotate cache` |
 | Runner tokens `glrt-`, one per pool | function secret env, run env override | until the runner is deleted | `ciburst rotate runner` |
@@ -205,7 +205,7 @@ While the project is private, `scripts/ci-push-image.sh` also pushes every image
 
 Consumer side: `include: project: <namespace>/ciburst, ref: v1, file: ci/ciburst.yml` sets `default: tags: [ci]`; jobs in a non-default pool set `tags: [<pool>]`; jobs that need a Docker daemon set `tags: [saas-linux-small-amd64]`; image builds use the `build` pool and `/kaniko/executor`. `ciburst check` runs against every configured project after `apply`.
 
-Adoption pipeline (M3): the include also carries `ciburst-setup` (manual, stage `.pre`, `tags: [saas-linux-small-amd64]`, image `registry.gitlab.com/<namespace>/ciburst/cli:1`), `ciburst-check` (automatic, same runner, reports jobs whose tags disagree with the stage map) and `ciburst-destroy` (manual). Inputs are four masked CI variables: `SCW_ACCESS_KEY`, `SCW_SECRET_KEY`, `SCW_DEFAULT_ORGANIZATION_ID`, `CIBURST_GITLAB_TOKEN` (a project access token, role Maintainer, scopes `api` and `create_runner`; the job token cannot create runners, hooks or variables). The config comes from `ciburst.json` in the consumer repo, or from defaults when the file is absent: `name` `ci-<project id>`, `projectIds` `[CI_PROJECT_ID]`, the four pools of `config.example.json` on the framework images. Outputs (`CIBURST_*`) are written as masked project variables through the API and read back from the job environment on the next run, so a second run plans only `noop`. `apply --no-wait` skips the readiness poll: the hook URL is known at function creation, the deploy continues on Scaleway, and the job ends in about two minutes, so a setup costs about two hosted-runner minutes. One owner step remains per adopter: creating the two tokens.
+Adoption pipeline (M3): the include also carries `ciburst-setup` (manual, stage `.pre`, `tags: [saas-linux-small-amd64]`, image `registry.gitlab.com/<namespace>/ciburst/cli:1`), `ciburst-check` (automatic, same runner, reports jobs whose tags disagree with the stage map) and `ciburst-destroy` (manual). Inputs are four masked CI variables: `SCW_ACCESS_KEY`, `SCW_SECRET_KEY`, `SCW_DEFAULT_ORGANIZATION_ID`, `CIBURST_GITLAB_TOKEN` (a personal access token of a project Owner with the scopes `api` and `create_runner`: runner creation needs `create_runner` and the Owner role, hooks and variables need `api`; the job token can create none of them, and project access tokens are a Premium feature on GitLab.com; an adopter who wants the token separate from a person creates a dedicated GitLab user with the Owner role). The config comes from `ciburst.json` in the consumer repo, or from defaults when the file is absent: `name` `ci-<project id>`, `projectIds` `[CI_PROJECT_ID]`, the four pools of `config.example.json` on the framework images. Outputs (`CIBURST_*`) are written as masked project variables through the API and read back from the job environment on the next run, so a second run plans only `noop`. `apply --no-wait` skips the readiness poll: the hook URL is known at function creation, the deploy continues on Scaleway, and the job ends in about two minutes, so a setup costs about two hosted-runner minutes. One owner step remains per adopter: creating the two tokens.
 
 ## 9. Testing
 
@@ -267,7 +267,7 @@ Glossary: pool (tag, image, resources, stages), run (one serverless container ex
 ## 14. Owner inputs
 
 1. The go for M1.
-2. For M2: `.local/scaleway.env` with a setup key holding `IAMManager`, `ProjectManager`, `ServerlessJobsFullAccess`, `FunctionsFullAccess`, `ObjectStorageFullAccess`, `ContainerRegistryFullAccess` on the organization; `.local/gitlab.env` with a personal access token, scope `api`, expiry chosen, and the drill consumer project id.
+2. For M2: `.local/scaleway.env` with a setup key holding `IAMManager`, `ProjectManager`, `ServerlessJobsFullAccess`, `FunctionsFullAccess`, `ObjectStorageFullAccess`, `ContainerRegistryFullAccess` on the organization; `.local/gitlab.env` with a personal access token of a project Owner, scopes `api` and `create_runner`, expiry chosen, and the drill consumer project id.
 3. The GitLab group `ciburst` and the private project `ciburst/ciburst` with hosted runners enabled, created through the API with the token on the push confirmation. At v1.0.0: DNS for `ciburst.zwa.la` (CNAME to GitLab Pages plus the verification TXT record) and the GitHub organization `ciburst`.
 
 ## 15. Sources, checked 2026-10-23 and 2026-10-24

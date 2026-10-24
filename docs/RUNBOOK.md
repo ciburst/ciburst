@@ -16,7 +16,7 @@
 
 1. Scaleway: create an API key with a policy on the organization holding `IAMManager`, `ProjectManager`, `ServerlessJobsFullAccess`, `FunctionsFullAccess`, `ObjectStorageFullAccess`. Write `.local/scaleway.env` with `SCW_ACCESS_KEY`, `SCW_SECRET_KEY`, `SCW_DEFAULT_ORGANIZATION_ID` (optional `SCW_DEFAULT_PROJECT_ID`), then `chmod 600 .local/scaleway.env`.
    Check: `ciburst plan --config .local/config.json --skip-gitlab` prints the provider and host steps without an authentication error.
-2. GitLab: create a personal access token with scope `api` and an expiry. Write `GITLAB_TOKEN=<token>` to `.local/gitlab.env`, then `chmod 600 .local/gitlab.env`.
+2. GitLab: create a personal access token with scopes `api` and `create_runner` and an expiry. Write `GITLAB_TOKEN=<token>` to `.local/gitlab.env`, then `chmod 600 .local/gitlab.env`.
    Check: `ciburst plan --config .local/config.json` prints runner and hook steps.
 3. Framework project `<namespace>/ciburst`: public, instance runners enabled (Settings, CI/CD, Runners), container registry visible to everyone.
    Check: the default-branch pipeline is green and `docker pull registry.gitlab.com/<namespace>/ciburst/node:edge` works without `docker login`.
