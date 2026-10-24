@@ -14,7 +14,7 @@ Base: the commit that adds this file. Three agents in worktrees, merged by the o
 
 ## Binding rules
 
-1. Names: every cloud resource is `<config.name>-<suffix>`: project `<name>`, IAM applications `<name>-dispatch` and `<name>-cache`, bucket `<name>-cache-<project id>`, job definitions `<name>-<pool.tag>`, namespace `<name>`, function `<name>-dispatch`.
+1. Names: `config.name` is at most 20 characters. Every cloud resource is `<config.name>-<suffix>`: project `<name>`, IAM applications `<name>-dispatch` and `<name>-cache`, bucket `<name>-cache-<project id>`, job definitions `<name>-<pool.tag>`, namespace `<name>`, function `<name>-dispatch`.
 2. Step ids: `project`, `key:dispatch`, `key:cache`, `bucket`, `definition:<tag>` (provider); `namespace`, `function`, `code` (host). Lookup by name before every create; a second `apply` plans only `noop`.
 3. Outputs: `CIBURST_PROJECT_ID`, `CIBURST_DISPATCH_ACCESS_KEY`, `CIBURST_DISPATCH_SECRET_KEY`, `CIBURST_CACHE_ACCESS_KEY`, `CIBURST_CACHE_SECRET_KEY` (provider, secrets only when created or rotated), `CIBURST_DISPATCH_URL` (host).
 4. Job definition fields: `cpu_limit` = vcpu x 1000 mvCPU, `memory_limit` MiB, `local_storage_capacity` MiB, `image_uri`, `job_timeout` as `"<seconds>s"`, `environment_variables` `CIBURST_POOL`, `CI_SERVER_URL`, `RUNNER_WAIT_TIMEOUT`, `CACHE_TYPE=s3`, `CACHE_S3_SERVER_ADDRESS=s3.<region>.scw.cloud`, `CACHE_S3_BUCKET_NAME`, `CACHE_S3_BUCKET_LOCATION=<region>`, `CACHE_SHARED=true` (cache keys only when `cache.type` is `s3`). Per-run overrides from `StartRequest.env` plus `CIBURST_PROJECT`, `CIBURST_PIPELINE`, `CIBURST_JOB`, `CIBURST_STAGE` from the labels.

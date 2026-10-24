@@ -12,6 +12,8 @@ pub const DEFAULT_REGION: &str = "fr-par";
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Credentials {
     pub secret_key: String,
+    /// Access key of the same API key; S3 signing needs it, the JSON APIs do not.
+    pub access_key: Option<String>,
     pub organization_id: String,
     pub default_project_id: Option<String>,
 }
@@ -24,13 +26,12 @@ impl Credentials {
                 .cloned()
                 .ok_or_else(|| Error::other(format!("{key} missing in .local/scaleway.env")))
         };
+        let optional = |key: &str| env.get(key).filter(|v| !v.is_empty()).cloned();
         Ok(Credentials {
             secret_key: get("SCW_SECRET_KEY")?,
+            access_key: optional("SCW_ACCESS_KEY"),
             organization_id: get("SCW_DEFAULT_ORGANIZATION_ID")?,
-            default_project_id: env
-                .get("SCW_DEFAULT_PROJECT_ID")
-                .filter(|v| !v.is_empty())
-                .cloned(),
+            default_project_id: optional("SCW_DEFAULT_PROJECT_ID"),
         })
     }
 }
@@ -73,6 +74,10 @@ impl ScalewayClient {
 
     pub fn default_project_id(&self) -> Option<&str> {
         self.credentials.default_project_id.as_deref()
+    }
+
+    pub fn access_key(&self) -> Option<&str> {
+        self.credentials.access_key.as_deref()
     }
 
     pub fn secret_key(&self) -> &str {

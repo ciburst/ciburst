@@ -119,7 +119,7 @@ Core modules: `config` (schema, defaults, validation reporting every error), `di
 }
 ```
 
-Secrets come from `.local/scaleway.env` (`SCW_ACCESS_KEY`, `SCW_SECRET_KEY`, `SCW_DEFAULT_ORGANIZATION_ID`, `SCW_DEFAULT_PROJECT_ID` optional) and `.local/gitlab.env` (`GITLAB_TOKEN`, scope `api`). Validation rejects a pool above the provider's capabilities, a tag or a stage used twice, and a `defaultPool` that is not a pool.
+Secrets come from `.local/scaleway.env` (`SCW_ACCESS_KEY`, `SCW_SECRET_KEY`, `SCW_DEFAULT_ORGANIZATION_ID`, `SCW_DEFAULT_PROJECT_ID` optional) and `.local/gitlab.env` (`GITLAB_TOKEN`, scope `api`). Validation rejects a pool above the provider's capabilities, a tag or a stage used twice, and a `defaultPool` that is not a pool. `name` is 2 to 20 characters, so the bucket name `<name>-cache-<project id>` stays within the S3 limit of 63.
 
 ### 5.5 Repository layout
 

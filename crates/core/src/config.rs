@@ -153,7 +153,7 @@ pub fn validate(mut config: Config) -> Result<Config> {
 
     if !valid_name(&config.name) {
         errors.push(
-            "name: 2 to 31 lowercase letters, digits or hyphens, starting with a letter"
+            "name: 2 to 20 lowercase letters, digits or hyphens, starting with a letter"
                 .to_string(),
         );
     }
@@ -256,7 +256,7 @@ pub fn check_capabilities(config: &Config, caps: &Capabilities) -> Vec<String> {
 
 fn valid_name(name: &str) -> bool {
     let len = name.len();
-    (2..=31).contains(&len)
+    (2..=20).contains(&len)
         && name.starts_with(|c: char| c.is_ascii_lowercase())
         && name
             .chars()
