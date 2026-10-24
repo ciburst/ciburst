@@ -1,6 +1,6 @@
 # Spec: ciburst, serverless GitLab runners, Scaleway first
 
-Status: M0 in Rust done 2026-10-24, waiting for the owner's go for M1. Background: `SEED.md`.
+Status: M1 agents A (provider) and B (host, function) merged 2026-10-24, agent C (images, ops) pending. Background: `SEED.md`.
 
 ## 0. Decision log
 
@@ -143,10 +143,10 @@ Provider `scaleway-jobs` (API `serverless-jobs/v1alpha1`, region from config):
 
 | Step | Resource | Lookup | Create |
 |---|---|---|---|
-| 1 | Project `<name>` | by name | `account/v3/projects` unless `SCW_DEFAULT_PROJECT_ID` is set |
-| 2 | IAM application `<name>-dispatch`, policy on the project with `ServerlessJobsFullAccess`, one API key | by name | secret key written once to `.local/outputs.env` |
+| 1 | Project `<name>` | by name | `account/v3/projects` unless `SCW_DEFAULT_PROJECT_ID` is set; output `CIBURST_PROJECT_ID` |
+| 2 | IAM application `<name>-dispatch`, policy on the project with `ServerlessJobsFullAccess`, one API key | by name; an application without policy or key plans `update` (repair) | secret key written once to `.local/outputs.env` |
 | 3 | IAM application `<name>-cache`, policy on the project with `ObjectStorageFullAccess`, one API key | by name | secret key written once to `.local/outputs.env` |
-| 4 | Bucket `<name>-cache-<project id>` in the region, lifecycle rule expiring objects after `cache.expireDays` | by name | S3 API with the owner key |
+| 4 | Bucket `<name>-cache-<project id>` in the region, lifecycle rule `ciburst-expire` expiring objects after `cache.expireDays` | by name, drift by the rule's days | S3 API with SigV4 (access and secret key of the owner); destroy empties the bucket first |
 | 5 | Job definition `<name>-<pool.tag>` per pool: `cpu_limit` = vcpu x 1000, `memory_limit`, `local_storage_capacity`, `image_uri`, `job_timeout`, `environment_variables` (`CIBURST_POOL`, `CI_SERVER_URL`, `RUNNER_WAIT_TIMEOUT`, cache address, bucket and region) | by name | create or update when any field differs |
 | start | `POST job-definitions/<id>/start` with `environment_variables` override (`RUNNER_TOKEN`, `CACHE_S3_ACCESS_KEY`, `CACHE_S3_SECRET_KEY`, labels) | | |
 | list | `GET job-runs?job_definition_id=<id>` states `queued, scheduled, running` map to live | | |
@@ -157,8 +157,8 @@ Host `scaleway-function` (API `functions/v1beta1`):
 | Step | Resource |
 |---|---|
 | 1 | Namespace `<name>` |
-| 2 | Function `<name>-dispatch`: runtime `rust196`, handler `handle`, privacy `public`, `min_scale 0`, `max_scale 5`, `memory_limit 128`, `timeout 30s`, `secret_environment_variables` (`HOOK_TOKEN`, `SCW_SECRET_KEY` of the dispatch key, `RUNNER_TOKEN_<POOL>` per pool, `CACHE_S3_ACCESS_KEY`, `CACHE_S3_SECRET_KEY`), `environment_variables` (`CIBURST_CONFIG` as JSON) |
-| 3 | Code: zip with a workspace `Cargo.toml`, `crates/core` and `crates/dispatch-scaleway` (`src/lib.rs` exporting `pub async fn handle(req: Request<Body>) -> Response<Body>` on axum 0.8); upload through the upload URL, then deploy, wait for `ready`, read `domain_name` |
+| 2 | Function `<name>-dispatch`: runtime `rust196`, handler `handle`, privacy `public`, `min_scale 0`, `max_scale 5`, `memory_limit 128`, `timeout 30s`, `http_option redirected`, `sandbox v2`; `secret_environment_variables` `HOOK_TOKEN`, `SCW_SECRET_KEY` of the dispatch key, `RUNNER_TOKEN_<POOL>` per pool, `CACHE_S3_ACCESS_KEY`, `CACHE_S3_SECRET_KEY`; `environment_variables` `CIBURST_CONFIG` (config JSON), `SCW_DEFAULT_ORGANIZATION_ID`, `SCW_DEFAULT_PROJECT_ID`, `SCW_REGION`, `CIBURST_CODE_DIGEST` (sha256 of the deployed zip); `description` `ciburst:<sha256 of settings and both environments>` decides `update` |
+| 3 | Code: a deterministic zip embedded by `crates/scaleway/build.rs`; root is the `ciburst-dispatch-scaleway` package (`src/lib.rs` exporting `pub async fn handle(req: Request<Body>) -> Response<Body>` on axum 0.8, `Cargo.toml` with its own `[workspace]` table carrying the inherited package and dependency tables, dependencies pointing at `vendor/core` and `vendor/scaleway`, dev and build dependencies dropped) plus the workspace `Cargo.lock`; upload through the upload URL, record the digest, deploy, poll until `ready` (up to 20 minutes, the first build compiles the dependency set), read `domain_name` |
 
 GitLab steps (`crates/core/src/gitlab.rs`), per project id: one runner per pool `POST /user/runners` (`project_type`, `tag_list` = `[pool.tag]`, `run_untagged false`, description `<name>-<pool.tag>`), enabled in every further project; hook `POST /projects/:id/hooks` (`url` = function URL, `token`, `job_events true`, `push_events false`, SSL verification on); `check`: `GET /projects/:id/ci/lint?include_jobs=true`, then every job's stage and tags against the stage map. Lookups by description and URL.
 
@@ -175,7 +175,7 @@ Secrets inventory:
 
 | Secret | Where | Lifetime | Rotation |
 |---|---|---|---|
-| Owner Scaleway key (IAMManager, ProjectManager, ServerlessJobsFullAccess, FunctionsFullAccess, ObjectStorageFullAccess) | `.local/scaleway.env` | owner chosen | delete after M2 |
+| Owner Scaleway key, access and secret key (IAMManager, ProjectManager, ServerlessJobsFullAccess, FunctionsFullAccess, ObjectStorageFullAccess) | `.local/scaleway.env` | owner chosen | delete after M2 |
 | Owner GitLab token, scope `api` | `.local/gitlab.env` | owner chosen | delete after M2, recreate for `check` and `rotate` |
 | Dispatch IAM key | function secret env, `.local/outputs.env` | none | `ciburst rotate key` |
 | Cache IAM key | function secret env, run env override, `.local/outputs.env` | none | `ciburst rotate cache` |
@@ -223,7 +223,7 @@ A provider is a crate implementing `ciburst_core::types::Provider` with a `capab
 |---|---|---|
 | M0, orchestrator, done | workspace, LICENSE, README, `crates/core`, `crates/cli` with the fake modules, contract harness, GitLab fake, CI lint, deny and test, `docs/PROVIDERS.md` | `cargo test` green, `ciburst plan` against the fake modules prints every step, second `apply` plans nothing |
 | M1, three agents | A: `crates/scaleway` provider (jobs, IAM, bucket, lifecycle) with an in-process fake of the Jobs, IAM and S3 APIs, passing the contract. B: `crates/scaleway` host (namespace, function, secrets, zip, upload, deploy) with a Functions fake, and `crates/dispatch-scaleway` (axum handler on `Dispatcher`, builds on Rust 1.96). C: `images/*` (five images, entrypoint with cache flags verified), CI `images` and `release` stages, `ci/ciburst.yml`, `docs/RUNBOOK.md` | all tests green on CI, image smoke green, plan and apply idempotent against the fakes |
-| M2, orchestrator with owner keys | drill: `ciburst apply` on an empty project, `check` on the drill consumer project, a pipeline with node, rust, playwright and kaniko jobs plus one hosted-runner job; start latency; kaniko verdict; cache hit on the second run; cost on the consumption page; fixes | runbook section "Drill" filled with dates and numbers |
+| M2, orchestrator with owner keys | drill: `ciburst apply` on an empty project, `check` on the drill consumer project, a pipeline with node, rust, playwright and kaniko jobs plus one hosted-runner job; start latency; kaniko verdict; cache hit on the second run; cost on the consumption page; API behaviour assumed by the fakes checked live (stop sets a run to `canceled`, a run's environment merges the definition's with the overrides, deleting an IAM application does not cascade to its policies and keys, a PATCH of a deployed function does not redeploy by itself); fixes | runbook section "Drill" filled with dates and numbers |
 | M3 | hardening from M2, GitHub mirror, `v1.0.0` tag with binaries | release pipeline green |
 
 Definition of done per milestone: tests green locally and on CI, `cargo fmt`, `clippy -D warnings` and `cargo deny` clean, docs updated, no secret and no identifying value in the repo, no em or en dash, summary to the owner with the go question for the next milestone.
@@ -236,6 +236,7 @@ Risks:
 | run start latency too high for short jobs | measured in M2; `waitTimeoutS` keeps a run alive for consecutive jobs |
 | stage map and tags disagree | `ciburst check` after every apply; runbook failure mode |
 | GitLab disables a hook after failures | dispatcher answers within 30 s; manual resend documented; sweep in backlog |
+| Scaleway's Rust builder is undocumented: assumed to build the zip root as a library package, resolve path dependencies under `vendor/`, build without `--locked`, on a toolchain of at least 1.96 | the first real deploy in M2 proves it; `build.rs` can emit a pruned lock if `--locked` is used |
 | `v1alpha1` Jobs API changes | API client isolated in `crates/scaleway`, contract tests pin the shapes |
 | Scaleway's Rust toolchain moves | `rust-toolchain.toml` and the host runtime are the two places to bump; CI proves the build on the same version |
 | `run-single` cache flags differ from `run` | verified by agent C in M1 with the fake GitLab before the images ship |
