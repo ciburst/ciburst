@@ -982,6 +982,34 @@ async fn the_type_scaleway_jobs_keeps_serverless_jobs_unless_told_otherwise() {
 }
 
 #[tokio::test]
+async fn plan_warns_when_the_zone_has_no_quota_for_the_pool_types() {
+    let backend = Arc::new(ScalewayFake::new());
+    for name in ["cp_servers_type_DEV1_M", "cp_servers_type_DEV1_L"] {
+        backend
+            .iam
+            .set_zone_quota(name, &[("fr-par-1", 0), ("nl-ams-1", 15), ("pl-waw-1", 5)]);
+    }
+    let (log, lines) = Log::memory();
+    provider(plain(), &backend, log).plan(&[]).await.unwrap();
+    let warning = lines
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|l| l.starts_with("warn vm pools cannot start"))
+        .cloned()
+        .expect("warning");
+    assert!(warning.contains("zone fr-par-1 has no quota for DEV1-M, DEV1-L"));
+    assert!(warning.contains("quota in nl-ams-1, pl-waw-1"));
+
+    backend
+        .iam
+        .set_zone_quota("cp_servers_type_DEV1_L", &[("fr-par-1", 2)]);
+    let (log, lines) = Log::memory();
+    provider(plain(), &backend, log).plan(&[]).await.unwrap();
+    assert!(lines.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn plan_warns_when_vms_cannot_pull_their_agent() {
     let backend = Arc::new(ScalewayFake::new());
     let (log, lines) = Log::memory();

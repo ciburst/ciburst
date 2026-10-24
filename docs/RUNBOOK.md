@@ -11,6 +11,7 @@
 | Image tags | `edge` from the default branch; `X.Y.Z`, `X.Y`, `X`, `latest` from a tag `vX.Y.Z` |
 | Binary | `ciburst-x86_64-unknown-linux-musl` in the framework project's generic package registry, linked from each release |
 | Runner | `gitlab-runner` 18.11.4, `run-single`. Serverless Jobs pools: shell executor, one run per pending job, exits after `waitTimeoutS` idle seconds. VM pools: Docker executor, `slots` processes per VM |
+| Instance quotas | per organization, zone and commercial type, resource `cp_servers_type_<TYPE>` with `_` for `-` (`cp_servers_type_DEV1_M`); read with `GET https://api.scaleway.com/iam/v1alpha1/quota/cp_servers_type_<TYPE>?organization_id=<org id>`. On 2026-10-24 the drill organization had 0 for DEV1, PLAY2 and BASIC3 types in `fr-par-1` to `fr-par-3`, and DEV1-S 10, DEV1-M 15, DEV1-L 5 in `nl-ams-1` to `-3`, `pl-waw-1` to `-3`, `it-mil-1` to `-3` and `se-sto-1` |
 | Serverless Jobs limits | 6 vCPU, 16 GB, 24 h per run, 400 parallel runs per organization, `linux/amd64`, images under 2 GB recommended; `/tmp` counts against the run's memory |
 
 ## Owner setup
@@ -130,6 +131,7 @@ Cost (scaleway.com/en/pricing/virtual-instances, 2026-10-24): billed per hour wi
 | Costs beyond the free tier | free tier exceeded | consumption page; per-second prices apply |
 | Function deploy fails with an unknown runtime | Scaleway retired `rust196` | runtime bump below |
 | VMs stay `starting` until the sweep ends them | cloud-init failed: runner download, agent image pull (`registryPublic`), or `vm.env` incomplete (the agent exits 64 naming the key) | fix the image or the config, `ciburst apply`, re-run the job |
+| VM jobs stay pending, no server appears, the function log shows `instance type unavailable` with `quota(s) exceeded` | the zone's quota for every type of the pool is 0 | set `provider.zone` to a zone with quota (Facts, Instance quotas) or ask Scaleway support to raise it, `ciburst apply`, re-run the jobs |
 | A `vm` job stays pending while VMs of the pool idle | the job's stage maps to a fast lane | move the job to a stage of the VM pool, `ciburst check` |
 | A draining VM takes minutes to end | a slot cut off from GitLab waits 300 s between job requests, and `SIGQUIT` does not shorten that wait | none; the VM keeps reporting `draining` until its slots exit |
 
@@ -241,6 +243,7 @@ Docker executor flags of the VM slots, date 2026-10-24, same sources; cache flag
 | `--docker-image` | Docker image to be used (`DOCKER_IMAGE`) | present; the pool's `image` for jobs without `image:` |
 | `--docker-privileged` | Give extended privileges to container (`DOCKER_PRIVILEGED`) | present |
 | `--docker-volumes` | Bind-mount a volume and create it if it doesn't exist prior to mounting, repeatable (`DOCKER_VOLUMES`) | present; `/cache` and `/certs/client` |
+| `--docker-cache-dir` | Directory where to store caches (`DOCKER_CACHE_DIR`) | present; `/var/lib/ciburst/slot-<n>/volumes` per slot. The executor names its volumes after token, system id, project id and concurrent id (`ProjectRealUniqueName`, `executors/docker/volume.go`); every slot reports concurrent id 0, so without it two jobs of one project on one VM share `/builds` and `/certs/client` (M3 drill). With it the volumes are host directories `<dir>/<unique name>/<md5 of path>` (`createHostBasedCacheVolume`); `CI_PROJECT_DIR` stays `/builds/<namespace>/<project>` |
 | `--max-builds 0` | How many builds to process before exiting, default 0 | present; 0 runs forever |
 | `--wait-timeout 0` | How long to wait in seconds before receiving the first job, default 0 | present; 0 never exits for idleness (`checkFinishedConditions` tests `WaitTimeout > 0`) |
 | `--config` | Config file (`CONFIG_FILE`) | present; read only with `--runner`, so every slot of a VM gets the system id derived from the machine id (`configfile.GenerateUniqueSystemID`), as one `gitlab-runner run` with `concurrent` slots does |

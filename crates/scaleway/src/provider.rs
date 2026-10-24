@@ -14,7 +14,7 @@ pub mod s3;
 pub mod sigv4;
 pub mod vm;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -43,6 +43,18 @@ pub const LEGACY_JOBS_TYPE: &str = "scaleway-jobs";
 /// Types with a local root volume, which terminate deletes; PLAY2 types only take block
 /// volumes, which terminate detaches and which would keep billing.
 pub const DEFAULT_INSTANCE_TYPES: [&str; 2] = ["DEV1-M", "DEV1-L"];
+
+/// The pool's commercial types in fallback order, [`DEFAULT_INSTANCE_TYPES`] when unset.
+fn instance_types(pool: &Pool) -> Vec<String> {
+    if pool.instance_types.is_empty() {
+        DEFAULT_INSTANCE_TYPES
+            .iter()
+            .map(|t| t.to_string())
+            .collect()
+    } else {
+        pool.instance_types.clone()
+    }
+}
 
 /// The user data key cloud-init reads on Scaleway Instances.
 pub const USER_DATA_KEY: &str = "cloud-init";
@@ -195,6 +207,65 @@ impl ScalewayJobs {
 
     fn security_group_name(&self) -> String {
         format!("{}-vm", self.name())
+    }
+
+    /// Warns for each VM pool none of whose instance types has quota in the zone, as the
+    /// dispatcher could start no VM for it. Quotas are per organization, zone and type; a
+    /// failed lookup only logs.
+    async fn warn_without_quota(&self, runtimes: &[(&Pool, Runtime)]) {
+        let mut limits: BTreeMap<String, Vec<(String, u64)>> = BTreeMap::new();
+        for (pool, runtime) in runtimes {
+            if *runtime != Runtime::Instances {
+                continue;
+            }
+            let types = instance_types(pool);
+            let mut startable = false;
+            let mut elsewhere = BTreeSet::new();
+            for commercial_type in &types {
+                if !limits.contains_key(commercial_type) {
+                    let name = iam::server_quota_name(commercial_type);
+                    match iam::zone_quota(&self.client, &name).await {
+                        Ok(found) => {
+                            limits.insert(commercial_type.clone(), found);
+                        }
+                        Err(error) => {
+                            self.log.warn(
+                                "quota check skipped",
+                                &[("quota", &name), ("error", &error.to_string())],
+                            );
+                            return;
+                        }
+                    }
+                }
+                let zones = &limits[commercial_type];
+                startable |=
+                    zones.is_empty() || zones.iter().any(|(zone, n)| *zone == self.zone && *n > 0);
+                elsewhere.extend(
+                    zones
+                        .iter()
+                        .filter(|(_, n)| *n > 0)
+                        .map(|(zone, _)| zone.clone()),
+                );
+            }
+            if !startable {
+                let zones: Vec<String> = elsewhere.into_iter().collect();
+                let zones = if zones.is_empty() {
+                    "no zone".to_string()
+                } else {
+                    zones.join(", ")
+                };
+                let reason = format!(
+                    "zone {} has no quota for {}: set provider.zone (quota in {zones}) or ask \
+                     Scaleway support to raise it",
+                    self.zone,
+                    types.join(", "),
+                );
+                self.log.warn(
+                    "vm pools cannot start",
+                    &[("pool", &pool.tag), ("reason", &reason)],
+                );
+            }
+        }
     }
 
     fn instances(&self) -> InstanceApi<'_> {
@@ -648,14 +719,7 @@ impl ScalewayJobs {
             &project_id,
             &request.env,
         )?;
-        let types: Vec<String> = if pool.instance_types.is_empty() {
-            DEFAULT_INSTANCE_TYPES
-                .iter()
-                .map(|t| t.to_string())
-                .collect()
-        } else {
-            pool.instance_types.clone()
-        };
+        let types = instance_types(pool);
         let job = request.labels.get("job").map(String::as_str);
         let docker_images = api.local_images(DOCKER_IMAGE_LABEL).await?;
         let mut fallback_images = None;
@@ -1039,6 +1103,7 @@ impl Provider for ScalewayJobs {
                     )],
                 );
             }
+            self.warn_without_quota(&runtimes).await;
             let action = if observed.security_group.is_some() {
                 Action::Noop
             } else {

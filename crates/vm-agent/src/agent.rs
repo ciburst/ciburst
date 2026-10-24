@@ -39,6 +39,11 @@ pub fn slot_command(config: &Config, slot: u32) -> SlotCommand {
         // Docker-in-Docker with TLS needs the client certificates shared by service and job.
         "--docker-volumes",
         "/certs/client",
+        // Slots share token, system id and concurrent id 0, so the runner would give two
+        // jobs of one project the same volumes (`/builds` too); with a cache dir per slot
+        // they become host directories of that slot.
+        "--docker-cache-dir",
+        &format!("{SLOT_ROOT}/slot-{slot}/volumes"),
         "--max-builds",
         "0",
         "--wait-timeout",
@@ -764,6 +769,8 @@ mod tests {
                 "/cache",
                 "--docker-volumes",
                 "/certs/client",
+                "--docker-cache-dir",
+                "/var/lib/ciburst/slot-2/volumes",
                 "--max-builds",
                 "0",
                 "--wait-timeout",
@@ -789,8 +796,8 @@ mod tests {
         let mut config = sample();
         config.cache = None;
         let command = slot_command(&config, 1);
-        assert_eq!(command.args.len(), 20);
-        assert_eq!(command.args[19], "/var/lib/ciburst/slot-1/config.toml");
+        assert_eq!(command.args.len(), 22);
+        assert_eq!(command.args[21], "/var/lib/ciburst/slot-1/config.toml");
         assert!(!command.args.iter().any(|arg| arg.starts_with("--cache")));
     }
 

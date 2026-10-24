@@ -3,6 +3,7 @@
 //! `policies`, `api_keys` with `total_count`; `RuleSpecs.permission_set_names`, `project_ids`;
 //! `APIKey.access_key`, `secret_key`, `application_id`, `default_project_id`.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -30,6 +31,7 @@ struct Inner {
     applications: Vec<Value>,
     policies: Vec<Value>,
     api_keys: Vec<Value>,
+    zone_quotas: BTreeMap<String, Vec<(String, u64)>>,
     next: u64,
     calls: Vec<Call>,
 }
@@ -78,6 +80,15 @@ impl FakeIam {
                 rule["permission_set_names"] = json!(sets);
             }
         }
+    }
+
+    /// Sets the per-zone limits of a quota such as `cp_servers_type_DEV1_M`. Unset server type
+    /// quotas allow 10 in every `fr-par` zone and in `nl-ams-1`.
+    pub fn set_zone_quota(&self, name: &str, limits: &[(&str, u64)]) {
+        self.inner.lock().expect("fake iam").zone_quotas.insert(
+            name.to_string(),
+            limits.iter().map(|(z, n)| (z.to_string(), *n)).collect(),
+        );
     }
 
     /// API keys as listed (without secrets).
@@ -321,6 +332,36 @@ impl HttpClient for FakeIam {
                 access_key,
                 "api key",
             )),
+            ("GET", ["iam", "v1alpha1", "quota", name]) => {
+                if url.get("organization_id").is_none() {
+                    return Ok(api_error(
+                        400,
+                        "invalid_arguments",
+                        "organization_id required",
+                    ));
+                }
+                let limits = match inner.zone_quotas.get(*name) {
+                    Some(limits) => limits.clone(),
+                    None if name.starts_with("cp_servers_type_") => {
+                        ["fr-par-1", "fr-par-2", "fr-par-3", "nl-ams-1"]
+                            .iter()
+                            .map(|z| (z.to_string(), 10))
+                            .collect()
+                    }
+                    None => return Ok(api_error(404, "not_found", "quota not found")),
+                };
+                Ok(reply(
+                    200,
+                    json!({
+                        "name": name,
+                        "locality_type": "zone",
+                        "limits": limits
+                            .iter()
+                            .map(|(zone, limit)| json!({ "zone": zone, "limit": limit }))
+                            .collect::<Vec<_>>(),
+                    }),
+                ))
+            }
             _ => Ok(api_error(404, "not_found", "no route")),
         }
     }

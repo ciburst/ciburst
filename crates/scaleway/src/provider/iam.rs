@@ -36,6 +36,32 @@ fn org(client: &ScalewayClient) -> (&'static str, String) {
     ("organization_id", client.organization_id().to_string())
 }
 
+/// The quota resource limiting servers of one commercial type: `cp_servers_type_DEV1_M` for
+/// `DEV1-M`.
+pub fn server_quota_name(commercial_type: &str) -> String {
+    format!("cp_servers_type_{}", commercial_type.replace('-', "_"))
+}
+
+/// Per-zone limits of a zone-scoped quota (`GET quota/<name>`): `u64::MAX` for an unlimited
+/// zone, empty when the quota is not zone-scoped.
+pub async fn zone_quota(client: &ScalewayClient, name: &str) -> Result<Vec<(String, u64)>> {
+    let quota = client
+        .get(&format!("{BASE}/quota/{name}"), &[org(client)])
+        .await?;
+    Ok(quota["limits"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|limit| {
+            let zone = limit["zone"].as_str()?.to_string();
+            if limit["unlimited"].as_bool() == Some(true) {
+                return Some((zone, u64::MAX));
+            }
+            Some((zone, limit["limit"].as_u64()?))
+        })
+        .collect())
+}
+
 pub async fn find_application(client: &ScalewayClient, name: &str) -> Result<Option<AppState>> {
     let apps = list_all(
         client,
