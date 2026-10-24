@@ -306,7 +306,7 @@ async fn start_creates_the_server_of_rule_four_then_user_data_then_poweron() {
     assert_eq!(
         commands[1],
         format!(
-            "id=$(docker create {AGENT_IMAGE} /ciburst-vm-agent) && docker cp \"$id:/ciburst-vm-agent\" /usr/local/bin/ciburst-vm-agent && docker rm \"$id\""
+            "systemctl start docker && id=$(docker create {AGENT_IMAGE} /ciburst-vm-agent) && docker cp \"$id:/ciburst-vm-agent\" /usr/local/bin/ciburst-vm-agent && docker rm \"$id\""
         )
     );
     assert_eq!(

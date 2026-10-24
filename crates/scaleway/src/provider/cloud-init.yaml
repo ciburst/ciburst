@@ -25,5 +25,5 @@ write_files:
       WantedBy=multi-user.target
 runcmd:
 {{INSTALL_DOCKER}}  - 'curl -fsSL -o /tmp/gitlab-runner {{RUNNER_URL}} && echo "{{RUNNER_SHA256}}  /tmp/gitlab-runner" | sha256sum -c - && install -m 0755 /tmp/gitlab-runner /usr/local/bin/gitlab-runner && rm -f /tmp/gitlab-runner'
-  - 'id=$(docker create {{AGENT_IMAGE}} /ciburst-vm-agent) && docker cp "$id:/ciburst-vm-agent" /usr/local/bin/ciburst-vm-agent && docker rm "$id"'
+  - 'systemctl start docker && id=$(docker create {{AGENT_IMAGE}} /ciburst-vm-agent) && docker cp "$id:/ciburst-vm-agent" /usr/local/bin/ciburst-vm-agent && docker rm "$id"'
   - 'systemctl daemon-reload && systemctl enable --now ciburst-vm-agent.service'
