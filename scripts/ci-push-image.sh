@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Tags and pushes a built pool image: `edge` on the default branch; X.Y.Z, X.Y, X and `latest`
-# on a tag vX.Y.Z. Usage: scripts/ci-push-image.sh <local reference> <image name>
+# Tags and pushes a built image: `edge` on the default branch; X.Y.Z, X.Y, X and `latest`
+# on a tag vX.Y.Z. With CIBURST_SCW_REGISTRY (`rg.<region>.scw.cloud/<namespace>`) and
+# CIBURST_SCW_REGISTRY_KEY (a Scaleway secret key) set, the same tags also go to that registry.
+# Usage: scripts/ci-push-image.sh <local reference> <image name>
 set -euo pipefail
 
 source_ref="${1:?usage: ci-push-image.sh <local reference> <image name>}"
 name="${2:?usage: ci-push-image.sh <local reference> <image name>}"
-repo="${CI_REGISTRY_IMAGE:?CI_REGISTRY_IMAGE is not set}/$name"
+repos=("${CI_REGISTRY_IMAGE:?CI_REGISTRY_IMAGE is not set}/$name")
 
 tags=()
 if [[ "${CI_COMMIT_TAG:-}" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
@@ -20,7 +22,15 @@ else
   exit 0
 fi
 
-for tag in "${tags[@]}"; do
-  docker tag "$source_ref" "$repo:$tag"
-  docker push "$repo:$tag"
+if [ -n "${CIBURST_SCW_REGISTRY:-}" ] && [ -n "${CIBURST_SCW_REGISTRY_KEY:-}" ]; then
+  printf '%s' "$CIBURST_SCW_REGISTRY_KEY" \
+    | docker login --username nologin --password-stdin "${CIBURST_SCW_REGISTRY%%/*}"
+  repos+=("$CIBURST_SCW_REGISTRY/$name")
+fi
+
+for repo in "${repos[@]}"; do
+  for tag in "${tags[@]}"; do
+    docker tag "$source_ref" "$repo:$tag"
+    docker push "$repo:$tag"
+  done
 done

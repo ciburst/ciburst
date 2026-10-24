@@ -11,4 +11,13 @@ name = "ciburst-vm-agent"
 path = "src/main.rs"
 
 [dependencies]
+async-trait.workspace = true
 ciburst-core = { path = "../core", version = "0.1.0" }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["time", "process"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["signal"] }
+
+[dev-dependencies]
+tempfile.workspace = true
