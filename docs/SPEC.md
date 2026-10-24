@@ -28,6 +28,7 @@ Status: M1 done 2026-10-24 (provider, host and function, images, CI, runbook); w
 | D20 | 2026-10-24 | The `build` pool is the osscontainertools kaniko fork, alpine variant (ships git), with builds dir `/kaniko/builds`: kaniko wipes the filesystem between stages but never `/kaniko`. |
 | D21 | 2026-10-24 | Every image writes its PATH to `/etc/profile.d/ciburst-path.sh` and removes `~/.bash_logout`, because the shell executor runs job steps in a login shell. |
 | D22 | 2026-10-24 | Releases on tags `vX.Y.Z` publish the five images as `X.Y.Z`, `X.Y`, `X` and `latest` (`edge` on `main`) and the Linux x86_64 musl binary through `glab`. Configs reference images by major tag (`node:1`), or `edge` before the first release. macOS and Windows binaries are backlog. |
+| D23 | 2026-10-24 | Adopters set up through their own pipeline, not from a workstation: a manual `ciburst-setup` job from the include runs the `ciburst` binary on a GitLab hosted runner (free 400 minutes per month), takes the Scaleway key and a project access token from four masked CI variables, and stores the outputs as masked project variables instead of `.local/outputs.env`. The local CLI with `.local/` stays the developer path; the owner's personal token is used only for the M2 drill. |
 
 ## 1. Purpose and scope
 
@@ -40,6 +41,7 @@ v1:
 3. Pool images: `base`, `node`, `rust`, `playwright`, `kaniko`.
 4. Binary `ciburst` with `plan`, `apply`, `destroy`, `status`, `check`, `rotate`.
 5. Consumer include `ci/ciburst.yml`, runbook, provider authoring guide.
+6. Setup pipeline for adopters: `ciburst-setup`, `ciburst-check` and `ciburst-destroy` jobs in the include, a `cli` image with the binary, outputs in project variables (M3).
 
 Backlog, not v1: a scheduled sweep that polls pending jobs; routing by job name patterns; a self-hosted dispatcher binary; providers for other clouds; group-level webhooks; a hosted dispatcher as a service; GitHub Actions support.
 
@@ -60,7 +62,7 @@ Backlog, not v1: a scheduled sweep that polls pending jobs; routing by job name 
 
 | Persona | Journey | Steps |
 |---|---|---|
-| Project owner | Give a GitLab project serverless runners | 1 write `config.json`, 2 `ciburst apply`, 3 include `ci/ciburst.yml`, tag non-default jobs |
+| Project owner | Give a GitLab project serverless runners | 1 create a Scaleway API key and a project access token, 2 set four masked CI variables, 3 include `ci/ciburst.yml` and run the manual `ciburst-setup` job; tag jobs of non-default pools |
 | Project owner | Add a toolchain | 1 add a pool with an image and its stages, 2 `ciburst apply`, 3 `ciburst check` |
 | Provider author | Add a cloud | 1 implement the `Provider` trait in a crate, 2 pass the contract tests, 3 register the name, 4 document it |
 | Operator | See what runs and what it costs | `ciburst status` and the provider's consumption page |
@@ -133,7 +135,7 @@ crates/core/                 ciburst-core: config, dispatch, gitlab, http, plan,
 crates/cli/                  binary ciburst: plan | apply | destroy | status | check | rotate; registry of providers and hosts
 crates/scaleway/             provider scaleway-jobs (jobs, iam, s3, sigv4), host scaleway-function, build.rs embedding the function zip, API fakes
 crates/dispatch-scaleway/    the function: `handle` and the testable `respond`
-images/base/ node/ rust/ playwright/ kaniko/ test/   Dockerfiles, shared entrypoint, smoke tests
+images/base/ node/ rust/ playwright/ kaniko/ cli/ test/   Dockerfiles, shared entrypoint, smoke tests; `cli` holds the binary for the setup job (M3)
 ci/ciburst.yml               consumer include with the pool templates
 scripts/                     ci-install-cargo-deny.sh ci-push-image.sh ci-release-binary.sh shellcheck.sh
 test/config.fake.json        dry-run config
@@ -194,6 +196,8 @@ Framework CI (`.gitlab-ci.yml`, hosted runners, image `rust:1.96.0-bookworm`): `
 
 Consumer side: `include: project: <namespace>/ciburst, ref: v1, file: ci/ciburst.yml` sets `default: tags: [ci]`; jobs in a non-default pool set `tags: [<pool>]`; jobs that need a Docker daemon set `tags: [saas-linux-small-amd64]`; image builds use the `build` pool and `/kaniko/executor`. `ciburst check` runs against every configured project after `apply`.
 
+Adoption pipeline (M3): the include also carries `ciburst-setup` (manual, stage `.pre`, `tags: [saas-linux-small-amd64]`, image `registry.gitlab.com/<namespace>/ciburst/cli:1`), `ciburst-check` (automatic, same runner, reports jobs whose tags disagree with the stage map) and `ciburst-destroy` (manual). Inputs are four masked CI variables: `SCW_ACCESS_KEY`, `SCW_SECRET_KEY`, `SCW_DEFAULT_ORGANIZATION_ID`, `CIBURST_GITLAB_TOKEN` (a project access token, role Maintainer, scopes `api` and `create_runner`; the job token cannot create runners, hooks or variables). The config comes from `ciburst.json` in the consumer repo, or from defaults when the file is absent: `name` `ci-<project id>`, `projectIds` `[CI_PROJECT_ID]`, the four pools of `config.example.json` on the framework images. Outputs (`CIBURST_*`) are written as masked project variables through the API and read back from the job environment on the next run, so a second run plans only `noop`. `apply --no-wait` skips the readiness poll: the hook URL is known at function creation, the deploy continues on Scaleway, and the job ends in about two minutes, so a setup costs about two hosted-runner minutes. One owner step remains per adopter: creating the two tokens.
+
 ## 9. Testing
 
 | Level | What | Where |
@@ -228,7 +232,8 @@ A provider is a crate implementing `ciburst_core::types::Provider` with a `capab
 | M0, orchestrator, done | workspace, LICENSE, README, `crates/core`, `crates/cli` with the fake modules, contract harness, GitLab fake, CI lint, deny and test, `docs/PROVIDERS.md` | `cargo test` green, `ciburst plan` against the fake modules prints every step, second `apply` plans nothing |
 | M1, three agents, done | A: `crates/scaleway` provider (jobs, IAM, bucket, lifecycle) with an in-process fake of the Jobs, IAM and S3 APIs, passing the contract. B: `crates/scaleway` host (namespace, function, secrets, zip, upload, deploy) with a Functions fake, and `crates/dispatch-scaleway` (axum handler on `Dispatcher`, builds on Rust 1.96). C: `images/*` (five images, entrypoint with cache flags verified), CI `images` and `release` stages, `ci/ciburst.yml`, `docs/RUNBOOK.md` | all tests green on CI, image smoke green, plan and apply idempotent against the fakes |
 | M2, orchestrator with owner keys | drill: `ciburst apply` on an empty project, `check` on the drill consumer project, a pipeline with node, rust, playwright and kaniko jobs plus one hosted-runner job; start latency; kaniko verdict; cache hit on the second run; cost on the consumption page; API behaviour assumed by the fakes checked live (stop sets a run to `canceled`, a run's environment merges the definition's with the overrides, deleting an IAM application does not cascade to its policies and keys, a PATCH of a deployed function does not redeploy by itself); fixes | runbook section "Drill" filled with dates and numbers |
-| M3 | hardening from M2, GitHub mirror, `v1.0.0` tag with binaries | release pipeline green |
+| M3, pipeline setup | `OutputsStore` on GitLab project variables (masked where allowed), `apply --no-wait`, config defaults from the job environment, `images/cli` with the binary, `ciburst-setup`, `ciburst-check` and `ciburst-destroy` jobs in the include, README "adopt in ten minutes" | a fresh consumer project is provisioned by its own pipeline from the four variables; the second run of `ciburst-setup` plans only `noop`; hosted-runner minutes per setup under three |
+| M4 | hardening from M2 and M3, GitHub mirror, `v1.0.0` tag with binaries and images | release pipeline green |
 
 Definition of done per milestone: tests green locally and on CI, `cargo fmt`, `clippy -D warnings` and `cargo deny` clean, docs updated, no secret and no identifying value in the repo, no em or en dash, summary to the owner with the go question for the next milestone.
 
