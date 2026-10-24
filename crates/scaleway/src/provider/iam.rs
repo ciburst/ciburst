@@ -1,5 +1,7 @@
 //! IAM `iam/v1alpha1`: one application per key with a project scoped policy and one API key.
 
+use std::collections::BTreeSet;
+
 use ciburst_core::types::KeyPair;
 use ciburst_core::{Error, Result};
 use serde_json::{Value, json};
@@ -9,17 +11,24 @@ use crate::client::ScalewayClient;
 
 const BASE: &str = "/iam/v1alpha1";
 
-/// What exists of one application: its id, its policy ids and its API key access keys.
+/// What exists of one application: its id, its policy ids, the permission sets those policies
+/// grant and its API key access keys.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AppState {
     pub id: String,
     pub policies: Vec<String>,
+    pub permission_sets: BTreeSet<String>,
     pub keys: Vec<String>,
 }
 
 impl AppState {
-    pub fn complete(&self) -> bool {
-        !self.policies.is_empty() && !self.keys.is_empty()
+    /// A policy granting every set in `wanted` and at least one key exist.
+    pub fn complete(&self, wanted: &[&str]) -> bool {
+        self.grants(wanted) && !self.keys.is_empty()
+    }
+
+    pub fn grants(&self, wanted: &[&str]) -> bool {
+        !self.policies.is_empty() && wanted.iter().all(|set| self.permission_sets.contains(*set))
     }
 }
 
@@ -52,7 +61,28 @@ pub async fn find_application(client: &ScalewayClient, name: &str) -> Result<Opt
     .iter()
     .filter(|p| p["application_id"].as_str() == Some(id))
     .filter_map(|p| p["id"].as_str().map(String::from))
-    .collect();
+    .collect::<Vec<String>>();
+    let mut permission_sets = BTreeSet::new();
+    for policy in &policies {
+        for rule in list_all(
+            client,
+            &format!("{BASE}/rules"),
+            vec![("policy_id", policy.clone())],
+            "rules",
+        )
+        .await?
+        {
+            for set in rule["permission_set_names"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                if let Some(set) = set.as_str() {
+                    permission_sets.insert(set.to_string());
+                }
+            }
+        }
+    }
     let keys = list_all(
         client,
         &format!("{BASE}/api-keys"),
@@ -67,6 +97,7 @@ pub async fn find_application(client: &ScalewayClient, name: &str) -> Result<Opt
     Ok(Some(AppState {
         id: id.to_string(),
         policies,
+        permission_sets,
         keys,
     }))
 }
@@ -89,7 +120,7 @@ pub async fn create_policy(
     client: &ScalewayClient,
     name: &str,
     application_id: &str,
-    permission_set: &str,
+    permission_sets: &[&str],
     project_id: &str,
 ) -> Result<String> {
     let policy = client
@@ -101,7 +132,7 @@ pub async fn create_policy(
                 "organization_id": client.organization_id(),
                 "application_id": application_id,
                 "rules": [{
-                    "permission_set_names": [permission_set],
+                    "permission_set_names": permission_sets,
                     "project_ids": [project_id],
                 }],
             }),
@@ -140,6 +171,13 @@ pub async fn delete_application(client: &ScalewayClient, app: &AppState) -> Resu
     }
     client
         .delete(&format!("{BASE}/applications/{}", app.id))
+        .await
+        .map(drop)
+}
+
+pub async fn delete_policy(client: &ScalewayClient, policy_id: &str) -> Result<()> {
+    client
+        .delete(&format!("{BASE}/policies/{policy_id}"))
         .await
         .map(drop)
 }

@@ -16,7 +16,8 @@ use super::scaleway_fake::{
 };
 
 /// Permission sets the fake accepts; the provider uses the first two.
-pub const PERMISSION_SETS: [&str; 4] = [
+pub const PERMISSION_SETS: [&str; 5] = [
+    "ContainerRegistryReadOnly",
     "ServerlessJobsFullAccess",
     "ObjectStorageFullAccess",
     "ServerlessJobsReadOnly",
@@ -64,6 +65,18 @@ impl FakeIam {
     /// Policies as created, including their `rules`.
     pub fn policies(&self) -> Vec<Value> {
         self.inner.lock().expect("fake iam").policies.clone()
+    }
+
+    /// Replaces the permission sets of the named policy, as an older ciburst version left them.
+    pub fn set_policy_sets(&self, name: &str, sets: &[&str]) {
+        let mut inner = self.inner.lock().expect("fake iam");
+        if let Some(policy) = inner.policies.iter_mut().find(|p| p["name"] == name)
+            && let Some(rules) = policy["rules"].as_array_mut()
+        {
+            for rule in rules {
+                rule["permission_set_names"] = json!(sets);
+            }
+        }
     }
 
     /// API keys as listed (without secrets).
@@ -237,6 +250,26 @@ impl HttpClient for FakeIam {
             }
             ("DELETE", ["iam", "v1alpha1", "policies", id]) => {
                 Ok(delete_where(&mut inner.policies, "id", id, "policy"))
+            }
+            ("GET", ["iam", "v1alpha1", "rules"]) => {
+                let Some(policy) = url.get("policy_id") else {
+                    return Ok(api_error(400, "invalid_arguments", "policy_id required"));
+                };
+                let Some(found) = inner.policies.iter().find(|p| p["id"] == policy) else {
+                    return Ok(api_error(404, "not_found", "policy not found"));
+                };
+                let items = found["rules"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, mut rule)| {
+                        rule["id"] = json!(format!("{policy}-rule-{index}"));
+                        rule
+                    })
+                    .collect();
+                Ok(list(items, &url, "rules"))
             }
             ("GET", ["iam", "v1alpha1", "api-keys"]) => {
                 let items = inner

@@ -48,10 +48,12 @@ impl KeyKind {
         }
     }
 
-    fn permission_set(self) -> &'static str {
+    /// Starting a job whose image is in a private registry of the project needs registry read
+    /// access besides the Jobs permissions (Scaleway answers 403 on `registry_image` otherwise).
+    fn permission_sets(self) -> &'static [&'static str] {
         match self {
-            KeyKind::Dispatch => "ServerlessJobsFullAccess",
-            KeyKind::Cache => "ObjectStorageFullAccess",
+            KeyKind::Dispatch => &["ServerlessJobsFullAccess", "ContainerRegistryReadOnly"],
+            KeyKind::Cache => &["ObjectStorageFullAccess"],
         }
     }
 
@@ -205,7 +207,7 @@ impl ScalewayJobs {
         let resource = format!("api key {}", self.app_name(kind));
         match app {
             None => Step::new(kind.step_id(), Action::Create, resource),
-            Some(app) if !app.complete() => {
+            Some(app) if !app.complete(kind.permission_sets()) => {
                 Step::new(kind.step_id(), Action::Update, resource).with_detail("repair")
             }
             Some(_) if rotate.contains(&kind.rotation()) => {
@@ -260,12 +262,17 @@ impl ScalewayJobs {
                 }
             }
         };
-        if app.policies.is_empty() {
+        if !app.grants(kind.permission_sets()) {
+            for policy in &app.policies {
+                iam::delete_policy(&self.client, policy).await?;
+                self.log
+                    .info("deleted iam policy", &[("name", &name), ("id", policy)]);
+            }
             let id = iam::create_policy(
                 &self.client,
                 &name,
                 &app.id,
-                kind.permission_set(),
+                kind.permission_sets(),
                 project_id,
             )
             .await?;

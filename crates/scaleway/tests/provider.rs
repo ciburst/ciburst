@@ -137,7 +137,7 @@ async fn apply_creates_the_resources_of_the_spec() {
         [
             (
                 json!("contract-dispatch"),
-                json!([{ "permission_set_names": ["ServerlessJobsFullAccess"], "project_ids": [project_id] }])
+                json!([{ "permission_set_names": ["ServerlessJobsFullAccess", "ContainerRegistryReadOnly"], "project_ids": [project_id] }])
             ),
             (
                 json!("contract-cache"),
@@ -579,4 +579,31 @@ async fn fakes_reject_unauthenticated_requests() {
     }
     let s3 = Request::new("HEAD", "https://s3.fr-par.scw.cloud/b");
     assert_eq!(fake.send(s3).await.unwrap().status, 403);
+}
+
+#[tokio::test]
+async fn a_dispatch_policy_without_registry_read_is_repaired() {
+    let (backend, provider, _) = provisioned(Log::silent()).await;
+    backend
+        .iam
+        .set_policy_sets("contract-dispatch", &["ServerlessJobsFullAccess"]);
+    let steps = provider.plan(&[]).await.unwrap();
+    let step = steps.iter().find(|s| s.id == "key:dispatch").unwrap();
+    assert_eq!(step.action, Action::Update);
+    assert_eq!(step.detail.as_deref(), Some("repair"));
+    let outputs = provider.apply(&steps).await.unwrap();
+    assert!(outputs.contains_key("CIBURST_DISPATCH_SECRET_KEY"));
+    let dispatch: Vec<_> = backend
+        .iam
+        .policies()
+        .into_iter()
+        .filter(|p| p["name"] == "contract-dispatch")
+        .collect();
+    assert_eq!(dispatch.len(), 1);
+    assert_eq!(
+        dispatch[0]["rules"][0]["permission_set_names"],
+        json!(["ServerlessJobsFullAccess", "ContainerRegistryReadOnly"])
+    );
+    let again = provider.plan(&[]).await.unwrap();
+    assert!(again.iter().all(|s| s.action == Action::Noop), "{again:?}");
 }

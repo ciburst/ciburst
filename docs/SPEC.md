@@ -155,7 +155,7 @@ Provider `scaleway-jobs` (API `serverless-jobs/v1alpha1`, region from config):
 | Step | Resource | Lookup | Create |
 |---|---|---|---|
 | 1 | Project `<name>` | by name | `account/v3/projects` unless `SCW_DEFAULT_PROJECT_ID` is set; output `CIBURST_PROJECT_ID` |
-| 2 | IAM application `<name>-dispatch`, policy on the project with `ServerlessJobsFullAccess`, one API key | by name; an application without policy or key plans `update` (repair) | secret key written once to `.local/outputs.env` |
+| 2 | IAM application `<name>-dispatch`, policy on the project with `ServerlessJobsFullAccess` and `ContainerRegistryReadOnly` (starting a job with a private registry image needs it), one API key | by name; an application without key, or whose policy lacks a set, plans `update` (repair) | secret key written once to `.local/outputs.env` |
 | 3 | IAM application `<name>-cache`, policy on the project with `ObjectStorageFullAccess`, one API key | by name | secret key written once to `.local/outputs.env` |
 | 4 | Bucket `<name>-cache-<project id>` in the region, lifecycle rule `ciburst-expire` expiring objects after `cache.expireDays` | by name, drift by the rule's days | S3 API with SigV4 (access and secret key of the owner); destroy empties the bucket first |
 | 5 | Job definition `<name>-<pool.tag>` per pool: `cpu_limit` = vcpu x 1000, `memory_limit`, `local_storage_capacity`, `image_uri`, `job_timeout`, `environment_variables` (`CIBURST_POOL`, `CI_SERVER_URL`, `RUNNER_WAIT_TIMEOUT`, cache address, bucket and region) | by name | create or update when any field differs |
