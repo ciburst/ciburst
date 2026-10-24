@@ -277,8 +277,10 @@ Date: 2026-10-24. Config: as the M3 drill, VMs in `nl-ams-1`, `slots` 2, `maxRun
 3. Swap: `/proc/swaps` read by a drill job.
    Result: passed. `/swapfile  file  4194300  268  -2` on the VM that ran the node job.
 4. Cost of runs 1 and 2 on the consumption page.
-   Result: ____ EUR
-5. Hetzner, once `.local/hetzner.env` exists: the `vm` pool on `runtime: "hetzner"`, `apply`, a cold pipeline.
+   Result: ____ EUR (read after the VMs ended)
+5. Without `defaultPool` (D36): a pending event of an unmapped stage.
+   Result: passed. `200 {"reason":"unmapped_stage","result":"ignored","stage":"deploy"}`, nothing started; the drill consumer's own pipelines on hosted runners no longer start runs.
+6. Hetzner, once `.local/hetzner.env` exists: the `vm` pool on `runtime: "hetzner"`, `apply`, a cold pipeline.
    Check: three CX33 servers with the labels; firewall applied (`public_net.firewalls[].status` `applied`); jobs pass; drain at minute 55 deletes every server; Primary IPs empty afterwards.
    Result: ____
 
