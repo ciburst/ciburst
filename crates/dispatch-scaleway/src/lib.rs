@@ -32,6 +32,8 @@ pub struct Env {
     pub secrets: Arc<Secrets>,
     pub credentials: Credentials,
     pub region: String,
+    /// Optional override of the callback URL VMs use; by default the webhook's Host header.
+    pub dispatch_url: Option<String>,
 }
 
 /// A variable that is missing or unusable. Carries the name only, never a value.
@@ -100,6 +102,7 @@ impl Env {
             secrets: Arc::new(secrets),
             credentials,
             region: required(vars::REGION)?,
+            dispatch_url: optional("CIBURST_DISPATCH_URL"),
         })
     }
 
@@ -137,7 +140,8 @@ pub async fn respond(
     log: Log,
     request: &Incoming<'_>,
 ) -> (u16, Vec<u8>) {
-    let dispatcher = Dispatcher::new(env.config.clone(), provider, env.secrets.clone(), log);
+    let dispatcher = Dispatcher::new(env.config.clone(), provider, env.secrets.clone(), log)
+        .with_dispatch_url(env.dispatch_url.clone());
     let response = dispatcher
         .handle_request(
             request.method,

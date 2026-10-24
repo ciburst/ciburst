@@ -59,6 +59,7 @@ pub struct Dispatcher {
     provider: Arc<dyn Provider>,
     secrets: Arc<Secrets>,
     log: Log,
+    dispatch_url: Option<String>,
 }
 
 impl Dispatcher {
@@ -73,6 +74,7 @@ impl Dispatcher {
             provider,
             secrets,
             log,
+            dispatch_url: None,
         }
     }
 
@@ -103,6 +105,13 @@ impl Dispatcher {
     }
 
     /// The GitLab webhook at the current time.
+    /// The dispatcher's own base URL, which VMs call back on. Without it the URL is taken from
+    /// the `Host` header of the authenticated webhook request.
+    pub fn with_dispatch_url(mut self, url: Option<String>) -> Dispatcher {
+        self.dispatch_url = url.map(|u| u.trim_end_matches('/').to_string());
+        self
+    }
+
     pub async fn handle(&self, headers: &[(String, String)], body: &[u8]) -> DispatchResponse {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -154,7 +163,16 @@ impl Dispatcher {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         fields.push(("pool", &pool.tag));
-        match self.schedule(&pool, labels.clone(), now).await {
+        let callback = self.dispatch_url.clone().or_else(|| {
+            header(headers, "x-forwarded-host")
+                .or_else(|| header(headers, "host"))
+                .filter(|h| !h.is_empty())
+                .map(|h| format!("https://{h}"))
+        });
+        match self
+            .schedule(&pool, labels.clone(), now, callback.as_deref())
+            .await
+        {
             Ok(Decision::Claimed { run_id, free }) => {
                 let free = free.to_string();
                 fields.push(("run", &run_id));
@@ -190,6 +208,7 @@ impl Dispatcher {
         pool: &Pool,
         labels: BTreeMap<String, String>,
         now: u64,
+        callback: Option<&str>,
     ) -> Result<Decision> {
         let Some(vms) = self.provider.capacity(&pool.tag).await? else {
             let live = self
@@ -202,7 +221,7 @@ impl Dispatcher {
             if live >= pool.max_runs as usize {
                 return Ok(Decision::AtCapacity(live));
             }
-            return self.start(pool, labels, false).await;
+            return self.start(pool, labels, false, None).await;
         };
         if let Some(target) = best_slot(&vms, now) {
             let free: u64 = vms
@@ -224,7 +243,7 @@ impl Dispatcher {
                         "claim_failed",
                         &[("run", &target.run_id), ("error", &message)],
                     );
-                    return self.start(pool, labels, true).await;
+                    return self.start(pool, labels, true, callback).await;
                 }
             }
         }
@@ -232,7 +251,7 @@ impl Dispatcher {
         if live >= pool.max_runs as usize {
             return Ok(Decision::AtCapacity(live));
         }
-        self.start(pool, labels, true).await
+        self.start(pool, labels, true, callback).await
     }
 
     async fn start(
@@ -240,8 +259,12 @@ impl Dispatcher {
         pool: &Pool,
         labels: BTreeMap<String, String>,
         vm: bool,
+        callback: Option<&str>,
     ) -> Result<Decision> {
-        let env = run_env(&self.config, &self.secrets, pool, vm)?;
+        let mut env = run_env(&self.config, &self.secrets, pool, vm)?;
+        if vm && let Some(url) = callback {
+            env.insert("CIBURST_DISPATCH_URL".to_string(), url.to_string());
+        }
         let run_id = self
             .provider
             .start(StartRequest {
@@ -1240,5 +1263,24 @@ mod tests {
         assert_eq!(response.body["result"], "started", "{}", response.body);
         assert_ne!(run_of(&response), run);
         assert!(s.lines().iter().any(|l| l.starts_with("warn claim_failed")));
+    }
+
+    #[tokio::test]
+    async fn vms_get_the_callback_url_from_the_host_header() {
+        let s = vm_setup(vm_secrets()).await;
+        let mut with_host = headers("hook-secret");
+        with_host.push(("Host".to_string(), "dispatch.example".to_string()));
+        let response = s
+            .post("/", &with_host, &event("test", "pending", 7, 1))
+            .await;
+        assert_eq!(response.body["result"], "started", "{}", response.body);
+        let started = s.recording.started.lock().unwrap();
+        assert_eq!(
+            started[0]
+                .env
+                .get("CIBURST_DISPATCH_URL")
+                .map(String::as_str),
+            Some("https://dispatch.example")
+        );
     }
 }

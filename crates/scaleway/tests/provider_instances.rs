@@ -395,9 +395,16 @@ async fn start_falls_back_when_over_quota_and_names_every_failure() {
 }
 
 #[tokio::test]
-async fn the_default_types_skip_play2_nano_which_has_no_local_volume() {
+async fn the_default_types_fall_back_to_dev1_l() {
     let (backend, provider, _) = provisioned(plain(), Log::silent()).await;
     backend.instance.set_out_of_stock("DEV1-M");
+    let id = provider.start(request(&plain(), "ci")).await.unwrap();
+    let servers = backend.instance.servers();
+    assert_eq!(servers.len(), 1);
+    assert_eq!(servers[0]["id"], id.as_str());
+    assert_eq!(servers[0]["commercial_type"], "DEV1-L");
+
+    backend.instance.set_out_of_stock("DEV1-L");
     let error = provider
         .start(request(&plain(), "ci"))
         .await
@@ -405,9 +412,8 @@ async fn the_default_types_skip_play2_nano_which_has_no_local_volume() {
         .to_string();
     assert_eq!(
         error,
-        "scaleway: pool ci: no instance type started (DEV1-M: out of stock; PLAY2-NANO: no local image)"
+        "scaleway: pool ci: no instance type started (DEV1-M: out of stock; DEV1-L: out of stock)"
     );
-    assert!(backend.instance.servers().is_empty());
 }
 
 #[tokio::test]

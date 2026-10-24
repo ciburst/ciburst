@@ -40,7 +40,9 @@ pub const LEGACY_JOBS_TYPE: &str = "scaleway-jobs";
 
 /// Commercial types tried in order when a pool names none (rule 4 of M3). PLAY2 types have no
 /// local storage, so no local image fits them and start skips them.
-pub const DEFAULT_INSTANCE_TYPES: [&str; 2] = ["DEV1-M", "PLAY2-NANO"];
+/// Types with a local root volume, which terminate deletes; PLAY2 types only take block
+/// volumes, which terminate detaches and which would keep billing.
+pub const DEFAULT_INSTANCE_TYPES: [&str; 2] = ["DEV1-M", "DEV1-L"];
 
 /// The user data key cloud-init reads on Scaleway Instances.
 pub const USER_DATA_KEY: &str = "cloud-init";

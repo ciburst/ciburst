@@ -12,7 +12,7 @@ use ciburst_core::{Error, Result};
 use serde_json::{Value, json};
 
 use super::list_all;
-use crate::client::{DEFAULT_ENDPOINT, ScalewayClient, urlencode};
+use crate::client::{ScalewayClient, urlencode};
 
 /// The Instance API pages with `per_page` (at most 100) and reports the total only in the
 /// `X-Total-Count` header, which the HTTP seam does not carry: a short page ends a listing.
@@ -98,7 +98,7 @@ impl<'a> InstanceApi<'a> {
         query: &[(&str, String)],
         body: Option<(&str, Vec<u8>)>,
     ) -> Result<std::result::Result<Value, ApiError>> {
-        let mut url = format!("{DEFAULT_ENDPOINT}{path}");
+        let mut url = format!("{}{path}", self.client.endpoint());
         for (index, (key, value)) in query.iter().enumerate() {
             url.push(if index == 0 { '?' } else { '&' });
             url.push_str(key);

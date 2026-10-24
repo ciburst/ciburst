@@ -64,6 +64,11 @@ impl ScalewayClient {
         self
     }
 
+    /// Base URL of the Scaleway API, `DEFAULT_ENDPOINT` unless `with_endpoint` changed it.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
     pub fn region(&self) -> &str {
         &self.region
     }
