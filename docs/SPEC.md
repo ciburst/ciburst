@@ -34,7 +34,7 @@ Status: M2 done 2026-10-24; M3 (VM provider, D30, D31) next. Background: `SEED.m
 | D27 | 2026-10-24 | Contributions under the Developer Certificate of Origin (`Signed-off-by`), copyright "The ciburst Authors", commit authors unchanged. Policy files (`CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `NOTICE`) land with v1.0.0. |
 | D28 | 2026-10-24 | Pool images: during the private phase CI pushes them into a Scaleway Container Registry namespace of the ciburst project (private, intra-region pulls free, storage 0.027 EUR per GB per month), created by the provider's optional `registry` step; Serverless Jobs pull from it without credentials. From v1.0.0 the public GitLab registry is canonical for adopters and the Scaleway mirror stays an option (public images free up to 75 GB). |
 | D30 | 2026-10-24 | Pools choose their provider (`pools[].provider`, default the config's `provider`). The default provider becomes `scaleway-instances`: one VM per run with a local Docker daemon and GitLab's Docker executor, so per-job `image:`, `services:`, Docker-in-Docker, image builds and testcontainers work as on GitLab's own runners. Serverless Jobs pools stay as optional fast lanes for jobs without a daemon. Other providers (Fly Machines, Lambda MicroVMs, spot VMs, remote builders) are backlog. |
-| D31 | 2026-10-24 | A VM ends itself through the dispatcher, never with a cloud key: Scaleway bills a guest `poweroff` as standby, and IAM cannot limit a key to one Instance. The dispatcher gives each VM a capability token (HMAC of its server id with a secret only the function holds); after its idle window the VM posts the token to the dispatcher's `/terminate`, which checks it and terminates that VM with the dispatch key. A token can only end its own VM. A cron trigger every minute terminates VMs past their maximum lifetime and VMs whose callback never came. GitLab's job events cannot do this: they name the pool's runner, not the VM, and a VM may serve further jobs within its paid hour. |
+| D31 | 2026-10-24 | A VM ends itself through the dispatcher, never with a cloud key: Scaleway bills a guest `poweroff` as standby, and IAM cannot limit a key to one Instance. Each VM gets a capability token (HMAC of its server id with a secret only the function holds) that can only report its own state and end its own VM. Lifecycle, detection and scheduling in section 6.1. A cron trigger every 30 minutes sweeps VMs that stopped reporting. GitLab's job events cannot do this: they name the pool's runner, not the VM. |
 | D29 | 2026-10-24 | No build pool. The M2 drill showed kaniko cannot unpack any base image in Scaleway's Serverless Jobs sandbox (`chown` denied), for RUN and COPY alike. Image builds run on GitLab's hosted runners through the include's `.ciburst-image-build` template; D5's fallback becomes the rule and D20 is withdrawn. |
 
 ## 1. Purpose and scope
@@ -173,11 +173,44 @@ Provider `scaleway-instances` (API `instance/v1`, zone `<region>-1` by default),
 | 2 | Security group `<name>-vm`: inbound drop, outbound accept |
 | 3 | Image `<name>-vm`: Ubuntu 24.04 with Docker CE and `gitlab-runner` baked by a builder VM from cloud-init, snapshotted, the builder deleted; rebuilt when its recipe digest changes |
 | start | `POST servers` with `commercial_type` from a fallback list (default `DEV1-M`, then `PLAY2-NANO`), the baked image, local root volume, `dynamic_ip_required`, tags `ciburst`, `<name>`, `pool:<tag>`, `job:<id>`; user data `cloud-init` with the pool's runner token, cache settings, the dispatcher URL and the VM's capability token; then `poweron` |
-| run | cloud-init starts `gitlab-runner run-single --executor docker --docker-privileged --max-builds 0 --wait-timeout <s>` with `concurrent` jobs per VM; the idle window is stretched to minute 55 of the paid hour, then the VM posts its token to `/terminate` |
+| run | cloud-init starts the supervisor with `concurrent` slots of `gitlab-runner run-single --executor docker --docker-privileged`; lifecycle in section 6.1 |
 | list | `GET servers?tags=<name>` with states `starting`, `running` as live |
 | stop | `terminate` (deletes the local volume, releases the dynamic IP) |
 
-The dispatcher starts a VM for a pending job unless the pool has `maxRuns` live VMs or a VM of the pool booted within the last two minutes; running VMs take further pending jobs themselves. The cron sweep terminates VMs older than `timeoutS` plus one hour and VMs stuck in `starting` for ten minutes.
+### 6.1 VM lifecycle
+
+Facts from `gitlab-runner` `commands/single.go`: a runner receives a job only by requesting one, about every 3 s while idle; `run-single` runs one job at a time; `SIGQUIT` stops further requests, lets the current job finish, then exits.
+
+Detection, on the VM. A supervisor runs `concurrent` `run-single` processes (one per slot, own config dir) and counts busy slots as job containers labelled `com.gitlab.gitlab-runner.job.id` (`docker ps`, every 5 s). It reports to the dispatcher (`POST /vm`, its token, `{state, free, uptime}`) on every change and every 10 minutes; the dispatcher writes the report into the server's tags `ciburst-state:<idle|busy|draining>`, `ciburst-free:<n>`, `ciburst-seen:<unix time>`. The tags are the only shared state; the function stays stateless.
+
+States and transitions:
+
+| State | Meaning | Next |
+|---|---|---|
+| `starting` | created, cloud-init running, no report yet | `idle` on the first report |
+| `idle` | every slot polling, no job | `busy` when a slot takes a job; `draining` at minute 55 of a paid hour |
+| `busy` | at least one slot runs a job | `idle` when all slots are free |
+| `draining` | idle at minute 55; slots keep polling for a 30 s grace, then get `SIGQUIT` | `busy` if a slot takes a job during the grace; `POST /terminate` after the last slot exited |
+
+Drain protocol, which keeps every job served:
+
+1. The VM reports `draining` first. From then on the dispatcher no longer counts it as capacity.
+2. Its slots keep polling for the 30 s grace. A job that went pending before step 1 was routed to this VM by the dispatcher, and a polling slot takes it within about 3 s.
+3. After the grace the supervisor sends `SIGQUIT`. A job taken in the last request still runs to its end.
+4. When all slots have exited, no request can reach GitLab, so no job can be assigned to the VM. Only then does it post `/terminate`; the dispatcher checks the token and terminates the server.
+
+Scheduling, on a pending job event: `free` is the sum of `ciburst-free` over the pool's VMs in state `idle` or `busy`; `starting` and `draining` VMs do not count. If `free > 0`, the dispatcher claims one slot by lowering that VM's `ciburst-free` and starts nothing. Otherwise it starts a VM, unless the pool already has `maxRuns` VMs that are not draining; then the job waits for the next slot that frees up. A burst of pending jobs on an empty pool therefore starts one VM per job up to `maxRuns`, and warm VMs within their paid hour are used first.
+
+Races and their effect:
+
+| Race | Effect |
+|---|---|
+| Two dispatcher calls claim the same free slot | one job waits for the next free slot; never stranded, because the VM keeps polling until it is idle, and idle means no pending job for its tag |
+| A job goes pending while a VM starts draining | taken in the grace, or the dispatcher already saw `draining` and started a VM; at worst one extra VM-hour (0.025 EUR) |
+| A VM boots for a job another VM already took | the new VM idles until minute 55 of its hour and drains; one VM-hour |
+| A VM hangs or loses its network | its jobs fail on GitLab's side when the runner stops updating them; the sweep removes it |
+
+Sweep, a cron trigger every 30 minutes: terminates VMs in `starting` for more than 10 minutes, VMs in `draining` for more than 15 minutes, VMs whose `ciburst-seen` is older than 30 minutes, and any VM older than 24 hours. It never touches a VM that reports, so it cannot race the scheduler or a running job. A job longer than the VM's report interval keeps the VM alive because the supervisor reports every 10 minutes independently of the job.
 
 Host `scaleway-function` (API `functions/v1beta1`):
 
@@ -258,7 +291,7 @@ A provider is a crate implementing `ciburst_core::types::Provider` with a `capab
 | M0, orchestrator, done | workspace, LICENSE, README, `crates/core`, `crates/cli` with the fake modules, contract harness, GitLab fake, CI lint, deny and test, `docs/PROVIDERS.md` | `cargo test` green, `ciburst plan` against the fake modules prints every step, second `apply` plans nothing |
 | M1, three agents, done | A: `crates/scaleway` provider (jobs, IAM, bucket, lifecycle) with an in-process fake of the Jobs, IAM and S3 APIs, passing the contract. B: `crates/scaleway` host (namespace, function, secrets, zip, upload, deploy) with a Functions fake, and `crates/dispatch-scaleway` (axum handler on `Dispatcher`, builds on Rust 1.96). C: `images/*` (five images, entrypoint with cache flags verified), CI `images` and `release` stages, `ci/ciburst.yml`, `docs/RUNBOOK.md` | all tests green on CI, image smoke green, plan and apply idempotent against the fakes |
 | M2, orchestrator with owner keys | provider step `registry`, CI push of the images into it, group and private project on GitLab.com, first push and pipeline; drill: `ciburst apply` on an empty project, `check` on the drill consumer project, a pipeline with node, rust, playwright and kaniko jobs plus one hosted-runner job; start latency; kaniko verdict; cache hit on the second run; cost on the consumption page; API behaviour assumed by the fakes checked live (stop sets a run to `canceled`, a run's environment merges the definition's with the overrides, deleting an IAM application does not cascade to its policies and keys, a PATCH of a deployed function does not redeploy by itself); fixes | runbook section "Drill" filled with dates and numbers |
-| M3, VM provider | per-pool `provider`, provider `scaleway-instances` with fake Instance API and contract tests, baked image recipe, VM entrypoint (Docker executor, hour-aligned idle window, `/terminate` callback), dispatcher routes `/terminate` and the cron sweep, include without the shell-executor caveats, drill on the drill consumer project with `image:`, `services:` (postgres), dind and a `docker build` | the drill pipeline passes on the VM pool; a VM ends by callback within minute 55 to 60 of its hour; a VM whose callback is blocked ends by the sweep; cost per pipeline recorded |
+| M3, VM provider | per-pool `provider`, provider `scaleway-instances` with fake Instance API and contract tests, baked image recipe, VM supervisor (slots, state reports, drain protocol), dispatcher routes `/vm` and `/terminate`, slot claims and the 30-minute cron sweep, a simulation test of the races in section 6.1 against the fakes, include without the shell-executor caveats, drill on the drill consumer project with `image:`, `services:` (postgres), dind and a `docker build` | the drill pipeline passes on the VM pool; a VM ends by callback within minute 55 to 60 of its hour; a VM whose reports are blocked ends by the sweep; no job of the drill waits longer than one job duration plus a VM boot; cost per pipeline recorded |
 | M4, pipeline setup | `OutputsStore` on GitLab project variables (masked where allowed), `apply --no-wait`, config defaults from the job environment, `images/cli` with the binary, `ciburst-setup`, `ciburst-check` and `ciburst-destroy` jobs in the include, README "adopt in ten minutes" | a fresh consumer project is provisioned by its own pipeline from the four variables; the second run of `ciburst-setup` plans only `noop`; hosted-runner minutes per setup under three |
 | M5, go public | hardening from M2 to M4, policy files (D27), project visibility public, GitHub mirror, Pages site at `ciburst.zwa.la`, crates.io publication of `ciburst-core`, `ciburst-scaleway` and `ciburst`, `v1.0.0` tag with binaries and images | release pipeline green, the images pull anonymously from the GitLab registry, the docs site answers |
 
