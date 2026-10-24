@@ -1,41 +1,25 @@
 {
   "name": "ci",
-  "gitlab": {
-    "url": "https://gitlab.com",
-    "projectIds": [
-      0
-    ]
-  },
-  "host": {
-    "type": "scaleway-function",
-    "region": "fr-par"
-  },
-  "provider": {
-    "type": "scaleway-jobs",
-    "region": "fr-par"
-  },
-  "defaultPool": "ci",
+  "gitlab": { "url": "https://gitlab.com", "projectIds": [0] },
+  "host": { "type": "scaleway-function", "region": "fr-par" },
+  "provider": { "type": "scaleway", "region": "fr-par", "registry": true, "registryPublic": true },
+  "defaultPool": "vm",
   "pools": [
     {
-      "tag": "ci",
-      "image": "registry.gitlab.com/<namespace>/ciburst/node:1",
-      "stages": [
-        "lint",
-        "test"
-      ],
-      "vcpu": 2,
-      "memoryMiB": 4096,
-      "storageMiB": 10240,
+      "tag": "vm",
+      "runtime": "instances",
+      "image": "ubuntu:24.04",
+      "stages": [],
+      "slots": 2,
+      "instanceTypes": ["DEV1-M", "DEV1-L"],
       "timeoutS": 3600,
-      "waitTimeoutS": 60,
-      "maxRuns": 10
+      "maxRuns": 4
     },
     {
       "tag": "rust",
+      "runtime": "jobs",
       "image": "registry.gitlab.com/<namespace>/ciburst/rust:1",
-      "stages": [
-        "rust"
-      ],
+      "stages": ["rust"],
       "vcpu": 4,
       "memoryMiB": 8192,
       "storageMiB": 10240,
@@ -45,10 +29,9 @@
     },
     {
       "tag": "playwright",
+      "runtime": "jobs",
       "image": "registry.gitlab.com/<namespace>/ciburst/playwright:1",
-      "stages": [
-        "e2e"
-      ],
+      "stages": ["e2e"],
       "vcpu": 4,
       "memoryMiB": 8192,
       "storageMiB": 10240,
@@ -57,8 +40,5 @@
       "maxRuns": 4
     }
   ],
-  "cache": {
-    "type": "s3",
-    "expireDays": 30
-  }
+  "cache": { "type": "s3", "expireDays": 30 }
 }
