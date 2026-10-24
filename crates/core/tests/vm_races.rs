@@ -3,17 +3,23 @@
 //! at minute 55 with a 30 s grace and `SIGQUIT`, and posts `/terminate` after its last slot
 //! exited. The real `Dispatcher` and the fake provider see every webhook, report, termination and
 //! the sweep cron. Each scenario asserts that every pending job starts within one job duration
-//! plus one boot, that no VM ends while a slot holds a job, and a bound on VM-hours.
+//! plus one boot, that no VM ends while a slot holds a job, and a bound on VM-hours. Bursts of
+//! simultaneous events run their dispatcher calls concurrently on paused tokio time, so with a
+//! ledger every call records its intent before any call reads the burst (M4 rule R3).
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 
 use async_trait::async_trait;
 use ciburst_core::Result;
 use ciburst_core::config::parse_config;
 use ciburst_core::dispatch::{DispatchResponse, Dispatcher};
 use ciburst_core::fake::FakeProvider;
+use ciburst_core::ledger::{GROUP_WINDOW_S, MemoryLedger};
 use ciburst_core::log::Log;
 use ciburst_core::store::MemoryStore;
 use ciburst_core::types::{
@@ -166,6 +172,7 @@ impl Vm {
 struct Decision {
     result: String,
     run: Option<String>,
+    leader: Option<String>,
 }
 
 struct Sim {
@@ -183,7 +190,17 @@ struct Sim {
 }
 
 impl Sim {
+    /// The M3 rule: no burst ledger.
     async fn new(slots: u32, max_runs: u32) -> Sim {
+        Sim::build(slots, max_runs, false).await
+    }
+
+    /// Burst grouping through a ledger with the default group wait.
+    async fn with_ledger(slots: u32, max_runs: u32) -> Sim {
+        Sim::build(slots, max_runs, true).await
+    }
+
+    async fn build(slots: u32, max_runs: u32, ledger: bool) -> Sim {
         let config = Arc::new(
             parse_config(
                 &json!({
@@ -222,9 +239,11 @@ impl Sim {
             provider_env: BTreeMap::new(),
         };
         let (log, lines) = Log::memory();
+        let dispatcher = Dispatcher::new(config, provider.clone(), Arc::new(secrets), log)
+            .with_ledger(ledger.then(|| Arc::new(MemoryLedger::new()) as _));
         Sim {
             now,
-            dispatcher: Dispatcher::new(config, provider.clone(), Arc::new(secrets), log),
+            dispatcher,
             provider,
             slots,
             jobs: Vec::new(),
@@ -277,25 +296,22 @@ impl Sim {
             .await
     }
 
-    fn webhook(&mut self, duration: u64) -> (usize, Vec<u8>) {
-        let index = self.jobs.len();
+    /// A job goes pending now; its event is sent separately.
+    fn webhook(&mut self, duration: u64) -> usize {
         self.jobs.push(Job {
             pending_at: self.t(),
             duration,
             started: None,
             failed: false,
         });
-        let body = json!({
-            "object_kind": "build", "build_status": "pending", "build_id": index,
-            "pipeline_id": 1, "project_id": 7, "build_stage": "test"
-        });
-        (index, body.to_string().into_bytes())
+        self.jobs.len() - 1
     }
 
     fn record(&mut self, response: DispatchResponse) {
         assert_eq!(response.status, 200, "{}", response.body);
         let result = response.body["result"].as_str().unwrap().to_string();
         let run = response.body["runId"].as_str().map(String::from);
+        let leader = response.body["leader"].as_str().map(String::from);
         if result == "started" {
             let run_id = run.clone().unwrap();
             let boots = std::mem::replace(&mut self.next_boots, true);
@@ -316,21 +332,66 @@ impl Sim {
                 jobs_taken: 0,
             });
         }
-        self.decisions.push(Decision { result, run });
+        self.decisions.push(Decision {
+            result,
+            run,
+            leader,
+        });
     }
 
     /// A job goes pending now; GitLab sends its event.
     async fn pending(&mut self, duration: u64) -> usize {
-        let (index, body) = self.webhook(duration);
-        let response = self.request("/", &gitlab_headers(), &body).await;
+        let index = self.webhook(duration);
+        let response = self.request("/", &gitlab_headers(), &event(index)).await;
         self.record(response);
         index
     }
 
+    /// `n` jobs go pending now and GitLab sends their events at once.
+    async fn burst(&mut self, n: usize, duration: u64) -> Vec<usize> {
+        let jobs: Vec<usize> = (0..n).map(|_| self.webhook(duration)).collect();
+        for response in self.deliver(&jobs).await {
+            self.record(response);
+        }
+        jobs
+    }
+
+    /// Sends the events of `jobs` concurrently; every call runs until it waits, so with a
+    /// ledger each one records its intent before any reads the burst.
+    async fn deliver(&self, jobs: &[usize]) -> Vec<DispatchResponse> {
+        let headers = gitlab_headers();
+        let bodies: Vec<Vec<u8>> = jobs.iter().map(|&job| event(job)).collect();
+        join_all(
+            bodies
+                .iter()
+                .map(|body| self.request("/", &headers, body))
+                .collect(),
+        )
+        .await
+    }
+
+    /// GitLab delivers the event of `job` once more; answers the result.
+    async fn again(&self, job: usize) -> String {
+        let response = self.request("/", &gitlab_headers(), &event(job)).await;
+        assert_eq!(response.status, 200, "{}", response.body);
+        response.body["result"].as_str().unwrap().to_string()
+    }
+
+    fn count(&self, result: &str) -> usize {
+        self.decisions.iter().filter(|d| d.result == result).count()
+    }
+
+    /// Seconds `job` waited for a slot.
+    fn waited(&self, job: usize) -> u64 {
+        let (started, _) = self.jobs[job].started.as_ref().expect("job started");
+        started - self.jobs[job].pending_at
+    }
+
     /// Two jobs go pending at once and both dispatcher calls read capacity before either claims.
     async fn pending_together(&mut self, duration: u64) -> (usize, usize) {
-        let (a, body_a) = self.webhook(duration);
-        let (b, body_b) = self.webhook(duration);
+        let a = self.webhook(duration);
+        let b = self.webhook(duration);
+        let (body_a, body_b) = (event(a), event(b));
         let headers = gitlab_headers();
         self.provider.interleave.store(true, Ordering::SeqCst);
         let (first, second) = tokio::join!(
@@ -570,6 +631,43 @@ impl Sim {
 
 fn gitlab_headers() -> Vec<(String, String)> {
     vec![("X-Gitlab-Token".to_string(), HOOK.to_string())]
+}
+
+/// The pending event of job `index`; its build id is the index.
+fn event(index: usize) -> Vec<u8> {
+    json!({
+        "object_kind": "build", "build_status": "pending", "build_id": index,
+        "pipeline_id": 1, "project_id": 7, "build_stage": "test"
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// Polls every future until all are ready, in order on each wake.
+async fn join_all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
+    let mut futures: Vec<Pin<Box<F>>> = futures.into_iter().map(Box::pin).collect();
+    let mut outputs: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut ready = true;
+        for (future, output) in futures.iter_mut().zip(outputs.iter_mut()) {
+            if output.is_none() {
+                match future.as_mut().poll(cx) {
+                    Poll::Ready(value) => *output = Some(value),
+                    Poll::Pending => ready = false,
+                }
+            }
+        }
+        if ready {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    outputs
+        .into_iter()
+        .map(|output| output.expect("polled to completion"))
+        .collect()
 }
 
 fn vm_headers(vm: &Vm) -> Vec<(String, String)> {
@@ -862,5 +960,202 @@ async fn the_sweep_needs_the_sweep_token() {
     for given in [json!("wrong"), json!(""), Value::Null, json!(HOOK)] {
         let body = json!({ vm::SWEEP_ARG: given }).to_string().into_bytes();
         assert_eq!(sim.request("/", &[], &body).await.status, 401);
+    }
+}
+
+const BURST_JOB_S: u64 = 5 * MIN;
+
+/// Longest wait of a burst of `n` jobs on `vms` VMs with `slots` each: one boot, then one job
+/// duration for every further round of slots.
+fn burst_bound(n: usize, vms: usize, slots: u32) -> u64 {
+    let rounds = n.div_ceil(vms * slots as usize) as u64;
+    BOOT_S + POLL_S + (rounds - 1) * BURST_JOB_S
+}
+
+fn taken_counts(sim: &Sim) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for line in sim.lines.lock().unwrap().iter() {
+        if line.starts_with("info started")
+            && let Some(rest) = line.split("taken=\"").nth(1)
+        {
+            let taken = rest.split('"').next().unwrap().to_string();
+            *counts.entry(taken).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_m3_drill_burst_starts_three_vms_at_two_slots() {
+    let mut sim = Sim::with_ledger(2, 4).await;
+    sim.burst(5, 10 * MIN).await;
+    assert_eq!(
+        sim.results(),
+        ["started", "grouped", "started", "grouped", "started"]
+    );
+    let leaders: Vec<Option<&str>> = sim.decisions.iter().map(|d| d.leader.as_deref()).collect();
+    assert_eq!(leaders, [None, Some("0"), None, Some("2"), None]);
+    assert_eq!(
+        taken_counts(&sim),
+        BTreeMap::from([("1".to_string(), 1), ("2".to_string(), 2)])
+    );
+    sim.run_to(2 * HOUR).await;
+    sim.check(bound(10 * MIN), &[]).await;
+    assert!((0..5).all(|job| sim.waited(job) == BOOT_S));
+    assert_eq!(sim.vms.len(), 3);
+    assert_eq!(sim.vm_hours(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cold_burst_starts_one_vm_per_group_of_slots_up_to_max_runs() {
+    for slots in 1..=3u32 {
+        for n in 1..=10usize {
+            for max_runs in [1u32, 2, 3, 10] {
+                let label = format!("slots {slots}, {n} jobs, maxRuns {max_runs}");
+                let mut sim = Sim::with_ledger(slots, max_runs).await;
+                let jobs = sim.burst(n, BURST_JOB_S).await;
+                let groups = n.div_ceil(slots as usize);
+                let vms = groups.min(max_runs as usize);
+                assert_eq!(sim.vms.len(), vms, "{label}: {:?}", sim.results());
+                assert_eq!(sim.count("started"), vms, "{label}");
+                assert_eq!(sim.count("at_capacity"), groups - vms, "{label}");
+                assert_eq!(sim.count("grouped"), n - groups, "{label}");
+                for (rank, &job) in jobs.iter().enumerate() {
+                    let leader = rank - rank % slots as usize;
+                    let expected = (leader != rank).then(|| jobs[leader].to_string());
+                    assert_eq!(sim.decisions[job].leader, expected, "{label}, job {job}");
+                }
+                sim.run_to(2 * HOUR).await;
+                let limit = burst_bound(n, vms, slots);
+                if vms == groups {
+                    assert!(limit <= bound(BURST_JOB_S), "{label}");
+                }
+                sim.check(limit, &[]).await;
+                assert_eq!(sim.vm_hours(), vms as u64, "{label}");
+            }
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_burst_beside_a_busy_vm_counts_it_toward_max_runs() {
+    for slots in 1..=3u32 {
+        for n in 1..=10usize {
+            for max_runs in [2u32, 3, 10] {
+                let label = format!("slots {slots}, {n} jobs, maxRuns {max_runs}");
+                let mut sim = Sim::with_ledger(slots, max_runs).await;
+                sim.burst(slots as usize, 2 * HOUR).await;
+                assert_eq!(sim.vms.len(), 1, "{label}");
+                assert_eq!(sim.count("grouped"), slots as usize - 1, "{label}");
+                sim.run_to(5 * MIN).await;
+                let busy = &sim.vms[0];
+                assert_eq!(busy.reported, Some((VmState::Busy, 0)), "{label}");
+
+                let jobs = sim.burst(n, BURST_JOB_S).await;
+                let groups = n.div_ceil(slots as usize);
+                let vms = groups.min(max_runs as usize - 1);
+                assert_eq!(sim.vms.len(), 1 + vms, "{label}: {:?}", sim.results());
+                sim.run_to(4 * HOUR).await;
+                sim.check(bound(2 * HOUR), &[]).await;
+                let limit = burst_bound(n, vms, slots);
+                for &job in &jobs {
+                    assert!(sim.waited(job) <= limit, "{label}, job {job}");
+                }
+                assert_eq!(sim.vm_hours(), 3 + vms as u64, "{label}");
+            }
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_duplicate_event_starts_nothing() {
+    let mut sim = Sim::with_ledger(2, 10).await;
+    let first = sim.burst(4, BURST_JOB_S).await;
+    assert_eq!(sim.results(), ["started", "grouped", "started", "grouped"]);
+
+    sim.run_to(3).await;
+    let mut jobs = vec![sim.webhook(BURST_JOB_S), sim.webhook(BURST_JOB_S)];
+    jobs.extend([first[0], first[3]]);
+    let responses = sim.deliver(&jobs).await;
+    let results: Vec<&str> = responses
+        .iter()
+        .map(|r| r.body["result"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        results,
+        ["started", "grouped", "duplicate", "duplicate"],
+        "re-delivered events neither start nor shift the ranks"
+    );
+    for response in responses.into_iter().take(2) {
+        sim.record(response);
+    }
+    sim.run_to(10).await;
+    assert_eq!(sim.again(first[1]).await, "duplicate");
+    assert_eq!(sim.vms.len(), 3);
+
+    sim.run_to(2 * HOUR).await;
+    sim.check(bound(BURST_JOB_S), &[]).await;
+    assert_eq!(sim.vm_hours(), 3);
+    assert_eq!(
+        sim.lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.starts_with("info duplicate"))
+            .count(),
+        3
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn late_jobs_ride_on_a_partial_group_or_claim_its_starting_vm() {
+    let mut sim = Sim::with_ledger(2, 10).await;
+    sim.burst(3, BURST_JOB_S).await;
+    assert_eq!(sim.results(), ["started", "grouped", "started"]);
+    sim.run_to(10).await;
+    let rider = sim.pending(BURST_JOB_S).await;
+    assert_eq!(sim.decisions[rider].result, "grouped");
+    assert_eq!(sim.decisions[rider].leader.as_deref(), Some("2"));
+
+    sim.run_to(GROUP_WINDOW_S + 10).await;
+    let claimer = sim.pending(BURST_JOB_S).await;
+    assert_eq!(sim.decisions[claimer].result, "claimed");
+    assert_eq!(sim.run_of(claimer), sim.run_of(2));
+    assert_eq!(sim.vms.len(), 2);
+
+    sim.run_to(2 * HOUR).await;
+    sim.check(bound(BURST_JOB_S), &[]).await;
+    assert_eq!(sim.vm_hours(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn without_a_ledger_a_cold_burst_starts_one_vm_per_job_as_in_m3() {
+    for slots in 1..=3u32 {
+        for n in 1..=10usize {
+            for max_runs in [1u32, 2, 3, 10] {
+                let label = format!("slots {slots}, {n} jobs, maxRuns {max_runs}");
+                let mut sim = Sim::new(slots, max_runs).await;
+                sim.burst(n, BURST_JOB_S).await;
+                let vms = n.min(max_runs as usize);
+                let mut expected = vec!["started"; vms];
+                expected.resize(n, "at_capacity");
+                assert_eq!(sim.results(), expected, "{label}");
+                sim.run_to(2 * HOUR).await;
+                sim.check(burst_bound(n, vms, slots), &[]).await;
+                assert_eq!(sim.vm_hours(), vms as u64, "{label}");
+                assert_eq!(
+                    taken_counts(&sim),
+                    BTreeMap::from([("1".to_string(), vms)]),
+                    "{label}"
+                );
+                let lines = sim.lines.lock().unwrap();
+                assert!(
+                    !lines
+                        .iter()
+                        .any(|l| l.contains("grouped") || l.contains("ledger_failed")),
+                    "{label}"
+                );
+            }
+        }
     }
 }

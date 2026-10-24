@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,7 +8,7 @@ use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 
 use crate::config::{CacheType, Config, Pool};
-use crate::ledger::{GROUP_WAIT_S, Ledger};
+use crate::ledger::{GROUP_WAIT_S, GROUP_WINDOW_S, Intent, Ledger};
 use crate::log::Log;
 use crate::provision::keys;
 use crate::types::{Provider, Secrets, StartRequest, VmCapacity, VmReport, VmState};
@@ -63,10 +64,8 @@ pub struct Dispatcher {
     log: Log,
     dispatch_url: Option<String>,
     /// Burst intents (M4 rule R3); `None` keeps the M3 rule.
-    #[allow(dead_code)]
     ledger: Option<Arc<dyn Ledger>>,
     /// Pause between recording an intent and reading the burst.
-    #[allow(dead_code)]
     group_wait: Duration,
 }
 
@@ -208,10 +207,25 @@ impl Dispatcher {
                 self.log.info("at_capacity", &fields);
                 reply(200, "at_capacity", json!({ "pool": pool.tag }))
             }
-            Ok(Decision::Started(run_id)) => {
+            Ok(Decision::Started { run_id, taken }) => {
+                let taken = taken.to_string();
                 fields.push(("run", &run_id));
+                fields.push(("taken", &taken));
                 self.log.info("started", &fields);
                 reply(200, "started", json!({ "pool": pool.tag, "runId": run_id }))
+            }
+            Ok(Decision::Grouped { leader }) => {
+                fields.push(("leader", &leader));
+                self.log.info("grouped", &fields);
+                reply(
+                    200,
+                    "grouped",
+                    json!({ "pool": pool.tag, "leader": leader }),
+                )
+            }
+            Ok(Decision::Duplicate) => {
+                self.log.info("duplicate", &fields);
+                reply(200, "duplicate", json!({ "pool": pool.tag }))
             }
             Err(error) => {
                 let message = error.to_string();
@@ -222,9 +236,10 @@ impl Dispatcher {
         }
     }
 
-    /// Spec 6.1, scheduling: a free slot of an `idle` or `busy` VM is claimed; otherwise a run
-    /// starts unless `maxRuns` runs are live (VMs: not draining). Providers without VMs answer
-    /// `None` from `capacity` and count live runs.
+    /// Spec 6.1, scheduling, M4 rules R1 to R6: a free slot of a claim candidate is claimed;
+    /// otherwise the job joins the burst ledger, or without one a VM starts unless `maxRuns`
+    /// VMs are live (not draining). Providers without VMs answer `None` from `capacity` and
+    /// count live runs.
     async fn schedule(
         &self,
         pool: &Pool,
@@ -243,14 +258,12 @@ impl Dispatcher {
             if live >= pool.max_runs as usize {
                 return Ok(Decision::AtCapacity(live));
             }
-            return self.start(pool, labels, false, None).await;
+            return self.start(pool, labels, false, None, 1).await;
         };
-        if let Some(target) = best_slot(&vms, now) {
-            let free: u64 = vms
-                .iter()
-                .filter(|v| counts_as_capacity(v, now))
-                .map(|v| u64::from(v.free))
-                .sum();
+        let job = labels.get("job").cloned().unwrap_or_default();
+        let candidates = claim_candidates(&vms, now);
+        if let Some(target) = spread(&candidates, &job) {
+            let free: u64 = candidates.iter().map(|v| u64::from(v.free)).sum();
             match self.provider.claim(&target.run_id).await {
                 Ok(()) => {
                     return Ok(Decision::Claimed {
@@ -265,7 +278,32 @@ impl Dispatcher {
                         "claim_failed",
                         &[("run", &target.run_id), ("error", &message)],
                     );
-                    return self.start(pool, labels, true, callback).await;
+                    return self.start(pool, labels, true, callback, 1).await;
+                }
+            }
+        }
+        if let Some(ledger) = self.ledger.as_deref().filter(|_| !job.is_empty()) {
+            match self.burst(ledger, pool, &job, now).await {
+                Ok(Burst::Duplicate) => return Ok(Decision::Duplicate),
+                Ok(Burst::Follower { leader }) => return Ok(Decision::Grouped { leader }),
+                Ok(Burst::Leader { group, taken }) => {
+                    let cutoff = now.saturating_sub(GROUP_WINDOW_S);
+                    let live_old = vms
+                        .iter()
+                        .filter(|v| v.state != VmState::Draining && v.created_at < cutoff)
+                        .count();
+                    let live = live_old + group;
+                    if live >= pool.max_runs as usize {
+                        return Ok(Decision::AtCapacity(live));
+                    }
+                    return self.start(pool, labels, true, callback, taken).await;
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    self.log.warn(
+                        "ledger_failed",
+                        &[("pool", &pool.tag), ("job", &job), ("error", &message)],
+                    );
                 }
             }
         }
@@ -273,15 +311,31 @@ impl Dispatcher {
         if live >= pool.max_runs as usize {
             return Ok(Decision::AtCapacity(live));
         }
-        self.start(pool, labels, true, callback).await
+        self.start(pool, labels, true, callback, 1).await
     }
 
+    /// M4 rule R3: records the intent, waits for the rest of the burst and ranks the intents of
+    /// the window. An error means the ledger failed (R4).
+    async fn burst(&self, ledger: &dyn Ledger, pool: &Pool, job: &str, now: u64) -> Result<Burst> {
+        ledger.record(&pool.tag, now, job).await?;
+        if !self.group_wait.is_zero() {
+            tokio::time::sleep(self.group_wait).await;
+        }
+        let intents = ledger
+            .since(&pool.tag, now.saturating_sub(GROUP_WINDOW_S))
+            .await?;
+        rank_burst(&intents, job, now, pool.slots)
+            .ok_or_else(|| Error::other("the ledger lacks the intent just recorded"))
+    }
+
+    /// Starts a run; `taken` slots of a new VM are already assigned (M4 rule R6).
     async fn start(
         &self,
         pool: &Pool,
         labels: BTreeMap<String, String>,
         vm: bool,
         callback: Option<&str>,
+        taken: u32,
     ) -> Result<Decision> {
         let mut env = run_env(&self.config, &self.secrets, pool, vm)?;
         if vm && let Some(url) = callback {
@@ -293,10 +347,10 @@ impl Dispatcher {
                 pool: pool.clone(),
                 env,
                 labels,
-                taken: 1,
+                taken,
             })
             .await?;
-        Ok(Decision::Started(run_id))
+        Ok(Decision::Started { run_id, taken })
     }
 
     /// The run id of a request that carries a valid capability token.
@@ -395,35 +449,137 @@ impl Dispatcher {
 }
 
 enum Decision {
-    Claimed { run_id: String, free: u64 },
+    Claimed {
+        run_id: String,
+        free: u64,
+    },
     AtCapacity(usize),
-    Started(String),
+    Started {
+        run_id: String,
+        taken: u32,
+    },
+    /// Rides on the VM its burst leader starts (M4 rule R3).
+    Grouped {
+        leader: String,
+    },
+    /// The job's intent was already recorded by an earlier event (M4 rule R3).
+    Duplicate,
 }
 
 /// Seconds after its last report that a VM still counts as capacity: two heartbeats and a
 /// minute, so one lost report does not matter but a hung VM stops absorbing claims.
 pub const CAPACITY_FRESH_S: u64 = 2 * vm::HEARTBEAT_S + 60;
 
-/// `starting` VMs do not poll yet, `draining` ones stop soon, and a VM silent for longer than
-/// [`CAPACITY_FRESH_S`] may hang; none of them takes a routed job.
-fn counts_as_capacity(vm: &VmCapacity, now: u64) -> bool {
-    matches!(vm.state, VmState::Idle | VmState::Busy)
-        && vm
+/// M4 rule R1: a VM takes a claim when it has a free slot, was created more than
+/// [`GROUP_WINDOW_S`] ago (younger VMs are accounted for by the burst ledger), and is `idle` or
+/// `busy` with a report within [`CAPACITY_FRESH_S`], or `starting` and younger than
+/// [`vm::SWEEP_STARTING_S`]. `draining` VMs stop soon and silent ones may hang.
+fn is_candidate(vm: &VmCapacity, now: u64) -> bool {
+    let age = now.saturating_sub(vm.created_at);
+    if vm.free == 0 || age <= GROUP_WINDOW_S {
+        return false;
+    }
+    match vm.state {
+        VmState::Idle | VmState::Busy => vm
             .seen
-            .is_some_and(|seen| now.saturating_sub(seen) <= CAPACITY_FRESH_S)
+            .is_some_and(|seen| now.saturating_sub(seen) <= CAPACITY_FRESH_S),
+        VmState::Starting => age < vm::SWEEP_STARTING_S,
+        VmState::Draining => false,
+    }
 }
 
-/// The VM with the most free slots; on a tie the one seen longest ago, then by id, so the
-/// choice is deterministic.
-fn best_slot(vms: &[VmCapacity], now: u64) -> Option<&VmCapacity> {
-    vms.iter()
-        .filter(|v| counts_as_capacity(v, now) && v.free > 0)
-        .min_by(|a, b| {
-            b.free
-                .cmp(&a.free)
-                .then(a.seen.unwrap_or(0).cmp(&b.seen.unwrap_or(0)))
-                .then(a.run_id.cmp(&b.run_id))
-        })
+fn claim_candidates(vms: &[VmCapacity], now: u64) -> Vec<&VmCapacity> {
+    vms.iter().filter(|v| is_candidate(v, now)).collect()
+}
+
+/// M4 rule R2: among the candidates with the most free slots, sorted by run id, the one at
+/// index `fnv1a64(job) % count`, so parallel claims of one burst spread over the VMs.
+fn spread<'a>(candidates: &[&'a VmCapacity], job: &str) -> Option<&'a VmCapacity> {
+    let most = candidates.iter().map(|v| v.free).max()?;
+    let mut top: Vec<&VmCapacity> = candidates
+        .iter()
+        .copied()
+        .filter(|v| v.free == most)
+        .collect();
+    top.sort_by(|a, b| a.run_id.cmp(&b.run_id));
+    let index = fnv1a64(job.as_bytes()) % top.len() as u64;
+    top.get(index as usize).copied()
+}
+
+/// FNV-1a, 64 bit.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// A job id in the burst order: a number when it parses as one, so `42` and a zero-padded
+/// `00000000000000000042` read back from a ledger are the same job. Numbers order before
+/// other ids, which keeps the order total when ids of both kinds meet.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum JobKey {
+    Number(u64),
+    Text(String),
+}
+
+impl JobKey {
+    fn parse(job: &str) -> JobKey {
+        job.parse()
+            .map(JobKey::Number)
+            .unwrap_or_else(|_| JobKey::Text(job.to_string()))
+    }
+}
+
+impl fmt::Display for JobKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            JobKey::Number(n) => write!(f, "{n}"),
+            JobKey::Text(s) => f.write_str(s),
+        }
+    }
+}
+
+/// A job's place in its burst (M4 rule R3).
+#[derive(Debug, PartialEq, Eq)]
+enum Burst {
+    /// The job's earliest intent is older than this event.
+    Duplicate,
+    /// Rank `r % slots != 0`: the job rides on the VM of the job at rank `r - r % slots`.
+    Follower { leader: String },
+    /// Rank `r % slots == 0`: group `r / slots` starts a VM with `taken` slots assigned.
+    Leader { group: usize, taken: u32 },
+}
+
+/// Ranks `job` among the intents of the window `[now - GROUP_WINDOW_S, ..]`: each job's
+/// earliest intent, ordered by time, then job id. `None` when the job has no intent there.
+fn rank_burst(intents: &[Intent], job: &str, now: u64, slots: u32) -> Option<Burst> {
+    let since = now.saturating_sub(GROUP_WINDOW_S);
+    let mut earliest: BTreeMap<JobKey, u64> = BTreeMap::new();
+    for intent in intents.iter().filter(|i| i.at >= since) {
+        let at = earliest
+            .entry(JobKey::parse(&intent.job))
+            .or_insert(intent.at);
+        *at = (*at).min(intent.at);
+    }
+    let mine = JobKey::parse(job);
+    if *earliest.get(&mine)? < now {
+        return Some(Burst::Duplicate);
+    }
+    let mut order: Vec<(u64, JobKey)> = earliest.into_iter().map(|(job, at)| (at, job)).collect();
+    order.sort();
+    let rank = order.iter().position(|(_, job)| *job == mine)?;
+    let slots = slots.max(1) as usize;
+    let leader = rank - rank % slots;
+    if leader != rank {
+        return Some(Burst::Follower {
+            leader: order[leader].1.to_string(),
+        });
+    }
+    let taken = (order.len() - rank).min(slots);
+    Some(Burst::Leader {
+        group: rank / slots,
+        taken: u32::try_from(taken).unwrap_or(u32::MAX),
+    })
 }
 
 /// `Some` when the body is a JSON object with the sweep key; the inner value is the given
@@ -489,9 +645,11 @@ mod tests {
     use super::*;
     use crate::config::parse_config;
     use crate::fake::FakeProvider;
+    use crate::ledger::MemoryLedger;
     use crate::store::MemoryStore;
     use crate::types::{KeyPair, Run};
     use async_trait::async_trait;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn config() -> Arc<Config> {
         Arc::new(
@@ -783,43 +941,307 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_best_slot_has_most_free_then_the_oldest_report() {
-        let vm = |id: &str, state: VmState, free: u32, seen: Option<u64>| VmCapacity {
+    const NOW: u64 = 1_800_000_000;
+
+    fn capacity(
+        id: &str,
+        state: VmState,
+        free: u32,
+        seen: Option<u64>,
+        created_at: u64,
+    ) -> VmCapacity {
+        VmCapacity {
             run_id: id.into(),
             state,
             free,
             seen,
-            created_at: 0,
+            created_at,
+        }
+    }
+
+    #[test]
+    fn claim_candidates_follow_r1_and_its_boundaries() {
+        let old = NOW - GROUP_WINDOW_S - 1;
+        let fresh = Some(NOW - CAPACITY_FRESH_S);
+        let cases = [
+            (capacity("idle", VmState::Idle, 1, fresh, old), true),
+            (capacity("busy", VmState::Busy, 1, fresh, old), true),
+            (capacity("full", VmState::Busy, 0, fresh, old), false),
+            (
+                capacity(
+                    "stale",
+                    VmState::Idle,
+                    2,
+                    Some(NOW - CAPACITY_FRESH_S - 1),
+                    old,
+                ),
+                false,
+            ),
+            (capacity("unseen", VmState::Idle, 2, None, old), false),
+            (
+                capacity("draining", VmState::Draining, 2, fresh, old),
+                false,
+            ),
+            (
+                capacity(
+                    "in-window",
+                    VmState::Idle,
+                    2,
+                    Some(NOW),
+                    NOW - GROUP_WINDOW_S,
+                ),
+                false,
+            ),
+            (
+                capacity("created-now", VmState::Idle, 2, Some(NOW), NOW),
+                false,
+            ),
+            (
+                capacity("future", VmState::Idle, 2, Some(NOW), NOW + 5),
+                false,
+            ),
+            (capacity("starting", VmState::Starting, 1, None, old), true),
+            (
+                capacity(
+                    "starting-young",
+                    VmState::Starting,
+                    1,
+                    None,
+                    NOW - GROUP_WINDOW_S,
+                ),
+                false,
+            ),
+            (
+                capacity(
+                    "starting-599",
+                    VmState::Starting,
+                    1,
+                    None,
+                    NOW - vm::SWEEP_STARTING_S + 1,
+                ),
+                true,
+            ),
+            (
+                capacity(
+                    "starting-600",
+                    VmState::Starting,
+                    1,
+                    None,
+                    NOW - vm::SWEEP_STARTING_S,
+                ),
+                false,
+            ),
+            (
+                capacity("starting-full", VmState::Starting, 0, None, old),
+                false,
+            ),
+        ];
+        for (vm, expected) in &cases {
+            assert_eq!(is_candidate(vm, NOW), *expected, "{vm:?}");
+        }
+        let vms: Vec<VmCapacity> = cases.iter().map(|(vm, _)| vm.clone()).collect();
+        let ids: Vec<&str> = claim_candidates(&vms, NOW)
+            .iter()
+            .map(|v| v.run_id.as_str())
+            .collect();
+        assert_eq!(ids, ["idle", "busy", "starting", "starting-599"]);
+        assert_eq!(GROUP_WINDOW_S, 30);
+    }
+
+    #[test]
+    fn fnv1a64_matches_the_reference_vectors() {
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a64(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn spread_picks_by_job_among_the_vms_with_most_free_slots() {
+        let vm = |id: &str, free: u32| capacity(id, VmState::Idle, free, Some(NOW), 0);
+        let pick = |vms: &[VmCapacity], job: &str| {
+            let refs: Vec<&VmCapacity> = vms.iter().collect();
+            spread(&refs, job).map(|v| v.run_id.clone())
         };
-        let pick = |vms: &[VmCapacity]| best_slot(vms, 10).map(|v| v.run_id.clone());
-        assert_eq!(pick(&[]), None);
+        assert_eq!(pick(&[], "1"), None);
         assert_eq!(
-            pick(&[
-                vm("starting", VmState::Starting, 4, None),
-                vm("draining", VmState::Draining, 4, Some(1)),
-                vm("full", VmState::Busy, 0, Some(1)),
-            ]),
-            None
+            pick(&[vm("a", 1), vm("b", 2), vm("c", 1)], "7").as_deref(),
+            Some("b")
+        );
+
+        let top = [vm("c", 2), vm("a", 2), vm("low", 1), vm("b", 2)];
+        let reversed: Vec<VmCapacity> = top.iter().rev().cloned().collect();
+        for job in 0..50 {
+            let job = job.to_string();
+            let expected = ["a", "b", "c"][(fnv1a64(job.as_bytes()) % 3) as usize];
+            assert_eq!(pick(&top, &job).as_deref(), Some(expected), "job {job}");
+            assert_eq!(
+                pick(&reversed, &job).as_deref(),
+                Some(expected),
+                "job {job}"
+            );
+        }
+
+        let mut hits: BTreeMap<String, usize> = BTreeMap::new();
+        for job in 1..=300 {
+            *hits
+                .entry(pick(&top, &job.to_string()).unwrap())
+                .or_default() += 1;
+        }
+        assert_eq!(hits.len(), 3, "{hits:?}");
+        assert!(hits.values().all(|&n| (70..=130).contains(&n)), "{hits:?}");
+
+        let pair = [vm("x", 1), vm("y", 1)];
+        let burst: Vec<String> = (100..110)
+            .map(|job| pick(&pair, &job.to_string()).unwrap())
+            .collect();
+        assert!(
+            burst.windows(2).all(|w| w[0] != w[1]),
+            "consecutive jobs alternate over two VMs: {burst:?}"
+        );
+    }
+
+    fn intent(at: u64, job: &str) -> Intent {
+        Intent {
+            at,
+            job: job.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_burst_ranks_by_time_then_job_number() {
+        let intents = [
+            intent(NOW, "10"),
+            intent(NOW, "9"),
+            intent(NOW - 1, "11"),
+            intent(NOW, "12"),
+            intent(NOW + 1, "8"),
+        ];
+        let rank = |job: &str, slots: u32| rank_burst(&intents, job, NOW, slots);
+        // Order: 11 (earlier), 9, 10, 12, 8 (later).
+        assert_eq!(
+            rank("9", 2),
+            Some(Burst::Follower {
+                leader: "11".into()
+            })
+        );
+        assert_eq!(rank("10", 2), Some(Burst::Leader { group: 1, taken: 2 }));
+        assert_eq!(
+            rank("12", 2),
+            Some(Burst::Follower {
+                leader: "10".into()
+            })
+        );
+        assert_eq!(rank("8", 1), Some(Burst::Leader { group: 4, taken: 1 }));
+        assert_eq!(
+            rank("10", 3),
+            Some(Burst::Follower {
+                leader: "11".into()
+            })
         );
         assert_eq!(
-            pick(&[
-                vm("a", VmState::Idle, 1, Some(5)),
-                vm("b", VmState::Busy, 2, Some(9)),
-                vm("c", VmState::Idle, 2, Some(7)),
-                vm("d", VmState::Starting, 3, None),
-            ])
-            .as_deref(),
-            Some("c")
+            rank_burst(&intents, "8", NOW + 1, 2),
+            Some(Burst::Leader { group: 2, taken: 1 })
         );
         assert_eq!(
-            pick(&[
-                vm("y", VmState::Idle, 1, Some(5)),
-                vm("x", VmState::Idle, 1, Some(5)),
-            ])
-            .as_deref(),
-            Some("x")
+            rank_burst(&intents, "8", NOW + 1, 3),
+            Some(Burst::Follower {
+                leader: "12".into()
+            })
         );
+        assert_eq!(
+            rank("11", 3),
+            Some(Burst::Duplicate),
+            "11 is older than now"
+        );
+        assert_eq!(rank("13", 2), None, "no intent of the job");
+    }
+
+    #[test]
+    fn a_burst_keeps_each_jobs_earliest_intent_inside_the_window() {
+        let window = NOW - GROUP_WINDOW_S;
+        let intents = [
+            intent(window - 1, "1"),
+            intent(window, "2"),
+            intent(NOW, "3"),
+            intent(NOW, "3"),
+            intent(NOW + 2, "2"),
+            intent(NOW + 1, "3"),
+            intent(NOW, "00000000000000000004"),
+        ];
+        assert_eq!(
+            rank_burst(&intents, "3", NOW, 2),
+            Some(Burst::Follower { leader: "2".into() }),
+            "1 left the window, 2 counts once at its earliest"
+        );
+        assert_eq!(
+            rank_burst(&intents, "4", NOW, 2),
+            Some(Burst::Leader { group: 1, taken: 1 }),
+            "a zero-padded id is the same job"
+        );
+        assert_eq!(
+            rank_burst(&intents, "3", NOW + 1, 2),
+            Some(Burst::Duplicate)
+        );
+        assert_eq!(
+            rank_burst(&intents, "2", NOW + 2, 2),
+            Some(Burst::Leader { group: 1, taken: 1 }),
+            "an intent that left the window does not make a duplicate"
+        );
+        assert_eq!(rank_burst(&intents, "1", NOW, 2), None);
+    }
+
+    #[test]
+    fn a_burst_orders_text_ids_after_numbers_and_by_string() {
+        let intents = [
+            intent(NOW, "b"),
+            intent(NOW, "10"),
+            intent(NOW, "a"),
+            intent(NOW, "9"),
+        ];
+        let leaders: Vec<Option<Burst>> = ["9", "10", "a", "b"]
+            .iter()
+            .map(|job| rank_burst(&intents, job, NOW, 1))
+            .collect();
+        assert_eq!(
+            leaders,
+            (0..4)
+                .map(|group| Some(Burst::Leader { group, taken: 1 }))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            rank_burst(&intents, "a", NOW, 0),
+            Some(Burst::Leader { group: 2, taken: 1 }),
+            "slots 0 counts as 1"
+        );
+    }
+
+    #[test]
+    fn a_leader_takes_the_slots_of_its_group() {
+        for slots in 1..=4u32 {
+            for n in 1..=9usize {
+                let intents: Vec<Intent> =
+                    (0..n).map(|job| intent(NOW, &job.to_string())).collect();
+                let mut leaders = 0;
+                let mut assigned = 0;
+                for job in 0..n {
+                    match rank_burst(&intents, &job.to_string(), NOW, slots).unwrap() {
+                        Burst::Leader { group, taken } => {
+                            assert_eq!(group, leaders);
+                            assert!(taken >= 1 && taken <= slots);
+                            leaders += 1;
+                            assigned += taken as usize;
+                        }
+                        Burst::Follower { leader } => {
+                            let leader: usize = leader.parse().unwrap();
+                            assert_eq!(leader, job - job % slots as usize);
+                        }
+                        Burst::Duplicate => panic!("no duplicate in {n} jobs"),
+                    }
+                }
+                assert_eq!(leaders, n.div_ceil(slots as usize), "slots {slots}, n {n}");
+                assert_eq!(assigned, n, "every job has a slot, slots {slots}");
+            }
+        }
     }
 
     const T0: u64 = 1_800_000_000;
@@ -862,13 +1284,22 @@ mod tests {
         dispatcher: Dispatcher,
         recording: Arc<Recording>,
         lines: Arc<Mutex<Vec<String>>>,
+        /// Creation time of new VMs.
+        clock: Arc<AtomicU64>,
     }
 
+    /// VMs of this setup are created at `T0`; requests arrive at `T0 + 60` unless given a time.
     async fn vm_setup(secrets: Secrets) -> VmSetup {
+        vm_setup_with(secrets, None).await
+    }
+
+    async fn vm_setup_with(secrets: Secrets, ledger: Option<Arc<dyn Ledger>>) -> VmSetup {
         let config = vm_config();
+        let clock = Arc::new(AtomicU64::new(T0));
+        let created = clock.clone();
         let inner = Arc::new(
             FakeProvider::new(config.clone(), Arc::new(MemoryStore::new()))
-                .with_clock(Arc::new(|| T0)),
+                .with_clock(Arc::new(move || created.load(Ordering::SeqCst))),
         );
         inner.apply(&inner.plan(&[]).await.unwrap()).await.unwrap();
         let recording = Arc::new(Recording {
@@ -878,10 +1309,14 @@ mod tests {
             fail_claim: Default::default(),
         });
         let (log, lines) = Log::memory();
+        let dispatcher = Dispatcher::new(config, recording.clone(), Arc::new(secrets), log)
+            .with_ledger(ledger)
+            .with_group_wait(Duration::ZERO);
         VmSetup {
-            dispatcher: Dispatcher::new(config, recording.clone(), Arc::new(secrets), log),
+            dispatcher,
             recording,
             lines,
+            clock,
         }
     }
 
@@ -898,12 +1333,29 @@ mod tests {
         }
 
         async fn pending(&self, stage: &str, job: u64) -> DispatchResponse {
-            self.post(
-                "/",
-                &headers("hook-secret"),
-                &event(stage, "pending", 7, job),
-            )
-            .await
+            self.pending_at(stage, job, T0 + 60).await
+        }
+
+        async fn pending_at(&self, stage: &str, job: u64, now: u64) -> DispatchResponse {
+            self.dispatcher
+                .handle_request(
+                    "POST",
+                    "/",
+                    &headers("hook-secret"),
+                    &event(stage, "pending", 7, job),
+                    now,
+                )
+                .await
+        }
+
+        fn taken(&self) -> Vec<u32> {
+            self.recording
+                .started
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| r.taken)
+                .collect()
         }
 
         async fn report(&self, run: &str, state: VmState, free: u32) {
@@ -942,24 +1394,31 @@ mod tests {
     #[tokio::test]
     async fn starts_vms_until_max_runs_not_counting_draining_ones() {
         let s = vm_setup(vm_secrets()).await;
-        let first = s.pending("test", 1).await;
+        let first = s.pending_at("test", 1, T0).await;
         assert_eq!(first.body["result"], "started", "{}", first.body);
         assert_eq!(first.body["pool"], "vm");
-        let second = s.pending("test", 2).await;
+        let second = s.pending_at("test", 2, T0).await;
         assert_eq!(
             second.body["result"], "started",
-            "starting VMs offer no slot"
+            "a VM inside the window offers no slot"
         );
-        let third = s.pending("test", 3).await;
+        let third = s.pending_at("test", 3, T0).await;
         assert_eq!(third.status, 200);
         assert_eq!(third.body, json!({ "result": "at_capacity", "pool": "vm" }));
 
         s.report(&run_of(&first), VmState::Draining, 2).await;
-        let fourth = s.pending("test", 4).await;
+        let fourth = s.pending_at("test", 4, T0 + GROUP_WINDOW_S).await;
         assert_eq!(
             fourth.body["result"], "started",
             "a draining VM frees its place"
         );
+        let fifth = s.pending_at("test", 5, T0 + GROUP_WINDOW_S + 1).await;
+        assert_eq!(
+            fifth.body["result"], "claimed",
+            "a starting VM out of the window is capacity"
+        );
+        assert!([run_of(&second), run_of(&fourth)].contains(&run_of(&fifth)));
+        assert_eq!(s.taken(), [1, 1, 1]);
 
         let started = s.recording.started.lock().unwrap().clone();
         assert_eq!(started.len(), 3);
@@ -976,8 +1435,8 @@ mod tests {
     #[tokio::test]
     async fn claims_a_free_slot_instead_of_starting() {
         let s = vm_setup(vm_secrets()).await;
-        let a = run_of(&s.pending("test", 1).await);
-        let b = run_of(&s.pending("test", 2).await);
+        let a = run_of(&s.pending_at("test", 1, T0).await);
+        let b = run_of(&s.pending_at("test", 2, T0).await);
         s.report(&a, VmState::Busy, 1).await;
         s.report(&b, VmState::Idle, 2).await;
 
@@ -1011,10 +1470,13 @@ mod tests {
 
     #[tokio::test]
     async fn one_job_pools_keep_counting_runs_and_never_get_the_vm_secret() {
-        let s = vm_setup(vm_secrets()).await;
+        let ledger = Arc::new(MemoryLedger::new());
+        let s = vm_setup_with(vm_secrets(), Some(ledger.clone())).await;
         let response = s.pending("build", 1).await;
         assert_eq!(response.body["result"], "started");
         assert_eq!(response.body["pool"], "jobs");
+        assert_eq!(s.taken(), [1]);
+        assert!(ledger.all().is_empty(), "one-job pools skip the ledger");
         let started = s.recording.started.lock().unwrap();
         assert!(!started[0].env.contains_key(keys::VM_SECRET));
     }
@@ -1036,8 +1498,8 @@ mod tests {
     #[tokio::test]
     async fn vm_requests_need_the_token_of_their_run() {
         let s = vm_setup(vm_secrets()).await;
-        let run = run_of(&s.pending("test", 1).await);
-        let other = run_of(&s.pending("test", 2).await);
+        let run = run_of(&s.pending_at("test", 1, T0).await);
+        let other = run_of(&s.pending_at("test", 2, T0).await);
         let body = serde_json::to_vec(&VmReport {
             state: VmState::Idle,
             free: 2,
@@ -1136,8 +1598,8 @@ mod tests {
     #[tokio::test]
     async fn a_vm_terminates_itself_only() {
         let s = vm_setup(vm_secrets()).await;
-        let run = run_of(&s.pending("test", 1).await);
-        let other = run_of(&s.pending("test", 2).await);
+        let run = run_of(&s.pending_at("test", 1, T0).await);
+        let other = run_of(&s.pending_at("test", 2, T0).await);
         let response = s
             .post(
                 "/terminate",
@@ -1288,6 +1750,7 @@ mod tests {
         assert_eq!(response.body["result"], "started", "{}", response.body);
         assert_ne!(run_of(&response), run);
         assert!(s.lines().iter().any(|l| l.starts_with("warn claim_failed")));
+        assert_eq!(s.taken(), [1, 1]);
     }
 
     #[tokio::test]
@@ -1307,5 +1770,237 @@ mod tests {
                 .map(String::as_str),
             Some("https://dispatch.example")
         );
+    }
+
+    impl VmSetup {
+        fn set_clock(&self, now: u64) {
+            self.clock.store(now, Ordering::SeqCst);
+        }
+    }
+
+    async fn record(ledger: &MemoryLedger, at: u64, jobs: &[u64]) {
+        for job in jobs {
+            ledger.record("vm", at, &job.to_string()).await.unwrap();
+        }
+    }
+
+    fn grouped(leader: &str) -> Value {
+        json!({ "result": "grouped", "pool": "vm", "leader": leader })
+    }
+
+    #[tokio::test]
+    async fn a_burst_leader_starts_a_vm_for_its_group_and_followers_ride_on_it() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let s = vm_setup_with(vm_secrets(), Some(ledger.clone())).await;
+        record(&ledger, T0, &[10, 11, 12]).await;
+
+        let leader = s.pending_at("test", 10, T0).await;
+        assert_eq!(leader.body["result"], "started", "{}", leader.body);
+        assert_eq!(s.pending_at("test", 11, T0).await.body, grouped("10"));
+        let second = s.pending_at("test", 12, T0).await;
+        assert_eq!(second.body["result"], "started", "{}", second.body);
+        assert_eq!(
+            s.pending_at("test", 13, T0).await.body,
+            grouped("12"),
+            "a late intent of the window rides on the partial group"
+        );
+        assert_eq!(
+            s.pending_at("test", 14, T0).await.body,
+            json!({ "result": "at_capacity", "pool": "vm" }),
+            "rank 4 is group 2 and maxRuns is 2"
+        );
+        assert_eq!(s.pending_at("test", 15, T0).await.body, grouped("14"));
+        assert_eq!(s.taken(), [2, 1]);
+
+        let mut free: Vec<u32> = s.vms().await.iter().map(|v| v.free).collect();
+        free.sort();
+        assert_eq!(free, [0, 1], "free = slots - taken");
+        let lines = s.lines();
+        assert!(lines.iter().any(|l| l.starts_with("info started")
+            && l.contains("job=\"10\"")
+            && l.contains("taken=\"2\"")));
+        assert!(lines.iter().any(|l| l.starts_with("info grouped")
+            && l.contains("job=\"11\"")
+            && l.contains("leader=\"10\"")
+            && l.contains("pool=\"vm\"")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("info at_capacity") && l.contains("live=\"2\""))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_event_starts_nothing() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let s = vm_setup_with(vm_secrets(), Some(ledger.clone())).await;
+        let first = s.pending_at("test", 20, T0).await;
+        assert_eq!(first.body["result"], "started");
+        let again = s.pending_at("test", 20, T0 + 5).await;
+        assert_eq!(again.status, 200);
+        assert_eq!(again.body, json!({ "result": "duplicate", "pool": "vm" }));
+        assert_eq!(s.taken(), [1]);
+        assert!(
+            s.lines()
+                .iter()
+                .any(|l| l.starts_with("info duplicate") && l.contains("job=\"20\""))
+        );
+        let next = s.pending_at("test", 21, T0 + 5).await;
+        assert_eq!(
+            next.body,
+            grouped("20"),
+            "the duplicate's second intent does not shift the ranks"
+        );
+    }
+
+    #[tokio::test]
+    async fn leaders_count_toward_max_runs_by_rank_beside_the_old_vms() {
+        for (old_state, rank_two) in [
+            (VmState::Busy, "at_capacity"),
+            (VmState::Draining, "started"),
+        ] {
+            let ledger = Arc::new(MemoryLedger::new());
+            let s = vm_setup_with(vm_secrets(), Some(ledger.clone())).await;
+            let old = run_of(&s.pending_at("test", 1, T0).await);
+            s.report(&old, old_state, 0).await;
+
+            let now = T0 + 60;
+            s.set_clock(now);
+            record(&ledger, now, &[2, 3, 4, 5]).await;
+            let first = s.pending_at("test", 2, now).await;
+            assert_eq!(first.body["result"], "started", "{old_state:?}");
+            assert_eq!(s.pending_at("test", 3, now).await.body, grouped("2"));
+            let second = s.pending_at("test", 4, now).await;
+            assert_eq!(second.body["result"], rank_two, "{old_state:?}");
+            assert_eq!(s.pending_at("test", 5, now).await.body, grouped("4"));
+            let expected: &[u32] = if old_state == VmState::Busy {
+                &[1, 2]
+            } else {
+                &[1, 2, 2]
+            };
+            assert_eq!(s.taken(), expected, "{old_state:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_claim_candidate_keeps_the_job_out_of_the_ledger() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let s = vm_setup_with(vm_secrets(), Some(ledger.clone())).await;
+        let run = run_of(&s.pending_at("test", 1, T0).await);
+        assert_eq!(ledger.all().len(), 1);
+        s.report(&run, VmState::Idle, 2).await;
+        let claimed = s.pending("test", 2).await;
+        assert_eq!(claimed.body["result"], "claimed");
+        assert_eq!(ledger.all().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_event_without_a_job_id_keeps_the_m3_rule() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let s = vm_setup_with(vm_secrets(), Some(ledger.clone())).await;
+        let body = json!({
+            "object_kind": "build", "build_stage": "test", "build_status": "pending",
+            "pipeline_id": 9, "project_id": 7
+        })
+        .to_string()
+        .into_bytes();
+        for _ in 0..2 {
+            let response = s
+                .dispatcher
+                .handle_request("POST", "/", &headers("hook-secret"), &body, T0)
+                .await;
+            assert_eq!(response.body["result"], "started", "{}", response.body);
+        }
+        assert!(ledger.all().is_empty());
+        assert_eq!(s.taken(), [1, 1]);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Fault {
+        Record,
+        Since,
+        Forget,
+    }
+
+    struct FaultyLedger(Fault);
+
+    #[async_trait]
+    impl Ledger for FaultyLedger {
+        async fn record(&self, _pool: &str, _at: u64, _job: &str) -> Result<()> {
+            match self.0 {
+                Fault::Record => Err(Error::provider("bucket refused the write")),
+                _ => Ok(()),
+            }
+        }
+        async fn since(&self, _pool: &str, _since: u64) -> Result<Vec<Intent>> {
+            match self.0 {
+                Fault::Since => Err(Error::provider("bucket refused the list")),
+                _ => Ok(vec![intent(T0, "99")]),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_ledger_falls_back_to_the_m3_rule() {
+        for fault in [Fault::Record, Fault::Since, Fault::Forget] {
+            let s = vm_setup_with(vm_secrets(), Some(Arc::new(FaultyLedger(fault)))).await;
+            let results: Vec<Value> = [
+                s.pending_at("test", 1, T0).await,
+                s.pending_at("test", 2, T0).await,
+                s.pending_at("test", 3, T0).await,
+            ]
+            .into_iter()
+            .map(|r| r.body["result"].clone())
+            .collect();
+            assert_eq!(
+                results,
+                [json!("started"), json!("started"), json!("at_capacity")],
+                "{fault:?}"
+            );
+            assert_eq!(s.taken(), [1, 1], "{fault:?}");
+            let failed: Vec<String> = s
+                .lines()
+                .into_iter()
+                .filter(|l| l.starts_with("warn ledger_failed"))
+                .collect();
+            assert_eq!(failed.len(), 3, "{fault:?}");
+            assert!(
+                failed[0].starts_with(r#"warn ledger_failed pool="vm" job="1" error="#),
+                "{failed:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn parallel_events_record_before_any_reads_during_the_group_wait() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let s = vm_setup_with(vm_secrets(), None).await;
+        let dispatcher = Dispatcher::new(
+            vm_config(),
+            s.recording.clone(),
+            Arc::new(vm_secrets()),
+            Log::silent(),
+        )
+        .with_ledger(Some(ledger.clone()));
+        assert_eq!(dispatcher.group_wait, Duration::from_secs(GROUP_WAIT_S));
+        let hook = headers("hook-secret");
+        let bodies: Vec<Vec<u8>> = [31, 30, 32]
+            .into_iter()
+            .map(|job| event("test", "pending", 7, job))
+            .collect();
+        let begin = tokio::time::Instant::now();
+        let (a, b, c) = tokio::join!(
+            dispatcher.handle_request("POST", "/", &hook, &bodies[0], T0),
+            dispatcher.handle_request("POST", "/", &hook, &bodies[1], T0),
+            dispatcher.handle_request("POST", "/", &hook, &bodies[2], T0),
+        );
+        assert_eq!(begin.elapsed(), Duration::from_secs(GROUP_WAIT_S));
+        assert_eq!(a.body, grouped("30"));
+        assert_eq!(b.body["result"], "started", "{}", b.body);
+        assert_eq!(c.body["result"], "started", "{}", c.body);
+        let mut taken = s.taken();
+        taken.sort();
+        assert_eq!(taken, [1, 2]);
+        assert_eq!(ledger.all().len(), 3);
     }
 }

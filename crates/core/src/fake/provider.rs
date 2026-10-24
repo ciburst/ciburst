@@ -363,7 +363,7 @@ impl Provider for FakeProvider {
                 run_id: run_id.clone(),
                 pool: run.pool.clone(),
                 state: VmState::Starting,
-                free: request.pool.slots,
+                free: request.pool.slots.saturating_sub(request.taken.max(1)),
                 seen: None,
                 drain: None,
                 created_at,
@@ -587,7 +587,7 @@ mod tests {
             VmCapacity {
                 run_id: run.clone(),
                 state: VmState::Starting,
-                free: 2,
+                free: 1,
                 seen: None,
                 created_at: T0,
             }
@@ -621,6 +621,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(only(&provider).await.free, 1);
+    }
+
+    #[tokio::test]
+    async fn a_new_vm_has_its_taken_slots_assigned() {
+        let (provider, _) = setup().await;
+        let mut free = Vec::new();
+        for taken in [0, 1, 2, 3] {
+            let run = provider
+                .start(StartRequest {
+                    taken,
+                    ..request("vm", true)
+                })
+                .await
+                .unwrap();
+            let vms = provider.capacity("vm").await.unwrap().unwrap();
+            free.push(vms.iter().find(|v| v.run_id == run).unwrap().free);
+        }
+        assert_eq!(free, [1, 1, 0, 0], "slots 2, taken at least 1");
     }
 
     #[tokio::test]
