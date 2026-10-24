@@ -4,4 +4,4 @@ mod host;
 mod provider;
 
 pub use host::FakeHost;
-pub use provider::FakeProvider;
+pub use provider::{Clock, FakeProvider, VM_RUNTIME};

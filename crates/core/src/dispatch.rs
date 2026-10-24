@@ -136,34 +136,34 @@ impl Dispatcher {
             ("job".to_string(), number(&event, "build_id")),
             ("stage".to_string(), stage.unwrap_or("").to_string()),
         ]);
-        let mut f: Vec<(&str, &str)> = labels
+        let mut fields: Vec<(&str, &str)> = labels
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        f.push(("pool", &pool.tag));
+        fields.push(("pool", &pool.tag));
         match self.schedule(&pool, labels.clone()).await {
             Ok(Decision::Claimed { run_id, free }) => {
                 let free = free.to_string();
-                f.push(("run", &run_id));
-                f.push(("free", &free));
-                self.log.info("claimed", &f);
+                fields.push(("run", &run_id));
+                fields.push(("free", &free));
+                self.log.info("claimed", &fields);
                 reply(200, "claimed", json!({ "pool": pool.tag, "runId": run_id }))
             }
             Ok(Decision::AtCapacity(live)) => {
                 let live = live.to_string();
-                f.push(("live", &live));
-                self.log.info("at_capacity", &f);
+                fields.push(("live", &live));
+                self.log.info("at_capacity", &fields);
                 reply(200, "at_capacity", json!({ "pool": pool.tag }))
             }
             Ok(Decision::Started(run_id)) => {
-                f.push(("run", &run_id));
-                self.log.info("started", &f);
+                fields.push(("run", &run_id));
+                self.log.info("started", &fields);
                 reply(200, "started", json!({ "pool": pool.tag, "runId": run_id }))
             }
             Err(error) => {
                 let message = error.to_string();
-                f.push(("error", &message));
-                self.log.error("start_failed", &f);
+                fields.push(("error", &message));
+                self.log.error("start_failed", &fields);
                 reply(500, "error", json!({}))
             }
         }
@@ -231,6 +231,19 @@ impl Dispatcher {
         vm::verify(secret, run, token).then_some(run)
     }
 
+    /// A refused VM or cron request. The run id is the caller's claim, shortened because the
+    /// header is unauthenticated input.
+    fn refuse(&self, route: &str, headers: &[(String, String)]) -> DispatchResponse {
+        let run: String = header(headers, vm::HEADER_RUN)
+            .unwrap_or("")
+            .chars()
+            .take(64)
+            .collect();
+        self.log
+            .warn("unauthorized", &[("route", route), ("run", &run)]);
+        unauthorized()
+    }
+
     async fn vm_report(
         &self,
         headers: &[(String, String)],
@@ -238,7 +251,7 @@ impl Dispatcher {
         now: u64,
     ) -> DispatchResponse {
         let Some(run) = self.vm_caller(headers) else {
-            return unauthorized();
+            return self.refuse(vm::PATH_REPORT, headers);
         };
         let Ok(report) = serde_json::from_slice::<VmReport>(body) else {
             return reply(400, "bad_request", json!({}));
@@ -267,7 +280,7 @@ impl Dispatcher {
 
     async fn vm_terminate(&self, headers: &[(String, String)]) -> DispatchResponse {
         let Some(run) = self.vm_caller(headers) else {
-            return unauthorized();
+            return self.refuse(vm::PATH_TERMINATE, headers);
         };
         match self.provider.stop(run).await {
             Ok(()) => {
@@ -285,6 +298,7 @@ impl Dispatcher {
 
     async fn sweep(&self, given: Option<&str>, now: u64) -> DispatchResponse {
         if !token_matches(given, self.secrets.hook_token.as_deref()) {
+            self.log.warn("unauthorized", &[("route", "sweep")]);
             return unauthorized();
         }
         match self.provider.sweep(now).await {
@@ -964,7 +978,16 @@ mod tests {
             .await;
         assert_eq!(response.status, 401);
         assert!(s.vms().await.iter().all(|v| v.state == VmState::Starting));
-        assert!(!s.lines().iter().any(|l| l.contains(&good)));
+        let lines = s.lines();
+        assert!(!lines.iter().any(|l| l.contains(&good)));
+        for route in [vm::PATH_REPORT, vm::PATH_TERMINATE] {
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l == &format!(r#"warn unauthorized route="{route}" run="{run}""#)),
+                "{lines:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1087,6 +1110,13 @@ mod tests {
                 .any(|l| l.starts_with("info swept") && l.contains("count=\"1\""))
         );
         assert!(!lines.iter().any(|l| l.contains("hook-secret")));
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| *l == r#"warn unauthorized route="sweep""#)
+                .count(),
+            4
+        );
 
         let mut secrets = vm_secrets();
         secrets.hook_token = None;
