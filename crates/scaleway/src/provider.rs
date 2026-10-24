@@ -1,31 +1,65 @@
-//! Provider `scaleway-jobs`: one Serverless Jobs definition per pool, started per pending job.
-//! Resources: project, IAM applications and keys, cache bucket with lifecycle, job definitions.
-//! Every resource is looked up by name; nothing is stored locally.
+//! Provider `scaleway`. A pool runs on Scaleway Instances (`instances`, the default: one VM per
+//! run with its own Docker daemon, spec section 6.1) or on Serverless Jobs (`jobs`: one job
+//! definition per pool, one job run per pending job). Shared resources: project, IAM
+//! applications and keys, cache bucket with lifecycle, registry namespace; per runtime the VM
+//! security group or the job definitions. Every resource is looked up by name or tag; nothing
+//! is stored locally.
 
+mod cloud_init;
 mod iam;
+mod instance;
 mod jobs;
 mod registry;
 pub mod s3;
 pub mod sigv4;
+pub mod vm;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ciburst_core::config::{CacheType, Config};
+use ciburst_core::config::{CacheType, Config, Pool};
 use ciburst_core::log::Log;
+use ciburst_core::provision::keys;
 use ciburst_core::types::{
     Action, Billing, Capabilities, KeyPair, Outputs, Provider, Rotation, Run, StartRequest, Step,
+    VmCapacity, VmReport,
 };
 use ciburst_core::{Error, Result};
 use serde_json::{Value, json};
 
 use crate::client::ScalewayClient;
 use iam::AppState;
+use instance::{ApiError, DOCKER_IMAGE_LABEL, FALLBACK_IMAGE_LABEL, InstanceApi};
 use registry::NamespaceState;
 
-pub const PROVIDER_NAME: &str = "scaleway-jobs";
+pub const PROVIDER_NAME: &str = "scaleway";
+
+/// Commercial types tried in order when a pool names none.
+pub const DEFAULT_INSTANCE_TYPES: [&str; 2] = ["DEV1-M", "PLAY2-NANO"];
+
+/// The user data key cloud-init reads on Scaleway Instances.
+pub const USER_DATA_KEY: &str = "cloud-init";
+
+const SECURITY_GROUP_STEP: &str = "vm:security-group";
 
 const PAGE_SIZE: usize = 100;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Runtime {
+    Instances,
+    Jobs,
+}
+
+impl Runtime {
+    fn parse(value: &str) -> Option<Runtime> {
+        match value {
+            "instances" => Some(Runtime::Instances),
+            "jobs" => Some(Runtime::Jobs),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyKind {
@@ -50,9 +84,14 @@ impl KeyKind {
 
     /// Starting a job whose image is in a private registry of the project needs registry read
     /// access besides the Jobs permissions (Scaleway answers 403 on `registry_image` otherwise).
+    /// The dispatcher also starts, tags and terminates VMs.
     fn permission_sets(self) -> &'static [&'static str] {
         match self {
-            KeyKind::Dispatch => &["ServerlessJobsFullAccess", "ContainerRegistryReadOnly"],
+            KeyKind::Dispatch => &[
+                "ServerlessJobsFullAccess",
+                "ContainerRegistryReadOnly",
+                "InstancesFullAccess",
+            ],
             KeyKind::Cache => &["ObjectStorageFullAccess"],
         }
     }
@@ -81,7 +120,14 @@ struct Observed {
     cache: Option<AppState>,
     bucket: BucketState,
     registry: Option<NamespaceState>,
+    security_group: Option<String>,
     definitions: Vec<Value>,
+}
+
+/// What a start attempt on one commercial type came to.
+enum Attempt {
+    Started,
+    Unavailable(ApiError),
 }
 
 pub struct ScalewayJobs {
@@ -89,16 +135,28 @@ pub struct ScalewayJobs {
     client: Arc<ScalewayClient>,
     log: Log,
     s3_access_key: Option<String>,
+    zone: String,
 }
+
+/// The provider serves both runtimes; the old name stays for existing callers.
+pub type Scaleway = ScalewayJobs;
 
 impl ScalewayJobs {
     pub fn new(config: Arc<Config>, client: Arc<ScalewayClient>, log: Log) -> ScalewayJobs {
         let s3_access_key = client.access_key().map(String::from);
+        let zone = config
+            .provider
+            .extra
+            .get("zone")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .unwrap_or_else(|| format!("{}-1", client.region()));
         ScalewayJobs {
             config,
             client,
             log,
             s3_access_key,
+            zone,
         }
     }
 
@@ -129,6 +187,14 @@ impl ScalewayJobs {
             .filter(|tag| !tag.is_empty())
     }
 
+    fn security_group_name(&self) -> String {
+        format!("{}-vm", self.name())
+    }
+
+    fn instances(&self) -> InstanceApi<'_> {
+        InstanceApi::new(&self.client, &self.zone)
+    }
+
     fn cache_on(&self) -> bool {
         self.config.cache.kind == CacheType::S3
     }
@@ -150,6 +216,48 @@ impl ScalewayJobs {
             .get("registryPublic")
             .and_then(Value::as_bool)
             .unwrap_or(false)
+    }
+
+    /// `provider.runtime`, the runtime of pools that name none: `instances` unless set.
+    fn default_runtime(&self) -> Result<Runtime> {
+        match self.config.provider.extra.get("runtime") {
+            None | Some(Value::Null) => Ok(Runtime::Instances),
+            Some(value) => value.as_str().and_then(Runtime::parse).ok_or_else(|| {
+                Error::provider(format!(
+                    "{PROVIDER_NAME}: provider.runtime {value} is not instances or jobs"
+                ))
+            }),
+        }
+    }
+
+    fn runtime(&self, pool: &Pool) -> Result<Runtime> {
+        match &pool.runtime {
+            None => self.default_runtime(),
+            Some(value) => Runtime::parse(value).ok_or_else(|| {
+                Error::provider(format!(
+                    "{PROVIDER_NAME}: pool {}: runtime {value} is not instances or jobs",
+                    pool.tag
+                ))
+            }),
+        }
+    }
+
+    /// The runtime of the pool `tag`; a pool gone from the config counts as the default.
+    fn runtime_of(&self, tag: &str) -> Result<Runtime> {
+        match self.config.pool_by_tag(tag) {
+            Some(pool) => self.runtime(pool),
+            None => self.default_runtime(),
+        }
+    }
+
+    fn pools_on(&self, runtime: Runtime) -> Result<Vec<&Pool>> {
+        let mut pools = Vec::new();
+        for pool in &self.config.pools {
+            if self.runtime(pool)? == runtime {
+                pools.push(pool);
+            }
+        }
+        Ok(pools)
     }
 
     fn s3(&self) -> Result<s3::S3> {
@@ -177,6 +285,7 @@ impl ScalewayJobs {
         let cache = iam::find_application(&self.client, &self.app_name(KeyKind::Cache)).await?;
         let mut bucket = None;
         let mut namespace = None;
+        let mut security_group = None;
         let mut definitions = Vec::new();
         if let Some(project_id) = &project {
             if self.cache_on() || self.s3_access_key.is_some() {
@@ -187,6 +296,10 @@ impl ScalewayJobs {
                 }
             }
             namespace = registry::find_namespace(&self.client, project_id, self.name()).await?;
+            security_group = self
+                .instances()
+                .find_security_group(project_id, &self.security_group_name())
+                .await?;
             definitions = jobs::list_definitions(&self.client, project_id)
                 .await?
                 .into_iter()
@@ -199,6 +312,7 @@ impl ScalewayJobs {
             cache,
             bucket,
             registry: namespace,
+            security_group,
             definitions,
         })
     }
@@ -387,6 +501,28 @@ impl ScalewayJobs {
         Ok(())
     }
 
+    async fn ensure_security_group(&self, project_id: &str) -> Result<()> {
+        let name = self.security_group_name();
+        let api = self.instances();
+        if api.find_security_group(project_id, &name).await?.is_none() {
+            let id = api.create_security_group(project_id, &name).await?;
+            self.log
+                .info("created security group", &[("name", &name), ("id", &id)]);
+        }
+        Ok(())
+    }
+
+    async fn delete_security_group(&self, project_id: &str) -> Result<()> {
+        let name = self.security_group_name();
+        let api = self.instances();
+        if let Some(id) = api.find_security_group(project_id, &name).await? {
+            api.delete_security_group(&id).await?;
+            self.log
+                .info("deleted security group", &[("name", &name), ("id", &id)]);
+        }
+        Ok(())
+    }
+
     async fn apply_definition(&self, tag: &str, action: Action, project_id: &str) -> Result<()> {
         let name = self.definition_name(tag);
         let existing = jobs::list_definitions(&self.client, project_id)
@@ -435,6 +571,336 @@ impl ScalewayJobs {
             .find(|d| d["name"].as_str() == Some(name.as_str()))
             .and_then(|d| d["id"].as_str().map(String::from)))
     }
+
+    async fn start_job(&self, request: StartRequest) -> Result<String> {
+        let tag = &request.pool.tag;
+        let not_provisioned =
+            || Error::provider(format!("{PROVIDER_NAME}: pool {tag} is not provisioned"));
+        let project_id = self
+            .client
+            .find_project(self.name())
+            .await?
+            .ok_or_else(not_provisioned)?;
+        let definition_id = self
+            .find_definition(&project_id, tag)
+            .await?
+            .ok_or_else(not_provisioned)?;
+        let env = jobs::run_env(&request.env, &request.labels);
+        jobs::start(&self.client, &definition_id, &env).await
+    }
+
+    /// Rule 4 of M3: the first commercial type that has a local image and capacity runs the
+    /// VM; the server id is the run id.
+    async fn start_vm(&self, request: StartRequest) -> Result<String> {
+        let pool = &request.pool;
+        let tag = &pool.tag;
+        let secret = request
+            .env
+            .get(keys::VM_SECRET)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Error::provider(format!(
+                    "{PROVIDER_NAME}: pool {tag}: {} missing",
+                    keys::VM_SECRET
+                ))
+            })?;
+        if !self.registry_on() {
+            return Err(Error::provider(format!(
+                "{PROVIDER_NAME}: pool {tag}: the instances runtime pulls its agent from the \
+                 registry namespace; set provider.registry"
+            )));
+        }
+        let not_provisioned =
+            || Error::provider(format!("{PROVIDER_NAME}: pool {tag} is not provisioned"));
+        let project_id = self
+            .client
+            .find_project(self.name())
+            .await?
+            .ok_or_else(not_provisioned)?;
+        let namespace = registry::find_namespace(&self.client, &project_id, self.name())
+            .await?
+            .ok_or_else(not_provisioned)?;
+        if !namespace.is_public {
+            return Err(Error::provider(format!(
+                "{PROVIDER_NAME}: pool {tag}: VMs pull the agent image without credentials; \
+                 set provider.registryPublic"
+            )));
+        }
+        let api = self.instances();
+        let security_group = api
+            .find_security_group(&project_id, &self.security_group_name())
+            .await?
+            .ok_or_else(not_provisioned)?;
+        let base = cloud_init::base_env(
+            &self.config,
+            pool,
+            self.client.region(),
+            &project_id,
+            &request.env,
+        )?;
+        let types: Vec<String> = if pool.instance_types.is_empty() {
+            DEFAULT_INSTANCE_TYPES
+                .iter()
+                .map(|t| t.to_string())
+                .collect()
+        } else {
+            pool.instance_types.clone()
+        };
+        let job = request.labels.get("job").map(String::as_str);
+        let docker_images = api.local_images(DOCKER_IMAGE_LABEL).await?;
+        let mut fallback_images = None;
+        let mut failures = Vec::new();
+        for commercial_type in &types {
+            let (image, install_docker) =
+                match instance::compatible(&docker_images, commercial_type) {
+                    Some(image) => (image, false),
+                    None => {
+                        if fallback_images.is_none() {
+                            fallback_images = Some(api.local_images(FALLBACK_IMAGE_LABEL).await?);
+                        }
+                        let fallback = fallback_images.as_deref().unwrap_or_default();
+                        match instance::compatible(fallback, commercial_type) {
+                            Some(image) => (image, true),
+                            None => {
+                                self.log.warn(
+                                    "instance type skipped",
+                                    &[
+                                        ("pool", tag),
+                                        ("type", commercial_type),
+                                        ("reason", "no local image"),
+                                    ],
+                                );
+                                failures.push(format!("{commercial_type}: no local image"));
+                                continue;
+                            }
+                        }
+                    }
+                };
+            let name = vm::server_name(self.name(), tag, job);
+            let body = json!({
+                "name": name,
+                "commercial_type": commercial_type,
+                "image": image,
+                "project": project_id,
+                "dynamic_ip_required": true,
+                "routed_ip_enabled": true,
+                "security_group": security_group,
+                "tags": vm::initial_tags(self.name(), tag, job, pool.slots),
+            });
+            let server = match api.create_server(&body).await? {
+                Ok(server) => server,
+                Err(error) if error.is_capacity() => {
+                    self.unavailable(tag, commercial_type, &error);
+                    failures.push(format!("{commercial_type}: {}", error.message));
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let id = server["id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .map(String::from)
+                .ok_or_else(|| Error::provider("scaleway server: response without id"))?;
+            match self
+                .boot(
+                    &api,
+                    &id,
+                    secret,
+                    &base,
+                    &namespace.endpoint,
+                    install_docker,
+                )
+                .await
+            {
+                Ok(Attempt::Started) => {
+                    self.log.info(
+                        "started server",
+                        &[
+                            ("pool", tag),
+                            ("name", &name),
+                            ("id", &id),
+                            ("type", commercial_type),
+                        ],
+                    );
+                    return Ok(id);
+                }
+                Ok(Attempt::Unavailable(error)) => {
+                    self.unavailable(tag, commercial_type, &error);
+                    failures.push(format!("{commercial_type}: {}", error.message));
+                    self.discard(&api, &id).await;
+                }
+                Err(error) => {
+                    self.discard(&api, &id).await;
+                    return Err(error);
+                }
+            }
+        }
+        Err(Error::provider(format!(
+            "{PROVIDER_NAME}: pool {tag}: no instance type started ({})",
+            failures.join("; ")
+        )))
+    }
+
+    /// User data, then power on. The VM gets its token, never the secret behind it.
+    async fn boot(
+        &self,
+        api: &InstanceApi<'_>,
+        id: &str,
+        secret: &str,
+        base: &BTreeMap<String, String>,
+        registry_endpoint: &str,
+        install_docker: bool,
+    ) -> Result<Attempt> {
+        let mut env = base.clone();
+        env.insert(cloud_init::RUN_ID.to_string(), id.to_string());
+        env.insert(
+            cloud_init::VM_TOKEN.to_string(),
+            ciburst_core::vm::token(secret, id),
+        );
+        let user_data = cloud_init::render(&env, registry_endpoint, install_docker)?;
+        api.set_user_data(id, USER_DATA_KEY, &user_data).await?;
+        match api.action(id, "poweron").await? {
+            Ok(()) => Ok(Attempt::Started),
+            Err(error) if error.is_capacity() => Ok(Attempt::Unavailable(error)),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn unavailable(&self, pool: &str, commercial_type: &str, error: &ApiError) {
+        self.log.warn(
+            "instance type unavailable",
+            &[
+                ("pool", pool),
+                ("type", commercial_type),
+                ("error", &error.message),
+            ],
+        );
+    }
+
+    /// Removes a server that failed to start; the original error matters more than this one.
+    async fn discard(&self, api: &InstanceApi<'_>, id: &str) {
+        let removed = match api.get_server(id).await {
+            Ok(Some(server)) => self.remove_server(api, &server).await.map(drop),
+            Ok(None) => Ok(()),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = removed {
+            self.log.warn(
+                "server not removed",
+                &[("id", id), ("error", &error.to_string())],
+            );
+        }
+    }
+
+    /// Ends a server: `terminate` deletes its local volumes and releases its dynamic IP; a
+    /// server that never powered on cannot terminate, so it and its local volumes are deleted.
+    /// `false` when it is already stopping.
+    async fn remove_server(&self, api: &InstanceApi<'_>, server: &Value) -> Result<bool> {
+        let id = server["id"].as_str().unwrap_or_default();
+        match server["state"].as_str().unwrap_or_default() {
+            "stopping" => Ok(false),
+            "stopped" => {
+                api.delete_server(id).await?;
+                for volume in server["volumes"]
+                    .as_object()
+                    .into_iter()
+                    .flat_map(|v| v.values())
+                {
+                    if volume["volume_type"] == "l_ssd"
+                        && let Some(volume_id) = volume["id"].as_str()
+                    {
+                        api.delete_volume(volume_id).await?;
+                    }
+                }
+                Ok(true)
+            }
+            _ => {
+                api.action(id, "terminate").await??;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Servers of this deployment in every state.
+    async fn servers(&self, project_id: &str) -> Result<Vec<Value>> {
+        Ok(self
+            .instances()
+            .list_servers(project_id, self.name())
+            .await?
+            .into_iter()
+            .filter(|s| vm::is_deployment(s, self.name()))
+            .collect())
+    }
+
+    /// The server `run_id` of this deployment.
+    async fn own_server(&self, api: &InstanceApi<'_>, run_id: &str) -> Result<Value> {
+        match api.get_server(run_id).await? {
+            Some(server) if vm::is_deployment(&server, self.name()) => Ok(server),
+            Some(_) => Err(Error::provider(format!(
+                "{PROVIDER_NAME}: server {run_id} does not belong to {}",
+                self.name()
+            ))),
+            None => Err(Error::provider(format!(
+                "{PROVIDER_NAME}: server {run_id} not found"
+            ))),
+        }
+    }
+
+    async fn job_runs(&self, project_id: &str, tags: &[&str]) -> Result<Vec<Run>> {
+        if tags.is_empty() {
+            return Ok(Vec::new());
+        }
+        let definitions = jobs::list_definitions(&self.client, project_id).await?;
+        let mut runs = Vec::new();
+        for tag in tags {
+            let name = self.definition_name(tag);
+            let Some(definition_id) = definitions
+                .iter()
+                .find(|d| d["name"].as_str() == Some(name.as_str()))
+                .and_then(|d| d["id"].as_str())
+            else {
+                continue;
+            };
+            for run in jobs::list_runs(&self.client, project_id, definition_id).await? {
+                runs.push(Run {
+                    run_id: run["id"].as_str().unwrap_or_default().to_string(),
+                    pool: tag.to_string(),
+                    state: jobs::run_state(run["state"].as_str().unwrap_or_default()),
+                    created_at: run["created_at"].as_str().unwrap_or_default().to_string(),
+                    labels: jobs::labels_from_env(&run["environment_variables"]),
+                });
+            }
+        }
+        Ok(runs)
+    }
+
+    /// Servers as runs, of one pool or of the whole deployment.
+    async fn vm_runs(&self, project_id: &str, pool: Option<&str>) -> Result<Vec<Run>> {
+        Ok(self
+            .servers(project_id)
+            .await?
+            .iter()
+            .filter_map(|server| {
+                let tags = vm::tags_of(server);
+                let tag = vm::tag_value(&tags, vm::TAG_POOL).unwrap_or_default();
+                if pool.is_some_and(|p| p != tag) {
+                    return None;
+                }
+                Some(Run {
+                    run_id: server["id"].as_str()?.to_string(),
+                    pool: tag.to_string(),
+                    state: vm::run_state(server["state"].as_str().unwrap_or_default()),
+                    created_at: server["creation_date"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    labels: vm::tag_value(&tags, vm::TAG_JOB)
+                        .map(|job| BTreeMap::from([("job".to_string(), job.to_string())]))
+                        .unwrap_or_default(),
+                })
+            })
+            .collect())
+    }
 }
 
 /// Every item of a paginated Scaleway list (`page`, `page_size`, `total_count`).
@@ -469,19 +935,29 @@ async fn list_all(
 #[async_trait]
 impl Provider for ScalewayJobs {
     fn capabilities(&self) -> Capabilities {
+        let vm = self.default_runtime().unwrap_or(Runtime::Instances) == Runtime::Instances;
         Capabilities {
             name: PROVIDER_NAME.into(),
-            docker_daemon: false,
+            docker_daemon: vm,
             max_vcpu: 6,
             max_memory_mib: 16384,
             max_storage_mib: 10240,
             max_duration_s: 86400,
             archs: vec!["amd64".into()],
-            billing: Billing::PerSecond,
+            billing: if vm {
+                Billing::PerHour
+            } else {
+                Billing::PerSecond
+            },
         }
     }
 
     async fn plan(&self, rotate: &[Rotation]) -> Result<Vec<Step>> {
+        self.default_runtime()?;
+        let mut runtimes = Vec::new();
+        for pool in &self.config.pools {
+            runtimes.push((pool, self.runtime(pool)?));
+        }
         let observed = self.observe().await?;
         let name = self.name();
         let mut steps = vec![Step::new(
@@ -537,8 +1013,26 @@ impl Provider for ScalewayJobs {
         } else if observed.registry.is_some() {
             steps.push(Step::new("registry", Action::Delete, registry_resource));
         }
+        let group_resource = format!("security group {}", self.security_group_name());
+        if runtimes.iter().any(|(_, r)| *r == Runtime::Instances) {
+            let action = if observed.security_group.is_some() {
+                Action::Noop
+            } else {
+                Action::Create
+            };
+            steps.push(Step::new(SECURITY_GROUP_STEP, action, group_resource));
+        } else if observed.security_group.is_some() {
+            steps.push(Step::new(
+                SECURITY_GROUP_STEP,
+                Action::Delete,
+                group_resource,
+            ));
+        }
         let region = self.client.region();
-        for pool in &self.config.pools {
+        for (pool, runtime) in &runtimes {
+            if *runtime != Runtime::Jobs {
+                continue;
+            }
             let resource = format!("job definition {}", self.definition_name(&pool.tag));
             let id = format!("definition:{}", pool.tag);
             let current = observed
@@ -560,9 +1054,13 @@ impl Provider for ScalewayJobs {
             steps.push(step);
         }
         for definition in &observed.definitions {
-            if let Some(tag) = self.definition_tag(definition)
-                && self.config.pool_by_tag(tag).is_none()
-            {
+            let Some(tag) = self.definition_tag(definition) else {
+                continue;
+            };
+            let kept = runtimes
+                .iter()
+                .any(|(pool, runtime)| pool.tag == tag && *runtime == Runtime::Jobs);
+            if !kept {
                 steps.push(Step::new(
                     format!("definition:{tag}"),
                     Action::Delete,
@@ -612,6 +1110,16 @@ impl Provider for ScalewayJobs {
                         outputs.insert("CIBURST_REGISTRY_ENDPOINT".to_string(), namespace.endpoint);
                     }
                 }
+                SECURITY_GROUP_STEP => {
+                    if step.action == Action::Delete {
+                        if let Some(project_id) = &project {
+                            self.delete_security_group(project_id).await?;
+                        }
+                    } else {
+                        let project_id = self.require_project(&project)?;
+                        self.ensure_security_group(project_id).await?;
+                    }
+                }
                 id => {
                     let tag = id.strip_prefix("definition:").ok_or_else(|| {
                         Error::provider(format!("{PROVIDER_NAME}: unknown step {id}"))
@@ -637,6 +1145,22 @@ impl Provider for ScalewayJobs {
     async fn destroy(&self) -> Result<()> {
         let project = self.client.find_project(self.name()).await?;
         if let Some(project_id) = &project {
+            let api = self.instances();
+            for server in self.servers(project_id).await? {
+                if self.remove_server(&api, &server).await? {
+                    let id = server["id"].as_str().unwrap_or_default();
+                    self.log.info("terminated server", &[("id", id)]);
+                }
+            }
+            if let Err(error) = self.delete_security_group(project_id).await {
+                self.log.warn(
+                    "security group not deleted",
+                    &[
+                        ("name", &self.security_group_name()),
+                        ("error", &error.to_string()),
+                    ],
+                );
+            }
             for definition in jobs::list_definitions(&self.client, project_id).await? {
                 if self.definition_tag(&definition).is_none() {
                     continue;
@@ -687,55 +1211,128 @@ impl Provider for ScalewayJobs {
                 "{PROVIDER_NAME}: RUNNER_TOKEN missing"
             )));
         }
-        let tag = &request.pool.tag;
-        let not_provisioned =
-            || Error::provider(format!("{PROVIDER_NAME}: pool {tag} is not provisioned"));
-        let project_id = self
-            .client
-            .find_project(self.name())
-            .await?
-            .ok_or_else(not_provisioned)?;
-        let definition_id = self
-            .find_definition(&project_id, tag)
-            .await?
-            .ok_or_else(not_provisioned)?;
-        let env = jobs::run_env(&request.env, &request.labels);
-        jobs::start(&self.client, &definition_id, &env).await
+        match self.runtime(&request.pool)? {
+            Runtime::Jobs => self.start_job(request).await,
+            Runtime::Instances => self.start_vm(request).await,
+        }
     }
 
     async fn list(&self, pool: Option<&str>) -> Result<Vec<Run>> {
         let Some(project_id) = self.client.find_project(self.name()).await? else {
             return Ok(Vec::new());
         };
-        let definitions = jobs::list_definitions(&self.client, &project_id).await?;
-        let tags: Vec<&str> = match pool {
-            Some(tag) => vec![tag],
-            None => self.config.pools.iter().map(|p| p.tag.as_str()).collect(),
+        let (job_tags, vms): (Vec<&str>, Option<Option<&str>>) = match pool {
+            Some(tag) => match self.runtime_of(tag)? {
+                Runtime::Jobs => (vec![tag], None),
+                Runtime::Instances => (Vec::new(), Some(Some(tag))),
+            },
+            None => (
+                self.pools_on(Runtime::Jobs)?
+                    .iter()
+                    .map(|p| p.tag.as_str())
+                    .collect(),
+                Some(None),
+            ),
         };
-        let mut runs = Vec::new();
-        for tag in tags {
-            let name = self.definition_name(tag);
-            let Some(definition_id) = definitions
-                .iter()
-                .find(|d| d["name"].as_str() == Some(name.as_str()))
-                .and_then(|d| d["id"].as_str())
-            else {
-                continue;
-            };
-            for run in jobs::list_runs(&self.client, &project_id, definition_id).await? {
-                runs.push(Run {
-                    run_id: run["id"].as_str().unwrap_or_default().to_string(),
-                    pool: tag.to_string(),
-                    state: jobs::run_state(run["state"].as_str().unwrap_or_default()),
-                    created_at: run["created_at"].as_str().unwrap_or_default().to_string(),
-                    labels: jobs::labels_from_env(&run["environment_variables"]),
-                });
-            }
+        let mut runs = self.job_runs(&project_id, &job_tags).await?;
+        if let Some(pool) = vms {
+            runs.extend(self.vm_runs(&project_id, pool).await?);
         }
         Ok(runs)
     }
 
     async fn stop(&self, run_id: &str) -> Result<()> {
+        let jobs = !self.pools_on(Runtime::Jobs)?.is_empty();
+        let instances = !self.pools_on(Runtime::Instances)?.is_empty();
+        if instances || !jobs {
+            let api = self.instances();
+            if let Some(server) = api.get_server(run_id).await? {
+                if !vm::is_deployment(&server, self.name()) {
+                    return Err(Error::provider(format!(
+                        "{PROVIDER_NAME}: server {run_id} does not belong to {}",
+                        self.name()
+                    )));
+                }
+                if self.remove_server(&api, &server).await? {
+                    self.log.info("terminated server", &[("id", run_id)]);
+                }
+                return Ok(());
+            }
+            if !jobs {
+                return Err(Error::provider(format!(
+                    "{PROVIDER_NAME}: server {run_id} not found"
+                )));
+            }
+        }
         jobs::stop(&self.client, run_id).await
+    }
+
+    async fn capacity(&self, pool: &str) -> Result<Option<Vec<VmCapacity>>> {
+        if self.runtime_of(pool)? != Runtime::Instances {
+            return Ok(None);
+        }
+        let Some(project_id) = self.client.find_project(self.name()).await? else {
+            return Ok(Some(Vec::new()));
+        };
+        Ok(Some(
+            self.servers(&project_id)
+                .await?
+                .iter()
+                .filter(|s| vm::tag_value(&vm::tags_of(s), vm::TAG_POOL) == Some(pool))
+                .filter(|s| matches!(s["state"].as_str(), Some("starting" | "running")))
+                .filter_map(vm::capacity)
+                .collect(),
+        ))
+    }
+
+    async fn claim(&self, run_id: &str) -> Result<()> {
+        let api = self.instances();
+        let server = self.own_server(&api, run_id).await?;
+        api.set_tags(run_id, &vm::claimed(&vm::tags_of(&server)))
+            .await
+    }
+
+    async fn report(&self, run_id: &str, report: &VmReport, now: u64) -> Result<()> {
+        let api = self.instances();
+        let server = self.own_server(&api, run_id).await?;
+        api.set_tags(run_id, &vm::reported(&vm::tags_of(&server), report, now))
+            .await
+    }
+
+    async fn sweep(&self, now: u64) -> Result<Vec<String>> {
+        let Some(project_id) = self.client.find_project(self.name()).await? else {
+            return Ok(Vec::new());
+        };
+        let api = self.instances();
+        let mut swept = Vec::new();
+        for server in self.servers(&project_id).await? {
+            let id = server["id"].as_str().unwrap_or_default().to_string();
+            if matches!(server["state"].as_str(), Some("stopping" | "locked")) {
+                continue;
+            }
+            let Some(capacity) = vm::capacity(&server) else {
+                self.log.warn(
+                    "sweep skipped",
+                    &[("id", &id), ("reason", "no creation date")],
+                );
+                continue;
+            };
+            let Some(reason) = vm::sweep_reason(&capacity, vm::drain_since(&server), now) else {
+                continue;
+            };
+            match self.remove_server(&api, &server).await {
+                Ok(true) => {
+                    self.log
+                        .info("swept server", &[("id", &id), ("reason", reason)]);
+                    swept.push(id);
+                }
+                Ok(false) => {}
+                Err(error) => self.log.warn(
+                    "sweep failed",
+                    &[("id", &id), ("error", &error.to_string())],
+                ),
+            }
+        }
+        Ok(swept)
     }
 }

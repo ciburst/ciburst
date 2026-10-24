@@ -1,5 +1,6 @@
-//! The provider's fake Scaleway: Account, IAM, Serverless Jobs and S3 behind one `HttpClient`
-//! that routes by host and path, plus the helpers the four fakes share.
+//! The provider's fake Scaleway: Account, IAM, Serverless Jobs, Container Registry, Instances
+//! with the Marketplace, and S3 behind one `HttpClient` that routes by host and path, plus the
+//! helpers the fakes share.
 
 use std::sync::Arc;
 
@@ -10,6 +11,7 @@ use serde_json::{Value, json};
 
 use super::account_api::FakeAccount;
 use super::iam_api::FakeIam;
+use super::instance_api::FakeInstance;
 use super::jobs_api::FakeJobs;
 use super::registry_api::FakeRegistry;
 use super::s3_api::FakeS3;
@@ -188,6 +190,7 @@ pub struct ScalewayFake {
     pub iam: FakeIam,
     pub jobs: FakeJobs,
     pub registry: FakeRegistry,
+    pub instance: FakeInstance,
     pub s3: FakeS3,
 }
 
@@ -204,6 +207,7 @@ impl ScalewayFake {
             iam: FakeIam::new(),
             jobs: FakeJobs::new(),
             registry: FakeRegistry::new(),
+            instance: FakeInstance::new(),
             s3: FakeS3::new(),
         }
     }
@@ -225,7 +229,7 @@ impl ScalewayFake {
         ))
     }
 
-    /// Every write request (not GET or HEAD) across the four APIs.
+    /// Every write request (not GET or HEAD) across the APIs.
     pub fn writes(&self) -> Vec<Call> {
         self.account
             .calls()
@@ -233,6 +237,7 @@ impl ScalewayFake {
             .chain(self.iam.calls())
             .chain(self.jobs.calls())
             .chain(self.registry.calls())
+            .chain(self.instance.calls())
             .chain(self.s3.calls())
             .filter(|c| c.method != "GET" && c.method != "HEAD")
             .collect()
@@ -255,6 +260,9 @@ impl HttpClient for ScalewayFake {
             }
             if url.path.starts_with("/registry/") {
                 return self.registry.send(request).await;
+            }
+            if url.path.starts_with("/instance/") || url.path.starts_with("/marketplace/") {
+                return self.instance.send(request).await;
             }
         } else if url.host.starts_with("s3.") && url.host.ends_with(".scw.cloud") {
             return self.s3.send(request).await;

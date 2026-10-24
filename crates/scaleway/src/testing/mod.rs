@@ -5,6 +5,7 @@
 pub mod account_api;
 pub mod functions_api;
 pub mod iam_api;
+pub mod instance_api;
 pub mod jobs_api;
 pub mod registry_api;
 pub mod s3_api;

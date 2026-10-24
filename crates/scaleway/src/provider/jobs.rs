@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use ciburst_core::config::{CacheType, Config, Pool};
+use ciburst_core::provision::keys;
 use ciburst_core::types::RunState;
 use ciburst_core::{Error, Result};
 use serde_json::{Value, json};
@@ -137,12 +138,14 @@ pub async fn delete_definition(client: &ScalewayClient, id: &str) -> Result<()> 
         .map(drop)
 }
 
-/// The run environment: per-run overrides plus the labels as `CIBURST_*` variables.
+/// The run environment: per-run overrides plus the labels as `CIBURST_*` variables. The VM
+/// secret signs VM tokens and stays in the dispatcher, so a job never receives it.
 pub fn run_env(
     env: &BTreeMap<String, String>,
     labels: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
     let mut out = env.clone();
+    out.remove(keys::VM_SECRET);
     for (label, var) in LABEL_ENV {
         if let Some(value) = labels.get(label) {
             out.insert(var.to_string(), value.clone());
@@ -253,10 +256,14 @@ mod tests {
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-        let env = BTreeMap::from([("RUNNER_TOKEN".to_string(), "t".to_string())]);
+        let env = BTreeMap::from([
+            ("RUNNER_TOKEN".to_string(), "t".to_string()),
+            ("CIBURST_VM_SECRET".to_string(), "s".to_string()),
+        ]);
         let merged = run_env(&env, &labels);
         assert_eq!(merged["CIBURST_STAGE"], "test");
         assert_eq!(merged["RUNNER_TOKEN"], "t");
+        assert!(!merged.contains_key("CIBURST_VM_SECRET"));
         let mut as_run = json!(merged);
         as_run["CIBURST_POOL"] = json!("ci");
         assert_eq!(labels_from_env(&as_run), labels);
