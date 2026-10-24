@@ -15,36 +15,36 @@ Status: M0, core and fake provider. The Scaleway provider and host, the pool ima
 
 1. Copy `config.example.json` to `config.json`; set `name`, `gitlab.projectIds`, pools and stages.
 2. Put credentials into `.local/scaleway.env` (`SCW_ACCESS_KEY`, `SCW_SECRET_KEY`, `SCW_DEFAULT_ORGANIZATION_ID`) and `.local/gitlab.env` (`GITLAB_TOKEN` with scope `api`).
-3. `node bin/provision.mjs plan`, then `node bin/provision.mjs apply`. Outputs land in `.local/outputs.env` (mode 600).
-4. `node bin/provision.mjs check` compares every project's pipeline with the stage map.
+3. `ciburst plan`, then `ciburst apply`. Outputs land in `.local/outputs.env` (mode 600).
+4. `ciburst check` compares every project's pipeline with the stage map.
 5. In the consumer pipeline: `default: tags: [<default pool>]`; jobs of other pools set `tags: [<pool>]`; jobs that need a Docker daemon keep a hosted runner tag.
 
 ## Commands
 
-| Command                           | Effect                                                                                     |
-| --------------------------------- | ------------------------------------------------------------------------------------------ |
-| `plan`                            | prints every step `apply` would run                                                        |
-| `apply`                           | creates or updates provider resources, GitLab runners, the dispatcher and the hooks        |
-| `check`                           | lints each project's pipeline and reports jobs whose tags disagree with their stage's pool |
-| `status`                          | dispatcher URL, live runs per pool, last runs                                              |
-| `rotate runner\|hook\|key\|cache` | replaces the secret and redeploys                                                          |
-| `destroy --yes <name>`            | removes every resource                                                                     |
+| Command | Effect |
+|---|---|
+| `plan` | prints every step `apply` would run |
+| `apply` | creates or updates provider resources, GitLab runners, the dispatcher and the hooks |
+| `check` | lints each project's pipeline and reports jobs whose tags disagree with their stage's pool |
+| `status` | dispatcher URL, live runs per pool, last runs |
+| `rotate runner\|hook\|key\|cache` | replaces the secret and redeploys |
+| `destroy --yes <name>` | removes every resource |
 
 Options: `--config <path>` (default `config.json`), `--local <dir>` (default `.local`), `--skip-gitlab`.
 
 ## Dry run without a cloud
 
 ```
-node bin/provision.mjs plan --config test/fixtures/config.fake.json --skip-gitlab
-node bin/provision.mjs apply --config test/fixtures/config.fake.json --skip-gitlab
-node bin/provision.mjs plan --config test/fixtures/config.fake.json --skip-gitlab
+cargo run -- plan --config test/config.fake.json --skip-gitlab
+cargo run -- apply --config test/config.fake.json --skip-gitlab
+cargo run -- plan --config test/config.fake.json --skip-gitlab
 ```
 
 The second plan prints only `noop` lines. State lives in `.local/state.json`.
 
 ## Development
 
-`npm install`, `npm test`, `npm run lint`, `npm run format`. Node 22 or later, no runtime dependencies. Providers and hosts: `docs/PROVIDERS.md`.
+Rust 1.96 (`rust-toolchain.toml`). `cargo test --workspace --all-features`, `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo deny check`. Providers and hosts: `docs/PROVIDERS.md`.
 
 ## License
 

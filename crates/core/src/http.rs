@@ -1,0 +1,124 @@
+use async_trait::async_trait;
+use serde::de::DeserializeOwned;
+
+use crate::{Error, Result};
+
+#[derive(Debug, Clone)]
+pub struct Request {
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<Vec<u8>>,
+}
+
+impl Request {
+    pub fn new(method: &str, url: impl Into<String>) -> Request {
+        Request {
+            method: method.to_string(),
+            url: url.into(),
+            headers: Vec::new(),
+            body: None,
+        }
+    }
+
+    pub fn header(mut self, name: &str, value: impl Into<String>) -> Request {
+        self.headers.push((name.to_string(), value.into()));
+        self
+    }
+
+    pub fn json(mut self, value: &serde_json::Value) -> Request {
+        self.body = Some(value.to_string().into_bytes());
+        self.header("content-type", "application/json")
+    }
+
+    pub fn header_value(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Response {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
+impl Response {
+    pub fn json_body(status: u16, value: &serde_json::Value) -> Response {
+        Response {
+            status,
+            body: value.to_string().into_bytes(),
+        }
+    }
+
+    pub fn empty(status: u16) -> Response {
+        Response {
+            status,
+            body: Vec::new(),
+        }
+    }
+
+    pub fn ok(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+
+    pub fn json<T: DeserializeOwned>(&self) -> Result<T> {
+        Ok(serde_json::from_slice(&self.body)?)
+    }
+}
+
+/// The one HTTP seam of the core. Production uses [`ReqwestClient`]; tests use in-memory fakes.
+#[async_trait]
+pub trait HttpClient: Send + Sync {
+    async fn send(&self, request: Request) -> Result<Response>;
+}
+
+#[cfg(feature = "reqwest")]
+pub struct ReqwestClient {
+    client: reqwest::Client,
+}
+
+#[cfg(feature = "reqwest")]
+impl ReqwestClient {
+    pub fn new() -> Result<ReqwestClient> {
+        let client = reqwest::Client::builder()
+            .user_agent(concat!("ciburst/", env!("CARGO_PKG_VERSION")))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|error| Error::Http(error.to_string()))?;
+        Ok(ReqwestClient { client })
+    }
+}
+
+#[cfg(feature = "reqwest")]
+#[async_trait]
+impl HttpClient for ReqwestClient {
+    async fn send(&self, request: Request) -> Result<Response> {
+        let method = reqwest::Method::from_bytes(request.method.as_bytes())
+            .map_err(|error| Error::Http(error.to_string()))?;
+        let mut builder = self.client.request(method, &request.url);
+        for (name, value) in &request.headers {
+            builder = builder.header(name, value);
+        }
+        if let Some(body) = request.body {
+            builder = builder.body(body);
+        }
+        let response = builder
+            .send()
+            .await
+            .map_err(|error| Error::Http(error.to_string()))?;
+        let status = response.status().as_u16();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| Error::Http(error.to_string()))?
+            .to_vec();
+        Ok(Response { status, body })
+    }
+}
