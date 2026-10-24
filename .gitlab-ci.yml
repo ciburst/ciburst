@@ -1,4 +1,4 @@
-stages: [lint, test]
+stages: [lint, test, images, release]
 
 default:
   image: rust:1.96.0-bookworm
@@ -28,6 +28,8 @@ lint:
     - rustup component add rustfmt clippy
     - cargo fmt --all --check
     - cargo clippy --workspace --all-targets --all-features -- -D warnings
+    - apt-get update && apt-get install -y --no-install-recommends shellcheck
+    - scripts/shellcheck.sh
 
 deny:
   extends: .rust
@@ -41,3 +43,72 @@ test:
   stage: test
   script:
     - cargo test --workspace --all-features
+
+.image:
+  stage: images
+  image: docker:27.5.1
+  services:
+    - docker:27.5.1-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: [images/**/*, .gitlab-ci.yml]
+  before_script:
+    - apk add --no-cache bash
+    - echo "$CI_REGISTRY_PASSWORD" | docker login --username "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - images/test/smoke.sh "$IMAGE" "ciburst-ci/$IMAGE:$CI_COMMIT_SHORT_SHA"
+    - scripts/ci-push-image.sh "ciburst-ci/$IMAGE:$CI_COMMIT_SHORT_SHA" "$IMAGE"
+
+image:base:
+  extends: .image
+  variables:
+    IMAGE: base
+
+image:node:
+  extends: .image
+  variables:
+    IMAGE: node
+
+image:rust:
+  extends: .image
+  variables:
+    IMAGE: rust
+
+image:playwright:
+  extends: .image
+  variables:
+    IMAGE: playwright
+
+image:kaniko:
+  extends: .image
+  variables:
+    IMAGE: kaniko
+
+.release:
+  stage: release
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
+
+release:binary:
+  extends: .release
+  script:
+    - scripts/ci-release-binary.sh
+  artifacts:
+    paths: [dist/, release-notes.md]
+    expire_in: 1 week
+
+release:
+  extends: .release
+  image: registry.gitlab.com/gitlab-org/cli:v1.124.0
+  needs: [release:binary, image:base, image:node, image:rust, image:playwright, image:kaniko]
+  variables:
+    GLAB_ENABLE_CI_AUTOLOGIN: "true"
+    BINARY: ciburst-x86_64-unknown-linux-musl
+    PACKAGE_URL: $CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/ciburst/$CI_COMMIT_TAG
+  script:
+    - |
+      glab release create "$CI_COMMIT_TAG" --name "ciburst $CI_COMMIT_TAG" --notes-file release-notes.md \
+        --assets-links="[{\"name\":\"${BINARY}\",\"url\":\"${PACKAGE_URL}/${BINARY}\",\"link_type\":\"package\"},{\"name\":\"${BINARY}.sha256\",\"url\":\"${PACKAGE_URL}/${BINARY}.sha256\",\"link_type\":\"other\"}]"
