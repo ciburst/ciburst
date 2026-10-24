@@ -1,0 +1,6 @@
+.local/
+node_modules/
+coverage/
+.claude/
+LICENSE
+SEED.md

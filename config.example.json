@@ -1,0 +1,54 @@
+{
+  "name": "ci",
+  "gitlab": { "url": "https://gitlab.com", "projectIds": [0] },
+  "host": { "type": "scaleway-function", "region": "fr-par" },
+  "provider": { "type": "scaleway-jobs", "region": "fr-par" },
+  "defaultPool": "ci",
+  "pools": [
+    {
+      "tag": "ci",
+      "image": "registry.gitlab.com/<namespace>/ciburst/node:24",
+      "stages": ["lint", "test"],
+      "vcpu": 2,
+      "memoryMiB": 4096,
+      "storageMiB": 10240,
+      "timeoutS": 3600,
+      "waitTimeoutS": 60,
+      "maxRuns": 10
+    },
+    {
+      "tag": "rust",
+      "image": "registry.gitlab.com/<namespace>/ciburst/rust:1",
+      "stages": ["rust"],
+      "vcpu": 4,
+      "memoryMiB": 8192,
+      "storageMiB": 10240,
+      "timeoutS": 3600,
+      "waitTimeoutS": 60,
+      "maxRuns": 4
+    },
+    {
+      "tag": "playwright",
+      "image": "registry.gitlab.com/<namespace>/ciburst/playwright:1",
+      "stages": ["e2e"],
+      "vcpu": 4,
+      "memoryMiB": 8192,
+      "storageMiB": 10240,
+      "timeoutS": 3600,
+      "waitTimeoutS": 60,
+      "maxRuns": 4
+    },
+    {
+      "tag": "build",
+      "image": "registry.gitlab.com/<namespace>/ciburst/kaniko:1",
+      "stages": ["build", "image"],
+      "vcpu": 2,
+      "memoryMiB": 4096,
+      "storageMiB": 10240,
+      "timeoutS": 1800,
+      "waitTimeoutS": 30,
+      "maxRuns": 4
+    }
+  ],
+  "cache": { "type": "s3", "expireDays": 30 }
+}

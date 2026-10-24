@@ -1,0 +1,32 @@
+stages: [lint, test]
+
+default:
+  image: node:22-bookworm-slim
+  tags: [saas-linux-small-amd64]
+  interruptible: true
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+.node:
+  cache:
+    key:
+      files: [package-lock.json]
+    paths: [.npm/]
+  before_script:
+    - npm ci --cache .npm --prefer-offline
+
+lint:
+  extends: .node
+  stage: lint
+  script:
+    - npm run lint
+
+test:
+  extends: .node
+  stage: test
+  script:
+    - npm test

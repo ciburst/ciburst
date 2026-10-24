@@ -1,0 +1,12 @@
+{
+  "name": "demo",
+  "gitlab": { "url": "https://gitlab.com", "projectIds": [1] },
+  "host": { "type": "fake" },
+  "provider": { "type": "fake" },
+  "defaultPool": "ci",
+  "pools": [
+    { "tag": "ci", "image": "example.invalid/node:24", "stages": ["lint", "test"] },
+    { "tag": "build", "image": "example.invalid/kaniko:1", "stages": ["build"], "maxRuns": 2 }
+  ],
+  "cache": { "type": "s3" }
+}
