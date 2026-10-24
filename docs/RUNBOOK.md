@@ -115,7 +115,7 @@ End a VM by hand, when the sweep does not:
    Check: the server is gone from the list and no IP of it remains under Flexible IPs.
 3. A job that ran on it fails once GitLab stops receiving its updates; re-run it.
 
-Cost (scaleway.com/en/pricing/virtual-instances, 2026-10-24): billed per hour with a 60 minute minimum. DEV1-M (3 vCPU, 4 GB, local SSD) 0.0202 EUR/h plus the dynamic IPv4 0.005 EUR/h: 0.0252 EUR per VM-hour. PLAY2-NANO (2 vCPU, 4 GB) 0.02754 EUR/h plus the IPv4 and a block volume, as it has no local storage.
+Cost (Scaleway product catalog, `nl-ams-1`, 2026-10-24): billed per hour with a 60 minute minimum. DEV1-M (3 vCPU, 4 GB) 0.020196 EUR/h, the dynamic IPv4 0.005 EUR/h and the 40 GB local SSD root volume at 0.000049 EUR per GB-hour (0.00196 EUR/h), billed as its own line: 0.0272 EUR per VM-hour. IPv6 addresses are free, but VMs need IPv4: `registry.gitlab.com`, the Scaleway registry and API have no IPv6 address (2026-10-24). PLAY2-NANO (2 vCPU, 4 GB) 0.02754 EUR/h plus the IPv4 and a block volume, as it has no local storage.
 
 ## Failure modes
 
@@ -183,31 +183,34 @@ Fixes found by the drill, all in the code since 2026-10-24:
 
 ## M3 drill
 
-Date: ____. Config: default pool `vm` (`runtime: instances`), fast lane `ci` (`runtime: jobs`) for stage `test`, `provider.registryPublic: true`. Pipeline `test/drill/gitlab-ci.yml` as `.gitlab-ci.yml` of the drill consumer branch `ciburst-drill`.
+Date: 2026-10-24, VMs in `nl-ams-1` (`provider.zone`; the organization has no DEV1 quota in the Paris zones). Config: default pool `vm` (`runtime: instances`), fast lane `ci` (`runtime: jobs`) for stage `test`, `provider.registryPublic: true`. Pipeline `test/drill/gitlab-ci.yml` as `.gitlab-ci.yml` of the drill consumer branch `ciburst-drill`.
 
 1. Default-branch pipeline of the framework project with `CIBURST_SCW_REGISTRY` and `CIBURST_SCW_REGISTRY_KEY` set.
    Check: `image:vm-agent` passes; `<registry endpoint>/vm-agent:edge` pulls without login.
-   Result: ____
+   Result: not run, the framework project is not pushed yet. The image was built with `images/vm-agent/build.sh` and pushed by hand; every VM pulled it without login.
 2. `ciburst apply`, then `ciburst plan`.
    Check: the plan prints only `noop`; the security group `<name>-vm` and the cron `<name>-sweep` exist.
-   Result: ____
+   Result: passed after the zone change: apply created `<name>-vm` in `nl-ams-1`, the plan printed 14 unchanged. The group left in `fr-par-1` was deleted by hand.
 3. `ciburst check --ref ciburst-drill` on the drill consumer project.
    Check: no problem line.
-   Result: ____
+   Result: every job matches the stage map. Without `--ref` the check lints the default branch, which is not converted and reports its untagged jobs.
 4. Run the drill pipeline.
    Check: `node`, `rust`, `postgres`, `dind`, `docker-build` pass on runner `<name>-vm`; `fast-lane` on `<name>-ci`; `hosted` on a GitLab runner; `$CI_REGISTRY_IMAGE/ciburst-drill:<short sha>` exists.
-   Result: ____
+   Result: passed in the third run.
+   - Run 1, GitLab's deliveries replayed after the zone change: 5 of 7. `node` and `rust` ran at the same time on one VM and broke each other's checkout: every slot reports concurrent id 0, so both got the same `/builds` volume. Fixed with a `--docker-cache-dir` per slot.
+   - Run 2, five new VMs: 6 of 7. `node` and `rust` overlapped on one VM with clean checkouts, `postgres` and `dind` overlapped without a certificate clash. `rust` failed because the consumer's `rust-toolchain.toml` pins another toolchain; the drill job now sets `RUSTUP_TOOLCHAIN`.
+   - Run 3, warm VMs: 7 of 7, five VM jobs on four VMs, the drill image pushed.
 5. VM start: job pending to running for the first VM job (create, boot, cloud-init, first poll).
-   Result: ____ s
+   Result: 47 to 50 s in run 2 (DEV1-M, `nl-ams-1`), 66 s in run 1.
 6. Tags while the pipeline runs: `starting`, then `idle` or `busy` with `ciburst-free`, `ciburst-seen` refreshed.
-   Result: ____
+   Result: passed. `starting` at create, `idle` with `ciburst-free:2` about 45 s later, `busy` while a job container runs, `idle` after it; `ciburst-seen` was under 2 minutes old on every idle VM. A slot that pulls its job's image has no labelled container yet and counts as free, for 10 to 50 s per job in the drill.
 7. Longest wait of a drill job against one job duration plus one VM boot.
-   Result: ____
+   Result: 51 s queued with new VMs (run 2), 3.4 s on warm VMs (run 3); jobs ran 19 to 66 s.
 8. End by callback: each VM reports `draining` and is gone between minute 55 and 60 of its hour.
-   Result: ____
+   Result: passed. Run 1's four VMs reported `draining` 55 min 26 s to 55 min 31 s after create and were gone 67 to 86 s later; no server, IP or volume remained.
 9. Sweep: create a powered-on server in the VM zone that never reports, tagged `ciburst`, `<name>`, `pool:<tag>`, `ciburst-state:starting` (no user data).
    Check: the first sweep after its tenth minute terminates it; VMs that report stay.
-   Result: ____
+   Result: passed. The DEV1-S test server, created at minute 26, was terminated by the sweep at minute 0 of the next hour and gone 15 s later; the four reporting VMs stayed.
 10. Cost per drill pipeline on the consumption page (Instances, IPs, Serverless Jobs).
     Result: ____ EUR
 

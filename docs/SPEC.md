@@ -206,7 +206,7 @@ Races and their effect:
 | Race | Effect |
 |---|---|
 | Two dispatcher calls claim the same free slot | one job waits for the next free slot; never stranded, because the VM keeps polling until it is idle, and idle means no pending job for its tag |
-| A job goes pending while a VM starts draining | taken in the grace, or the dispatcher already saw `draining` and started a VM; at worst one extra VM-hour (0.025 EUR) |
+| A job goes pending while a VM starts draining | taken in the grace, or the dispatcher already saw `draining` and started a VM; at worst one extra VM-hour (0.027 EUR) |
 | A VM boots for a job another VM already took | the new VM idles until minute 55 of its hour and drains; one VM-hour |
 | A VM hangs or loses its network | its jobs fail on GitLab's side when the runner stops updating them; the sweep removes it |
 | Pending events of one pool arrive in parallel | each dispatcher call counts the VMs before the others' creates land, so a burst can pass `maxRuns` by up to the function's `max_scale` minus one (M3 drill: 5 VMs at `maxRuns` 4); the extra VMs idle out their hour |
