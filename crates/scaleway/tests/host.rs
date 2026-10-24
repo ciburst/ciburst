@@ -59,6 +59,7 @@ fn client(fake: &Arc<FakeFunctions>, project: Option<&str>) -> Arc<ScalewayClien
         fake.clone(),
         Credentials {
             secret_key: "owner-secret".into(),
+            access_key: None,
             organization_id: "22222222-2222-4222-8222-222222222222".into(),
             default_project_id: project.map(String::from),
         },

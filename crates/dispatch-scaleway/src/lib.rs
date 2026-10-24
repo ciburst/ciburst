@@ -83,6 +83,7 @@ impl Env {
         };
         let credentials = Credentials {
             secret_key: required(vars::SECRET_KEY)?,
+            access_key: None,
             organization_id: required(vars::ORGANIZATION_ID)?,
             default_project_id: Some(required(vars::PROJECT_ID)?),
         };
