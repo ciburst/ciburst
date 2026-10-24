@@ -154,6 +154,13 @@ impl Provisioner {
             }
             steps.push(step);
         }
+        for tag in self.orphan_runner_tags(&runners) {
+            steps.push(Step::new(
+                format!("runner:{tag}"),
+                Action::Delete,
+                format!("gitlab runner {}-{tag}", self.config.name),
+            ));
+        }
         for &project_id in self.other_projects() {
             let enabled = gitlab.list_runners(project_id).await?;
             for pool in &self.config.pools {
@@ -171,6 +178,21 @@ impl Provisioner {
             }
         }
         Ok(steps)
+    }
+
+    /// Tags of runners this deployment created for pools gone from the config: described
+    /// `<name>-<tag>` and tagged exactly `[<tag>]`, so another deployment's runners never match.
+    fn orphan_runner_tags(&self, runners: &[crate::gitlab::Runner]) -> Vec<String> {
+        let prefix = format!("{}-", self.config.name);
+        runners
+            .iter()
+            .filter_map(|r| {
+                let tag = r.description.strip_prefix(&prefix)?;
+                (r.tag_list.len() == 1 && r.tag_list[0] == tag).then_some(tag)
+            })
+            .filter(|tag| self.config.pool_by_tag(tag).is_none())
+            .map(String::from)
+            .collect()
     }
 
     async fn hook_steps(&self, rotate: bool) -> Result<Vec<Step>> {
@@ -210,6 +232,19 @@ impl Provisioner {
         };
         let primary = self.primary_project();
         let runners = gitlab.list_runners(primary).await?;
+        for step in steps.iter().filter(|s| s.action == Action::Delete) {
+            let Some(tag) = step.id.strip_prefix("runner:") else {
+                continue;
+            };
+            let description = format!("{}-{tag}", self.config.name);
+            if let Some(runner) = runners.iter().find(|r| r.description == description) {
+                gitlab.delete_runner(runner.id).await?;
+                self.log.info(
+                    "runner_deleted",
+                    &[("pool", tag), ("id", &runner.id.to_string())],
+                );
+            }
+        }
         let mut created = Outputs::new();
         for pool in &self.config.pools {
             let id = format!("runner:{}", pool.tag);

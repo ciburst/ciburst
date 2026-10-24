@@ -403,3 +403,63 @@ async fn secrets_survive_a_later_failing_step() {
         saved[keys::DISPATCH_SECRET_KEY]
     );
 }
+
+#[tokio::test]
+async fn a_removed_pool_deletes_its_runner() {
+    let s = setup(config(&[7]), true);
+    s.provisioner.apply(&[]).await.unwrap();
+    assert_eq!(s.fake.runner_count(), 2);
+    let mut smaller = (*s.config).clone();
+    smaller.pools.retain(|p| p.tag != "build");
+    let smaller = Arc::new(smaller);
+    let provider = Arc::new(FakeProvider::new(
+        smaller.clone(),
+        Arc::new(MemoryStore::new()),
+    ));
+    let provisioner = Provisioner::new(
+        smaller,
+        provider,
+        s.host.clone(),
+        Some(Arc::new(Gitlab::new(
+            "https://gitlab.example",
+            FAKE_TOKEN,
+            s.fake.clone(),
+        ))),
+        s.outputs.clone(),
+        Log::silent(),
+    );
+    let plan = provisioner.plan(&[]).await.unwrap();
+    let step = plan.iter().find(|s| s.id == "runner:build").unwrap();
+    assert_eq!(step.action, Action::Delete);
+    provisioner.apply(&[]).await.unwrap();
+    assert_eq!(s.fake.runner_count(), 1);
+    let again = provisioner.plan(&[]).await.unwrap();
+    assert!(!again.iter().any(|s| s.id == "runner:build"), "{again:?}");
+
+    let mut prefix_config = (*s.config).clone();
+    prefix_config.name = "de".into();
+    prefix_config.pools.retain(|p| p.tag == "ci");
+    let prefix_config = Arc::new(prefix_config);
+    let other = Provisioner::new(
+        prefix_config.clone(),
+        Arc::new(FakeProvider::new(
+            prefix_config,
+            Arc::new(MemoryStore::new()),
+        )),
+        s.host.clone(),
+        Some(Arc::new(Gitlab::new(
+            "https://gitlab.example",
+            FAKE_TOKEN,
+            s.fake.clone(),
+        ))),
+        Arc::new(MemoryOutputs::new()),
+        Log::silent(),
+    );
+    let foreign = other.plan(&[]).await.unwrap();
+    assert!(
+        !foreign
+            .iter()
+            .any(|s| s.action == Action::Delete && s.id.starts_with("runner:")),
+        "runner demo-ci belongs to another deployment: {foreign:?}"
+    );
+}
