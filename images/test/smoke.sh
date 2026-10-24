@@ -52,6 +52,13 @@ contains "gitlab-runner --version" "$out" "Version:      $runner_version"
 out="$(docker run --rm "$ref" "${toolchain[@]}" 2>&1)"
 contains "${toolchain[*]}" "$out" "$expect_tool"
 
+# The shell executor runs every job step in a login shell that ends with the exit builtin.
+if out="$(docker run --rm "$ref" bash --login -c "${toolchain[*]}; exit" 2>&1)"; then
+  contains "login shell: ${toolchain[*]}" "$out" "$expect_tool"
+else
+  fail "login shell: ${toolchain[*]} exits non-zero: $out"
+fi
+
 out="$(docker run --rm "$ref" id -un 2>&1)"
 contains "user" "$out" "$user"
 

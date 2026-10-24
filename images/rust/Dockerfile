@@ -17,6 +17,8 @@ COPY --from=runner /usr/bin/gitlab-runner /usr/local/bin/gitlab-runner
 COPY --chmod=0755 base/entrypoint.sh /usr/local/bin/ciburst-entrypoint
 
 RUN useradd --create-home --shell /bin/bash runner \
+ && rm -f /home/runner/.bash_logout \
+ && echo "export PATH=\"$PATH\"" > /etc/profile.d/ciburst-path.sh \
  && mkdir -p /builds /cache \
  && chown runner:runner /builds /cache \
  && chown -R runner:runner "$CARGO_HOME"

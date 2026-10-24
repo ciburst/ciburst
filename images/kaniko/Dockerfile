@@ -13,7 +13,8 @@ COPY --from=runner /usr/bin/gitlab-runner /usr/local/bin/gitlab-runner
 COPY --chmod=0755 base/entrypoint.sh /usr/local/bin/ciburst-entrypoint
 
 ENV CIBURST_BUILDS_DIR=/kaniko/builds
-RUN mkdir -p /kaniko/builds /cache
+RUN mkdir -p /kaniko/builds /cache \
+ && echo "export PATH=\"$PATH\"" > /etc/profile.d/ciburst-path.sh
 
 WORKDIR /root
 ENTRYPOINT ["/usr/local/bin/ciburst-entrypoint"]

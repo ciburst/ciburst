@@ -94,7 +94,6 @@ image:kaniko:
 
 release:binary:
   extends: .release
-  needs: []
   script:
     - scripts/ci-release-binary.sh
   artifacts:
@@ -105,17 +104,11 @@ release:
   extends: .release
   image: registry.gitlab.com/gitlab-org/cli:v1.124.0
   needs: [release:binary, image:base, image:node, image:rust, image:playwright, image:kaniko]
+  variables:
+    GLAB_ENABLE_CI_AUTOLOGIN: "true"
+    BINARY: ciburst-x86_64-unknown-linux-musl
+    PACKAGE_URL: $CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/ciburst/$CI_COMMIT_TAG
   script:
-    - echo "release $CI_COMMIT_TAG"
-  release:
-    tag_name: $CI_COMMIT_TAG
-    name: ciburst $CI_COMMIT_TAG
-    description: ./release-notes.md
-    assets:
-      links:
-        - name: ciburst-x86_64-unknown-linux-musl
-          url: $CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/ciburst/$CI_COMMIT_TAG/ciburst-x86_64-unknown-linux-musl
-          link_type: package
-        - name: ciburst-x86_64-unknown-linux-musl.sha256
-          url: $CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/ciburst/$CI_COMMIT_TAG/ciburst-x86_64-unknown-linux-musl.sha256
-          link_type: other
+    - |
+      glab release create "$CI_COMMIT_TAG" --name "ciburst $CI_COMMIT_TAG" --notes-file release-notes.md \
+        --assets-links="[{\"name\":\"${BINARY}\",\"url\":\"${PACKAGE_URL}/${BINARY}\",\"link_type\":\"package\"},{\"name\":\"${BINARY}.sha256\",\"url\":\"${PACKAGE_URL}/${BINARY}.sha256\",\"link_type\":\"other\"}]"
