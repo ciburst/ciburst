@@ -5,9 +5,9 @@
 //!
 //! The function environment is exactly what `ciburst_dispatch_scaleway::Env` reads, named in
 //! [`vars`]:
-//! - plain: `CIBURST_CONFIG` (config JSON), `SCW_DEFAULT_ORGANIZATION_ID`,
-//!   `SCW_DEFAULT_PROJECT_ID`, `SCW_REGION`;
-//! - secret: `HOOK_TOKEN`, `SCW_SECRET_KEY` (the dispatch key), `RUNNER_TOKEN_<TAG>` per pool,
+//! - plain: `CIBURST_CONFIG` (config JSON), `CIBURST_ORGANIZATION_ID`, `CIBURST_PROJECT_ID`,
+//!   `CIBURST_REGION` (Scaleway reserves the `SCW_` prefix);
+//! - secret: `HOOK_TOKEN`, `CIBURST_DISPATCH_KEY` (the dispatch key), `RUNNER_TOKEN_<TAG>` per pool,
 //!   `CACHE_S3_ACCESS_KEY` and `CACHE_S3_SECRET_KEY` when a cache key exists.
 //!
 //! On top, the plain variable `CIBURST_CODE_DIGEST` records the sha256 of the deployed zip for
@@ -54,11 +54,11 @@ const POLL_ATTEMPTS: u32 = 240;
 /// Names of the function's environment variables, shared with the function crate.
 pub mod vars {
     pub const CONFIG: &str = "CIBURST_CONFIG";
-    pub const ORGANIZATION_ID: &str = "SCW_DEFAULT_ORGANIZATION_ID";
-    pub const PROJECT_ID: &str = "SCW_DEFAULT_PROJECT_ID";
-    pub const REGION: &str = "SCW_REGION";
+    pub const ORGANIZATION_ID: &str = "CIBURST_ORGANIZATION_ID";
+    pub const PROJECT_ID: &str = "CIBURST_PROJECT_ID";
+    pub const REGION: &str = "CIBURST_REGION";
     pub const HOOK_TOKEN: &str = "HOOK_TOKEN";
-    pub const SECRET_KEY: &str = "SCW_SECRET_KEY";
+    pub const SECRET_KEY: &str = "CIBURST_DISPATCH_KEY";
     pub const CACHE_ACCESS_KEY: &str = "CACHE_S3_ACCESS_KEY";
     pub const CACHE_SECRET_KEY: &str = "CACHE_S3_SECRET_KEY";
     pub const CODE_DIGEST: &str = "CIBURST_CODE_DIGEST";

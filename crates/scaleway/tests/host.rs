@@ -137,14 +137,14 @@ async fn plans_applies_and_converges() {
         [
             "CACHE_S3_ACCESS_KEY",
             "CACHE_S3_SECRET_KEY",
+            "CIBURST_DISPATCH_KEY",
             "HOOK_TOKEN",
             "RUNNER_TOKEN_BUILD_X",
-            "RUNNER_TOKEN_CI",
-            "SCW_SECRET_KEY"
+            "RUNNER_TOKEN_CI"
         ]
     );
     assert_eq!(
-        fake.secret(FUNCTION, "SCW_SECRET_KEY").as_deref(),
+        fake.secret(FUNCTION, "CIBURST_DISPATCH_KEY").as_deref(),
         Some("dispatch-secret")
     );
     assert!(
