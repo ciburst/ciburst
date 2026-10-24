@@ -1,0 +1,49 @@
+# ciburst consumer include. Jobs run in the ci pool unless they extend a pool template.
+# The job's stage selects the pool; the template sets the matching stage and tag.
+# The `image:` keyword is ignored in every pool.
+#
+# Examples:
+#
+# clippy:
+#   extends: .ciburst-rust
+#   script:
+#     - cargo clippy --all-targets -- -D warnings
+#
+# e2e:
+#   extends: .ciburst-playwright
+#   script:
+#     - npm ci
+#     - npx playwright test
+#
+# container-image:
+#   extends: .ciburst-build
+#   script:
+#     - /kaniko/executor --context "$CI_PROJECT_DIR" --dockerfile "$CI_PROJECT_DIR/Dockerfile" --destination "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+#
+# compose-test:
+#   stage: test
+#   tags: [saas-linux-small-amd64]
+#   image: docker:27.5.1
+#   services: [docker:27.5.1-dind]
+#   variables:
+#     DOCKER_TLS_CERTDIR: "/certs"
+#   script:
+#     - docker compose up --abort-on-container-exit
+
+default:
+  tags: [ci]
+
+.ciburst-rust:
+  stage: rust
+  tags: [rust]
+
+.ciburst-playwright:
+  stage: e2e
+  tags: [playwright]
+
+.ciburst-build:
+  stage: build
+  tags: [build]
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - printf '{"auths":{"%s":{"auth":"%s"}}}' "$CI_REGISTRY" "$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')" > /kaniko/.docker/config.json
