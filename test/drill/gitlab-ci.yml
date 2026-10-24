@@ -16,6 +16,8 @@ node:
   script:
     - node --version
     - node --version | grep -q '^v24\.'
+    - cat /proc/swaps
+    - grep -q '^/swapfile ' /proc/swaps
 
 rust:
   stage: vm

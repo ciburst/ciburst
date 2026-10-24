@@ -251,7 +251,7 @@ Cost: CX33 0.0144 EUR per hour with IPv4 and disk, every started hour billed; th
 - The dispatcher's IAM key can only start, list and stop Serverless Jobs and Instances in the dedicated project. The dispatcher holds no GitLab token. With Hetzner pools it holds a Hetzner project token, which Hetzner cannot narrow further: use a Hetzner project for ciburst alone.
 - A job can read its run's environment (its pool's runner token, the cache key), as on any runner. The dispatch IAM key never enters a run. The cache key can only read and write the cache bucket.
 - Images run as the non-root user `runner`.
-- A VM runs jobs privileged (Docker-in-Docker), so every job can read the VM's user data: its pool's runner token, the cache key and the VM's own token. This equals GitLab's own privileged runners; the VM token can only report for and end its own VM, and the dispatch key never reaches a VM.
+- A VM runs jobs privileged (Docker-in-Docker), so every job can read the VM's user data: its pool's runner token, the cache key and the VM's own token. This equals GitLab's own privileged runners; the VM token can only report for and end its own VM, and the dispatch key never reaches a VM. Scaleway and Hetzner both keep the user data with the server until it is deleted; it never holds the VM secret, the dispatch key or the Hetzner token.
 - Burst intents live in the cache bucket, which every job can write with the cache key. A forged intent can at most cost one VM-hour or delay one job until a slot frees.
 
 Secrets inventory:

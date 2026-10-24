@@ -13,6 +13,8 @@
 | Runner | `gitlab-runner` 18.11.4, `run-single`. Serverless Jobs pools: shell executor, one run per pending job, exits after `waitTimeoutS` idle seconds. VM pools: Docker executor, `slots` processes per VM |
 | Instance quotas | per organization, zone and commercial type, resource `cp_servers_type_<TYPE>` with `_` for `-` (`cp_servers_type_DEV1_M`); read with `GET https://api.scaleway.com/iam/v1alpha1/quota/cp_servers_type_<TYPE>?organization_id=<org id>`. On 2026-10-24 the drill organization had 0 for DEV1, PLAY2 and BASIC3 types in `fr-par-1` to `fr-par-3`, and DEV1-S 10, DEV1-M 15, DEV1-L 5 in `nl-ams-1` to `-3`, `pl-waw-1` to `-3`, `it-mil-1` to `-3` and `se-sto-1` |
 | Serverless Jobs limits | 6 vCPU, 16 GB, 24 h per run, 400 parallel runs per organization, `linux/amd64`, images under 2 GB recommended; `/tmp` counts against the run's memory |
+| Hetzner (M4) | provider `hetzner` for pools with `runtime: "hetzner"`: firewall `<name>-vm`, servers `<name>-<tag>-<8 hex>` with labels `ciburst-*`, run ids `hetzner:<server name>`; API limit 3600 requests per hour per project |
+| Burst intents (M4) | empty objects `ciburst/intents/<pool>/<unix s, 10 digits>-<job id, 20 digits>` in the cache bucket, expired by its lifecycle rule |
 
 ## Owner setup
 
@@ -24,6 +26,8 @@
    Check: the default-branch pipeline is green and `docker pull registry.gitlab.com/<namespace>/ciburst/node:edge` works without `docker login`.
 4. Consumer: copy `config.example.json` to `.local/config.json`; set `name`, `gitlab.projectIds` (the consumer project id) and each pool's `image` (`:edge` until the first release tag, then `:<major>`).
    Check: `ciburst plan --config .local/config.json` exits 0.
+5. Hetzner, only for pools with `runtime: "hetzner"`: in the Hetzner Console create a project used by ciburst alone (a token cannot be narrowed below a project), then Security, API tokens, Generate API token with permission Read & Write. Write `HCLOUD_TOKEN=<token>` to `.local/hetzner.env`, then `chmod 600 .local/hetzner.env`. Add `"providers": { "hetzner": {} }` to the config (optional `"location"`: `nbg1` default, `fsn1`, `hel1`; optional `"image"`: `docker-ce` default, any image must ship Docker), and give each Hetzner pool `"runtime": "hetzner"` (optional `"instanceTypes"`, default `cx33` then `cx43`; never `cax*`, the agent is amd64). Tags end with a letter or digit; `<name>-<tag>` stays within 54 characters. The registry namespace must be public (`provider.registryPublic`), because Hetzner VMs pull the agent from it.
+   Check: `ciburst plan` shows `hetzner:firewall create`; after `apply` the function holds `HCLOUD_TOKEN` as a secret variable.
 
 ## Provisioning
 
@@ -46,6 +50,7 @@ Gitignored. Never committed.
 | `config.json` | owner | 644 | config with the real project ids |
 | `scaleway.env` | owner | 600 | owner Scaleway key |
 | `gitlab.env` | owner | 600 | owner GitLab token |
+| `hetzner.env` | owner | 600 | `HCLOUD_TOKEN`, only with Hetzner pools |
 | `outputs.env` | `ciburst apply` | 600 | `CIBURST_DISPATCH_URL`, `CIBURST_HOOK_TOKEN`, dispatch and cache keys, `CIBURST_RUNNER_ID_<TAG>`, `CIBURST_RUNNER_TOKEN_<TAG>` |
 | `state.json` | `ciburst` | 600 | provider and host state |
 
@@ -117,6 +122,41 @@ End a VM by hand, when the sweep does not:
 
 Cost (Scaleway product catalog, `nl-ams-1`, 2026-10-24): billed per hour with a 60 minute minimum. DEV1-M (3 vCPU, 4 GB) 0.020196 EUR/h, the dynamic IPv4 0.005 EUR/h and the 40 GB local SSD root volume at 0.000049 EUR per GB-hour (0.00196 EUR/h), billed as its own line: 0.0272 EUR per VM-hour. IPv6 addresses are free, but VMs need IPv4: `registry.gitlab.com`, the Scaleway registry and API have no IPv6 address (2026-10-24). PLAY2-NANO (2 vCPU, 4 GB) 0.02754 EUR/h plus the IPv4 and a block volume, as it has no local storage.
 
+## Burst grouping (M4)
+
+A pending job of a VM pool first claims a free slot on a VM created more than 30 s ago: `idle` or `busy` and reported within 21 minutes, or `starting` and younger than 10 minutes. Without one, it leaves an intent in the cache bucket, waits 2 s and reads the intents of the last 30 s. Ranked by time and job id, every `slots`-th job starts a VM with its group's slots already taken; the others ride on that VM. The function writes and lists intents with the cache key; bucket and endpoint come from `CIBURST_PROJECT_ID` and `CIBURST_REGION`. A read follows at most 20 pages of 1000 keys.
+
+| Result | Meaning |
+|---|---|
+| `claimed` | a free slot on a VM older than 30 s; `runId` names it |
+| `started` | this job leads its burst group; a VM started with `taken` slots assigned |
+| `grouped` | rides on the VM its leader starts; `leader` is that job's id |
+| `duplicate` | GitLab delivered this job's pending event again within 30 s; nothing started |
+| `at_capacity` | `maxRuns` reached by VMs older than 30 s plus leaders ranked earlier; the job waits for a free slot |
+
+Log lines: `started ... taken="<n>"`, `grouped ... leader="<id>"`, `duplicate ... job="<id>"`, `warn ledger_failed pool="<tag>" job="<id>" error="..."` (this event used the M3 rule, one VM per job up to `maxRuns`).
+
+Reading a `grouped` delivery (hook page, Recent events): its leader's delivery shows `started` with the VM sized for the group, `at_capacity` (the group waits for a slot) or 500 (the start failed; the group waits for the next VM). GitLab does not bind a job to the leader's VM: any VM of the pool that asks first takes it.
+
+Inspect a pool's intents:
+
+1. Console: Object Storage, bucket `<name>-cache-<project id>`, folder `ciburst/intents/<pool>/`.
+2. CLI with `CIBURST_CACHE_ACCESS_KEY` and `CIBURST_CACHE_SECRET_KEY` from `.local/outputs.env` as the key pair: `aws s3api list-objects-v2 --endpoint-url https://s3.<region>.scw.cloud --region <region> --bucket <name>-cache-<project id> --prefix ciburst/intents/<pool>/ --start-after ciburst/intents/<pool>/<unix seconds>`.
+   Check: a cold burst of N jobs at `slots` S shows N keys within about 2 s and `ceil(N / S)` new servers.
+3. Never delete intents by hand. A key outside the format is ignored; a forged key in the format costs at most one VM-hour.
+
+Known limits, each at most one VM-hour: a VM created in the 2 to 3 s after its intent left the 30 s window counts neither as old nor by rank, so a new burst at that instant can pass `maxRuns` by one; a repeated delivery within the same second is not recognised as a duplicate.
+
+## Hetzner (M4)
+
+Same agent, cloud-init and lifecycle as the VM runtime above; state lives in server labels (`ciburst-state`, `ciburst-free`, `ciburst-seen`, `ciburst-drain`, plus `ciburst`, `ciburst-name`, `ciburst-pool`, `ciburst-job`). The firewall `<name>-vm` has no rules and is applied to the label selector `ciburst-name==<name>`, so no inbound traffic reaches a VM; cloud-init also turns SSH password login off. A start is refused while the firewall is missing or lost its selector.
+
+Check in the console: Servers (labels per VM), Firewalls (`<name>-vm`, no rules, the selector lists the running VMs), Primary IPs (empty while no VM runs). CLI: `hcloud server list -l ciburst-name=<name>`, `hcloud firewall describe <name>-vm`.
+
+End a VM by hand: Console, the server, Delete; or `DELETE https://api.hetzner.cloud/v1/servers/<id>` with `Authorization: Bearer <token>`. Powered-off servers still bill.
+
+Cost (hetzner.com/cloud/cost-optimized, 2026-10-24): CX33 (4 vCPU, 8 GB, 80 GB) 0.0144 EUR/h, the price page includes the IPv4 while the invoice lists the Primary IP as its own line; every started hour is billed, IPv6 is free.
+
 ## Failure modes
 
 | Symptom | Cause | Action |
@@ -133,6 +173,15 @@ Cost (Scaleway product catalog, `nl-ams-1`, 2026-10-24): billed per hour with a 
 | VMs stay `starting` until the sweep ends them | cloud-init failed: runner download, agent image pull (`registryPublic`), or `vm.env` incomplete (the agent exits 64 naming the key) | fix the image or the config, `ciburst apply`, re-run the job |
 | VM jobs stay pending, no server appears, the function log shows `instance type unavailable` with `quota(s) exceeded` | the zone's quota for every type of the pool is 0 | set `provider.zone` to a zone with quota (Facts, Instance quotas) or ask Scaleway support to raise it, `ciburst apply`, delete the security group `<name>-vm` of the old zone (console, Instances, Security groups), re-run the jobs |
 | VMs start or slots get claimed for a pipeline whose jobs all run on hosted runners | the dispatcher sees no tags; the jobs' stages fall to the default pool, a VM pool | make a fast lane the `defaultPool` and list the VM pool's stages, `ciburst apply`; started VMs end at minute 55 |
+| Function log shows `ledger_failed` | cache bucket missing, cache key rotated without `ciburst apply`, or more than 20 pages of intents | `ciburst apply`; until then every job starts its own VM |
+| `hetzner: pool X: no server type started (cx33: resource_unavailable ...)` | the location is out of stock for every type | add types to `instanceTypes` or set `providers.hetzner.location` |
+| Hetzner `resource_limit_exceeded` | the project's server or core limit | ask Hetzner for a higher limit or lower `maxRuns` |
+| Hetzner `unauthorized` (401) or `forbidden` (403) | token deleted or read-only | new Read & Write token in `.local/hetzner.env`, `ciburst apply` |
+| Hetzner `rate_limit_exceeded` (429) | 3600 requests per hour per project | wait; look for report storms in the function log |
+| `hetzner: pool X is not provisioned` | firewall missing or without its selector | `ciburst plan` shows the repair, `ciburst apply` |
+| `scaleway: shared environment: ...` on a Hetzner start | registry off, private, or not provisioned | `provider.registry` and `provider.registryPublic` true, `ciburst apply` |
+| Hetzner VM swept from `starting` | cloud-init failed (agent pull, GitLab unreachable); no SSH | server Console view: `/var/log/cloud-init-output.log`, `journalctl -u ciburst-vm-agent` |
+| Primary IPs left after VMs ended | the automatic IPv4 was not deleted with its server | delete them under Primary IPs; they bill hourly |
 | A `vm` job stays pending while VMs of the pool idle | the job's stage maps to a fast lane | move the job to a stage of the VM pool, `ciburst check` |
 | A draining VM takes minutes to end | a slot cut off from GitLab waits 300 s between job requests, and `SIGQUIT` does not shorten that wait | none; the VM keeps reporting `draining` until its slots exit |
 
@@ -214,6 +263,24 @@ Date: 2026-10-24, VMs in `nl-ams-1` (`provider.zone`; the organization has no DE
    Result: passed. The DEV1-S test server, created at minute 26, was terminated by the sweep at minute 0 of the next hour and gone 15 s later; the four reporting VMs stayed.
 10. Cost per drill pipeline on the consumption page (Instances, IPs, Serverless Jobs).
     Result: 0.29 EUR for the whole drill: nine DEV1-M hours (four in run 1, five shared by runs 2 and 3) and the one-hour DEV1-S sweep test, with 10 IPv4 hours and 760 GB-hours of local SSD. The local SSD was billed for two hours per VM, as each VM spanned two clock hours, so a VM-hour cost about 0.030 EUR in practice. A cold pipeline with five VM jobs costs about 0.15 EUR, a warm one nothing extra; Serverless Jobs stayed inside the free tier.
+
+## M4 drill
+
+Date: 2026-10-24. Config: as the M3 drill, VMs in `nl-ams-1`, `slots` 2, `maxRuns` 4, default pool `ci`; the function at the M4 code.
+
+1. Cold burst on Scaleway: push an empty commit to `ciburst-drill` with no VM running.
+   Check: five VM jobs start three VMs; delivery results `started` three times and `grouped` twice; no `ledger_failed`; five intent keys in the bucket; every job passes.
+   Result: passed. Seven of seven jobs green on three DEV1-M VMs (M3: five). The five intents carry the same second; ranked by job id, the first, third and fifth job started VMs with `ciburst-free` 0, 0 and 1, the second and fourth answered `grouped` with their leader. Each pair started on its VM within 20 ms; the VM jobs queued 59.6 to 66.5 s, the 2 s group wait included.
+2. Warm reuse: a second pipeline within the VMs' paid hour.
+   Check: `claimed` for every VM job, no new VM.
+   Result: passed. Five `claimed` answers 3 minutes after the cold run, no new VM, every VM job queued 3.1 to 3.3 s. Three of the five claims named the same VM: parallel calls read the same free counts, and the job id spreads them only statistically; any polling slot takes the job anyway.
+3. Swap: `/proc/swaps` read by a drill job.
+   Result: passed. `/swapfile  file  4194300  268  -2` on the VM that ran the node job.
+4. Cost of runs 1 and 2 on the consumption page.
+   Result: ____ EUR
+5. Hetzner, once `.local/hetzner.env` exists: the `vm` pool on `runtime: "hetzner"`, `apply`, a cold pipeline.
+   Check: three CX33 servers with the labels; firewall applied (`public_net.firewalls[].status` `applied`); jobs pass; drain at minute 55 deletes every server; Primary IPs empty afterwards.
+   Result: ____
 
 ## `run-single` flag verification
 
