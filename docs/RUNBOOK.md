@@ -117,7 +117,7 @@ Date: 2026-10-24. Region `fr-par`, config name `ciburst-dev`, images in the proj
 2. `ciburst check` on the drill consumer.
    Result: valid pipeline, 30 untagged jobs; every job needs a pool tag or a hosted runner tag.
 3. Pipeline with a node, a rust, a playwright and a kaniko job plus one `saas-linux-small-amd64` job (drill consumer branch `ciburst-drill`).
-   Result: node, rust, playwright pass; kaniko fails (item 5); hosted job ____.
+   Result: node, rust, playwright pass; kaniko fails (item 5); the `saas-linux-small-amd64` job runs on GitLab's shared runners (0.1 s queued), never on a pool.
 4. Start latency.
    Dispatcher answer: 0.1 to 0.4 s warm. Run queued to running: 14 s (`ci`, node image). Synthetic pending event, no job to take: run `succeeded` 111 s after running, of which 60 s idle window.
    Per pool with a real job, queued then run: ci 3.5 to 6.9 s and 8 to 11 s; rust 27.5 to 28.5 s and 7.8 s; playwright 5.7 to 38.6 s and 9.6 to 17.9 s; first pulls of the larger images are the slow cases.
