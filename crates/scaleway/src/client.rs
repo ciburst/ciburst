@@ -211,6 +211,7 @@ mod tests {
     fn credentials() -> Credentials {
         Credentials {
             secret_key: "secret".into(),
+            access_key: None,
             organization_id: "org".into(),
             default_project_id: None,
         }
