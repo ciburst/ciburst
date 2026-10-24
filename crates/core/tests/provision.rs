@@ -328,3 +328,78 @@ async fn host_url_is_known_after_apply() {
             .any(|s| s.id == "dispatcher" && s.action == Action::Noop)
     );
 }
+
+/// Fails every step with the given id, like a Scaleway call that rejects a job definition.
+struct FailingStep {
+    inner: Arc<FakeProvider>,
+    fail: &'static str,
+}
+
+#[async_trait::async_trait]
+impl Provider for FailingStep {
+    fn capabilities(&self) -> ciburst_core::types::Capabilities {
+        self.inner.capabilities()
+    }
+    async fn plan(&self, rotate: &[Rotation]) -> ciburst_core::Result<Vec<Step>> {
+        self.inner.plan(rotate).await
+    }
+    async fn apply(&self, steps: &[Step]) -> ciburst_core::Result<ciburst_core::types::Outputs> {
+        if steps.iter().any(|s| s.id == self.fail) {
+            return Err(ciburst_core::Error::provider("registry image not found"));
+        }
+        self.inner.apply(steps).await
+    }
+    async fn destroy(&self) -> ciburst_core::Result<()> {
+        self.inner.destroy().await
+    }
+    async fn start(
+        &self,
+        request: ciburst_core::types::StartRequest,
+    ) -> ciburst_core::Result<String> {
+        self.inner.start(request).await
+    }
+    async fn list(
+        &self,
+        pool: Option<&str>,
+    ) -> ciburst_core::Result<Vec<ciburst_core::types::Run>> {
+        self.inner.list(pool).await
+    }
+    async fn stop(&self, run_id: &str) -> ciburst_core::Result<()> {
+        self.inner.stop(run_id).await
+    }
+}
+
+#[tokio::test]
+async fn secrets_survive_a_later_failing_step() {
+    let config = config(&[7]);
+    let inner = Arc::new(FakeProvider::new(
+        config.clone(),
+        Arc::new(MemoryStore::new()),
+    ));
+    let failing = Arc::new(FailingStep {
+        inner: inner.clone(),
+        fail: "definition:build",
+    });
+    let outputs = Arc::new(MemoryOutputs::new());
+    let host = Arc::new(FakeHost::new(config.clone(), Arc::new(MemoryStore::new())));
+    let provisioner = Provisioner::new(
+        config.clone(),
+        failing,
+        host.clone(),
+        None,
+        outputs.clone(),
+        Log::silent(),
+    );
+    assert!(provisioner.apply(&[]).await.is_err());
+    let saved = outputs.read().await.unwrap();
+    assert!(saved.contains_key(keys::DISPATCH_SECRET_KEY), "{saved:?}");
+    assert!(saved.contains_key(keys::CACHE_SECRET_KEY), "{saved:?}");
+
+    let healthy = Provisioner::new(config, inner, host, None, outputs.clone(), Log::silent());
+    healthy.apply(&[]).await.unwrap();
+    let after = outputs.read().await.unwrap();
+    assert_eq!(
+        after[keys::DISPATCH_SECRET_KEY],
+        saved[keys::DISPATCH_SECRET_KEY]
+    );
+}

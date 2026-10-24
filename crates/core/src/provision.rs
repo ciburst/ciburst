@@ -351,10 +351,17 @@ impl Provisioner {
 
         let provider_rotate = provider_rotations(rotate);
         let provider_steps = self.provider.plan(&provider_rotate).await?;
-        let provider_outputs = self.provider.apply(&provider_steps).await?;
-        self.outputs
-            .write(&provider_outputs, !provider_rotate.is_empty())
-            .await?;
+        // One step at a time: a secret the provider shows once is saved before a later step
+        // can fail. Providers return secrets only when they created them, so they overwrite.
+        for step in &provider_steps {
+            if step.is_noop() {
+                continue;
+            }
+            let outputs = self.provider.apply(std::slice::from_ref(step)).await?;
+            self.outputs.write(&outputs, true).await?;
+        }
+        let tail = self.provider.apply(&[]).await?;
+        self.outputs.write(&tail, false).await?;
         applied.extend(provider_steps);
 
         let current = self.outputs.read().await?;
