@@ -111,24 +111,39 @@ Add a toolchain:
 
 ## M2 drill
 
-Date: ____
+Date: 2026-10-24. Region `fr-par`, config name `ciburst-dev`, images in the project's Scaleway registry.
 
-1. `ciburst apply` on an empty Scaleway project.
-   Result: ____ (second `plan` only `noop`: yes / no)
+1. `ciburst apply` on the Scaleway project.
+   Result: done after five fixes below; second `plan` only `noop`: yes (17 unchanged).
 2. `ciburst check` on the drill consumer.
-   Result: ____
+   Result: valid pipeline, 30 untagged jobs; every job needs a pool tag or a hosted runner tag.
 3. Pipeline with a node, a rust, a playwright and a kaniko job plus one `saas-linux-small-amd64` job.
    Result: ____
-4. Start latency from job created to job running, per pool.
-   ci: ____ s, rust: ____ s, playwright: ____ s, build: ____ s
+4. Start latency.
+   Dispatcher answer: 0.1 to 0.4 s warm. Run queued to running: 14 s (`ci`, node image). Synthetic pending event, no job to take: run `succeeded` 111 s after running, of which 60 s idle window.
+   Per pool with a real job: ci ____ s, rust ____ s, playwright ____ s, build ____ s.
 5. Kaniko verdict: multi-stage build and push from the `build` pool under gVisor.
    Result: ____ (works / needs `--force` / fails: ____)
 6. Cache hit on the second run of the same job.
    Result: ____ (`Successfully extracted cache`: yes / no)
 7. Cost on the Scaleway consumption page after the drill.
    Result: ____ EUR
-8. Cockpit queries for the function and the runs.
-   Result: ____
+8. Logs.
+   Result: Cockpit's Scaleway logs source holds bucket logs only; function build logs and function logs are not exported there (2026-10-24). Builder failures are diagnosed with probe functions.
+9. Image push into the project registry, five images.
+   Result: 3 min (rust 60 s, playwright 81 s).
+10. Function build on Scaleway (`rust196`).
+   Result: about 5 min per deploy.
+
+Fixes found by the drill, all in the code since 2026-10-24:
+
+| Finding | Fix |
+|---|---|
+| A job definition is rejected with `registry image not found` while its image is missing | push the images before the definitions; with `provider.registry` run `apply`, push, `apply` again |
+| Function variables may not start with `SCW_` | the function reads `CIBURST_DISPATCH_KEY`, `CIBURST_ORGANIZATION_ID`, `CIBURST_PROJECT_ID`, `CIBURST_REGION` |
+| Scaleway's Rust builder fails on workspace inheritance | `build.rs` writes every inherited value into the zipped manifests |
+| A failed apply lost the IAM secrets Scaleway shows once | outputs are saved after every provider step |
+| Starting a job with a private registry image needs registry read | the dispatch policy grants `ContainerRegistryReadOnly`; older policies are repaired |
 
 ## `run-single` flag verification
 
