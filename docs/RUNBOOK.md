@@ -132,6 +132,7 @@ Cost (Scaleway product catalog, `nl-ams-1`, 2026-10-24): billed per hour with a 
 | Function deploy fails with an unknown runtime | Scaleway retired `rust196` | runtime bump below |
 | VMs stay `starting` until the sweep ends them | cloud-init failed: runner download, agent image pull (`registryPublic`), or `vm.env` incomplete (the agent exits 64 naming the key) | fix the image or the config, `ciburst apply`, re-run the job |
 | VM jobs stay pending, no server appears, the function log shows `instance type unavailable` with `quota(s) exceeded` | the zone's quota for every type of the pool is 0 | set `provider.zone` to a zone with quota (Facts, Instance quotas) or ask Scaleway support to raise it, `ciburst apply`, delete the security group `<name>-vm` of the old zone (console, Instances, Security groups), re-run the jobs |
+| VMs start or slots get claimed for a pipeline whose jobs all run on hosted runners | the dispatcher sees no tags; the jobs' stages fall to the default pool, a VM pool | make a fast lane the `defaultPool` and list the VM pool's stages, `ciburst apply`; started VMs end at minute 55 |
 | A `vm` job stays pending while VMs of the pool idle | the job's stage maps to a fast lane | move the job to a stage of the VM pool, `ciburst check` |
 | A draining VM takes minutes to end | a slot cut off from GitLab waits 300 s between job requests, and `SIGQUIT` does not shorten that wait | none; the VM keeps reporting `draining` until its slots exit |
 
@@ -163,7 +164,7 @@ Date: 2026-10-24. Region `fr-par`, config name `ciburst-dev`, images in the proj
 6. Cache hit on the second run of the same job.
    Result: yes. First run uploads to the bucket in 4.7 s; the next pipeline restores it in 0.3 s (`Successfully extracted cache`).
 7. Cost on the Scaleway consumption page after the drill.
-   Result: ____ EUR
+   Result: 0 EUR for compute. Month to date on 2026-10-24, M2 and M3 together: Serverless Jobs 12838 vCPU-s and 27570 GB-s (0.19 EUR) and the function, all inside the free tier; Object Storage 0.01 EUR and Container Registry 0.01 EUR.
 8. Logs.
    Result: Cockpit's Scaleway logs source holds bucket logs only; function build logs and function logs are not exported there (2026-10-24). Builder failures are diagnosed with probe functions.
 9. Image push into the project registry, five images.
@@ -207,12 +208,12 @@ Date: 2026-10-24, VMs in `nl-ams-1` (`provider.zone`; the organization has no DE
 7. Longest wait of a drill job against one job duration plus one VM boot.
    Result: 51 s queued with new VMs (run 2), 3.4 s on warm VMs (run 3); jobs ran 19 to 66 s.
 8. End by callback: each VM reports `draining` and is gone between minute 55 and 60 of its hour.
-   Result: passed. Run 1's four VMs reported `draining` 55 min 26 s to 55 min 31 s after create and were gone 67 to 86 s later; no server, IP or volume remained.
+   Result: passed. Run 1's four VMs reported `draining` 55 min 26 s to 55 min 31 s after create and were gone 67 to 86 s later; run 2's five VMs reported `draining` 55 min 17 s to 55 min 32 s after create and were gone within 2 minutes. No server, IP or volume remained.
 9. Sweep: create a powered-on server in the VM zone that never reports, tagged `ciburst`, `<name>`, `pool:<tag>`, `ciburst-state:starting` (no user data).
    Check: the first sweep after its tenth minute terminates it; VMs that report stay.
    Result: passed. The DEV1-S test server, created at minute 26, was terminated by the sweep at minute 0 of the next hour and gone 15 s later; the four reporting VMs stayed.
 10. Cost per drill pipeline on the consumption page (Instances, IPs, Serverless Jobs).
-    Result: ____ EUR
+    Result: 0.29 EUR for the whole drill: nine DEV1-M hours (four in run 1, five shared by runs 2 and 3) and the one-hour DEV1-S sweep test, with 10 IPv4 hours and 760 GB-hours of local SSD. The local SSD was billed for two hours per VM, as each VM spanned two clock hours, so a VM-hour cost about 0.030 EUR in practice. A cold pipeline with five VM jobs costs about 0.15 EUR, a warm one nothing extra; Serverless Jobs stayed inside the free tier.
 
 ## `run-single` flag verification
 
