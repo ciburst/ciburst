@@ -1,18 +1,163 @@
-//! Host `scaleway-function`: the dispatcher as a Serverless Function built by Scaleway from a
-//! zip embedded in this crate at build time. Implemented in M1 by agent B; see
-//! `docs/milestones/M1-scaleway.md`.
+//! Host `scaleway-function`: the dispatcher as a Serverless Function (`functions/v1beta1`) built
+//! by Scaleway from a zip embedded in this crate by `build.rs`.
+//!
+//! Steps: `namespace` (`<name>`), `function` (`<name>-dispatch`), `code` (the embedded zip).
+//!
+//! The function environment is exactly what `ciburst_dispatch_scaleway::Env` reads, named in
+//! [`vars`]:
+//! - plain: `CIBURST_CONFIG` (config JSON), `SCW_DEFAULT_ORGANIZATION_ID`,
+//!   `SCW_DEFAULT_PROJECT_ID`, `SCW_REGION`;
+//! - secret: `HOOK_TOKEN`, `SCW_SECRET_KEY` (the dispatch key), `RUNNER_TOKEN_<TAG>` per pool,
+//!   `CACHE_S3_ACCESS_KEY` and `CACHE_S3_SECRET_KEY` when a cache key exists.
+//!
+//! On top, the plain variable `CIBURST_CODE_DIGEST` records the sha256 of the deployed zip for
+//! this host's plan; the function does not read it. The sha256 of the settings and both
+//! environments is kept in the function's `description` as `ciburst:<hex>`.
 
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use ciburst_core::config::Config;
+use ciburst_core::http::Request;
 use ciburst_core::log::Log;
-use ciburst_core::types::{Host, Outputs, Secrets, Step};
+use ciburst_core::types::{Action, Host, Outputs, Secrets, Step};
 use ciburst_core::{Error, Result};
+use serde::Serialize;
+use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::client::ScalewayClient;
 
 pub const HOST_NAME: &str = "scaleway-function";
+
+pub const RUNTIME: &str = "rust196";
+pub const HANDLER: &str = "handle";
+pub const PRIVACY: &str = "public";
+pub const MIN_SCALE: u32 = 0;
+pub const MAX_SCALE: u32 = 5;
+pub const MEMORY_LIMIT_MB: u32 = 128;
+pub const TIMEOUT: &str = "30s";
+pub const HTTP_OPTION: &str = "redirected";
+pub const SANDBOX: &str = "v2";
+pub const DESCRIPTION_PREFIX: &str = "ciburst:";
+
+const STEP_NAMESPACE: &str = "namespace";
+const STEP_FUNCTION: &str = "function";
+const STEP_CODE: &str = "code";
+
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// A Rust build on Scaleway compiles the whole dependency set; 20 minutes at most.
+const POLL_ATTEMPTS: u32 = 240;
+
+/// Names of the function's environment variables, shared with the function crate.
+pub mod vars {
+    pub const CONFIG: &str = "CIBURST_CONFIG";
+    pub const ORGANIZATION_ID: &str = "SCW_DEFAULT_ORGANIZATION_ID";
+    pub const PROJECT_ID: &str = "SCW_DEFAULT_PROJECT_ID";
+    pub const REGION: &str = "SCW_REGION";
+    pub const HOOK_TOKEN: &str = "HOOK_TOKEN";
+    pub const SECRET_KEY: &str = "SCW_SECRET_KEY";
+    pub const CACHE_ACCESS_KEY: &str = "CACHE_S3_ACCESS_KEY";
+    pub const CACHE_SECRET_KEY: &str = "CACHE_S3_SECRET_KEY";
+    pub const CODE_DIGEST: &str = "CIBURST_CODE_DIGEST";
+
+    /// `RUNNER_TOKEN_<TAG>`: tag upper-cased, every other character than ASCII letters and
+    /// digits replaced by `_`, the rule of `ciburst_core::provision::keys`.
+    pub fn runner_token(tag: &str) -> String {
+        let name: String = tag
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        format!("RUNNER_TOKEN_{name}")
+    }
+}
+
+#[cfg(ciburst_embedded_code)]
+static CODE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/function.zip"));
+#[cfg(not(ciburst_embedded_code))]
+static CODE: &[u8] = &[];
+
+/// The function's source zip, packed by `build.rs`. Empty in the vendored copy inside the zip.
+pub fn embedded_code() -> &'static [u8] {
+    CODE
+}
+
+/// Hex sha256 of [`embedded_code`].
+pub fn embedded_code_digest() -> &'static str {
+    static DIGEST: OnceLock<String> = OnceLock::new();
+    DIGEST.get_or_init(|| hex::encode(Sha256::digest(CODE)))
+}
+
+/// Everything the `function` step compares. Holds secrets: never logged, never serialized
+/// anywhere but into the digest and the API request.
+#[derive(Serialize)]
+struct Settings {
+    runtime: &'static str,
+    handler: &'static str,
+    privacy: &'static str,
+    min_scale: u32,
+    max_scale: u32,
+    memory_limit: u32,
+    timeout: &'static str,
+    http_option: &'static str,
+    sandbox: &'static str,
+    environment_variables: BTreeMap<String, String>,
+    secret_environment_variables: BTreeMap<String, String>,
+}
+
+impl Settings {
+    fn description(&self) -> Result<String> {
+        let digest = Sha256::digest(serde_json::to_vec(self)?);
+        Ok(format!("{DESCRIPTION_PREFIX}{}", hex::encode(digest)))
+    }
+
+    /// The create or update body; `code_digest` is carried in the plain environment.
+    fn body(&self, code_digest: Option<&str>, remove_secrets: &[String]) -> Result<Value> {
+        let mut secrets: Vec<Value> = self
+            .secret_environment_variables
+            .iter()
+            .map(|(key, value)| json!({ "key": key, "value": value }))
+            .collect();
+        secrets.extend(remove_secrets.iter().map(|key| json!({ "key": key })));
+        Ok(json!({
+            "runtime": self.runtime,
+            "handler": self.handler,
+            "privacy": self.privacy,
+            "min_scale": self.min_scale,
+            "max_scale": self.max_scale,
+            "memory_limit": self.memory_limit,
+            "timeout": self.timeout,
+            "http_option": self.http_option,
+            "sandbox": self.sandbox,
+            "description": self.description()?,
+            "environment_variables": self.environment(code_digest),
+            "secret_environment_variables": secrets,
+        }))
+    }
+
+    fn environment(&self, code_digest: Option<&str>) -> BTreeMap<String, String> {
+        let mut env = self.environment_variables.clone();
+        if let Some(digest) = code_digest {
+            env.insert(vars::CODE_DIGEST.to_string(), digest.to_string());
+        }
+        env
+    }
+}
+
+/// The resources found by name.
+struct Found {
+    project: Option<String>,
+    namespace: Option<Value>,
+    function: Option<Value>,
+}
 
 pub struct ScalewayFunction {
     config: Arc<Config>,
@@ -29,27 +174,493 @@ impl ScalewayFunction {
         }
     }
 
-    fn todo(what: &str) -> Error {
-        Error::provider(format!("{HOST_NAME}: {what} is implemented in M1"))
+    fn namespace_name(&self) -> &str {
+        &self.config.name
+    }
+
+    fn function_name(&self) -> String {
+        format!("{}-dispatch", self.config.name)
+    }
+
+    fn base(&self) -> String {
+        format!("/functions/v1beta1/regions/{}", self.client.region())
+    }
+
+    fn settings(&self, project_id: &str, secrets: &Secrets) -> Result<Settings> {
+        let environment_variables = BTreeMap::from([
+            (
+                vars::CONFIG.to_string(),
+                serde_json::to_string(&*self.config)?,
+            ),
+            (
+                vars::ORGANIZATION_ID.to_string(),
+                self.client.organization_id().to_string(),
+            ),
+            (vars::PROJECT_ID.to_string(), project_id.to_string()),
+            (vars::REGION.to_string(), self.client.region().to_string()),
+        ]);
+        let mut secret = BTreeMap::new();
+        if let Some(token) = &secrets.hook_token {
+            secret.insert(vars::HOOK_TOKEN.to_string(), token.clone());
+        }
+        if let Some(dispatch) = &secrets.dispatch {
+            secret.insert(vars::SECRET_KEY.to_string(), dispatch.secret_key.clone());
+        }
+        for pool in &self.config.pools {
+            if let Some(token) = secrets.runner_tokens.get(&pool.tag) {
+                secret.insert(vars::runner_token(&pool.tag), token.clone());
+            }
+        }
+        if let Some(cache) = &secrets.cache {
+            secret.insert(vars::CACHE_ACCESS_KEY.to_string(), cache.access_key.clone());
+            secret.insert(vars::CACHE_SECRET_KEY.to_string(), cache.secret_key.clone());
+        }
+        Ok(Settings {
+            runtime: RUNTIME,
+            handler: HANDLER,
+            privacy: PRIVACY,
+            min_scale: MIN_SCALE,
+            max_scale: MAX_SCALE,
+            memory_limit: MEMORY_LIMIT_MB,
+            timeout: TIMEOUT,
+            http_option: HTTP_OPTION,
+            sandbox: SANDBOX,
+            environment_variables,
+            secret_environment_variables: secret,
+        })
+    }
+
+    async fn find_namespace(&self, project_id: &str) -> Result<Option<Value>> {
+        let name = self.namespace_name();
+        let list = self
+            .client
+            .get(
+                &format!("{}/namespaces", self.base()),
+                &[
+                    ("project_id", project_id.to_string()),
+                    ("name", name.to_string()),
+                ],
+            )
+            .await?;
+        Ok(find_named(&list["namespaces"], name))
+    }
+
+    async fn find_function(&self, namespace_id: &str) -> Result<Option<Value>> {
+        let name = self.function_name();
+        let list = self
+            .client
+            .get(
+                &format!("{}/functions", self.base()),
+                &[
+                    ("namespace_id", namespace_id.to_string()),
+                    ("name", name.clone()),
+                ],
+            )
+            .await?;
+        Ok(find_named(&list["functions"], &name))
+    }
+
+    async fn find(&self) -> Result<Found> {
+        let mut found = Found {
+            project: self.client.find_project(&self.config.name).await?,
+            namespace: None,
+            function: None,
+        };
+        if let Some(project) = &found.project {
+            found.namespace = self.find_namespace(project).await?;
+        }
+        if let Some(namespace) = &found.namespace {
+            found.function = self.find_function(id_of(namespace)?).await?;
+        }
+        Ok(found)
+    }
+
+    /// Polls `path` until its `status` is one of `done`; `error` fails unless listed.
+    async fn wait(&self, path: &str, done: &[&str]) -> Result<Value> {
+        for attempt in 0..POLL_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+            let value = self.client.get(path, &[]).await?;
+            let status = value["status"].as_str().unwrap_or("");
+            if done.contains(&status) {
+                return Ok(value);
+            }
+            if status == "error" {
+                return Err(Error::provider(format!(
+                    "{HOST_NAME}: {path} is in error: {}",
+                    failure_message(&value)
+                )));
+            }
+        }
+        Err(Error::provider(format!(
+            "{HOST_NAME}: {path} not {} after {} attempts",
+            done.join(" or "),
+            POLL_ATTEMPTS
+        )))
+    }
+
+    /// Polls `path` until it answers 404.
+    async fn wait_gone(&self, path: &str) -> Result<()> {
+        for attempt in 0..POLL_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+            match self.client.get(path, &[]).await {
+                Ok(_) => {}
+                Err(error) if is_not_found(&error) => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::provider(format!(
+            "{HOST_NAME}: {path} still present after {POLL_ATTEMPTS} attempts"
+        )))
+    }
+
+    async fn ensure_namespace(&self, project_id: &str) -> Result<Value> {
+        let namespace = match self.find_namespace(project_id).await? {
+            Some(namespace) => namespace,
+            None => {
+                let created = self
+                    .client
+                    .post(
+                        &format!("{}/namespaces", self.base()),
+                        &json!({
+                            "name": self.namespace_name(),
+                            "project_id": project_id,
+                            "environment_variables": {},
+                            "secret_environment_variables": [],
+                        }),
+                    )
+                    .await?;
+                self.log
+                    .info("namespace_created", &[("name", self.namespace_name())]);
+                created
+            }
+        };
+        let path = format!("{}/namespaces/{}", self.base(), id_of(&namespace)?);
+        self.wait(&path, &["ready"]).await
+    }
+
+    async fn upload(&self, function_id: &str) -> Result<()> {
+        let code = embedded_code();
+        if code.is_empty() {
+            return Err(Error::provider(format!(
+                "{HOST_NAME}: this build carries no function code"
+            )));
+        }
+        let target = self
+            .client
+            .get(
+                &format!("{}/functions/{function_id}/upload-url", self.base()),
+                &[("content_length", code.len().to_string())],
+            )
+            .await?;
+        let url = target["url"]
+            .as_str()
+            .filter(|u| !u.is_empty())
+            .ok_or_else(|| Error::provider(format!("{HOST_NAME}: upload-url without url")))?;
+        let mut request = Request::new("PUT", url);
+        if let Some(headers) = target["headers"].as_object() {
+            for (name, values) in headers {
+                // The HTTP client sets the length from the body itself.
+                if name.eq_ignore_ascii_case("content-length") {
+                    continue;
+                }
+                for value in header_values(values) {
+                    request = request.header(name, value);
+                }
+            }
+        }
+        request.body = Some(code.to_vec());
+        let response = self.client.http().send(request).await?;
+        if !response.ok() {
+            return Err(Error::provider(format!(
+                "{HOST_NAME}: code upload: {}",
+                response.status
+            )));
+        }
+        Ok(())
     }
 }
 
 #[async_trait]
 impl Host for ScalewayFunction {
-    async fn plan(&self, _secrets: &Secrets) -> Result<Vec<Step>> {
-        let _ = (&self.config, &self.client, &self.log);
-        Err(Self::todo("plan"))
+    async fn plan(&self, secrets: &Secrets) -> Result<Vec<Step>> {
+        let found = self.find().await?;
+        let function_name = self.function_name();
+        let namespace = Step::new(
+            STEP_NAMESPACE,
+            if found.namespace.is_some() {
+                Action::Noop
+            } else {
+                Action::Create
+            },
+            format!("function namespace {}", self.namespace_name()),
+        );
+        let mut function = Step::new(
+            STEP_FUNCTION,
+            Action::Create,
+            format!("function {function_name}"),
+        );
+        let mut code = Step::new(
+            STEP_CODE,
+            Action::Create,
+            format!("function code {function_name}"),
+        )
+        .with_detail(format!("zip sha256 {}", embedded_code_digest()));
+        if let (Some(project), Some(existing)) = (&found.project, &found.function) {
+            let wanted = self.settings(project, secrets)?.description()?;
+            if existing["description"].as_str() == Some(wanted.as_str()) {
+                function.action = Action::Noop;
+            } else {
+                function.action = Action::Update;
+                function.detail = Some("settings, config or secrets changed".into());
+            }
+            let deployed = existing["environment_variables"][vars::CODE_DIGEST].as_str();
+            let status = existing["status"].as_str().unwrap_or("");
+            code.action = match deployed {
+                _ if status == "created" => Action::Create,
+                None => Action::Create,
+                Some(_) if status == "error" => {
+                    code.detail = Some("last deploy failed".into());
+                    Action::Update
+                }
+                Some(digest) if digest != embedded_code_digest() => Action::Update,
+                Some(_) => Action::Noop,
+            };
+        }
+        Ok(vec![namespace, function, code])
     }
 
-    async fn apply(&self, _steps: &[Step], _secrets: &Secrets) -> Result<Outputs> {
-        Err(Self::todo("apply"))
+    async fn apply(&self, steps: &[Step], secrets: &Secrets) -> Result<Outputs> {
+        if let Some(step) = steps
+            .iter()
+            .find(|s| ![STEP_NAMESPACE, STEP_FUNCTION, STEP_CODE].contains(&s.id.as_str()))
+        {
+            return Err(Error::provider(format!(
+                "{HOST_NAME}: unknown step {}",
+                step.id
+            )));
+        }
+        let action = |id: &str| {
+            steps
+                .iter()
+                .find(|s| s.id == id)
+                .map(|s| s.action)
+                .unwrap_or(Action::Noop)
+        };
+        let project = self
+            .client
+            .find_project(&self.config.name)
+            .await?
+            .ok_or_else(|| {
+                Error::provider(format!(
+                    "{HOST_NAME}: project {} not found, the provider creates it",
+                    self.config.name
+                ))
+            })?;
+        let namespace = self.ensure_namespace(&project).await?;
+        let namespace_id = id_of(&namespace)?.to_string();
+        let settings = self.settings(&project, secrets)?;
+        let function_name = self.function_name();
+
+        let mut changed = false;
+        let function = match self.find_function(&namespace_id).await? {
+            None => {
+                let mut body = settings.body(None, &[])?;
+                body["name"] = json!(function_name);
+                body["namespace_id"] = json!(namespace_id);
+                let created = self
+                    .client
+                    .post(&format!("{}/functions", self.base()), &body)
+                    .await?;
+                self.log
+                    .info("function_created", &[("name", &function_name)]);
+                changed = true;
+                created
+            }
+            Some(existing) if action(STEP_FUNCTION) == Action::Update => {
+                let code_digest = existing["environment_variables"][vars::CODE_DIGEST].as_str();
+                let remove: Vec<String> = secret_keys(&existing)
+                    .into_iter()
+                    .filter(|key| !settings.secret_environment_variables.contains_key(key))
+                    .collect();
+                let body = settings.body(code_digest, &remove)?;
+                let updated = self
+                    .client
+                    .patch(
+                        &format!("{}/functions/{}", self.base(), id_of(&existing)?),
+                        &body,
+                    )
+                    .await?;
+                self.log
+                    .info("function_updated", &[("name", &function_name)]);
+                changed = true;
+                updated
+            }
+            Some(existing) => existing,
+        };
+        let function_id = id_of(&function)?.to_string();
+        let path = format!("{}/functions/{function_id}", self.base());
+        let stable = ["ready", "created", "error"];
+        let mut current = self.wait(&path, &stable).await?;
+
+        // A function in `created` has never received code, whatever the plan said.
+        if action(STEP_CODE) != Action::Noop || current["status"] == "created" {
+            self.upload(&function_id).await?;
+            self.client
+                .patch(
+                    &path,
+                    &json!({
+                        "environment_variables":
+                            settings.environment(Some(embedded_code_digest())),
+                    }),
+                )
+                .await?;
+            self.log.info(
+                "function_code_uploaded",
+                &[("name", &function_name), ("sha256", embedded_code_digest())],
+            );
+            current = self.wait(&path, &stable).await?;
+            changed = true;
+        }
+        if changed {
+            self.client
+                .post(&format!("{path}/deploy"), &json!({}))
+                .await?;
+            current = self.wait(&path, &["ready"]).await?;
+            self.log
+                .info("function_deployed", &[("name", &function_name)]);
+        }
+        let url = function_url(&current).ok_or_else(|| {
+            Error::provider(format!("{HOST_NAME}: {function_name} has no domain name"))
+        })?;
+        Ok(Outputs::from([(
+            ciburst_core::provision::keys::DISPATCH_URL.to_string(),
+            url,
+        )]))
     }
 
     async fn destroy(&self) -> Result<()> {
-        Err(Self::todo("destroy"))
+        let found = self.find().await?;
+        if let Some(function) = &found.function {
+            let path = format!("{}/functions/{}", self.base(), id_of(function)?);
+            tolerate_not_found(self.client.delete(&path).await)?;
+            self.log
+                .info("function_deleted", &[("name", &self.function_name())]);
+        }
+        if let Some(namespace) = &found.namespace {
+            let path = format!("{}/namespaces/{}", self.base(), id_of(namespace)?);
+            tolerate_not_found(self.client.delete(&path).await)?;
+            self.wait_gone(&path).await?;
+            self.log
+                .info("namespace_deleted", &[("name", self.namespace_name())]);
+        }
+        Ok(())
     }
 
     async fn url(&self) -> Result<Option<String>> {
-        Err(Self::todo("url"))
+        Ok(self.find().await?.function.as_ref().and_then(function_url))
+    }
+}
+
+fn find_named(list: &Value, name: &str) -> Option<Value> {
+    list.as_array()?
+        .iter()
+        .find(|item| item["name"].as_str() == Some(name))
+        .cloned()
+}
+
+fn id_of(value: &Value) -> Result<&str> {
+    value["id"]
+        .as_str()
+        .ok_or_else(|| Error::provider(format!("{HOST_NAME}: resource without id")))
+}
+
+fn function_url(function: &Value) -> Option<String> {
+    function["domain_name"]
+        .as_str()
+        .filter(|d| !d.is_empty())
+        .map(|d| format!("https://{d}/"))
+}
+
+fn secret_keys(function: &Value) -> BTreeSet<String> {
+    function["secret_environment_variables"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s["key"].as_str().map(String::from))
+        .collect()
+}
+
+/// `UploadURL.headers` is a map of header names to lists of values.
+fn header_values(values: &Value) -> Vec<String> {
+    match values {
+        Value::Array(list) => list
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        Value::String(value) => vec![value.clone()],
+        _ => Vec::new(),
+    }
+}
+
+fn failure_message(value: &Value) -> String {
+    let mut parts: Map<String, Value> = Map::new();
+    for key in ["error_message", "build_message"] {
+        if let Some(text) = value[key].as_str().filter(|t| !t.is_empty()) {
+            parts.insert(key.to_string(), Value::String(text.to_string()));
+        }
+    }
+    if parts.is_empty() {
+        "no message".to_string()
+    } else {
+        Value::Object(parts).to_string()
+    }
+}
+
+fn is_not_found(error: &Error) -> bool {
+    matches!(error, Error::Provider(message) if message.contains(": 404 "))
+}
+
+fn tolerate_not_found(result: Result<Value>) -> Result<()> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) if is_not_found(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runner_token_names_follow_the_outputs_rule() {
+        assert_eq!(vars::runner_token("ci"), "RUNNER_TOKEN_CI");
+        assert_eq!(vars::runner_token("rust-1.96"), "RUNNER_TOKEN_RUST_1_96");
+        assert_eq!(
+            ciburst_core::provision::keys::runner_token("rust-1.96"),
+            format!("CIBURST_{}", vars::runner_token("rust-1.96"))
+        );
+    }
+
+    #[test]
+    fn not_found_is_read_from_the_client_error() {
+        assert!(is_not_found(&Error::provider(
+            "scaleway DELETE /x: 404 not found"
+        )));
+        assert!(!is_not_found(&Error::provider(
+            "scaleway DELETE /x: 403 denied"
+        )));
+        assert!(tolerate_not_found(Err(Error::provider("scaleway GET /x: 404 gone"))).is_ok());
+    }
+
+    #[test]
+    fn upload_headers_accept_lists_and_strings() {
+        assert_eq!(header_values(&json!(["a", "b"])), ["a", "b"]);
+        assert_eq!(header_values(&json!("c")), ["c"]);
+        assert!(header_values(&json!(null)).is_empty());
     }
 }
