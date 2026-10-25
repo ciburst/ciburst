@@ -5,9 +5,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use ciburst_core::check::{SUGGESTED_MEMORY_MIB, SUGGESTED_VCPU, Suggestion};
 use ciburst_core::composite::Composite;
 use ciburst_core::config::{
-    Config, check_capabilities, load_config, merge_config, read_config_file,
+    Config, JOBS_RUNTIME, check_capabilities, load_config, merge_config, read_config_file,
 };
 use ciburst_core::fake::{FakeHost, FakeProvider};
 use ciburst_core::gitlab::Gitlab;
@@ -92,11 +93,15 @@ enum Command {
     },
     /// Live runs per pool
     Status,
-    /// Compare every project's pipeline with the stage map
+    /// Compare every project's pipeline with the routing of the pools
     Check {
         /// Branch, tag or commit to lint instead of the default branch
         #[arg(long = "ref")]
         content_ref: Option<String>,
+        /// Print lanes for the Docker-free jobs that run on a VM pool, with the tags each job
+        /// needs
+        #[arg(long)]
+        suggest: bool,
     },
     /// Replace a secret and redeploy: runner, hook, key, cache or vm
     Rotate { kind: String },
@@ -498,9 +503,15 @@ pub async fn run_with_env(args: Vec<String>, env: Env, out: &mut dyn Write) -> R
     };
 
     let rotation = match &cli.command {
-        Command::Check { content_ref } => {
+        Command::Check {
+            content_ref,
+            suggest,
+        } => {
             let gitlab = modules.gitlab().await?;
             let report = provision::check(&config, &gitlab, content_ref.as_deref()).await?;
+            if *suggest {
+                return write_suggestions(out, &report);
+            }
             return write_check(out, &report);
         }
         Command::Status => {
@@ -648,4 +659,47 @@ fn write_check(out: &mut dyn Write, report: &[ProjectReport]) -> Result<i32> {
         }
     }
     Ok(if failed { 1 } else { 0 })
+}
+
+/// `check --suggest` (D46): per image a pool entry for `ciburst.json` and the tags of its jobs.
+/// Exits 0 unless a pipeline is invalid.
+fn write_suggestions(out: &mut dyn Write, report: &[ProjectReport]) -> Result<i32> {
+    let mut failed = false;
+    for project in report {
+        let id = project.project_id;
+        if !project.valid {
+            failed = true;
+            writeln!(
+                out,
+                "project {id}: pipeline invalid: {}",
+                project.errors.join("; ")
+            )?;
+            continue;
+        }
+        if project.suggestions.is_empty() {
+            writeln!(out, "project {id}: no Docker-free job runs on a VM pool")?;
+            continue;
+        }
+        for lane in &project.suggestions {
+            writeln!(out, "project {id}: lane {} for {}", lane.tag, lane.image)?;
+            writeln!(out, "  {}", lane_entry(lane))?;
+            for job in &lane.jobs {
+                writeln!(out, "  job {job}: tags: [{}]", lane.tag)?;
+            }
+        }
+    }
+    Ok(if failed { 1 } else { 0 })
+}
+
+/// A suggested lane as one line of the `pools` array of `ciburst.json`.
+fn lane_entry(lane: &Suggestion) -> String {
+    let quote = |text: &str| Value::from(text).to_string();
+    let jobs: Vec<String> = lane.jobs.iter().map(|job| quote(job)).collect();
+    format!(
+        r#"{{ "tag": {}, "runtime": {}, "image": {}, "jobs": [{}], "vcpu": {SUGGESTED_VCPU}, "memoryMiB": {SUGGESTED_MEMORY_MIB} }}"#,
+        quote(&lane.tag),
+        quote(JOBS_RUNTIME),
+        quote(&lane.image),
+        jobs.join(", "),
+    )
 }

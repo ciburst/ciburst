@@ -171,16 +171,16 @@ impl Dispatcher {
         if !self.config.gitlab.project_ids.contains(&project_id) {
             return ignored("project", json!({}));
         }
-        if let Some(name) = event
+        let name = event
             .get("build_name")
             .and_then(Value::as_str)
-            .filter(|name| is_own_job(name))
-        {
+            .unwrap_or("");
+        if is_own_job(name) {
             return ignored("own_job", json!({ "name": name }));
         }
 
         let stage = event.get("build_stage").and_then(Value::as_str);
-        let Some(pool) = self.config.pool_for_stage(stage).cloned() else {
+        let Some(pool) = self.config.pool_for(name, stage).cloned() else {
             return ignored("unmapped_stage", json!({ "stage": stage.unwrap_or("") }));
         };
         let labels = BTreeMap::from([
@@ -193,6 +193,25 @@ impl Dispatcher {
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
+        if let Some(vm_pool) = self.config.vm_first_pool(&pool)
+            && let Some((run_id, free)) = self
+                .claim_for_lane(vm_pool, &pool, &labels["job"], now)
+                .await
+        {
+            let free = free.to_string();
+            fields.extend([
+                ("pool", vm_pool.tag.as_str()),
+                ("run", run_id.as_str()),
+                ("free", free.as_str()),
+                ("lane", pool.tag.as_str()),
+            ]);
+            self.log.info("claimed", &fields);
+            return reply(
+                200,
+                "claimed",
+                json!({ "pool": vm_pool.tag, "lane": pool.tag, "runId": run_id }),
+            );
+        }
         fields.push(("pool", &pool.tag));
         let callback = self.dispatch_url.clone().or_else(|| {
             header(headers, "x-forwarded-host")
@@ -271,9 +290,7 @@ impl Dispatcher {
             return self.start(pool, labels, false, None, 1).await;
         };
         let job = labels.get("job").cloned().unwrap_or_default();
-        let candidates = claim_candidates(&vms, now);
-        if let Some(target) = spread(&candidates, &job) {
-            let free: u64 = candidates.iter().map(|v| u64::from(v.free)).sum();
+        if let Some((target, free)) = claim_target(&vms, &job, now) {
             match self.provider.claim(&target.run_id).await {
                 Ok(()) => {
                     return Ok(Decision::Claimed {
@@ -322,6 +339,49 @@ impl Dispatcher {
             return Ok(Decision::AtCapacity(live));
         }
         self.start(pool, labels, true, callback, 1).await
+    }
+
+    /// D47: a pending job of `lane` claims a free slot of `vm_pool` when one of its VMs is a
+    /// claim candidate (M4 rules R1, R2); `None` leaves it to the lane. A failed read or claim
+    /// logs `claim_failed` and also leaves it to the lane, which never uses the ledger.
+    async fn claim_for_lane(
+        &self,
+        vm_pool: &Pool,
+        lane: &Pool,
+        job: &str,
+        now: u64,
+    ) -> Option<(String, u64)> {
+        let vms = match self.provider.capacity(&vm_pool.tag).await {
+            Ok(vms) => vms?,
+            Err(error) => {
+                let message = error.to_string();
+                self.log.warn(
+                    "claim_failed",
+                    &[
+                        ("pool", &vm_pool.tag),
+                        ("lane", &lane.tag),
+                        ("error", &message),
+                    ],
+                );
+                return None;
+            }
+        };
+        let (target, free) = claim_target(&vms, job, now)?;
+        match self.provider.claim(&target.run_id).await {
+            Ok(()) => Some((target.run_id.clone(), free)),
+            Err(error) => {
+                let message = error.to_string();
+                self.log.warn(
+                    "claim_failed",
+                    &[
+                        ("run", &target.run_id),
+                        ("lane", &lane.tag),
+                        ("error", &message),
+                    ],
+                );
+                None
+            }
+        }
     }
 
     /// M4 rule R3: records the intent, waits for the rest of the burst and ranks the intents of
@@ -500,6 +560,13 @@ fn is_candidate(vm: &VmCapacity, now: u64) -> bool {
 
 fn claim_candidates(vms: &[VmCapacity], now: u64) -> Vec<&VmCapacity> {
     vms.iter().filter(|v| is_candidate(v, now)).collect()
+}
+
+/// The VM `job` claims (M4 rules R1, R2) and the free slots of every candidate.
+fn claim_target<'a>(vms: &'a [VmCapacity], job: &str, now: u64) -> Option<(&'a VmCapacity, u64)> {
+    let candidates = claim_candidates(vms, now);
+    let target = spread(&candidates, job)?;
+    Some((target, candidates.iter().map(|v| u64::from(v.free)).sum()))
 }
 
 /// M4 rule R2: among the candidates with the most free slots, sorted by run id, the one at
@@ -720,6 +787,22 @@ mod tests {
         started: Mutex<Vec<StartRequest>>,
         fail: bool,
         fail_claim: std::sync::atomic::AtomicBool,
+        /// Pools asked for capacity and runs claimed, in order.
+        asked: Mutex<Vec<String>>,
+        claimed: Mutex<Vec<String>>,
+    }
+
+    impl Recording {
+        fn new(inner: Arc<FakeProvider>, fail: bool) -> Recording {
+            Recording {
+                inner,
+                started: Mutex::new(Vec::new()),
+                fail,
+                fail_claim: Default::default(),
+                asked: Mutex::new(Vec::new()),
+                claimed: Mutex::new(Vec::new()),
+            }
+        }
     }
 
     use std::sync::Mutex;
@@ -752,12 +835,14 @@ mod tests {
             self.inner.stop(run_id).await
         }
         async fn capacity(&self, pool: &str) -> Result<Option<Vec<VmCapacity>>> {
+            self.asked.lock().unwrap().push(pool.to_string());
             self.inner.capacity(pool).await
         }
         async fn claim(&self, run_id: &str) -> Result<()> {
             if self.fail_claim.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(Error::provider("tag update refused"));
             }
+            self.claimed.lock().unwrap().push(run_id.to_string());
             self.inner.claim(run_id).await
         }
         async fn report(&self, run_id: &str, report: &VmReport, now: u64) -> Result<()> {
@@ -776,12 +861,7 @@ mod tests {
         ));
         let plan = inner.plan(&[]).await.unwrap();
         inner.apply(&plan).await.unwrap();
-        let recording = Arc::new(Recording {
-            inner,
-            started: Mutex::new(Vec::new()),
-            fail,
-            fail_claim: Default::default(),
-        });
+        let recording = Arc::new(Recording::new(inner, fail));
         let (log, lines) = Log::memory();
         let dispatcher = Dispatcher::new(config, recording.clone(), secrets(), log);
         (dispatcher, recording, lines)
@@ -1366,7 +1446,14 @@ mod tests {
     }
 
     async fn vm_setup_with(secrets: Secrets, ledger: Option<Arc<dyn Ledger>>) -> VmSetup {
-        let config = vm_config();
+        setup_of(vm_config(), secrets, ledger).await
+    }
+
+    async fn setup_of(
+        config: Arc<Config>,
+        secrets: Secrets,
+        ledger: Option<Arc<dyn Ledger>>,
+    ) -> VmSetup {
         let clock = Arc::new(AtomicU64::new(T0));
         let created = clock.clone();
         let inner = Arc::new(
@@ -1374,12 +1461,7 @@ mod tests {
                 .with_clock(Arc::new(move || created.load(Ordering::SeqCst))),
         );
         inner.apply(&inner.plan(&[]).await.unwrap()).await.unwrap();
-        let recording = Arc::new(Recording {
-            inner,
-            started: Mutex::new(Vec::new()),
-            fail: false,
-            fail_claim: Default::default(),
-        });
+        let recording = Arc::new(Recording::new(inner, false));
         let (log, lines) = Log::memory();
         let dispatcher = Dispatcher::new(config, recording.clone(), Arc::new(secrets), log)
             .with_ledger(ledger)
@@ -2074,5 +2156,188 @@ mod tests {
         taken.sort();
         assert_eq!(taken, [1, 2]);
         assert_eq!(ledger.all().len(), 3);
+    }
+
+    fn lane_config(vm_pool: bool) -> Arc<Config> {
+        let vm = if vm_pool {
+            r#"{ "tag": "vm", "image": "ubuntu:24.04", "runtime": "instances", "slots": 2, "maxRuns": 2 },"#
+        } else {
+            ""
+        };
+        let default = if vm_pool { "vm" } else { "node-24" };
+        Arc::new(
+            parse_config(&format!(
+                r#"{{
+                  "name": "demo",
+                  "gitlab": {{ "url": "https://gitlab.example", "projectIds": [7] }},
+                  "host": {{ "type": "fake" }}, "provider": {{ "type": "fake" }},
+                  "defaultPool": "{default}",
+                  "pools": [
+                    {vm}
+                    {{ "tag": "node-24", "image": "node:24-bookworm-slim", "runtime": "jobs",
+                      "jobs": ["lint", "unit-*"], "maxRuns": 2 }},
+                    {{ "tag": "rust-1", "image": "rust:1.96.0-bookworm", "runtime": "jobs",
+                      "jobs": ["clippy"], "vmFirst": false }}
+                  ],
+                  "cache": {{ "type": "s3" }}
+                }}"#
+            ))
+            .unwrap(),
+        )
+    }
+
+    fn lane_secrets() -> Secrets {
+        let mut secrets = vm_secrets();
+        secrets.runner_tokens = ["vm", "node-24", "rust-1"]
+            .into_iter()
+            .map(|tag| (tag.to_string(), format!("glrt-{tag}")))
+            .collect();
+        secrets
+    }
+
+    impl VmSetup {
+        async fn named_at(&self, name: &str, job: u64, now: u64) -> DispatchResponse {
+            let mut body: Value =
+                serde_json::from_slice(&event("test", "pending", 7, job)).unwrap();
+            body["build_name"] = name.into();
+            self.dispatcher
+                .handle_request(
+                    "POST",
+                    "/",
+                    &headers("hook-secret"),
+                    body.to_string().as_bytes(),
+                    now,
+                )
+                .await
+        }
+
+        fn started_pools(&self) -> Vec<String> {
+            self.recording
+                .started
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| r.pool.tag.clone())
+                .collect()
+        }
+    }
+
+    /// A VM of pool `vm` created at `T0` that reports `free` idle slots at `T0 + 60`.
+    async fn idle_vm(s: &VmSetup, job: u64, free: u32) -> String {
+        let run = run_of(&s.pending_at("test", job, T0).await);
+        s.report(&run, VmState::Idle, free).await;
+        run
+    }
+
+    #[tokio::test]
+    async fn a_lane_job_claims_a_free_vm_slot_first() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let s = setup_of(lane_config(true), lane_secrets(), Some(ledger.clone())).await;
+        let vm = idle_vm(&s, 1, 2).await;
+        let claimed = s.named_at("lint", 2, T0 + 60).await;
+        assert_eq!(claimed.status, 200);
+        assert_eq!(
+            claimed.body,
+            json!({ "result": "claimed", "pool": "vm", "lane": "node-24", "runId": vm })
+        );
+        assert_eq!(s.vms().await[0].free, 1);
+        assert!(s.lines().contains(&format!(
+            r#"info claimed job="2" pipeline="9" project="7" stage="test" pool="vm" run="{vm}" free="2" lane="node-24""#
+        )));
+        let second = s.named_at("unit-api", 3, T0 + 60).await;
+        assert_eq!(second.body["result"], "claimed", "{}", second.body);
+        assert_eq!(second.body["lane"], "node-24");
+        assert_eq!(s.vms().await[0].free, 0);
+        let full = s.named_at("lint", 4, T0 + 60).await;
+        assert_eq!(full.body["result"], "started", "{}", full.body);
+        assert_eq!(full.body["pool"], "node-24");
+        assert_eq!(s.started_pools(), ["vm", "node-24"]);
+        assert_eq!(*s.recording.claimed.lock().unwrap(), [vm.clone(), vm]);
+        assert_eq!(ledger.all().len(), 1, "only the VM job's intent");
+    }
+
+    #[tokio::test]
+    async fn a_lane_job_without_a_claim_candidate_starts_its_lane() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let s = setup_of(lane_config(true), lane_secrets(), Some(ledger.clone())).await;
+        let first = s.named_at("lint", 1, T0).await;
+        assert_eq!(first.body["result"], "started", "{}", first.body);
+        assert_eq!(first.body["pool"], "node-24");
+        assert!(run_of(&first).starts_with("fake-"));
+        idle_vm(&s, 2, 2).await;
+        let in_window = s.named_at("unit-api", 3, T0 + GROUP_WINDOW_S).await;
+        assert_eq!(
+            in_window.body["result"], "started",
+            "a VM inside the window offers no slot"
+        );
+        assert_eq!(in_window.body["pool"], "node-24");
+        assert_eq!(s.started_pools(), ["node-24", "vm", "node-24"]);
+        assert!(s.recording.claimed.lock().unwrap().is_empty());
+        assert_eq!(ledger.all().len(), 1, "lanes never use the ledger");
+        let started = s.recording.started.lock().unwrap();
+        assert_eq!(started[0].env["RUNNER_TOKEN"], "glrt-node-24");
+        assert!(!started[0].env.contains_key(keys::VM_SECRET));
+        assert!(
+            s.lines()
+                .iter()
+                .any(|l| l.starts_with("info started") && l.contains(r#"pool="node-24""#))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lane_with_vm_first_false_never_claims() {
+        let s = setup_of(lane_config(true), lane_secrets(), None).await;
+        idle_vm(&s, 1, 2).await;
+        let response = s.named_at("clippy", 2, T0 + 60).await;
+        assert_eq!(response.body["result"], "started", "{}", response.body);
+        assert_eq!(response.body["pool"], "rust-1");
+        assert_eq!(s.vms().await[0].free, 2);
+        assert!(s.recording.claimed.lock().unwrap().is_empty());
+        assert_eq!(*s.recording.asked.lock().unwrap(), ["vm", "rust-1"]);
+    }
+
+    #[tokio::test]
+    async fn without_a_vm_pool_a_lane_never_claims() {
+        let s = setup_of(lane_config(false), lane_secrets(), None).await;
+        let response = s.named_at("lint", 1, T0 + 60).await;
+        assert_eq!(response.body["result"], "started", "{}", response.body);
+        assert_eq!(response.body["pool"], "node-24");
+        let other = s.pending("deploy", 2).await;
+        assert_eq!(other.body["pool"], "node-24", "the default pool");
+        assert_eq!(*s.recording.asked.lock().unwrap(), ["node-24", "node-24"]);
+        assert!(s.recording.claimed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_lane_at_max_runs_answers_at_capacity() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let s = setup_of(lane_config(true), lane_secrets(), Some(ledger.clone())).await;
+        for job in 1..=2 {
+            assert_eq!(s.named_at("lint", job, T0).await.body["result"], "started");
+        }
+        let third = s.named_at("unit-api", 3, T0).await;
+        assert_eq!(third.status, 200);
+        assert_eq!(
+            third.body,
+            json!({ "result": "at_capacity", "pool": "node-24" })
+        );
+        assert!(s.lines().iter().any(|l| l.starts_with("info at_capacity")
+            && l.contains(r#"pool="node-24""#)
+            && l.contains(r#"live="2""#)));
+        assert!(ledger.all().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_claim_leaves_the_job_to_its_lane() {
+        let s = setup_of(lane_config(true), lane_secrets(), None).await;
+        let vm = idle_vm(&s, 1, 2).await;
+        s.recording.fail_claim.store(true, Ordering::SeqCst);
+        let response = s.named_at("lint", 2, T0 + 60).await;
+        assert_eq!(response.body["result"], "started", "{}", response.body);
+        assert_eq!(response.body["pool"], "node-24");
+        assert!(s.lines().iter().any(|l| l.starts_with(&format!(
+            r#"warn claim_failed run="{vm}" lane="node-24" error="#
+        ))));
+        assert_eq!(s.vms().await[0].free, 2);
     }
 }

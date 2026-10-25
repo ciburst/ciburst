@@ -24,7 +24,21 @@ struct RunnerRecord {
     id: u64,
     description: String,
     tag_list: Vec<String>,
+    run_untagged: bool,
     projects: Vec<u64>,
+}
+
+impl RunnerRecord {
+    fn to_json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "description": self.description,
+            "tag_list": self.tag_list,
+            "run_untagged": self.run_untagged,
+            "runner_type": "project_type",
+            "projects": self.projects.iter().map(|id| json!({ "id": id })).collect::<Vec<_>>(),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +141,7 @@ struct Inner {
     jobs: BTreeMap<u64, Vec<LintJob>>,
     ref_jobs: BTreeMap<(u64, String), Vec<LintJob>>,
     lint_errors: BTreeMap<u64, Vec<String>>,
+    merged_yaml: BTreeMap<u64, String>,
     variables: BTreeMap<u64, Vec<FakeVariable>>,
     pipeline_jobs: BTreeMap<u64, Vec<FakeJob>>,
     runner_creation_forbidden: bool,
@@ -214,6 +229,27 @@ impl FakeGitlab {
             .expect("fake gitlab")
             .ref_jobs
             .insert((project_id, content_ref.to_string()), jobs);
+    }
+
+    /// The merged YAML that CI lint answers with `include_merged_yaml=true` for a valid
+    /// pipeline of the project, at any ref.
+    pub fn set_merged_yaml(&self, project_id: u64, yaml: &str) {
+        self.inner
+            .lock()
+            .expect("fake gitlab")
+            .merged_yaml
+            .insert(project_id, yaml.to_string());
+    }
+
+    /// The tags of a runner, `None` for an unknown one.
+    pub fn runner_tags(&self, runner_id: u64) -> Option<Vec<String>> {
+        self.inner
+            .lock()
+            .expect("fake gitlab")
+            .runners
+            .iter()
+            .find(|r| r.id == runner_id)
+            .map(|r| r.tag_list.clone())
     }
 
     pub fn set_lint_errors(&self, project_id: u64, errors: Vec<String>) {
@@ -336,6 +372,51 @@ fn variable_not_found() -> Response {
     json(404, json!({ "message": "404 Variable Not Found" }))
 }
 
+fn runner_not_found() -> Response {
+    json(404, json!({ "message": "404 Runner Not Found" }))
+}
+
+/// Parameters of `PUT /runners/:id`, at least one of which GitLab requires.
+const RUNNER_UPDATE_KEYS: [&str; 9] = [
+    "description",
+    "active",
+    "paused",
+    "tag_list",
+    "run_untagged",
+    "locked",
+    "access_level",
+    "maximum_timeout",
+    "maintenance_note",
+];
+
+/// `tag_list` as GitLab takes it: an array of strings or a comma-separated string, trimmed,
+/// without empty or repeated tags.
+fn tag_list(value: &Value) -> std::result::Result<Vec<String>, Response> {
+    let given: Vec<String> = match value {
+        Value::Null => Vec::new(),
+        Value::String(text) => text.split(',').map(String::from).collect(),
+        Value::Array(items) if items.iter().all(Value::is_string) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        _ => return Err(json(400, json!({ "error": "tag_list is invalid" }))),
+    };
+    let mut tags: Vec<String> = Vec::new();
+    for tag in given.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        if !tags.iter().any(|t| t == tag) {
+            tags.push(tag.to_string());
+        }
+    }
+    Ok(tags)
+}
+
+fn untagged_without_tags() -> Response {
+    bad_request(
+        "tags_list",
+        "can not be empty when runner is not allowed to pick untagged jobs".to_string(),
+    )
+}
+
 impl FakeGitlab {
     fn route(&self, request: &Request) -> (Response, Headers) {
         let mut inner = self.inner.lock().expect("fake gitlab");
@@ -446,25 +527,68 @@ impl FakeGitlab {
             }
             ("POST", ["user", "runners"]) => {
                 let body = body.unwrap_or(Value::Null);
+                let tag_list = match tag_list(&body["tag_list"]) {
+                    Ok(tags) => tags,
+                    Err(response) => return (response, Headers::new()),
+                };
+                let run_untagged = body["run_untagged"].as_bool().unwrap_or(true);
+                if tag_list.is_empty() && !run_untagged {
+                    return (untagged_without_tags(), Headers::new());
+                }
                 let runner_id = inner.next_id;
                 inner.next_id += 1;
                 inner.runners.push(RunnerRecord {
                     id: runner_id,
                     description: body["description"].as_str().unwrap_or("").to_string(),
-                    tag_list: body["tag_list"]
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|v| v.as_str().map(String::from))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
+                    tag_list,
+                    run_untagged,
                     projects: vec![body["project_id"].as_u64().unwrap_or(0)],
                 });
                 json(
                     201,
                     json!({ "id": runner_id, "token": format!("glrt-fake-{runner_id}"), "token_expires_at": null }),
                 )
+            }
+            ("GET", ["runners", r]) => match inner.runners.iter().find(|x| Some(x.id) == id(r)) {
+                Some(runner) => json(200, runner.to_json()),
+                None => runner_not_found(),
+            },
+            ("PUT", ["runners", r]) => {
+                let body = body.unwrap_or(Value::Null);
+                let Some(runner) = inner.runners.iter_mut().find(|x| Some(x.id) == id(r)) else {
+                    return (runner_not_found(), Headers::new());
+                };
+                if !RUNNER_UPDATE_KEYS
+                    .iter()
+                    .any(|key| body.get(key).is_some_and(|v| !v.is_null()))
+                {
+                    return (
+                        json(
+                            400,
+                            json!({ "error": format!("{} are missing, at least one parameter must be provided", RUNNER_UPDATE_KEYS.join(", ")) }),
+                        ),
+                        Headers::new(),
+                    );
+                }
+                let mut tags = runner.tag_list.clone();
+                if body.get("tag_list").is_some() {
+                    match tag_list(&body["tag_list"]) {
+                        Ok(given) => tags = given,
+                        Err(response) => return (response, Headers::new()),
+                    }
+                }
+                let run_untagged = body["run_untagged"]
+                    .as_bool()
+                    .unwrap_or(runner.run_untagged);
+                if tags.is_empty() && !run_untagged {
+                    return (untagged_without_tags(), Headers::new());
+                }
+                runner.tag_list = tags;
+                runner.run_untagged = run_untagged;
+                if let Some(description) = body["description"].as_str() {
+                    runner.description = description.to_string();
+                }
+                json(200, runner.to_json())
             }
             ("DELETE", ["runners", r]) => {
                 let runner_id = id(r).unwrap_or(0);
@@ -542,10 +666,16 @@ impl FakeGitlab {
                     Some(jobs) => jobs.unwrap_or_default(),
                     None => inner.jobs.get(&project).cloned().unwrap_or_default(),
                 };
-                json(
-                    200,
-                    json!({ "valid": valid, "errors": errors, "warnings": [], "jobs": jobs }),
-                )
+                let mut answer =
+                    json!({ "valid": valid, "errors": errors, "warnings": [], "jobs": jobs });
+                if let Some(yaml) = inner.merged_yaml.get(&project).filter(|_| {
+                    valid
+                        && query_value(&request.url, "include_merged_yaml").as_deref()
+                            == Some("true")
+                }) {
+                    answer["merged_yaml"] = yaml.clone().into();
+                }
+                json(200, answer)
             }
             _ => json(
                 404,

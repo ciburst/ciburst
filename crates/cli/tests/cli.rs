@@ -271,6 +271,144 @@ async fn check_needs_only_the_config_and_gitlab() {
     assert!(fake.calls().iter().all(|c| c.path == "/projects/1/ci/lint"));
 }
 
+/// GitLab's merged YAML of a pipeline: includes merged, `extends` and `default:` not applied.
+const MERGED_YAML: &str = r#"---
+variables:
+  RUST_VERSION: 1.96.0
+default:
+  interruptible: true
+stages:
+- build
+- test
+".node":
+  image: node:24-bookworm-slim
+  before_script:
+  - npm ci
+lint:
+  extends: ".node"
+  stage: test
+  script:
+  - npm run lint
+cargo-test:
+  stage: test
+  image: rust:${RUST_VERSION}-bookworm
+  script:
+  - cargo test --locked
+integration:
+  extends: ".node"
+  stage: test
+  services:
+  - postgres:17
+  script:
+  - npm run test:integration
+docker-build:
+  stage: build
+  image: docker:27
+  services:
+  - docker:dind
+  script:
+  - docker build -t app .
+ciburst-check:
+  stage: ".pre"
+  image: registry.gitlab.com/ciburst/ciburst/cli:edge
+  script:
+  - ciburst check
+"#;
+
+#[tokio::test]
+async fn check_suggest_prints_lanes_for_docker_free_jobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, local) = paths(dir.path());
+    std::fs::write(&config, SCALEWAY_CONFIG).unwrap();
+    std::fs::create_dir_all(&local).unwrap();
+    std::fs::write(
+        local.join("gitlab.env"),
+        format!("GITLAB_TOKEN={FAKE_TOKEN}\n"),
+    )
+    .unwrap();
+    let job = |name: &str, stage: &str, tag: &str| LintJob {
+        name: name.into(),
+        stage: Some(stage.into()),
+        tag_list: vec![tag.into()],
+    };
+    let jobs = |lint: &str, cargo: &str| {
+        vec![
+            job("ciburst-check", ".pre", "saas-linux-small-amd64"),
+            job("docker-build", "build", "vm"),
+            job("lint", "test", lint),
+            job("cargo-test", "test", cargo),
+            job("integration", "test", "vm"),
+        ]
+    };
+    let fake = Arc::new(FakeGitlab::new());
+    fake.set_jobs(1, jobs("vm", "vm"));
+    fake.set_merged_yaml(1, MERGED_YAML);
+    let local = local.display().to_string();
+    let args = ["--config", &config, "--local", &local, "check", "--suggest"];
+    let (code, out) = run(env(Some(fake.clone())), &args).await;
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(
+        out,
+        concat!(
+            "project 1: lane node-24 for node:24-bookworm-slim\n",
+            r#"  { "tag": "node-24", "runtime": "jobs", "image": "node:24-bookworm-slim", "jobs": ["lint"], "vcpu": 2, "memoryMiB": 4096 }"#,
+            "\n",
+            "  job lint: tags: [node-24]\n",
+            "project 1: lane rust-1 for rust:1.96.0-bookworm\n",
+            r#"  { "tag": "rust-1", "runtime": "jobs", "image": "rust:1.96.0-bookworm", "jobs": ["cargo-test"], "vcpu": 2, "memoryMiB": 4096 }"#,
+            "\n",
+            "  job cargo-test: tags: [rust-1]\n",
+        )
+    );
+    let lint = fake.calls().pop().unwrap();
+    assert_eq!(lint.query, "include_jobs=true&include_merged_yaml=true");
+
+    let entries: Vec<&str> = out
+        .lines()
+        .filter_map(|line| line.strip_prefix("  {").map(|_| line.trim()))
+        .collect();
+    let with_lanes = SCALEWAY_CONFIG.replace(
+        r#""runtime": "instances" }]"#,
+        &format!(r#""runtime": "instances" }}, {}]"#, entries.join(", ")),
+    );
+    let parsed = parse_config(&with_lanes).unwrap();
+    assert_eq!(parsed.pools.len(), 3);
+    assert_eq!(
+        parsed.pool_for("lint", Some("test")).unwrap().tag,
+        "node-24"
+    );
+    assert_eq!(
+        (parsed.pools[2].vcpu, parsed.pools[2].memory_mib),
+        (2, 4096)
+    );
+    std::fs::write(&config, &with_lanes).unwrap();
+    fake.set_jobs(1, jobs("node-24", "rust-1"));
+    let (code, out) = run(env(Some(fake.clone())), &args[..5]).await;
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out, "project 1: every job matches the stage map\n");
+    let (code, out) = run(env(Some(fake.clone())), &args).await;
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out, "project 1: no Docker-free job runs on a VM pool\n");
+
+    fake.set_jobs(1, jobs("vm", "rust-1"));
+    let (code, out) = run(env(Some(fake.clone())), &args[..5]).await;
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(
+        out,
+        "project 1: job lint (stage test): the job name maps to pool node-24 but the job is tagged vm\n"
+    );
+    fake.set_lint_errors(
+        1,
+        vec!["jobs config should contain at least one visible job".into()],
+    );
+    let (code, out) = run(env(Some(fake.clone())), &args).await;
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(
+        out,
+        "project 1: pipeline invalid: jobs config should contain at least one visible job\n"
+    );
+}
+
 #[tokio::test]
 async fn status_needs_no_gitlab_token() {
     let dir = tempfile::tempdir().unwrap();
