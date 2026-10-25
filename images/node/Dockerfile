@@ -3,7 +3,7 @@ FROM gitlab/gitlab-runner:v18.11.4 AS runner
 
 FROM node:24.22.1-bookworm-slim
 
-LABEL org.opencontainers.image.source="https://gitlab.com/<namespace>/ciburst" \
+LABEL org.opencontainers.image.source="https://gitlab.com/ciburst/ciburst" \
       org.opencontainers.image.title="ciburst node pool image" \
       org.opencontainers.image.licenses="Apache-2.0"
 

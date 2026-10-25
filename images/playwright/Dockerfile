@@ -3,7 +3,7 @@ FROM gitlab/gitlab-runner:v18.11.4 AS runner
 
 FROM mcr.microsoft.com/playwright:v1.64.1-noble
 
-LABEL org.opencontainers.image.source="https://gitlab.com/<namespace>/ciburst" \
+LABEL org.opencontainers.image.source="https://gitlab.com/ciburst/ciburst" \
       org.opencontainers.image.title="ciburst playwright pool image" \
       org.opencontainers.image.licenses="Apache-2.0"
 

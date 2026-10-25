@@ -12,8 +12,6 @@ allow = [
   "CDLA-Permissive-2.0",
   "ISC",
   "MIT",
-  "MPL-2.0",
-  "OpenSSL",
   "Unicode-3.0",
   "Zlib",
 ]
@@ -22,6 +20,8 @@ private = { ignore = true }
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Path dev-dependencies (the `testing` features of the workspace crates) carry no version.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
