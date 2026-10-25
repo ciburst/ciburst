@@ -153,6 +153,16 @@ async fn names_a_missing_input() {
     );
 
     let mut vars = job_vars("true");
+    vars.insert("CIBURST_SCW_ACCESS_KEY".into(), "SCWACCESS".into());
+    vars.insert("CIBURST_SCW_SECRET_KEY".into(), "secret".into());
+    vars.insert("CIBURST_SCW_DEFAULT_ORGANIZATION_ID".into(), "org".into());
+    let run = ciburst(vars, fake.clone(), &["--config", &absent, "plan"]).await;
+    assert_eq!(
+        run.out,
+        "CIBURST_SCW_ORGANIZATION_ID missing; the job has CIBURST_SCW_DEFAULT_ORGANIZATION_ID, but pipeline mode reads only CIBURST_* variables: rename it to CIBURST_SCW_ORGANIZATION_ID"
+    );
+
+    let mut vars = job_vars("true");
     vars.insert("SCW_ACCESS_KEY".into(), "SCWACCESS".into());
     let run = ciburst(vars, fake.clone(), &["--config", &absent, "plan"]).await;
     assert!(

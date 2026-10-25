@@ -163,8 +163,11 @@ impl Modules {
             .filter(|value| !value.is_empty())
             .cloned()
             .ok_or_else(|| {
-                let workstation = workstation_name(key)
-                    .filter(|name| self.vars.get(*name).is_some_and(|v| !v.is_empty()));
+                let workstation = workstation_name(key).and_then(|name| {
+                    [name.to_string(), format!("CIBURST_{name}")]
+                        .into_iter()
+                        .find(|found| self.vars.get(found).is_some_and(|v| !v.is_empty()))
+                });
                 Error::other(match workstation {
                     Some(name) => format!(
                         "{key} missing; the job has {name}, but pipeline mode reads only CIBURST_* variables: rename it to {key}"
