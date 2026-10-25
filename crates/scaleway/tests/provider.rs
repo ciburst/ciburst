@@ -13,7 +13,7 @@ use ciburst_scaleway::client::{Credentials, ScalewayClient};
 use ciburst_scaleway::provider::Scaleway;
 use ciburst_scaleway::provider::s3::{S3, lifecycle_xml};
 use ciburst_scaleway::testing::scaleway_fake::{
-    FAKE_ACCESS_KEY, FAKE_REGION, FAKE_SECRET_KEY, ScalewayFake,
+    FAKE_ACCESS_KEY, FAKE_REGION, FAKE_SECRET_KEY, Failure, ScalewayFake,
 };
 use ciburst_scaleway::testing::{RUNNER_FIXTURE_URL, runner_fixture_sha256};
 use serde_json::json;
@@ -480,6 +480,35 @@ async fn start_refuses_without_token_or_definition() {
     request.pool.tag = "gone".into();
     let error = provider.start(request).await.unwrap_err().to_string();
     assert_eq!(error, "scaleway: pool gone is not provisioned");
+}
+
+/// M7 hardening rule R4 for lanes: 429 and 503 may pass on a repeat for every call, another
+/// 5xx and a transport timeout only for reads. A start whose answer never came may have
+/// started a run, so it is not retryable.
+#[tokio::test]
+async fn job_start_failures_are_retryable_where_a_repeat_may_pass() {
+    let (backend, provider, _) = provisioned(Log::silent()).await;
+    let definitions = "/serverless-jobs/v1alpha1/regions/fr-par/job-definitions".to_string();
+    let start = format!("{definitions}/*/start");
+    for (method, path, failure, retryable) in [
+        ("POST", &start, Failure::Status(429), true),
+        ("POST", &start, Failure::Status(503), true),
+        ("POST", &start, Failure::Status(500), false),
+        ("GET", &definitions, Failure::Status(502), true),
+        ("GET", &definitions, Failure::Timeout, true),
+    ] {
+        backend.jobs.fail_next(method, path, failure);
+        let error = provider.start(start_request(0)).await.unwrap_err();
+        let case = format!("{method} {path} {failure:?}: {error}");
+        assert_eq!(error.is_retryable(), retryable, "{case}");
+        assert!(backend.jobs.runs().is_empty(), "{case}");
+    }
+    backend.jobs.fail_next("POST", &start, Failure::Timeout);
+    let error = provider.start(start_request(0)).await.unwrap_err();
+    assert!(!error.is_retryable(), "{error}");
+    assert_eq!(backend.jobs.runs().len(), 1, "the run started all the same");
+    provider.start(start_request(0)).await.unwrap();
+    assert_eq!(backend.jobs.runs().len(), 2);
 }
 
 #[tokio::test]

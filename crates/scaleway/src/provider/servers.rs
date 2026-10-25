@@ -3,6 +3,7 @@
 //! capacity, claim, report, stop and sweep of servers.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use ciburst_core::config::Pool;
 use ciburst_core::provision::keys;
@@ -11,17 +12,40 @@ use ciburst_core::{Error, Result};
 use serde_json::{Value, json};
 
 use super::cloud_init::Download;
-use super::instance::{self, ApiError, DOCKER_IMAGE_LABEL, FALLBACK_IMAGE_LABEL, InstanceApi};
+use super::instance::{ApiError, InstanceApi};
 use super::runner::runner_url;
 use super::vm;
+use super::vm_start::{IMAGES_VAR, Lookups, SECURITY_GROUP_VAR, VmImage};
 use super::{PROVIDER_NAME, Runtime, Scaleway, USER_DATA_KEY, cloud_init, iam, instance_types};
 
 pub(super) const SECURITY_GROUP_STEP: &str = "vm:security-group";
+
+/// M7 hardening rule R4: the pause before a call on a created server is repeated.
+const RETRY_PAUSE: Duration = Duration::from_millis(300);
 
 /// What a start attempt on one commercial type came to.
 enum Attempt {
     Started,
     Unavailable(ApiError),
+}
+
+/// Powers the server on: `None` once it starts, else Scaleway's refusal. A failure that may
+/// pass on a repeat is the `Err`.
+async fn power_on(api: &InstanceApi<'_>, id: &str) -> Result<Option<ApiError>> {
+    match api.action(id, "poweron").await? {
+        Ok(()) => Ok(None),
+        Err(error) if error.retryable => Err(error.into()),
+        Err(error) => Ok(Some(error)),
+    }
+}
+
+/// M7 hardening rule R4: the dispatcher repeats a start that failed with a retryable error.
+/// Once a server was created, a repeat would create a second one, so the error ends the start.
+fn settled(error: Error) -> Error {
+    match error {
+        Error::Retryable(message) => Error::provider(message),
+        error => error,
+    }
 }
 
 impl Scaleway {
@@ -123,7 +147,10 @@ impl Scaleway {
     }
 
     /// Rule 4 of M3: the first commercial type that has a local image and capacity runs the
-    /// VM; the server id is the run id.
+    /// VM; the server id is the run id. Security group and images come from the function's
+    /// environment; a value missing there or refused by Scaleway is looked up and logged as
+    /// `warn start_lookup` (M7 hardening rule R3). `CIBURST_PROJECT_ID` makes the project
+    /// lookup a no-op in the function.
     pub(super) async fn start_vm(&self, request: StartRequest) -> Result<String> {
         let pool = &request.pool;
         let tag = &pool.tag;
@@ -169,11 +196,6 @@ impl Scaleway {
                 sha256: &agent,
             },
         );
-        let api = self.instances();
-        let security_group = api
-            .find_security_group(&project_id, &self.security_group_name())
-            .await?
-            .ok_or_else(not_provisioned)?;
         let base = cloud_init::base_env(
             &self.config,
             pool,
@@ -181,49 +203,89 @@ impl Scaleway {
             &project_id,
             &request.env,
         )?;
+        let api = self.instances();
+        let group_name = self.security_group_name();
+        let mut lookups = Lookups::default();
+        // A value of the environment that Scaleway refused makes every later value a lookup.
+        let mut stale = false;
+        let (mut security_group, mut group_preset) = match &self.vm_start.security_group {
+            Some(id) => (id.clone(), true),
+            None => {
+                self.start_lookup(tag, None, &format!("{SECURITY_GROUP_VAR} unset"));
+                let found = lookups
+                    .security_group(&api, &project_id, &group_name)
+                    .await?;
+                (found.ok_or_else(not_provisioned)?, false)
+            }
+        };
         let types = instance_types(pool);
         let job = request.labels.get("job").map(String::as_str);
-        let docker_images = api.local_images(DOCKER_IMAGE_LABEL).await?;
-        let mut fallback_images = None;
+        let free = pool.slots.saturating_sub(taken);
         let mut failures = Vec::new();
         for commercial_type in &types {
-            let (image, install_docker) =
-                match instance::compatible(&docker_images, commercial_type) {
-                    Some(image) => (image, false),
-                    None => {
-                        if fallback_images.is_none() {
-                            fallback_images = Some(api.local_images(FALLBACK_IMAGE_LABEL).await?);
-                        }
-                        let fallback = fallback_images.as_deref().unwrap_or_default();
-                        match instance::compatible(fallback, commercial_type) {
-                            Some(image) => (image, true),
-                            None => {
-                                self.log.warn(
-                                    "instance type skipped",
-                                    &[
-                                        ("pool", tag),
-                                        ("type", commercial_type),
-                                        ("reason", "no local image"),
-                                    ],
-                                );
-                                failures.push(format!("{commercial_type}: no local image"));
-                                continue;
-                            }
+            let preset = self
+                .vm_start
+                .images
+                .as_ref()
+                .and_then(|images| images.get(commercial_type))
+                .filter(|_| !stale);
+            let (mut image, image_preset) = match preset {
+                Some(image) => (image.clone(), true),
+                None => {
+                    if !stale {
+                        let reason = match self.vm_start.images {
+                            None => format!("{IMAGES_VAR} unset"),
+                            Some(_) => format!("not in {IMAGES_VAR}"),
+                        };
+                        self.start_lookup(tag, Some(commercial_type), &reason);
+                    }
+                    match lookups.image(&api, commercial_type).await? {
+                        Some(image) => (image, false),
+                        None => {
+                            self.no_local_image(tag, commercial_type, &mut failures);
+                            continue;
                         }
                     }
-                };
+                }
+            };
             let name = vm::server_name(self.name(), tag, job);
-            let body = json!({
-                "name": name,
-                "commercial_type": commercial_type,
-                "image": image,
-                "project": project_id,
-                "dynamic_ip_required": true,
-                "routed_ip_enabled": true,
-                "security_group": security_group,
-                "tags": vm::initial_tags(self.name(), tag, job, pool.slots.saturating_sub(taken)),
-            });
-            let server = match api.create_server(&body).await? {
+            let body = |security_group: &str, image: &VmImage| {
+                json!({
+                    "name": name,
+                    "commercial_type": commercial_type,
+                    "image": image.image,
+                    "project": project_id,
+                    "dynamic_ip_required": true,
+                    "routed_ip_enabled": true,
+                    "security_group": security_group,
+                    "tags": vm::initial_tags(self.name(), tag, job, free),
+                })
+            };
+            let mut created = api.create_server(&body(&security_group, &image)).await?;
+            if let Err(error) = &created
+                && (group_preset || image_preset)
+                && error.is_missing_image_or_group()
+            {
+                stale = true;
+                group_preset = false;
+                let reason = format!("create refused: {} {}", error.status, error.message);
+                self.start_lookup(tag, Some(commercial_type), &reason);
+                let found = lookups
+                    .security_group(&api, &project_id, &group_name)
+                    .await?;
+                let group = found.ok_or_else(not_provisioned)?;
+                let Some(fresh) = lookups.image(&api, commercial_type).await? else {
+                    security_group = group;
+                    self.no_local_image(tag, commercial_type, &mut failures);
+                    continue;
+                };
+                if (&group, &fresh) != (&security_group, &image) {
+                    security_group = group;
+                    image = fresh;
+                    created = api.create_server(&body(&security_group, &image)).await?;
+                }
+            }
+            let server = match created {
                 Ok(server) => server,
                 Err(error) if error.is_capacity() => {
                     self.unavailable(tag, commercial_type, &error);
@@ -238,7 +300,7 @@ impl Scaleway {
                 .map(String::from)
                 .ok_or_else(|| Error::provider("scaleway server: response without id"))?;
             match self
-                .boot(&api, &id, secret, &base, downloads, install_docker)
+                .boot(&api, &id, secret, &base, downloads, image.install_docker)
                 .await
             {
                 Ok(Attempt::Started) => {
@@ -260,7 +322,7 @@ impl Scaleway {
                 }
                 Err(error) => {
                     self.discard(&api, &id).await;
-                    return Err(error);
+                    return Err(settled(error));
                 }
             }
         }
@@ -271,7 +333,10 @@ impl Scaleway {
     }
 
     /// User data, then power on. The VM gets its token, never the secret behind it, and the
-    /// URLs and SHA-256 of runner and agent.
+    /// URLs and SHA-256 of runner and agent. The server exists, so a retryable failure of
+    /// either call is repeated here once (M7 hardening rule R4): the dispatcher's retry would
+    /// repeat the whole start and create a second server. Before power on is repeated, the
+    /// server is read, as a power on whose answer got lost may have started it.
     async fn boot(
         &self,
         api: &InstanceApi<'_>,
@@ -288,12 +353,50 @@ impl Scaleway {
             ciburst_core::vm::token(secret, id),
         );
         let user_data = cloud_init::render(&env, runner, agent, install_docker)?;
-        api.set_user_data(id, USER_DATA_KEY, &user_data).await?;
-        match api.action(id, "poweron").await? {
-            Ok(()) => Ok(Attempt::Started),
-            Err(error) if error.is_capacity() => Ok(Attempt::Unavailable(error)),
-            Err(error) => Err(error.into()),
+        if let Err(error) = api.set_user_data(id, USER_DATA_KEY, &user_data).await {
+            if !error.is_retryable() {
+                return Err(error);
+            }
+            tokio::time::sleep(RETRY_PAUSE).await;
+            api.set_user_data(id, USER_DATA_KEY, &user_data).await?;
         }
+        let refused = match power_on(api, id).await {
+            Err(error) if error.is_retryable() => {
+                tokio::time::sleep(RETRY_PAUSE).await;
+                let server = api.get_server(id).await?.unwrap_or_default();
+                if matches!(server["state"].as_str(), Some("starting" | "running")) {
+                    return Ok(Attempt::Started);
+                }
+                power_on(api, id).await?
+            }
+            result => result?,
+        };
+        match refused {
+            None => Ok(Attempt::Started),
+            Some(error) if error.is_capacity() => Ok(Attempt::Unavailable(error)),
+            Some(error) => Err(error.into()),
+        }
+    }
+
+    /// `warn start_lookup`: the start looks up what the function's environment lacks or what
+    /// Scaleway refused (M7 hardening rule R3).
+    fn start_lookup(&self, pool: &str, commercial_type: Option<&str>, reason: &str) {
+        let mut fields = vec![("pool", pool)];
+        fields.extend(commercial_type.map(|t| ("type", t)));
+        fields.push(("reason", reason));
+        self.log.warn("start_lookup", &fields);
+    }
+
+    fn no_local_image(&self, pool: &str, commercial_type: &str, failures: &mut Vec<String>) {
+        self.log.warn(
+            "instance type skipped",
+            &[
+                ("pool", pool),
+                ("type", commercial_type),
+                ("reason", "no local image"),
+            ],
+        );
+        failures.push(format!("{commercial_type}: no local image"));
     }
 
     fn unavailable(&self, pool: &str, commercial_type: &str, error: &ApiError) {

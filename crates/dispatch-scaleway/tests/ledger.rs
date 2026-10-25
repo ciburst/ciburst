@@ -1,7 +1,8 @@
 //! The function against the fake Scaleway: the burst ledger (M4 rule R13), built from the cache
 //! key, project and region, absent without them, and written by `respond` for a pending job of a
-//! VM pool that finds no free slot; and the agent of `CIBURST_AGENT_SHA256` (D38) and the pinned
-//! runner of the cache bucket (M6 rule R6) in the user data of the VMs it starts.
+//! VM pool that finds no free slot; the agent of `CIBURST_AGENT_SHA256` (D38) and the pinned
+//! runner of the cache bucket (M6 rule R6) in the user data of the VMs it starts; and the
+//! Scaleway calls of such a start with and without the variables of M7 hardening rule R3.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use ciburst_dispatch_scaleway::{Env, EnvError, Incoming, respond};
 use ciburst_scaleway::host::vars;
 use ciburst_scaleway::provider::Scaleway;
 use ciburst_scaleway::testing::scaleway_fake::{
-    FAKE_ACCESS_KEY, FAKE_ORGANIZATION_ID, FAKE_SECRET_KEY, ScalewayFake,
+    Call, FAKE_ACCESS_KEY, FAKE_ORGANIZATION_ID, FAKE_SECRET_KEY, ScalewayFake,
 };
 use ciburst_scaleway::testing::{
     RUNNER_FIXTURE_URL, agent_fixture, agent_fixture_sha256, runner_fixture_sha256,
@@ -277,4 +278,65 @@ async fn the_function_hands_its_agent_to_the_vms_it_starts() {
         Env::from_lookup(|name| invalid.get(name).cloned()).err(),
         Some(EnvError::Invalid(vars::AGENT_SHA256.to_string()))
     );
+}
+
+/// `<method> <path>` of each call after the first `from`.
+fn since(calls: Vec<Call>, from: usize) -> Vec<String> {
+    calls[from..]
+        .iter()
+        .map(|c| format!("{} {}", c.method, c.path))
+        .collect()
+}
+
+/// The Instance calls and the number of all Scaleway calls of one pending job that starts a
+/// VM through the function.
+async fn vm_start_calls(backend: &Arc<ScalewayFake>, env: &Env) -> (Vec<String>, usize) {
+    let (instance, all) = (backend.instance.calls().len(), backend.calls().len());
+    let (status, body) = pending_job(backend, env).await;
+    assert_eq!(
+        (status, &body["result"]),
+        (200, &json!("started")),
+        "{body}"
+    );
+    (
+        since(backend.instance.calls(), instance),
+        backend.calls().len() - all,
+    )
+}
+
+/// M7 hardening rule R3, measured on the fake: a pending job that starts a VM makes eight
+/// Scaleway calls through a function without `CIBURST_VM_SECURITY_GROUP` and
+/// `CIBURST_VM_IMAGES`, and six with the values the host resolves at apply: the capacity read,
+/// create, user data and power on, and the burst intent's write and read.
+#[tokio::test]
+async fn the_function_starts_a_vm_without_lookups_on_the_resolved_variables() {
+    let (backend, mut vars) = deployed("instances").await;
+    let zone = "GET /instance/v1/zones/fr-par-1";
+    let lookups = [
+        format!("{zone}/security_groups"),
+        "GET /marketplace/v2/local-images".to_string(),
+    ];
+
+    let (looked_up, total) = vm_start_calls(&backend, &env(&vars)).await;
+    assert_eq!(looked_up.len(), 6, "{looked_up:#?}");
+    assert_eq!(looked_up[0], format!("{zone}/servers"), "capacity");
+    assert_eq!(looked_up[1..3], lookups);
+    assert_eq!(total, 8);
+
+    let config = Arc::new(parse_config(&vars[vars::CONFIG]).unwrap());
+    let provider = Scaleway::new(config, backend.client(), Log::silent());
+    let resolved = provider
+        .resolve_vm_start(&vars[vars::PROJECT_ID])
+        .await
+        .unwrap()
+        .unwrap();
+    vars.extend(resolved.vars());
+    let (direct, total) = vm_start_calls(&backend, &env(&vars)).await;
+    assert_eq!(direct.len(), 4, "{direct:#?}");
+    assert_eq!(direct[0], format!("{zone}/servers"), "capacity");
+    assert!(
+        direct.iter().all(|call| !lookups.contains(call)),
+        "{direct:#?}"
+    );
+    assert_eq!(total, 6);
 }

@@ -26,7 +26,7 @@ use ciburst_hetzner::Hetzner;
 use ciburst_scaleway::client::{Credentials, ScalewayClient};
 use ciburst_scaleway::host::vars;
 use ciburst_scaleway::ledger::ScalewayLedger;
-use ciburst_scaleway::provider::Scaleway;
+use ciburst_scaleway::provider::{Scaleway, VmStart};
 use http::{Request, Response, StatusCode};
 
 /// GitLab job events are a few kilobytes, VM reports and cron arguments less.
@@ -45,6 +45,9 @@ pub struct Env {
     /// `CIBURST_AGENT_SHA256`, the agent new VMs download from the cache bucket (D38); a VM
     /// start without it fails naming the variable.
     pub agent_sha256: Option<String>,
+    /// `CIBURST_VM_SECURITY_GROUP` and `CIBURST_VM_IMAGES`, which spare a VM start its lookups
+    /// (M7 hardening rule R3); a start without them looks them up.
+    pub vm_start: VmStart,
     /// Pause between recording a burst intent and reading the burst (M4 rule R3); not read from
     /// the environment.
     pub group_wait: Duration,
@@ -141,6 +144,11 @@ impl Env {
             }
             found => found,
         };
+        let vm_start = VmStart::from_vars(
+            optional(vars::VM_SECURITY_GROUP).as_deref(),
+            optional(vars::VM_IMAGES).as_deref(),
+        )
+        .map_err(|_| EnvError::Invalid(vars::VM_IMAGES.to_string()))?;
         Ok(Env {
             config: Arc::new(config),
             secrets: Arc::new(secrets),
@@ -153,6 +161,7 @@ impl Env {
                 None
             },
             agent_sha256,
+            vm_start,
             group_wait: Duration::from_secs(GROUP_WAIT_S),
         })
     }
@@ -175,7 +184,8 @@ impl Env {
         let client = ScalewayClient::new(http.clone(), self.credentials.clone(), &self.region);
         let main: Arc<dyn Provider> = Arc::new(
             Scaleway::new(self.config.clone(), Arc::new(client), log.clone())
-                .with_agent_sha256(self.agent_sha256.clone()),
+                .with_agent_sha256(self.agent_sha256.clone())
+                .with_vm_start(self.vm_start.clone()),
         );
         let ledger = self.ledger_on(http.clone());
         let Some(token) = &self.hetzner_token else {
@@ -493,8 +503,14 @@ mod tests {
         .into_bytes()
     }
 
+    /// The body without `ms`, which every answer of the dispatcher carries as a whole number
+    /// (M7 rule R1).
     fn parse(body: &[u8]) -> Value {
-        serde_json::from_slice(body).unwrap()
+        let mut value: Value = serde_json::from_slice(body).unwrap();
+        if let Some(ms) = value.as_object_mut().and_then(|map| map.remove("ms")) {
+            assert!(ms.is_u64(), "ms {ms}");
+        }
+        value
     }
 
     #[test]
@@ -529,6 +545,27 @@ mod tests {
         let mut no_vm = vars_map();
         no_vm.remove(vars::VM_SECRET);
         assert!(env_from(&no_vm).unwrap().secrets.vm_secret.is_none());
+    }
+
+    #[test]
+    fn reads_what_apply_resolved_for_vm_starts() {
+        assert_eq!(env_from(&vars_map()).unwrap().vm_start, VmStart::default());
+        let mut resolved = vars_map();
+        resolved.insert(vars::VM_SECURITY_GROUP.to_string(), "sg-1".to_string());
+        resolved.insert(
+            vars::VM_IMAGES.to_string(),
+            r#"{"DEV1-M":{"image":"img-1","installDocker":false}}"#.to_string(),
+        );
+        let start = env_from(&resolved).unwrap().vm_start;
+        assert_eq!(start.security_group.as_deref(), Some("sg-1"));
+        let images = start.images.unwrap();
+        assert_eq!(images["DEV1-M"].image, "img-1");
+        assert!(!images["DEV1-M"].install_docker);
+        resolved.insert(vars::VM_IMAGES.to_string(), "DEV1-M=img-1".to_string());
+        assert_eq!(
+            env_from(&resolved).err(),
+            Some(EnvError::Invalid(vars::VM_IMAGES.to_string()))
+        );
     }
 
     #[test]

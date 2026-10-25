@@ -2,7 +2,8 @@
 //! definitions, start with environment overrides, job runs and stop. Shapes from scaleway-sdk-go
 //! `api/jobs/v1alpha1`: `job_definitions`, `job_runs`, `total_count`; start answers
 //! `{ "job_runs": [...] }`; run states `queued`, `scheduled`, `running`, `succeeded`, `failed`,
-//! `canceled`, `internal_error`.
+//! `canceled`, `internal_error`. [`FakeJobs::fail_next`] fails the next call of a method on a
+//! path once (M7 hardening rule R4).
 
 use std::sync::Mutex;
 
@@ -12,8 +13,8 @@ use ciburst_core::http::{HttpClient, Request, Response};
 use serde_json::{Map, Value, json};
 
 use super::scaleway_fake::{
-    Call, Url, api_error, authorized, body_json, call_of, fake_time, fake_uuid, paginate, reply,
-    unauthorized,
+    Call, Failure, Failures, Url, answer, api_error, authorized, body_json, call_of,
+    failure_status, fake_time, fake_uuid, paginate, reply, unauthorized,
 };
 
 const LIVE: [&str; 3] = ["queued", "scheduled", "running"];
@@ -24,6 +25,7 @@ struct Inner {
     next: u64,
     calls: Vec<Call>,
     max_page_size: usize,
+    failures: Failures,
 }
 
 pub struct FakeJobs {
@@ -45,8 +47,19 @@ impl FakeJobs {
                 next: 0,
                 calls: Vec::new(),
                 max_page_size: 100,
+                failures: Failures::default(),
             }),
         }
+    }
+
+    /// The next `method` call on `path` (a `*` segment stands for any one) fails once with
+    /// `failure`.
+    pub fn fail_next(&self, method: &str, path: &str, failure: Failure) {
+        self.inner
+            .lock()
+            .expect("fake jobs")
+            .failures
+            .arm(method, path, failure);
     }
 
     pub fn calls(&self) -> Vec<Call> {
@@ -147,8 +160,20 @@ fn write_fields(
 impl HttpClient for FakeJobs {
     async fn send(&self, request: Request) -> Result<Response> {
         let url = Url::parse(&request.url);
+        let failure = {
+            let mut inner = self.inner.lock().expect("fake jobs");
+            inner.calls.push(call_of(&request, &url));
+            inner.failures.take(&request.method, &url.path)
+        };
+        let target = request.url.clone();
+        answer(failure, &target, failure_status, self.respond(request)).await
+    }
+}
+
+impl FakeJobs {
+    async fn respond(&self, request: Request) -> Result<Response> {
+        let url = Url::parse(&request.url);
         let mut inner = self.inner.lock().expect("fake jobs");
-        inner.calls.push(call_of(&request, &url));
         if !authorized(&request) {
             return Ok(unauthorized());
         }

@@ -1,5 +1,7 @@
 //! The `instances` runtime against the fake Instance API: plan, start with type fallback, the
-//! cloud-init user data, capacity, claim, report, list, stop, sweep and destroy.
+//! cloud-init user data, capacity, claim, report, list, stop, sweep and destroy; the start on
+//! the values `apply` resolved (M7 hardening rule R3) and which of its failures may be retried
+//! (rule R4).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -14,9 +16,12 @@ use ciburst_core::types::{
 use ciburst_core::vm::{
     SWEEP_DRAINING_S, SWEEP_MAX_AGE_S, SWEEP_SILENT_S, SWEEP_STARTING_S, verify,
 };
-use ciburst_scaleway::provider::Scaleway;
+use ciburst_scaleway::client::{Credentials, ScalewayClient};
+use ciburst_scaleway::provider::{Scaleway, VmImage, VmStart};
 use ciburst_scaleway::testing::instance_api::FAKE_CLOCK;
-use ciburst_scaleway::testing::scaleway_fake::{FAKE_ACCESS_KEY, ScalewayFake};
+use ciburst_scaleway::testing::scaleway_fake::{
+    Call, FAKE_ACCESS_KEY, FAKE_REGION, Failure, ScalewayFake, fake_uuid,
+};
 use ciburst_scaleway::testing::{
     RUNNER_FIXTURE_URL, agent_fixture, agent_fixture_sha256, runner_fixture_sha256,
 };
@@ -1274,12 +1279,13 @@ async fn destroy_waits_for_terminated_servers_before_the_security_group_and_proj
     for _ in 0..2 {
         provider.start(request(&plain(), "ci")).await.unwrap();
     }
+    let started = lines.lock().unwrap().len();
     backend.instance.set_slow_terminate(true);
     provider.destroy().await.unwrap();
     assert!(backend.instance.servers().is_empty());
     assert!(backend.instance.security_groups().is_empty());
     assert!(backend.account.projects().is_empty());
-    let logged = lines.lock().unwrap().clone();
+    let logged = lines.lock().unwrap()[started..].to_vec();
     assert!(!logged.iter().any(|l| l.starts_with("warn")), "{logged:?}");
     assert_eq!(
         logged
@@ -1315,4 +1321,434 @@ async fn the_fake_wants_user_data_as_plain_text_and_serves_the_marketplace_openl
     assert_eq!(response.status, 200);
     let body: Value = response.json().unwrap();
     assert_eq!(body["total_count"], 2);
+}
+
+const ZONE: &str = "/instance/v1/zones/fr-par-1";
+
+/// The provider as the function builds it after `apply`: `CIBURST_PROJECT_ID` as the client's
+/// project, the agent of `CIBURST_AGENT_SHA256`, and `vm_start` from
+/// `CIBURST_VM_SECURITY_GROUP` and `CIBURST_VM_IMAGES`.
+fn function_provider(
+    config: Arc<Config>,
+    backend: &Arc<ScalewayFake>,
+    project_id: &str,
+    vm_start: VmStart,
+    log: Log,
+) -> Scaleway {
+    let credentials = Credentials {
+        default_project_id: Some(project_id.to_string()),
+        ..ScalewayFake::credentials()
+    };
+    let client = ScalewayClient::new(backend.clone(), credentials, FAKE_REGION);
+    Scaleway::new(config, Arc::new(client), log)
+        .with_agent_sha256(Some(agent_fixture_sha256()))
+        .with_vm_start(vm_start)
+}
+
+/// `<method> <path>` of each call after the first `from`.
+fn since(calls: Vec<Call>, from: usize) -> Vec<String> {
+    calls[from..]
+        .iter()
+        .map(|c| format!("{} {}", c.method, c.path))
+        .collect()
+}
+
+fn warnings(lines: &[String]) -> Vec<&str> {
+    lines
+        .iter()
+        .filter(|l| l.starts_with("warn"))
+        .map(String::as_str)
+        .collect()
+}
+
+/// M7 hardening rule R3, measured on the fake: with the values `apply` resolved a start makes
+/// three calls, create, user data and power on; without them it first looks up the security
+/// group and the images. The project id comes from `CIBURST_PROJECT_ID` without a call.
+#[tokio::test]
+async fn a_start_on_the_resolved_values_makes_no_lookup() {
+    let config = plain();
+    let (backend, provider, project_id) = provisioned(config.clone(), Log::silent()).await;
+    let resolved = provider.resolve_vm_start(&project_id).await.unwrap();
+    let group = backend.instance.security_groups()[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let docker = VmImage {
+        image: fake_uuid(9, 1),
+        install_docker: false,
+    };
+    assert_eq!(
+        resolved,
+        Some(VmStart {
+            security_group: Some(group.clone()),
+            images: Some(BTreeMap::from([
+                ("DEV1-L".to_string(), docker.clone()),
+                ("DEV1-M".to_string(), docker),
+            ])),
+        })
+    );
+
+    let (log, lines) = Log::memory();
+    let looking = function_provider(
+        config.clone(),
+        &backend,
+        &project_id,
+        VmStart::default(),
+        log,
+    );
+    let (instance, all) = (backend.instance.calls().len(), backend.calls().len());
+    let first = looking.start(request(&config, "ci")).await.unwrap();
+    assert_eq!(
+        since(backend.instance.calls(), instance),
+        [
+            format!("GET {ZONE}/security_groups"),
+            "GET /marketplace/v2/local-images".to_string(),
+            format!("POST {ZONE}/servers"),
+            format!("PATCH {ZONE}/servers/{first}/user_data/cloud-init"),
+            format!("POST {ZONE}/servers/{first}/action"),
+        ]
+    );
+    assert_eq!(backend.calls().len() - all, 5, "no call to another API");
+    assert_eq!(
+        warnings(&lines.lock().unwrap()),
+        [
+            r#"warn start_lookup pool="ci" reason="CIBURST_VM_SECURITY_GROUP unset""#,
+            r#"warn start_lookup pool="ci" type="DEV1-M" reason="CIBURST_VM_IMAGES unset""#,
+        ]
+    );
+
+    let (log, lines) = Log::memory();
+    let direct = function_provider(
+        config.clone(),
+        &backend,
+        &project_id,
+        resolved.unwrap(),
+        log,
+    );
+    let (instance, all) = (backend.instance.calls().len(), backend.calls().len());
+    let second = direct.start(request(&config, "ci")).await.unwrap();
+    assert_eq!(
+        since(backend.instance.calls(), instance),
+        [
+            format!("POST {ZONE}/servers"),
+            format!("PATCH {ZONE}/servers/{second}/user_data/cloud-init"),
+            format!("POST {ZONE}/servers/{second}/action"),
+        ]
+    );
+    assert_eq!(backend.calls().len() - all, 3, "no call to another API");
+    assert!(warnings(&lines.lock().unwrap()).is_empty());
+    let server = backend.instance.server(&second).unwrap();
+    assert_eq!(server["security_group"]["id"], group.as_str());
+    assert_eq!(server["image"]["name"], "docker");
+    let user_data = backend.instance.user_data(&second, "cloud-init").unwrap();
+    assert!(!user_data.contains("docker.io"), "the image has Docker");
+}
+
+#[tokio::test]
+async fn a_type_missing_from_the_images_is_looked_up_alone() {
+    let config = plain();
+    let (backend, provider, project_id) = provisioned(config.clone(), Log::silent()).await;
+    let mut resolved = provider
+        .resolve_vm_start(&project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    resolved.images.as_mut().unwrap().remove("DEV1-M");
+    let (log, lines) = Log::memory();
+    let dispatcher = function_provider(config.clone(), &backend, &project_id, resolved, log);
+    let instance = backend.instance.calls().len();
+    let id = dispatcher.start(request(&config, "ci")).await.unwrap();
+    assert_eq!(
+        since(backend.instance.calls(), instance),
+        [
+            "GET /marketplace/v2/local-images".to_string(),
+            format!("POST {ZONE}/servers"),
+            format!("PATCH {ZONE}/servers/{id}/user_data/cloud-init"),
+            format!("POST {ZONE}/servers/{id}/action"),
+        ]
+    );
+    assert_eq!(
+        warnings(&lines.lock().unwrap()),
+        [r#"warn start_lookup pool="ci" type="DEV1-M" reason="not in CIBURST_VM_IMAGES""#]
+    );
+}
+
+#[tokio::test]
+async fn a_refused_image_is_looked_up_and_the_create_repeated() {
+    let config = plain();
+    let (backend, provider, project_id) = provisioned(config.clone(), Log::silent()).await;
+    let resolved = provider
+        .resolve_vm_start(&project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    backend.instance.remove_local_images("docker");
+    let (log, lines) = Log::memory();
+    let dispatcher = function_provider(config.clone(), &backend, &project_id, resolved, log);
+    let instance = backend.instance.calls().len();
+    let id = dispatcher.start(request(&config, "ci")).await.unwrap();
+    assert_eq!(
+        since(backend.instance.calls(), instance),
+        [
+            format!("POST {ZONE}/servers"),
+            format!("GET {ZONE}/security_groups"),
+            "GET /marketplace/v2/local-images".to_string(),
+            "GET /marketplace/v2/local-images".to_string(),
+            format!("POST {ZONE}/servers"),
+            format!("PATCH {ZONE}/servers/{id}/user_data/cloud-init"),
+            format!("POST {ZONE}/servers/{id}/action"),
+        ]
+    );
+    let server = backend.instance.server(&id).unwrap();
+    assert_eq!(server["commercial_type"], "DEV1-M");
+    assert_eq!(server["image"]["name"], "ubuntu_noble");
+    let user_data = backend.instance.user_data(&id, "cloud-init").unwrap();
+    assert!(user_data.contains("apt-get install -y docker.io"));
+    assert_eq!(
+        warnings(&lines.lock().unwrap()),
+        [
+            r#"warn start_lookup pool="ci" type="DEV1-M" reason="create refused: 400 image not found""#
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_refused_security_group_is_looked_up_and_the_create_repeated() {
+    let config = plain();
+    let (backend, provider, project_id) = provisioned(config.clone(), Log::silent()).await;
+    let mut resolved = provider
+        .resolve_vm_start(&project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    resolved.security_group = Some(fake_uuid(14, 999));
+    let (log, lines) = Log::memory();
+    let dispatcher = function_provider(config.clone(), &backend, &project_id, resolved, log);
+    let instance = backend.instance.calls().len();
+    let id = dispatcher.start(request(&config, "ci")).await.unwrap();
+    assert_eq!(
+        since(backend.instance.calls(), instance),
+        [
+            format!("POST {ZONE}/servers"),
+            format!("GET {ZONE}/security_groups"),
+            "GET /marketplace/v2/local-images".to_string(),
+            format!("POST {ZONE}/servers"),
+            format!("PATCH {ZONE}/servers/{id}/user_data/cloud-init"),
+            format!("POST {ZONE}/servers/{id}/action"),
+        ]
+    );
+    let group = &backend.instance.security_groups()[0]["id"];
+    assert_eq!(
+        backend.instance.server(&id).unwrap()["security_group"]["id"],
+        *group
+    );
+    assert_eq!(
+        warnings(&lines.lock().unwrap()),
+        [
+            r#"warn start_lookup pool="ci" type="DEV1-M" reason="create refused: 404 security group not found""#
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_the_lookups_cannot_fix_ends_the_start() {
+    let config = plain();
+    let (backend, provider, project_id) = provisioned(config.clone(), Log::silent()).await;
+    let resolved = provider
+        .resolve_vm_start(&project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let servers = format!("{ZONE}/servers");
+    for (vm_start, calls) in [
+        (
+            resolved,
+            vec![
+                format!("POST {servers}"),
+                format!("GET {ZONE}/security_groups"),
+                "GET /marketplace/v2/local-images".to_string(),
+            ],
+        ),
+        (
+            VmStart::default(),
+            vec![
+                format!("GET {ZONE}/security_groups"),
+                "GET /marketplace/v2/local-images".to_string(),
+                format!("POST {servers}"),
+            ],
+        ),
+    ] {
+        let dispatcher = function_provider(
+            config.clone(),
+            &backend,
+            &project_id,
+            vm_start,
+            Log::silent(),
+        );
+        backend
+            .instance
+            .fail_next("POST", &servers, Failure::Status(404));
+        let instance = backend.instance.calls().len();
+        let error = dispatcher.start(request(&config, "ci")).await.unwrap_err();
+        assert_eq!(since(backend.instance.calls(), instance), calls);
+        assert_eq!(
+            error.to_string(),
+            format!("scaleway POST {servers}: 404 resource is not found")
+        );
+        assert!(!error.is_retryable());
+    }
+    assert!(backend.instance.servers().is_empty());
+}
+
+/// M7 hardening rule R4 until a server exists: 429 and 503 may pass on a repeat for every call,
+/// another 5xx and a transport timeout only for reads. A failed start leaves no server.
+#[tokio::test]
+async fn start_failures_are_retryable_until_the_server_exists() {
+    let config = plain();
+    let (backend, provider, _) = provisioned(config.clone(), Log::silent()).await;
+    let servers = format!("{ZONE}/servers");
+    let groups = format!("{ZONE}/security_groups");
+    let images = "/marketplace/v2/local-images".to_string();
+    for (method, path, failure, retryable) in [
+        ("POST", &servers, Failure::Status(429), true),
+        ("POST", &servers, Failure::Status(503), true),
+        ("POST", &servers, Failure::Status(500), false),
+        ("GET", &groups, Failure::Status(504), true),
+        ("GET", &images, Failure::Timeout, true),
+    ] {
+        backend.instance.fail_next(method, path, failure);
+        let error = provider.start(request(&config, "ci")).await.unwrap_err();
+        let case = format!("{method} {path} {failure:?}: {error}");
+        assert_eq!(error.is_retryable(), retryable, "{case}");
+        assert!(backend.instance.servers().is_empty(), "{case}");
+    }
+    provider.start(request(&config, "ci")).await.unwrap();
+    assert_eq!(backend.instance.servers().len(), 1, "the repeat passes");
+    backend.instance.set_out_of_stock("DEV1-M");
+    backend.instance.set_out_of_stock("DEV1-L");
+    let error = provider.start(request(&config, "ci")).await.unwrap_err();
+    assert!(!error.is_retryable(), "out of stock everywhere: {error}");
+}
+
+/// The dispatcher's retry: the whole start once more after a retryable error.
+async fn start_with_retry(provider: &Scaleway, config: &Config) -> ciburst_core::Result<String> {
+    match provider.start(request(config, "ci")).await {
+        Err(error) if error.is_retryable() => provider.start(request(config, "ci")).await,
+        result => result,
+    }
+}
+
+/// M7 hardening rule R4 once the server exists: a repeat of the whole start would create a
+/// second server, so the start repeats user data and power on itself, once after 300 ms, and
+/// reads the server first in case a power on whose answer got lost started it. What still
+/// fails removes the server and ends the start for good.
+#[tokio::test(start_paused = true)]
+async fn calls_on_a_created_server_are_repeated_within_the_start() {
+    let config = plain();
+    let (backend, provider, project_id) = provisioned(config.clone(), Log::silent()).await;
+    let resolved = provider
+        .resolve_vm_start(&project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let dispatcher = function_provider(
+        config.clone(),
+        &backend,
+        &project_id,
+        resolved,
+        Log::silent(),
+    );
+    let user_data = format!("{ZONE}/servers/*/user_data/cloud-init");
+    let action = format!("{ZONE}/servers/*/action");
+    let creates = || {
+        backend
+            .instance
+            .calls()
+            .iter()
+            .filter(|c| c.method == "POST" && c.path == format!("{ZONE}/servers"))
+            .count()
+    };
+    for (method, path, failure, repeated) in [
+        ("PATCH", &user_data, Failure::Status(503), "PATCH user_data"),
+        ("PATCH", &user_data, Failure::Status(500), "PATCH user_data"),
+        ("PATCH", &user_data, Failure::Timeout, "PATCH user_data"),
+        ("POST", &action, Failure::Status(503), "GET POST action"),
+        ("POST", &action, Failure::Status(502), "GET POST action"),
+        ("POST", &action, Failure::Timeout, "GET"),
+    ] {
+        let (before, created) = (backend.instance.calls().len(), creates());
+        backend.instance.fail_next(method, path, failure);
+        let started = tokio::time::Instant::now();
+        let id = start_with_retry(&dispatcher, &config).await.unwrap();
+        let case = format!("{method} {path} {failure:?}");
+        assert_eq!(creates() - created, 1, "{case}: one create");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(300),
+            "{case}"
+        );
+        let server = format!("{ZONE}/servers/{id}");
+        let tail = match repeated {
+            "PATCH user_data" => vec![
+                format!("PATCH {server}/user_data/cloud-init"),
+                format!("PATCH {server}/user_data/cloud-init"),
+                format!("POST {server}/action"),
+            ],
+            "GET POST action" => vec![
+                format!("PATCH {server}/user_data/cloud-init"),
+                format!("POST {server}/action"),
+                format!("GET {server}"),
+                format!("POST {server}/action"),
+            ],
+            _ => vec![
+                format!("PATCH {server}/user_data/cloud-init"),
+                format!("POST {server}/action"),
+                format!("GET {server}"),
+            ],
+        };
+        let calls = since(backend.instance.calls(), before);
+        assert_eq!(calls[1..], tail, "{case}");
+        let state = backend.instance.server(&id).unwrap()["state"].clone();
+        assert!(
+            matches!(state.as_str(), Some("starting" | "running")),
+            "{case}: {state}"
+        );
+        provider.stop(&id).await.unwrap();
+    }
+
+    for (method, path, failure) in [
+        ("PATCH", &user_data, Failure::Status(503)),
+        ("POST", &action, Failure::Status(503)),
+        ("POST", &action, Failure::Status(500)),
+    ] {
+        let created = creates();
+        backend.instance.fail_next(method, path, failure);
+        backend.instance.fail_next(method, path, failure);
+        let error = start_with_retry(&dispatcher, &config).await.unwrap_err();
+        let case = format!("{method} {path} twice {failure:?}: {error}");
+        assert!(!error.is_retryable(), "{case}");
+        assert_eq!(creates() - created, 1, "{case}: one create");
+        assert!(backend.instance.servers().is_empty(), "{case}: removed");
+    }
+}
+
+/// A create whose answer never came may have made the server, so repeating it could make a
+/// second one. The sweep ends the stopped server after `SWEEP_STARTING_S`.
+#[tokio::test]
+async fn a_create_that_timed_out_is_not_retryable() {
+    let (backend, provider, _) = provisioned(plain(), Log::silent()).await;
+    backend
+        .instance
+        .fail_next("POST", &format!("{ZONE}/servers"), Failure::Timeout);
+    let error = provider.start(request(&plain(), "ci")).await.unwrap_err();
+    assert!(!error.is_retryable(), "{error}");
+    assert!(error.to_string().contains("timed out"), "{error}");
+    let servers = backend.instance.servers();
+    assert_eq!(servers.len(), 1);
+    assert_eq!(servers[0]["state"], "stopped");
+    let swept = provider
+        .sweep(FAKE_CLOCK + SWEEP_STARTING_S + 1)
+        .await
+        .unwrap();
+    assert_eq!(swept.len(), 1);
+    assert!(backend.instance.servers().is_empty());
 }

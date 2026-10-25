@@ -37,7 +37,9 @@ impl Credentials {
 }
 
 /// JSON client for the Scaleway API: auth header, error mapping, region. Provider and host build
-/// their endpoints on top of `get`, `post`, `patch` and `delete`.
+/// their endpoints on top of `get`, `post`, `patch` and `delete`. A failure that a repeated call
+/// may not meet is [`Error::Retryable`] ([`retryable_status`], [`transport_error`]); only GETs
+/// count as idempotent here.
 pub struct ScalewayClient {
     http: Arc<dyn HttpClient>,
     endpoint: String,
@@ -115,15 +117,25 @@ impl ScalewayClient {
         if let Some(body) = body {
             request = request.json(body);
         }
-        let response = self.http.send(request).await?;
+        let idempotent = method == "GET";
+        let response = self
+            .http
+            .send(request)
+            .await
+            .map_err(|error| transport_error(error, method, path, idempotent))?;
         if response.ok() {
             return parse(&response);
         }
-        Err(Error::provider(format!(
+        let message = format!(
             "scaleway {method} {path}: {} {}",
             response.status,
             error_message(&response)
-        )))
+        );
+        if retryable_status(response.status, idempotent) {
+            Err(Error::retryable(message))
+        } else {
+            Err(Error::provider(message))
+        }
     }
 
     pub async fn get(&self, path: &str, query: &[(&str, String)]) -> Result<Value> {
@@ -163,6 +175,24 @@ impl ScalewayClient {
             .flatten()
             .find(|p| p["name"].as_str() == Some(name))
             .and_then(|p| p["id"].as_str().map(String::from)))
+    }
+}
+
+/// M7 hardening rule R4: a 429 or a 503 may pass when the call is repeated, and for an
+/// idempotent call every other 5xx too.
+pub fn retryable_status(status: u16, idempotent: bool) -> bool {
+    status == 429 || status == 503 || (idempotent && (500..600).contains(&status))
+}
+
+/// A transport failure of an idempotent call may pass when repeated; any other call may have
+/// taken effect, so its error stays as it is. The HTTP client reports timeouts and other
+/// transport failures alike, so every one of them counts.
+pub fn transport_error(error: Error, method: &str, path: &str, idempotent: bool) -> Error {
+    match error {
+        Error::Http(_) if idempotent => {
+            Error::retryable(format!("scaleway {method} {path}: {error}"))
+        }
+        error => error,
     }
 }
 
@@ -261,6 +291,59 @@ mod tests {
             error,
             "scaleway DELETE /x/v1/y: 403 insufficient permissions"
         );
+    }
+
+    /// A transport that never answers.
+    struct TimedOut;
+
+    #[async_trait]
+    impl HttpClient for TimedOut {
+        async fn send(&self, _: Request) -> Result<Response> {
+            Err(Error::Http("operation timed out".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn classifies_failures_for_one_retry() {
+        for (status, get, post) in [
+            (429, true, true),
+            (503, true, true),
+            (500, true, false),
+            (502, true, false),
+            (504, true, false),
+            (404, false, false),
+            (409, false, false),
+        ] {
+            let recorder = Arc::new(Recorder {
+                requests: Mutex::new(Vec::new()),
+                response: Response::json_body(status, &serde_json::json!({ "message": "m" })),
+            });
+            let client = ScalewayClient::new(recorder, credentials(), "fr-par");
+            let error = client.get("/x/v1/y", &[]).await.unwrap_err();
+            assert_eq!(error.is_retryable(), get, "GET {status}");
+            assert_eq!(
+                error.to_string(),
+                format!("scaleway GET /x/v1/y: {status} m")
+            );
+            let error = client
+                .post("/x/v1/y", &serde_json::json!({}))
+                .await
+                .unwrap_err();
+            assert_eq!(error.is_retryable(), post, "POST {status}");
+        }
+        let client = ScalewayClient::new(Arc::new(TimedOut), credentials(), "fr-par");
+        let get = client.get("/x/v1/y", &[]).await.unwrap_err();
+        assert!(get.is_retryable());
+        assert_eq!(
+            get.to_string(),
+            "scaleway GET /x/v1/y: http: operation timed out"
+        );
+        let post = client
+            .post("/x/v1/y/start", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(!post.is_retryable(), "a start may have taken effect");
+        assert_eq!(post.to_string(), "http: operation timed out");
     }
 
     #[tokio::test]

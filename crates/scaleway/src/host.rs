@@ -7,8 +7,11 @@
 //! The function environment is exactly what `ciburst_dispatch_scaleway::Env` reads, named in
 //! [`vars`]:
 //! - plain: `CIBURST_CONFIG` (config JSON), `CIBURST_ORGANIZATION_ID`, `CIBURST_PROJECT_ID`,
-//!   `CIBURST_REGION` (Scaleway reserves the `SCW_` prefix), and every variable of
-//!   `Secrets::dispatcher_env` under its own name (`CIBURST_AGENT_SHA256`, D38);
+//!   `CIBURST_REGION` (Scaleway reserves the `SCW_` prefix), every variable of
+//!   `Secrets::dispatcher_env` under its own name (`CIBURST_AGENT_SHA256`, D38), and with VM
+//!   pools of the `scaleway` provider `CIBURST_VM_SECURITY_GROUP` and `CIBURST_VM_IMAGES`, which
+//!   this host resolves on every plan and apply (`Scaleway::resolve_vm_start`, M7 hardening
+//!   rule R3), so a changed image or security group plans a function update;
 //! - secret: `HOOK_TOKEN`, `CIBURST_DISPATCH_KEY` (the dispatch key), `RUNNER_TOKEN_<TAG>` per pool,
 //!   `CACHE_S3_ACCESS_KEY` and `CACHE_S3_SECRET_KEY` when a cache key exists, `CIBURST_VM_SECRET`
 //!   and `CIBURST_SWEEP_TOKEN` when the provisioner made them, and every credential of an added
@@ -37,6 +40,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::client::ScalewayClient;
+use crate::provider::{LEGACY_JOBS_TYPE, PROVIDER_NAME, Scaleway};
 
 pub const HOST_NAME: &str = "scaleway-function";
 
@@ -45,7 +49,9 @@ pub const HANDLER: &str = "handle";
 pub const PRIVACY: &str = "public";
 pub const MIN_SCALE: u32 = 0;
 pub const MAX_SCALE: u32 = 5;
-pub const MEMORY_LIMIT_MB: u32 = 128;
+/// Scaleway gives a function CPU in proportion to its memory: 1024 MB get 560 mvCPU, 128 MB
+/// only 70 (D50).
+pub const MEMORY_LIMIT_MB: u32 = 1024;
 pub const TIMEOUT: &str = "30s";
 pub const HTTP_OPTION: &str = "redirected";
 pub const SANDBOX: &str = "v2";
@@ -77,6 +83,9 @@ pub mod vars {
     pub const CODE_DIGEST: &str = "CIBURST_CODE_DIGEST";
     /// The agent VMs download (D38), from `Secrets::dispatcher_env`.
     pub const AGENT_SHA256: &str = ciburst_core::provision::keys::AGENT_SHA256;
+    /// What a VM start uses without looking it up (M7 hardening rule R3).
+    pub const VM_SECURITY_GROUP: &str = crate::provider::SECURITY_GROUP_VAR;
+    pub const VM_IMAGES: &str = crate::provider::IMAGES_VAR;
 
     /// Whether `name` can carry a credential of an added provider (`Secrets::provider_env`,
     /// for example `HCLOUD_TOKEN`): upper-case letters, digits and `_`, not starting with a
@@ -114,6 +123,8 @@ pub mod vars {
             VM_SECRET,
             SWEEP_TOKEN,
             CODE_DIGEST,
+            VM_SECURITY_GROUP,
+            VM_IMAGES,
         ]
         .contains(&name)
             || ["RUNNER_TOKEN_", "SCW_"]
@@ -245,13 +256,28 @@ impl ScalewayFunction {
         format!("/functions/v1beta1/regions/{}", self.client.region())
     }
 
-    fn settings(&self, project_id: &str, secrets: &Secrets) -> Result<Settings> {
+    /// `CIBURST_VM_SECURITY_GROUP` and `CIBURST_VM_IMAGES` for the VM pools of the `scaleway`
+    /// provider; none for another provider type or without such pools.
+    async fn vm_start_vars(&self, project_id: &str) -> Result<BTreeMap<String, String>> {
+        if ![PROVIDER_NAME, LEGACY_JOBS_TYPE].contains(&self.config.provider.kind.as_str()) {
+            return Ok(BTreeMap::new());
+        }
+        let provider = Scaleway::new(self.config.clone(), self.client.clone(), self.log.clone());
+        Ok(provider
+            .resolve_vm_start(project_id)
+            .await?
+            .map(|start| start.vars())
+            .unwrap_or_default())
+    }
+
+    async fn settings(&self, project_id: &str, secrets: &Secrets) -> Result<Settings> {
         check_dispatcher_env(secrets)?;
         let mut environment_variables: BTreeMap<String, String> = secrets
             .dispatcher_env
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect();
+        environment_variables.extend(self.vm_start_vars(project_id).await?);
         environment_variables.extend([
             (
                 vars::CONFIG.to_string(),
@@ -557,7 +583,7 @@ impl Host for ScalewayFunction {
             };
         }
         if let (Some(project), Some(existing)) = (&found.project, &found.function) {
-            let wanted = self.settings(project, secrets)?.description()?;
+            let wanted = self.settings(project, secrets).await?.description()?;
             if existing["description"].as_str() == Some(wanted.as_str()) {
                 function.action = Action::Noop;
             } else {
@@ -610,7 +636,7 @@ impl Host for ScalewayFunction {
             })?;
         let namespace = self.ensure_namespace(&project).await?;
         let namespace_id = id_of(&namespace)?.to_string();
-        let settings = self.settings(&project, secrets)?;
+        let settings = self.settings(&project, secrets).await?;
         let function_name = self.function_name();
 
         let mut changed = false;
@@ -864,6 +890,30 @@ mod tests {
         ] {
             assert!(!vars::provider_name_ok(name), "{name}");
         }
+    }
+
+    /// D50: a function deployed with 128 MB carries another description, so it plans
+    /// `update  function <name>  (settings, config or secrets changed)`.
+    #[test]
+    fn the_description_covers_the_memory_limit() {
+        let settings = |memory_limit| Settings {
+            runtime: RUNTIME,
+            handler: HANDLER,
+            privacy: PRIVACY,
+            min_scale: MIN_SCALE,
+            max_scale: MAX_SCALE,
+            memory_limit,
+            timeout: TIMEOUT,
+            http_option: HTTP_OPTION,
+            sandbox: SANDBOX,
+            environment_variables: BTreeMap::new(),
+            secret_environment_variables: BTreeMap::new(),
+        };
+        assert_eq!(MEMORY_LIMIT_MB, 1024);
+        assert_ne!(
+            settings(128).description().unwrap(),
+            settings(MEMORY_LIMIT_MB).description().unwrap()
+        );
     }
 
     #[test]

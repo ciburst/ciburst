@@ -9,6 +9,9 @@
 //! function) and `ready` on the next `GET`, or `error` when [`FakeFunctions::fail_next_build`]
 //! was called. A cron is `creating` after create, `pending` after an update and `ready` on the
 //! next `GET`; deleting a function or namespace deletes its crons.
+//!
+//! `memory_limit` takes the sizes of [`MEMORY_LIMITS`], and `cpu_limit` follows it at 70 mvCPU
+//! per 128 MB, as Scaleway allocates a function's CPU.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -289,6 +292,22 @@ fn check_cron(body: &Value) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// The memory sizes of a function in MB.
+pub const MEMORY_LIMITS: [u64; 7] = [128, 256, 512, 1024, 2048, 3072, 4096];
+
+/// The `cpu_limit` in mvCPU of the body's `memory_limit`; `None` without one.
+fn cpu_limit(body: &Value) -> std::result::Result<Option<u64>, String> {
+    match body.get("memory_limit") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => match value.as_u64() {
+            Some(mb) if MEMORY_LIMITS.contains(&mb) => Ok(Some(mb * 70 / 128)),
+            _ => Err(format!(
+                "memory_limit {value} is not one of {MEMORY_LIMITS:?}"
+            )),
+        },
+    }
+}
+
 const FUNCTION_FIELDS: [&str; 11] = [
     "runtime",
     "handler",
@@ -422,6 +441,10 @@ impl Inner {
                         json!({ "type": "transient_state", "message": "function is in a transient state" }),
                     );
                 }
+                let cpu = match cpu_limit(&body) {
+                    Ok(cpu) => cpu,
+                    Err(message) => return invalid(&message),
+                };
                 if let Err(message) = apply_secrets(&mut record.secrets, &body) {
                     return invalid(&message);
                 }
@@ -429,6 +452,9 @@ impl Inner {
                     if let Some(value) = body.get(field) {
                         record.value[field] = value.clone();
                     }
+                }
+                if let Some(cpu) = cpu {
+                    record.value["cpu_limit"] = json!(cpu);
                 }
                 record.value["secret_environment_variables"] = hashed(&record.secrets);
                 if record.deployed.is_some() {
@@ -570,6 +596,10 @@ impl Inner {
         if body["runtime"].as_str().unwrap_or("").is_empty() {
             return invalid("runtime required");
         }
+        let cpu = match cpu_limit(&body) {
+            Ok(cpu) => cpu.unwrap_or(70),
+            Err(message) => return invalid(&message),
+        };
         let mut secrets = BTreeMap::new();
         if let Err(message) = apply_secrets(&mut secrets, &body) {
             return invalid(&message);
@@ -586,7 +616,7 @@ impl Inner {
         value["name"] = json!(name);
         value["namespace_id"] = json!(namespace_id);
         value["status"] = json!("created");
-        value["cpu_limit"] = json!(70);
+        value["cpu_limit"] = json!(cpu);
         value["error_message"] = Value::Null;
         value["build_message"] = Value::Null;
         value["domain_name"] = json!(format!(

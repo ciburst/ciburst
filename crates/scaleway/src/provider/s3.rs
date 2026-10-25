@@ -11,6 +11,7 @@ use ciburst_core::{Error, Result};
 use md5::{Digest, Md5};
 
 use super::sigv4;
+use crate::client::{retryable_status, transport_error};
 use crate::ledger::INTENT_PREFIX;
 
 /// The single rule of M4, which expired every object; a bucket that still has it gets the
@@ -128,7 +129,11 @@ impl S3 {
         if !body.is_empty() {
             request.body = Some(body);
         }
-        let response = self.http.send(request).await?;
+        let response = self
+            .http
+            .send(request)
+            .await
+            .map_err(|error| transport_error(error, method, &path, idempotent(method)))?;
         Ok((path, response))
     }
 
@@ -301,6 +306,12 @@ impl S3 {
     }
 }
 
+/// Reads change nothing, so a failed one may be repeated (M7 hardening rule R4).
+fn idempotent(method: &str) -> bool {
+    matches!(method, "GET" | "HEAD")
+}
+
+/// The error of a non-2xx answer; [`Error::Retryable`] when repeating the call may pass.
 fn s3_error(method: &str, path: &str, response: &Response) -> Error {
     let text = response.text();
     let code = xml_values(&text, "Code").into_iter().next();
@@ -312,7 +323,11 @@ fn s3_error(method: &str, path: &str, response: &Response) -> Error {
         (None, None) => text,
     };
     let message = format!("scaleway s3 {method} {path}: {} {detail}", response.status);
-    Error::provider(message.trim_end())
+    if retryable_status(response.status, idempotent(method)) {
+        Error::retryable(message.trim_end())
+    } else {
+        Error::provider(message.trim_end())
+    }
 }
 
 /// The lifecycle document of [`LIFECYCLE_RULES`], each expiring after `days`.

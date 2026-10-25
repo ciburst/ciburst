@@ -1,5 +1,5 @@
-//! `ScalewayLedger` against the S3 fake (M4 rule R13), and the fake's object writes and
-//! ListObjectsV2 against what S3 answers.
+//! `ScalewayLedger` against the S3 fake (M4 rule R13): its failures that may be retried (M7
+//! hardening rule R4), and the fake's object writes and ListObjectsV2 against what S3 answers.
 
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use ciburst_scaleway::ledger::{MAX_PAGES, ScalewayLedger};
 use ciburst_scaleway::provider::s3::{S3, xml_values};
 use ciburst_scaleway::provider::sigv4;
 use ciburst_scaleway::testing::s3_api::{DEFAULT_PAGE, FakeS3};
-use ciburst_scaleway::testing::scaleway_fake::{FAKE_ACCESS_KEY, FAKE_SECRET_KEY};
+use ciburst_scaleway::testing::scaleway_fake::{FAKE_ACCESS_KEY, FAKE_SECRET_KEY, Failure};
 
 const BUCKET: &str = "demo-cache-p-1";
 const CACHE_ACCESS: &str = "SCWCACHEACCESS000000";
@@ -61,6 +61,45 @@ fn listings(fake: &FakeS3) -> Vec<String> {
         .filter(|c| c.method == "GET" && c.query.contains("list-type=2"))
         .map(|c| c.query)
         .collect()
+}
+
+/// M7 hardening rule R4 for the cache bucket: 429 and 503 may pass on a repeat for every call,
+/// another 5xx and a transport timeout only for reads.
+#[tokio::test]
+async fn failures_are_retryable_where_a_repeat_may_pass() {
+    let (fake, ledger) = ledger().await;
+    let intents = format!("/{BUCKET}/ciburst/intents/vm/*");
+    let listing = format!("/{BUCKET}");
+    for (method, path, failure, retryable) in [
+        ("PUT", &intents, Failure::Status(429), true),
+        ("PUT", &intents, Failure::Status(503), true),
+        ("PUT", &intents, Failure::Status(500), false),
+        ("PUT", &intents, Failure::Timeout, false),
+        ("GET", &listing, Failure::Status(500), true),
+        ("GET", &listing, Failure::Timeout, true),
+    ] {
+        fake.fail_next(method, path, failure);
+        let error = match method {
+            "PUT" => ledger.record("vm", NOW, "42").await.unwrap_err(),
+            _ => ledger.since("vm", NOW).await.unwrap_err(),
+        };
+        assert_eq!(
+            error.is_retryable(),
+            retryable,
+            "{method} {path} {failure:?}: {error}"
+        );
+    }
+    fake.fail_next("PUT", &intents, Failure::Status(503));
+    let error = ledger.record("vm", NOW, "42").await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "scaleway s3 PUT /{BUCKET}/ciburst/intents/vm/1800000000-00000000000000000042: 503 \
+             SlowDown Please reduce your request rate."
+        )
+    );
+    ledger.record("vm", NOW, "42").await.unwrap();
+    assert_eq!(ledger.since("vm", NOW).await.unwrap(), [intent(NOW, "42")]);
 }
 
 #[tokio::test]
