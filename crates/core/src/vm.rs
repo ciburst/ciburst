@@ -17,7 +17,7 @@ pub const HEADER_TOKEN: &str = "X-Ciburst-Token";
 pub const PATH_REPORT: &str = "/vm";
 /// Path the VM posts to after its last slot exited; empty body.
 pub const PATH_TERMINATE: &str = "/terminate";
-/// Body key of the cron trigger's arguments: `{"ciburst_sweep": "<hook token>"}`.
+/// Body key of the cron trigger's arguments: `{"ciburst_sweep": "<sweep token>"}`.
 pub const SWEEP_ARG: &str = "ciburst_sweep";
 
 /// Minute of a paid hour from which an idle VM drains.

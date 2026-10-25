@@ -4,6 +4,14 @@ use crate::config::Config;
 
 const DEFAULT_STAGE: &str = "test";
 
+/// Jobs of the CI/CD component run on hosted runners; the dispatcher and `check` skip them
+/// (spec D41).
+pub const OWN_JOB_PREFIX: &str = "ciburst-";
+
+pub fn is_own_job(name: &str) -> bool {
+    name.starts_with(OWN_JOB_PREFIX)
+}
+
 /// A job as returned by GitLab's CI lint with `include_jobs`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LintJob {
@@ -26,7 +34,7 @@ pub struct Problem {
 /// Compares the jobs of a linted pipeline with the stage map.
 pub fn check_jobs(config: &Config, jobs: &[LintJob]) -> Vec<Problem> {
     let mut problems = Vec::new();
-    for job in jobs {
+    for job in jobs.iter().filter(|job| !is_own_job(&job.name)) {
         let stage = job.stage.as_deref().unwrap_or(DEFAULT_STAGE);
         let expected = config.pool_for_stage(Some(stage)).map(|p| p.tag.as_str());
         let chosen: Vec<&str> = job
@@ -123,6 +131,24 @@ mod tests {
                 "stage deploy maps to no pool but the job is tagged ci"
             )]
         );
+    }
+
+    #[test]
+    fn skips_the_components_own_jobs() {
+        let problems = check_jobs(
+            &config(),
+            &[
+                job("ciburst-setup", Some(".pre"), &["saas-linux-small-amd64"]),
+                job("ciburst-check", Some(".pre"), &["ci"]),
+                job("ciburst-destroy", Some("build"), &[]),
+                job("ciburst", Some("build"), &["ci"]),
+            ],
+        );
+        let names: Vec<&str> = problems.iter().map(|p| p.job.as_str()).collect();
+        assert_eq!(names, ["ciburst"]);
+        assert!(is_own_job("ciburst-setup"));
+        assert!(!is_own_job("ciburst"));
+        assert!(!is_own_job("my-ciburst-job"));
     }
 
     #[test]
