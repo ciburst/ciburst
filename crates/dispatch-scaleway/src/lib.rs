@@ -503,8 +503,14 @@ mod tests {
         .into_bytes()
     }
 
+    /// The body without `ms`, which every answer of the dispatcher carries as a whole number
+    /// (M7 rule R1).
     fn parse(body: &[u8]) -> Value {
-        serde_json::from_slice(body).unwrap()
+        let mut value: Value = serde_json::from_slice(body).unwrap();
+        if let Some(ms) = value.as_object_mut().and_then(|map| map.remove("ms")) {
+            assert!(ms.is_u64(), "ms {ms}");
+        }
+        value
     }
 
     #[test]

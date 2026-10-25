@@ -1600,25 +1600,19 @@ async fn a_refusal_the_lookups_cannot_fix_ends_the_start() {
     assert!(backend.instance.servers().is_empty());
 }
 
-/// M7 hardening rule R4: 429 and 503 may pass on a repeat for every call, another 5xx and a
-/// transport timeout only for user data, power on and reads. A failed start leaves no server.
+/// M7 hardening rule R4 until a server exists: 429 and 503 may pass on a repeat for every call,
+/// another 5xx and a transport timeout only for reads. A failed start leaves no server.
 #[tokio::test]
-async fn start_failures_are_retryable_where_a_repeat_may_pass() {
+async fn start_failures_are_retryable_until_the_server_exists() {
     let config = plain();
     let (backend, provider, _) = provisioned(config.clone(), Log::silent()).await;
     let servers = format!("{ZONE}/servers");
-    let user_data = format!("{ZONE}/servers/*/user_data/cloud-init");
-    let action = format!("{ZONE}/servers/*/action");
     let groups = format!("{ZONE}/security_groups");
     let images = "/marketplace/v2/local-images".to_string();
     for (method, path, failure, retryable) in [
         ("POST", &servers, Failure::Status(429), true),
         ("POST", &servers, Failure::Status(503), true),
         ("POST", &servers, Failure::Status(500), false),
-        ("PATCH", &user_data, Failure::Status(500), true),
-        ("PATCH", &user_data, Failure::Timeout, true),
-        ("POST", &action, Failure::Status(502), true),
-        ("POST", &action, Failure::Timeout, true),
         ("GET", &groups, Failure::Status(504), true),
         ("GET", &images, Failure::Timeout, true),
     ] {
@@ -1634,6 +1628,107 @@ async fn start_failures_are_retryable_where_a_repeat_may_pass() {
     backend.instance.set_out_of_stock("DEV1-L");
     let error = provider.start(request(&config, "ci")).await.unwrap_err();
     assert!(!error.is_retryable(), "out of stock everywhere: {error}");
+}
+
+/// The dispatcher's retry: the whole start once more after a retryable error.
+async fn start_with_retry(provider: &Scaleway, config: &Config) -> ciburst_core::Result<String> {
+    match provider.start(request(config, "ci")).await {
+        Err(error) if error.is_retryable() => provider.start(request(config, "ci")).await,
+        result => result,
+    }
+}
+
+/// M7 hardening rule R4 once the server exists: a repeat of the whole start would create a
+/// second server, so the start repeats user data and power on itself, once after 300 ms, and
+/// reads the server first in case a power on whose answer got lost started it. What still
+/// fails removes the server and ends the start for good.
+#[tokio::test(start_paused = true)]
+async fn calls_on_a_created_server_are_repeated_within_the_start() {
+    let config = plain();
+    let (backend, provider, project_id) = provisioned(config.clone(), Log::silent()).await;
+    let resolved = provider
+        .resolve_vm_start(&project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let dispatcher = function_provider(
+        config.clone(),
+        &backend,
+        &project_id,
+        resolved,
+        Log::silent(),
+    );
+    let user_data = format!("{ZONE}/servers/*/user_data/cloud-init");
+    let action = format!("{ZONE}/servers/*/action");
+    let creates = || {
+        backend
+            .instance
+            .calls()
+            .iter()
+            .filter(|c| c.method == "POST" && c.path == format!("{ZONE}/servers"))
+            .count()
+    };
+    for (method, path, failure, repeated) in [
+        ("PATCH", &user_data, Failure::Status(503), "PATCH user_data"),
+        ("PATCH", &user_data, Failure::Status(500), "PATCH user_data"),
+        ("PATCH", &user_data, Failure::Timeout, "PATCH user_data"),
+        ("POST", &action, Failure::Status(503), "GET POST action"),
+        ("POST", &action, Failure::Status(502), "GET POST action"),
+        ("POST", &action, Failure::Timeout, "GET"),
+    ] {
+        let (before, created) = (backend.instance.calls().len(), creates());
+        backend.instance.fail_next(method, path, failure);
+        let started = tokio::time::Instant::now();
+        let id = start_with_retry(&dispatcher, &config).await.unwrap();
+        let case = format!("{method} {path} {failure:?}");
+        assert_eq!(creates() - created, 1, "{case}: one create");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(300),
+            "{case}"
+        );
+        let server = format!("{ZONE}/servers/{id}");
+        let tail = match repeated {
+            "PATCH user_data" => vec![
+                format!("PATCH {server}/user_data/cloud-init"),
+                format!("PATCH {server}/user_data/cloud-init"),
+                format!("POST {server}/action"),
+            ],
+            "GET POST action" => vec![
+                format!("PATCH {server}/user_data/cloud-init"),
+                format!("POST {server}/action"),
+                format!("GET {server}"),
+                format!("POST {server}/action"),
+            ],
+            _ => vec![
+                format!("PATCH {server}/user_data/cloud-init"),
+                format!("POST {server}/action"),
+                format!("GET {server}"),
+            ],
+        };
+        let calls = since(backend.instance.calls(), before);
+        assert_eq!(calls[1..], tail, "{case}");
+        let state = backend.instance.server(&id).unwrap()["state"].clone();
+        assert!(
+            matches!(state.as_str(), Some("starting" | "running")),
+            "{case}: {state}"
+        );
+        provider.stop(&id).await.unwrap();
+    }
+
+    for (method, path, failure) in [
+        ("PATCH", &user_data, Failure::Status(503)),
+        ("POST", &action, Failure::Status(503)),
+        ("POST", &action, Failure::Status(500)),
+    ] {
+        let created = creates();
+        backend.instance.fail_next(method, path, failure);
+        backend.instance.fail_next(method, path, failure);
+        let error = start_with_retry(&dispatcher, &config).await.unwrap_err();
+        let case = format!("{method} {path} twice {failure:?}: {error}");
+        assert!(!error.is_retryable(), "{case}");
+        assert_eq!(creates() - created, 1, "{case}: one create");
+        assert!(backend.instance.servers().is_empty(), "{case}: removed");
+    }
 }
 
 /// A create whose answer never came may have made the server, so repeating it could make a

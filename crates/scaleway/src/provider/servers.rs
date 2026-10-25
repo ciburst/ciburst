@@ -3,6 +3,7 @@
 //! capacity, claim, report, stop and sweep of servers.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use ciburst_core::config::Pool;
 use ciburst_core::provision::keys;
@@ -19,10 +20,32 @@ use super::{PROVIDER_NAME, Runtime, Scaleway, USER_DATA_KEY, cloud_init, iam, in
 
 pub(super) const SECURITY_GROUP_STEP: &str = "vm:security-group";
 
+/// M7 hardening rule R4: the pause before a call on a created server is repeated.
+const RETRY_PAUSE: Duration = Duration::from_millis(300);
+
 /// What a start attempt on one commercial type came to.
 enum Attempt {
     Started,
     Unavailable(ApiError),
+}
+
+/// Powers the server on: `None` once it starts, else Scaleway's refusal. A failure that may
+/// pass on a repeat is the `Err`.
+async fn power_on(api: &InstanceApi<'_>, id: &str) -> Result<Option<ApiError>> {
+    match api.action(id, "poweron").await? {
+        Ok(()) => Ok(None),
+        Err(error) if error.retryable => Err(error.into()),
+        Err(error) => Ok(Some(error)),
+    }
+}
+
+/// M7 hardening rule R4: the dispatcher repeats a start that failed with a retryable error.
+/// Once a server was created, a repeat would create a second one, so the error ends the start.
+fn settled(error: Error) -> Error {
+    match error {
+        Error::Retryable(message) => Error::provider(message),
+        error => error,
+    }
 }
 
 impl Scaleway {
@@ -299,7 +322,7 @@ impl Scaleway {
                 }
                 Err(error) => {
                     self.discard(&api, &id).await;
-                    return Err(error);
+                    return Err(settled(error));
                 }
             }
         }
@@ -310,7 +333,10 @@ impl Scaleway {
     }
 
     /// User data, then power on. The VM gets its token, never the secret behind it, and the
-    /// URLs and SHA-256 of runner and agent.
+    /// URLs and SHA-256 of runner and agent. The server exists, so a retryable failure of
+    /// either call is repeated here once (M7 hardening rule R4): the dispatcher's retry would
+    /// repeat the whole start and create a second server. Before power on is repeated, the
+    /// server is read, as a power on whose answer got lost may have started it.
     async fn boot(
         &self,
         api: &InstanceApi<'_>,
@@ -327,11 +353,28 @@ impl Scaleway {
             ciburst_core::vm::token(secret, id),
         );
         let user_data = cloud_init::render(&env, runner, agent, install_docker)?;
-        api.set_user_data(id, USER_DATA_KEY, &user_data).await?;
-        match api.action(id, "poweron").await? {
-            Ok(()) => Ok(Attempt::Started),
-            Err(error) if error.is_capacity() => Ok(Attempt::Unavailable(error)),
-            Err(error) => Err(error.into()),
+        if let Err(error) = api.set_user_data(id, USER_DATA_KEY, &user_data).await {
+            if !error.is_retryable() {
+                return Err(error);
+            }
+            tokio::time::sleep(RETRY_PAUSE).await;
+            api.set_user_data(id, USER_DATA_KEY, &user_data).await?;
+        }
+        let refused = match power_on(api, id).await {
+            Err(error) if error.is_retryable() => {
+                tokio::time::sleep(RETRY_PAUSE).await;
+                let server = api.get_server(id).await?.unwrap_or_default();
+                if matches!(server["state"].as_str(), Some("starting" | "running")) {
+                    return Ok(Attempt::Started);
+                }
+                power_on(api, id).await?
+            }
+            result => result?,
+        };
+        match refused {
+            None => Ok(Attempt::Started),
+            Some(error) if error.is_capacity() => Ok(Attempt::Unavailable(error)),
+            Some(error) => Err(error.into()),
         }
     }
 
