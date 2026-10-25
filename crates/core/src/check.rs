@@ -49,8 +49,27 @@ pub struct Suggestion {
     pub tagged: Vec<String>,
 }
 
+/// The tags of `job` that name a pool.
+fn pool_tags<'a>(config: &Config, job: &'a LintJob) -> Vec<&'a str> {
+    job.tag_list
+        .iter()
+        .map(String::as_str)
+        .filter(|tag| config.pool_by_tag(tag).is_some())
+        .collect()
+}
+
+/// M6.1 rule R8: a job tagged only for other runners whose pending events still reach a pool,
+/// because `ignoreJobs` misses it.
+fn runs_elsewhere_unignored(config: &Config, job: &LintJob) -> bool {
+    let stage = job.stage.as_deref().unwrap_or(DEFAULT_STAGE);
+    !job.tag_list.is_empty()
+        && pool_tags(config, job).is_empty()
+        && config.pool_for(&job.name, Some(stage)).is_some()
+}
+
 /// Compares the jobs of a linted pipeline with the routing of the config (D46): each job's
-/// tags, and for a job routed to a lane what keeps it from running there.
+/// tags, for a job routed to a lane what keeps it from running there, and `ignoreJobs` against
+/// the jobs of other runners (M6.1 rule R8).
 pub fn check_jobs(config: &Config, jobs: &[LintJob], pipeline: &Pipeline) -> Vec<Problem> {
     let mut problems = Vec::new();
     for job in jobs.iter().filter(|job| !is_own_job(&job.name)) {
@@ -62,14 +81,20 @@ pub fn check_jobs(config: &Config, jobs: &[LintJob], pipeline: &Pipeline) -> Vec
         } else {
             format!("stage {stage}")
         };
-        let chosen: Vec<&str> = job
-            .tag_list
-            .iter()
-            .map(String::as_str)
-            .filter(|tag| config.pool_by_tag(tag).is_some())
-            .collect();
+        let chosen = pool_tags(config, job);
         let mut found = Vec::new();
-        if chosen.len() > 1 {
+        if config.ignores(&job.name) {
+            if let Some(tag) = chosen.first() {
+                found.push(format!(
+                    "is in ignoreJobs but tagged for pool {tag}: no runner starts for it"
+                ));
+            }
+        } else if runs_elsewhere_unignored(config, job) {
+            found.push(format!(
+                "runs on other runners (tags {}) but ignoreJobs misses it: its pending events start VMs",
+                job.tag_list.join(", ")
+            ));
+        } else if chosen.len() > 1 {
             found.push(format!("tagged for several pools: {}", chosen.join(", ")));
         } else if chosen.len() == 1 && Some(chosen[0]) != expected {
             found.push(match expected {
@@ -89,7 +114,8 @@ pub fn check_jobs(config: &Config, jobs: &[LintJob], pipeline: &Pipeline) -> Vec
                 "untagged: add tags [{pool}] or a hosted runner tag"
             ));
         }
-        if let Some(lane) = pool.filter(|pool| config.is_lane(pool))
+        let here = job.tag_list.is_empty() || !chosen.is_empty();
+        if let Some(lane) = pool.filter(|pool| here && config.is_lane(pool))
             && let Some(spec) = pipeline.job(&job.name)
         {
             found.extend(lane_problems(lane, spec, pipeline));
@@ -223,6 +249,18 @@ pub fn suggest_lanes(config: &Config, jobs: &[LintJob], pipeline: &Pipeline) -> 
         });
     }
     suggestions
+}
+
+/// M6.1 rule R8: the names for `ignoreJobs` of the jobs tagged only for other runners that
+/// `ignoreJobs` misses, in the order the jobs come.
+pub fn suggest_ignore_jobs(config: &Config, jobs: &[LintJob]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for job in jobs.iter().filter(|job| !is_own_job(&job.name)) {
+        if runs_elsewhere_unignored(config, job) && !names.contains(&job.name) {
+            names.push(job.name.clone());
+        }
+    }
+    names
 }
 
 /// The last path segment of an image reference without registry, path and digest, and its
@@ -363,19 +401,96 @@ mod tests {
     }
 
     #[test]
-    fn accepts_matching_and_foreign_tags() {
-        let problems = check_jobs(
-            &config(),
-            &[
-                job("unit", Some("test"), &["ci"]),
-                job("image", Some("build"), &["build"]),
-                job("deploy", Some("deploy"), &["ci"]),
-                job("hosted", Some("test"), &["saas-linux-small-amd64"]),
-                job("implicit", None, &["ci"]),
-            ],
-            &Pipeline::default(),
-        );
+    fn accepts_matching_tags_and_ignored_foreign_ones() {
+        let mut config = config();
+        config.ignore_jobs = vec!["hosted-*".into()];
+        let jobs = [
+            job("unit", Some("test"), &["ci"]),
+            job("image", Some("build"), &["build"]),
+            job("deploy", Some("deploy"), &["ci"]),
+            job("hosted-a", Some("test"), &["saas-linux-small-amd64"]),
+            job("hosted-b", Some("test"), &[]),
+            job("implicit", None, &["ci"]),
+        ];
+        let problems = check_jobs(&config, &jobs, &Pipeline::default());
         assert!(problems.is_empty(), "{problems:?}");
+        assert!(suggest_ignore_jobs(&config, &jobs).is_empty());
+    }
+
+    #[test]
+    fn ignore_jobs_must_cover_the_jobs_of_other_runners_and_only_them() {
+        let mut config = config();
+        config.ignore_jobs = vec!["pages".into(), "release*".into()];
+        let jobs = [
+            job("hosted", Some("test"), &["saas-linux-small-amd64"]),
+            job("macos", Some("build"), &["saas-macos-medium-m1", "macos"]),
+            job("hosted", Some("test"), &["saas-linux-small-amd64"]),
+            job("pages", Some("deploy"), &["saas-linux-small-amd64"]),
+            job("release-notes", Some("deploy"), &["ci"]),
+            job("release-tag", Some("deploy"), &["build", "ci"]),
+            job("release-plain", Some("deploy"), &[]),
+            job("ciburst-setup", Some(".pre"), &["saas-linux-small-amd64"]),
+        ];
+        let problems = check_jobs(&config, &jobs, &Pipeline::default());
+        assert_eq!(
+            summary(&problems),
+            vec![
+                (
+                    "hosted",
+                    "ci",
+                    "runs on other runners (tags saas-linux-small-amd64) but ignoreJobs misses it: its pending events start VMs"
+                ),
+                (
+                    "macos",
+                    "build",
+                    "runs on other runners (tags saas-macos-medium-m1, macos) but ignoreJobs misses it: its pending events start VMs"
+                ),
+                (
+                    "hosted",
+                    "ci",
+                    "runs on other runners (tags saas-linux-small-amd64) but ignoreJobs misses it: its pending events start VMs"
+                ),
+                (
+                    "release-notes",
+                    "",
+                    "is in ignoreJobs but tagged for pool ci: no runner starts for it"
+                ),
+                (
+                    "release-tag",
+                    "",
+                    "is in ignoreJobs but tagged for pool build: no runner starts for it"
+                ),
+            ]
+        );
+        assert_eq!(suggest_ignore_jobs(&config, &jobs), ["hosted", "macos"]);
+
+        config.default_pool = None;
+        let unmapped = [job("hosted", Some("deploy"), &["saas-linux-small-amd64"])];
+        assert!(
+            check_jobs(&config, &unmapped, &Pipeline::default()).is_empty(),
+            "a job no pool takes starts nothing"
+        );
+        assert!(suggest_ignore_jobs(&config, &unmapped).is_empty());
+    }
+
+    #[test]
+    fn a_job_of_other_runners_gets_no_lane_problems() {
+        let pipeline = pipeline(json!({
+            "lint": { "image": "docker:27", "script": ["docker build ."] }
+        }));
+        let problems = check_jobs(
+            &lane_config(),
+            &[job("lint", Some("test"), &["saas-linux-small-amd64"])],
+            &pipeline,
+        );
+        assert_eq!(
+            summary(&problems),
+            vec![(
+                "lint",
+                "node-24",
+                "runs on other runners (tags saas-linux-small-amd64) but ignoreJobs misses it: its pending events start VMs"
+            )]
+        );
     }
 
     #[test]

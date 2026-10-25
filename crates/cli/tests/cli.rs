@@ -472,8 +472,25 @@ unit-smoke:
             "\n",
             "  job e2e: tags: [node-24]\n",
             "  job unit: tags: [node-24]\n",
+            "project 1: jobs on other runners\n",
+            "  \"ignoreJobs\": [\"unit-smoke\"]\n",
         )
     );
+    let (code, out) = run(env(Some(fake.clone())), &args[..5]).await;
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(
+        out,
+        "project 1: job unit-smoke (stage test): runs on other runners (tags saas-linux-small-amd64) but ignoreJobs misses it: its pending events start VMs\n"
+    );
+
+    let ignoring = SCALEWAY_CONFIG.replacen('{', r#"{ "ignoreJobs": ["unit-smoke"],"#, 1);
+    std::fs::write(&config, ignoring).unwrap();
+    let (code, out) = run(env(Some(fake.clone())), &args[..5]).await;
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out, "project 1: every job matches the stage map\n");
+    let (code, out) = run(env(Some(fake.clone())), &args).await;
+    assert_eq!(code, 0, "{out}");
+    assert!(!out.contains("ignoreJobs"), "{out}");
 }
 
 /// A delivery as GitLab's hook events list shows it.

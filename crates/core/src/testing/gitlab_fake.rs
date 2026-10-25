@@ -49,6 +49,7 @@ struct HookRecord {
     token: String,
     job_events: bool,
     push_events: bool,
+    pipeline_events: bool,
     alert_status: String,
     disabled_until: Option<String>,
     /// Deliveries, oldest first.
@@ -63,6 +64,7 @@ impl HookRecord {
             "project_id": self.project_id,
             "job_events": self.job_events,
             "push_events": self.push_events,
+            "pipeline_events": self.pipeline_events,
             "enable_ssl_verification": true,
             "alert_status": self.alert_status,
             "disabled_until": self.disabled_until,
@@ -167,6 +169,80 @@ impl FakeJob {
     }
 }
 
+/// Headers and body of a request GitLab sends to a hook.
+pub type HookRequest = (Vec<(String, String)>, Vec<u8>);
+
+/// A job as a pipeline event lists it under `builds`; GitLab sends no tags there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FakeBuild {
+    pub id: u64,
+    pub name: String,
+    pub stage: String,
+    pub status: String,
+    /// `on_success`, `on_failure`, `always`, `manual` or `delayed`.
+    pub when: String,
+    pub manual: bool,
+    pub allow_failure: bool,
+}
+
+impl FakeBuild {
+    /// A job of `when: on_success` in status `created`, as every job of a new pipeline.
+    pub fn created(id: u64, name: &str, stage: &str) -> FakeBuild {
+        FakeBuild {
+            id,
+            name: name.to_string(),
+            stage: stage.to_string(),
+            status: "created".to_string(),
+            when: "on_success".to_string(),
+            manual: false,
+            allow_failure: false,
+        }
+    }
+
+    /// A manual job, which GitLab lists in status `manual`.
+    pub fn manual(id: u64, name: &str, stage: &str) -> FakeBuild {
+        FakeBuild {
+            status: "manual".to_string(),
+            when: "manual".to_string(),
+            manual: true,
+            allow_failure: true,
+            ..FakeBuild::created(id, name, stage)
+        }
+    }
+
+    pub fn with_status(mut self, status: &str) -> FakeBuild {
+        self.status = status.to_string();
+        self
+    }
+
+    pub fn with_when(mut self, when: &str) -> FakeBuild {
+        self.when = when.to_string();
+        self
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "stage": self.stage,
+            "name": self.name,
+            "status": self.status,
+            "created_at": "2026-10-25 12:00:00 UTC",
+            "started_at": null,
+            "finished_at": null,
+            "duration": null,
+            "queued_duration": null,
+            "failure_reason": null,
+            "when": self.when,
+            "manual": self.manual,
+            "allow_failure": self.allow_failure,
+            "user": { "id": 1, "name": "Demo User", "username": "demo" },
+            "runner": null,
+            "artifacts_file": { "filename": null, "size": null },
+            "environment": null,
+        })
+    }
+}
+
 #[derive(Debug, Default)]
 struct Inner {
     runners: Vec<RunnerRecord>,
@@ -241,14 +317,81 @@ impl FakeGitlab {
             .map(|h| h.token.clone())
     }
 
-    pub fn hook_flags(&self, hook_id: u64) -> Option<(bool, bool)> {
+    /// `job_events`, `push_events` and `pipeline_events` of a hook.
+    pub fn hook_flags(&self, hook_id: u64) -> Option<(bool, bool, bool)> {
         self.inner
             .lock()
             .expect("fake gitlab")
             .hooks
             .iter()
             .find(|h| h.id == hook_id)
-            .map(|h| (h.job_events, h.push_events))
+            .map(|h| (h.job_events, h.push_events, h.pipeline_events))
+    }
+
+    /// Turns the hook's pipeline events off, as on a hook created before M6.1.
+    pub fn clear_pipeline_events(&self, hook_id: u64) {
+        let mut inner = self.inner.lock().expect("fake gitlab");
+        let hook = inner
+            .hooks
+            .iter_mut()
+            .find(|h| h.id == hook_id)
+            .expect("hook to change");
+        hook.pipeline_events = false;
+    }
+
+    /// The request GitLab sends hook `hook_id` when pipeline `pipeline_id` of the hook's
+    /// project reaches `status`: the hook's token, `X-Gitlab-Event: Pipeline Hook` and the body
+    /// with `builds`. `None` for an unknown hook or one without pipeline events.
+    pub fn pipeline_hook(
+        &self,
+        hook_id: u64,
+        pipeline_id: u64,
+        status: &str,
+        builds: &[FakeBuild],
+    ) -> Option<HookRequest> {
+        let inner = self.inner.lock().expect("fake gitlab");
+        let hook = inner
+            .hooks
+            .iter()
+            .find(|h| h.id == hook_id && h.pipeline_events)?;
+        let mut stages: Vec<&str> = Vec::new();
+        for build in builds {
+            if !stages.contains(&build.stage.as_str()) {
+                stages.push(&build.stage);
+            }
+        }
+        let body = json!({
+            "object_kind": "pipeline",
+            "object_attributes": {
+                "id": pipeline_id,
+                "iid": pipeline_id % 1000,
+                "ref": "main",
+                "tag": false,
+                "source": "push",
+                "status": status,
+                "detailed_status": status,
+                "stages": stages,
+                "created_at": "2026-10-25 12:00:00 UTC",
+                "finished_at": null,
+                "duration": null,
+                "queued_duration": null,
+                "variables": [],
+            },
+            "merge_request": null,
+            "project": {
+                "id": hook.project_id,
+                "name": "demo",
+                "path_with_namespace": "group/demo",
+                "default_branch": "main",
+            },
+            "builds": builds.iter().map(FakeBuild::to_json).collect::<Vec<_>>(),
+        });
+        let headers = vec![
+            ("Content-Type".to_string(), "application/json".to_string()),
+            ("X-Gitlab-Event".to_string(), "Pipeline Hook".to_string()),
+            ("X-Gitlab-Token".to_string(), hook.token.clone()),
+        ];
+        Some((headers, body.to_string().into_bytes()))
     }
 
     pub fn set_jobs(&self, project_id: u64, jobs: Vec<LintJob>) {
@@ -736,6 +879,7 @@ impl FakeGitlab {
                     token: body["token"].as_str().unwrap_or("").to_string(),
                     job_events: body["job_events"].as_bool().unwrap_or(false),
                     push_events: body["push_events"].as_bool().unwrap_or(true),
+                    pipeline_events: body["pipeline_events"].as_bool().unwrap_or(false),
                     alert_status: "executable".to_string(),
                     disabled_until: None,
                     events: Vec::new(),
@@ -764,6 +908,7 @@ impl FakeGitlab {
                         hook.token = body["token"].as_str().unwrap_or("").to_string();
                         hook.job_events = body["job_events"].as_bool().unwrap_or(false);
                         hook.push_events = body["push_events"].as_bool().unwrap_or(true);
+                        hook.pipeline_events = body["pipeline_events"].as_bool().unwrap_or(false);
                         json(200, hook.to_json())
                     }
                 }

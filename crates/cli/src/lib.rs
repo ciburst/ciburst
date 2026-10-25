@@ -99,7 +99,7 @@ enum Command {
         #[arg(long = "ref")]
         content_ref: Option<String>,
         /// Print lanes for the Docker-free jobs that run on a VM pool, with the tags each job
-        /// needs
+        /// needs, and ignoreJobs for the jobs of other runners
         #[arg(long)]
         suggest: bool,
     },
@@ -734,8 +734,9 @@ fn write_check(out: &mut dyn Write, report: &[ProjectReport]) -> Result<i32> {
     Ok(if failed { 1 } else { 0 })
 }
 
-/// `check --suggest` (D46): per image a pool entry for `ciburst.json` and the tags of its jobs.
-/// Exits 0 unless a pipeline is invalid.
+/// `check --suggest` (D46): per image a pool entry for `ciburst.json` and the tags of its jobs,
+/// then the `ignoreJobs` key for the jobs of other runners (M6.1 rule R8). Exits 0 unless a
+/// pipeline is invalid.
 fn write_suggestions(out: &mut dyn Write, report: &[ProjectReport]) -> Result<i32> {
     let mut failed = false;
     for project in report {
@@ -751,7 +752,6 @@ fn write_suggestions(out: &mut dyn Write, report: &[ProjectReport]) -> Result<i3
         }
         if project.suggestions.is_empty() {
             writeln!(out, "project {id}: no Docker-free job runs on a VM pool")?;
-            continue;
         }
         for lane in &project.suggestions {
             writeln!(out, "project {id}: lane {} for {}", lane.tag, lane.image)?;
@@ -760,8 +760,21 @@ fn write_suggestions(out: &mut dyn Write, report: &[ProjectReport]) -> Result<i3
                 writeln!(out, "  job {job}: tags: [{}]", lane.tag)?;
             }
         }
+        if !project.ignore.is_empty() {
+            writeln!(out, "project {id}: jobs on other runners")?;
+            writeln!(out, "  {}", ignore_entry(&project.ignore))?;
+        }
     }
     Ok(if failed { 1 } else { 0 })
+}
+
+/// M6.1 rule R8: the `ignoreJobs` key of `ciburst.json` for jobs of other runners.
+fn ignore_entry(names: &[String]) -> String {
+    let names: Vec<String> = names
+        .iter()
+        .map(|name| Value::from(name.as_str()).to_string())
+        .collect();
+    format!(r#""ignoreJobs": [{}]"#, names.join(", "))
 }
 
 /// A suggested lane as one line of the `pools` array of `ciburst.json`.

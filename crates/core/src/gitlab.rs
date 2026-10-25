@@ -48,6 +48,9 @@ pub struct Hook {
     /// RFC 3339 end of a temporary disable.
     #[serde(default)]
     pub disabled_until: Option<String>,
+    /// Pipeline events reach the dispatcher (M6.1 rule R2).
+    #[serde(default)]
+    pub pipeline_events: bool,
 }
 
 fn executable() -> String {
@@ -99,6 +102,8 @@ pub struct Delivery {
     pub subject: String,
     pub status: String,
     pub result: String,
+    /// The answer's `pool`; for the warm step every pool and its action, `vm:started` (M6.1
+    /// rule R4).
     pub pool: String,
     pub ms: String,
 }
@@ -132,12 +137,23 @@ impl HookEvent {
             None => "?".to_string(),
             Some(answer) => text_of(answer.get(key)).unwrap_or_else(|| "-".into()),
         };
+        let pool = match answer.as_ref().and_then(|a| a.get("pools")) {
+            Some(Value::Array(pools)) if !pools.is_empty() => pools
+                .iter()
+                .map(|pool| {
+                    let text = |key: &str| text_of(pool.get(key)).unwrap_or_else(|| "?".into());
+                    format!("{}:{}", text("pool"), text("action"))
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+            _ => field("pool"),
+        };
         Delivery {
             time,
             subject,
             status,
             result: field("result"),
-            pool: field("pool"),
+            pool,
             ms: field("ms"),
         }
     }
@@ -597,6 +613,7 @@ fn hook_body(url: &str, token: &str) -> Value {
         "url": url,
         "token": token,
         "job_events": true,
+        "pipeline_events": true,
         "push_events": false,
         "enable_ssl_verification": true,
     })
@@ -974,16 +991,30 @@ mod tests {
             .create_hook(7, "https://d.example/", "t1")
             .await
             .unwrap();
-        assert_eq!(
-            gitlab.list_hooks(7).await.unwrap()[0].url,
-            "https://d.example/"
-        );
+        let listed = gitlab.list_hooks(7).await.unwrap().remove(0);
+        assert_eq!(listed.url, "https://d.example/");
+        assert!(hook.pipeline_events && listed.pipeline_events);
         assert_eq!(fake.hook_token(hook.id), Some("t1".into()));
+        assert_eq!(fake.hook_flags(hook.id), Some((true, false, true)));
+        fake.clear_pipeline_events(hook.id);
+        assert!(!gitlab.list_hooks(7).await.unwrap()[0].pipeline_events);
         gitlab
             .update_hook(7, hook.id, "https://d.example/", "t2")
             .await
             .unwrap();
         assert_eq!(fake.hook_token(hook.id), Some("t2".into()));
+        assert_eq!(fake.hook_flags(hook.id), Some((true, false, true)));
+        let put = fake.calls().pop().unwrap();
+        assert_eq!(
+            put.body.unwrap(),
+            json!({
+                "url": "https://d.example/", "token": "t2", "job_events": true,
+                "pipeline_events": true, "push_events": false, "enable_ssl_verification": true
+            })
+        );
+        let old: Hook =
+            serde_json::from_value(json!({ "id": 1, "url": "https://d.example/" })).unwrap();
+        assert!(!old.pipeline_events);
         gitlab.delete_hook(7, hook.id).await.unwrap();
         assert!(gitlab.list_hooks(7).await.unwrap().is_empty());
     }
@@ -1084,6 +1115,37 @@ mod tests {
             "response_status": status,
             "created_at": format!("2026-10-25T12:00:{:02}.123Z", id % 60),
         })
+    }
+
+    #[test]
+    fn a_warm_delivery_shows_each_pool_and_its_action() {
+        let pipeline = json!({ "object_kind": "pipeline", "object_attributes": { "id": 31 } });
+        let warm = json!({
+            "result": "warm", "pipeline": 31, "ms": 2410,
+            "pools": [
+                { "pool": "vm", "action": "started", "runId": "r", "vmJobs": 3 },
+                { "pool": "big", "action": "capacity", "vmJobs": 1 },
+                { "action": "disabled" }
+            ]
+        });
+        let line = |response: Value| {
+            let event: HookEvent =
+                serde_json::from_value(event(1, pipeline.clone(), json!("200"), response)).unwrap();
+            let d = event.delivery();
+            format!("{} {} {} {}", d.subject, d.result, d.pool, d.ms)
+        };
+        assert_eq!(
+            line(Value::String(warm.to_string())),
+            "pipeline 31 warm vm:started,big:capacity,?:disabled 2410"
+        );
+        assert_eq!(
+            line(json!({ "result": "closed", "pipeline": 31, "pools": [], "ms": 4 })),
+            "pipeline 31 closed - 4"
+        );
+        assert_eq!(
+            line(json!({ "result": "duplicate", "pipeline": 31, "ms": 90 })),
+            "pipeline 31 duplicate - 90"
+        );
     }
 
     #[tokio::test]
