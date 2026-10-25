@@ -230,8 +230,8 @@ pub trait Provider: Send + Sync {
         Ok(())
     }
 
-    /// Environment a run of another provider needs from this one (M4 R11): the agent image and
-    /// the cache location. Secrets travel in the start request instead.
+    /// Environment a run of another provider needs from this one (D38): the agent's URL and
+    /// SHA-256 and the cache location. Secrets travel in the start request instead.
     async fn shared_env(&self) -> Result<BTreeMap<String, String>> {
         Ok(BTreeMap::new())
     }

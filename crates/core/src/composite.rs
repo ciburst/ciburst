@@ -369,8 +369,8 @@ mod tests {
         let mut main = Member::new("main", "", &calls);
         main.shared = BTreeMap::from([
             (
-                "CIBURST_AGENT_IMAGE".to_string(),
-                "registry.example/vm-agent:edge".to_string(),
+                "CIBURST_AGENT_URL".to_string(),
+                "https://bucket.example/ciburst/agent/0a1b".to_string(),
             ),
             ("CACHE_TYPE".to_string(), "s3".to_string()),
         ]);
@@ -438,8 +438,8 @@ mod tests {
                 ("RUNNER_TOKEN".to_string(), "glrt-x".to_string()),
                 ("CACHE_TYPE".to_string(), "mine".to_string()),
                 (
-                    "CIBURST_AGENT_IMAGE".to_string(),
-                    "registry.example/vm-agent:edge".to_string()
+                    "CIBURST_AGENT_URL".to_string(),
+                    "https://bucket.example/ciburst/agent/0a1b".to_string()
                 ),
             ]),
             "keys already present win"

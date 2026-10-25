@@ -20,8 +20,6 @@ private = { ignore = true }
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
-# Path dev-dependencies (the `testing` features of the workspace crates) carry no version.
-allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

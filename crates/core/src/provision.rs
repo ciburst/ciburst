@@ -13,6 +13,7 @@ use crate::gitlab::{Gitlab, Job};
 use crate::http::{HttpClient, Request};
 use crate::log::Log;
 use crate::plan::OutputsStore;
+use crate::time::parse_rfc3339;
 use crate::types::{Action, Host, KeyPair, Outputs, Provider, Rotation, Run, Secrets, Step};
 use crate::{Error, Result};
 
@@ -768,65 +769,6 @@ fn now_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// Unix seconds of an RFC 3339 timestamp such as `2026-10-25T12:00:00.123Z`.
-fn parse_rfc3339(text: &str) -> Option<u64> {
-    let bytes = text.as_bytes();
-    if bytes.len() < 20 {
-        return None;
-    }
-    let number = |range: std::ops::Range<usize>| -> Option<i64> {
-        let part = text.get(range)?;
-        part.bytes()
-            .all(|b| b.is_ascii_digit())
-            .then(|| part.parse().ok())?
-    };
-    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
-    let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
-    if bytes[4] != b'-'
-        || bytes[7] != b'-'
-        || !matches!(bytes[10], b'T' | b't' | b' ')
-        || bytes[13] != b':'
-        || bytes[16] != b':'
-        || !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
-        return None;
-    }
-    let mut rest = &text[19..];
-    if let Some(fraction) = rest.strip_prefix('.') {
-        let digits = fraction.bytes().take_while(u8::is_ascii_digit).count();
-        if digits == 0 {
-            return None;
-        }
-        rest = &fraction[digits..];
-    }
-    let offset = match rest {
-        "Z" | "z" => 0,
-        _ => {
-            let sign = match rest.as_bytes().first()? {
-                b'+' => 1,
-                b'-' => -1,
-                _ => return None,
-            };
-            if rest.len() != 6 || rest.as_bytes()[3] != b':' {
-                return None;
-            }
-            let hours: i64 = rest.get(1..3)?.parse().ok()?;
-            let minutes: i64 = rest.get(4..6)?.parse().ok()?;
-            sign * (hours * 3600 + minutes * 60)
-        }
-    };
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
-    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
-    u64::try_from(days * 86_400 + hour * 3600 + minute * 60 + second - offset).ok()
 }
 
 #[cfg(test)]
