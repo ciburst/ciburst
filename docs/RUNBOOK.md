@@ -229,6 +229,7 @@ A lane with `vmFirst` (the default when the config has a VM pool) borrows the sl
 - Without a free slot the dispatcher starts a lane run below the lane's `maxRuns` (`started`), else answers `at_capacity`. A lane job never starts a VM and never joins the burst ledger.
 - A lane run whose job a VM slot took first idles `waitTimeoutS` and exits; those seconds are billed.
 - A lane job whose claimed slot another job took first waits for the next free VM slot or a lane run that still polls.
+- A failed claim or capacity read logs `warn claim_failed` with `lane` and starts a lane run instead.
 
 ### Lane bootstrap
 
