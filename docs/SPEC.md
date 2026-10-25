@@ -1,6 +1,6 @@
 # Spec: ciburst, GitLab runners that exist only while jobs run
 
-Status: M5 roundup done 2026-10-25 (adoption drill in `docs/RUNBOOK.md`); the Hetzner drill waits for the owner's token; M6 go public next.
+Status: M5 roundup done 2026-10-25 (adoption drill in `docs/RUNBOOK.md`); M6 serverless lanes (D45 to D47, `docs/milestones/M6-serverless-lanes.md`) in progress; M7 go public next; the Hetzner drill waits for the owner's token.
 
 ## 0. Decision log
 
@@ -50,6 +50,9 @@ Status: M5 roundup done 2026-10-25 (adoption drill in `docs/RUNBOOK.md`); the He
 | D42 | 2026-10-25 | `apply` changes nothing when a pool could not start a run (no Instance quota for its types in the zone, no agent): `Provider::preflight`. `plan` only warns. |
 | D43 | 2026-10-25 | One region per deployment: the dispatcher, the cache bucket, the agent object and the VMs live in `provider.region`, and a `provider.zone` outside it is refused. The drill consumer's first pipelines ran VMs in `nl-ams-1` against a cache bucket in `fr-par`: in a warm Rust test job, moving the caches took 555 s and the script 277 s. Scaleway offers `rust196` in every region. |
 | D44 | 2026-10-25 | VM slots archive caches with `FF_USE_FASTZIP=true` and `CACHE_COMPRESSION_LEVEL=fastest` (run-single `--env`): the bucket is in the VM's region, so bytes are cheap and compressing was the slow part. |
+| D45 | 2026-10-25 | Serverless lanes run the job's own image (owner: "implement the new strategy"). A pool with runtime `jobs` takes any public `linux/amd64` image with `sh`; its run executes `lane-bootstrap.sh`, which installs missing `git`, `curl` and CA certificates (`apk`; `apt-get` as root in its own directories, because the sandbox drops root's capabilities; RPM-based images must ship them), fetches the pinned gitlab-runner from the deployment's bucket (public object `ciburst/runner/<sha256>`, hash-checked) and runs `run-single` with the shell executor. ciburst's pool images go. Measured in `nl-ams`: runs start in 5 to 28 s, a Rust compile at 2 vCPU matches GitLab's small runner and at 4 vCPU takes half its time, a TypeScript check is within 12 %; the bootstrap adds 0 to 21 s by image. |
+| D46 | 2026-10-25 | Pools route by job name too: `jobs` glob patterns, matched against the job name before `stages`, then `defaultPool`. `ciburst check` flags a lane job that needs a Docker daemon or names another image than its lane; `check --suggest` prints lanes for the Docker-free jobs. |
+| D47 | 2026-10-25 | Paid VM slots first: the VM pool's GitLab runner also carries the tag of every lane with `vmFirst` (default when a VM pool exists). A pending lane job claims a free VM slot when there is one and starts a lane run otherwise; a lane run that loses the race ends after its `waitTimeoutS`. |
 
 ## 1. Purpose and scope
 

@@ -71,6 +71,13 @@ pub struct Pool {
     pub image: String,
     #[serde(default)]
     pub stages: Vec<String>,
+    /// Job name patterns (`*`, `?`) routed to this pool before any stage (D46).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jobs: Vec<String>,
+    /// Lanes: a pending job claims a free slot of the VM pool before a lane run starts (D47);
+    /// `None` means yes when a VM pool exists.
+    #[serde(default, rename = "vmFirst", skip_serializing_if = "Option::is_none")]
+    pub vm_first: Option<bool>,
     #[serde(default = "d_vcpu")]
     pub vcpu: u32,
     #[serde(default = "d_memory", rename = "memoryMiB")]
@@ -176,6 +183,8 @@ impl Config {
                 tag: "vm".to_string(),
                 image: "ubuntu:24.04".to_string(),
                 stages: Vec::new(),
+                jobs: Vec::new(),
+                vm_first: None,
                 vcpu: DEFAULT_VCPU,
                 memory_mib: DEFAULT_MEMORY_MIB,
                 storage_mib: DEFAULT_STORAGE_MIB,

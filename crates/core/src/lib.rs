@@ -11,6 +11,7 @@ pub mod error;
 pub mod fake;
 pub mod gitlab;
 pub mod http;
+pub mod lane;
 pub mod ledger;
 pub mod log;
 pub mod plan;
