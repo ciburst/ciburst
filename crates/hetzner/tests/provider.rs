@@ -501,7 +501,7 @@ async fn pool_types_fall_back_on_placement_errors_and_free_follows_taken() {
     let server = fake.server(name_of(&run_id)).unwrap();
     assert_eq!(server["server_type"]["name"], "cx53");
     assert_eq!(labels(&server)["ciburst-free"], "2");
-    for (taken, free) in [(0, "2"), (2, "1"), (3, "0"), (5, "0")] {
+    for (taken, free) in [(0, "3"), (2, "1"), (3, "0"), (5, "0")] {
         start.taken = taken;
         let run_id = provider.start(start.clone()).await.unwrap();
         let server = fake.server(name_of(&run_id)).unwrap();

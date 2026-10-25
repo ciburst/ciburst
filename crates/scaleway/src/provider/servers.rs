@@ -154,7 +154,7 @@ impl Scaleway {
     pub(super) async fn start_vm(&self, request: StartRequest) -> Result<String> {
         let pool = &request.pool;
         let tag = &pool.tag;
-        let taken = request.taken.max(1);
+        let taken = request.taken;
         let secret = request
             .env
             .get(keys::VM_SECRET)

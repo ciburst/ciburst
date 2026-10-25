@@ -404,7 +404,7 @@ async fn a_server_starts_with_the_slots_the_dispatcher_already_took() {
         (2, 2, "ciburst-free:0"),
         (3, 3, "ciburst-free:0"),
         (2, 5, "ciburst-free:0"),
-        (2, 0, "ciburst-free:1"),
+        (2, 0, "ciburst-free:2"),
         (3, 1, "ciburst-free:2"),
     ] {
         let mut start = request(&config, "ci");

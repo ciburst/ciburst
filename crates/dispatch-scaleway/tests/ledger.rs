@@ -270,7 +270,6 @@ fn record_keys(backend: &ScalewayFake, vars: &BTreeMap<String, String>) -> Vec<S
 /// M6.1 rules R3 to R5 through the function: the warm step writes the record, a VM job's
 /// pending event its marker, the final status deletes both.
 #[tokio::test]
-#[ignore = "needs Dispatcher::with_records in respond (M6.1 agent A)"]
 async fn pipeline_events_keep_their_records_in_the_cache_bucket() {
     let (backend, vars) = deployed("instances").await;
     let env = env(&vars);
@@ -414,10 +413,11 @@ async fn vm_start_calls(backend: &Arc<ScalewayFake>, env: &Env) -> (Vec<String>,
     )
 }
 
-/// M7 hardening rule R3, measured on the fake: a pending job that starts a VM makes eight
+/// M7 hardening rule R3, measured on the fake: a pending job that starts a VM makes nine
 /// Scaleway calls through a function without `CIBURST_VM_SECURITY_GROUP` and
-/// `CIBURST_VM_IMAGES`, and six with the values the host resolves at apply: the capacity read,
-/// create, user data and power on, and the burst intent's write and read.
+/// `CIBURST_VM_IMAGES`, and seven with the values the host resolves at apply: the capacity read,
+/// create, user data and power on, the burst intent's write and read, and the read of its
+/// pipeline's warm start record (M6.1 rule R5).
 #[tokio::test]
 async fn the_function_starts_a_vm_without_lookups_on_the_resolved_variables() {
     let (backend, mut vars) = deployed("instances").await;
@@ -431,7 +431,7 @@ async fn the_function_starts_a_vm_without_lookups_on_the_resolved_variables() {
     assert_eq!(looked_up.len(), 6, "{looked_up:#?}");
     assert_eq!(looked_up[0], format!("{zone}/servers"), "capacity");
     assert_eq!(looked_up[1..3], lookups);
-    assert_eq!(total, 8);
+    assert_eq!(total, 9);
 
     let config = Arc::new(parse_config(&vars[vars::CONFIG]).unwrap());
     let provider = Scaleway::new(config, backend.client(), Log::silent());
@@ -448,5 +448,5 @@ async fn the_function_starts_a_vm_without_lookups_on_the_resolved_variables() {
         direct.iter().all(|call| !lookups.contains(call)),
         "{direct:#?}"
     );
-    assert_eq!(total, 6);
+    assert_eq!(total, 7);
 }

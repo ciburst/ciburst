@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ciburst_core::config::Config;
+use ciburst_core::dispatch::WARM_PREFIX as WARM;
 use ciburst_core::http::HttpClient;
 use ciburst_core::ledger::{Intent, Ledger};
 use ciburst_core::types::KeyPair;
@@ -84,10 +85,16 @@ pub fn is_id(id: &str) -> bool {
         && (id == "0" || !id.starts_with('0'))
 }
 
-/// The object key of an intent; the job id is an [`is_id`] number.
+/// The object key of an intent; the job id is an [`is_id`] number, or `warm:<pipeline id>` for a
+/// warm start (M6.1 rule R4), stored as `<at>-warm-<pipeline id, 20 digits>` so that it sorts
+/// after the jobs of the same second.
 pub fn intent_key(pool: &str, at: u64, job: &str) -> Result<String> {
     let prefix = pool_prefix(pool)?;
-    if !is_id(job) {
+    let (marker, id) = match job.strip_prefix(WARM) {
+        Some(pipeline) => ("warm-", pipeline),
+        None => ("", job),
+    };
+    if !is_id(id) {
         return Err(invalid(format!("job id {job:?} is not a number")));
     }
     if at.to_string().len() > AT_DIGITS {
@@ -95,21 +102,32 @@ pub fn intent_key(pool: &str, at: u64, job: &str) -> Result<String> {
             "time {at} has more than {AT_DIGITS} digits"
         )));
     }
-    Ok(format!("{prefix}{at:0AT_DIGITS$}-{job:0>JOB_DIGITS$}"))
+    Ok(format!(
+        "{prefix}{at:0AT_DIGITS$}-{marker}{id:0>JOB_DIGITS$}"
+    ))
 }
 
 /// The intent a key below `prefix` stands for; `None` for any other key.
 pub fn parse_intent(prefix: &str, key: &str) -> Option<Intent> {
     let (at, job) = key.strip_prefix(prefix)?.split_once('-')?;
+    let (warm, job) = match job.strip_prefix("warm-") {
+        Some(pipeline) => (true, pipeline),
+        None => (false, job),
+    };
     let digits =
         |text: &str, len: usize| text.len() == len && text.bytes().all(|b| b.is_ascii_digit());
     if !digits(at, AT_DIGITS) || !digits(job, JOB_DIGITS) {
         return None;
     }
     let job = job.trim_start_matches('0');
+    let job = if job.is_empty() { "0" } else { job };
     Some(Intent {
         at: at.parse().ok()?,
-        job: if job.is_empty() { "0" } else { job }.to_string(),
+        job: if warm {
+            format!("{WARM}{job}")
+        } else {
+            job.to_string()
+        },
     })
 }
 
@@ -212,5 +230,35 @@ mod tests {
         ] {
             assert_eq!(parse_intent(prefix, key), None, "{key}");
         }
+    }
+
+    #[test]
+    fn warm_intents_read_back_and_sort_after_the_jobs_of_their_second() {
+        let warm = intent_key("vm", 100, "warm:901").unwrap();
+        assert_eq!(
+            warm,
+            "ciburst/intents/vm/0000000100-warm-00000000000000000901"
+        );
+        let mut keys = [
+            warm,
+            intent_key("vm", 100, "18446744073709551615").unwrap(),
+            intent_key("vm", 101, "1").unwrap(),
+        ];
+        keys.sort();
+        let jobs: Vec<String> = keys
+            .iter()
+            .map(|k| parse_intent("ciburst/intents/vm/", k).unwrap().job)
+            .collect();
+        assert_eq!(jobs, ["18446744073709551615", "warm:901", "1"]);
+        for job in ["warm:", "warm:042", "warm:x", "warm-1", "cold:1"] {
+            assert!(intent_key("vm", 1, job).is_err(), "{job:?}");
+        }
+        assert_eq!(
+            parse_intent(
+                "ciburst/intents/vm/",
+                "ciburst/intents/vm/0000000001-warm-1"
+            ),
+            None
+        );
     }
 }

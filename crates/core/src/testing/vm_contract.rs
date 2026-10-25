@@ -157,7 +157,7 @@ pub async fn run_vm_provider_contract<F: VmProviderFactory>(factory: &F) {
     // start: free = slots - taken, never below zero
     {
         let (_backend, provider) = provisioned(factory, &config).await;
-        for (taken, free) in [(2, 1), (1, 2), (3, 0), (5, 0)] {
+        for (taken, free) in [(2, 1), (0, 3), (1, 2), (3, 0), (5, 0)] {
             let run = provider.start(request(&pool, taken)).await.expect("start");
             assert!(!run.is_empty());
             let started = vm(&*provider, "vm", &run).await;

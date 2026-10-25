@@ -601,7 +601,7 @@ impl Hetzner {
                 user_data.len()
             )));
         }
-        let taken = request.taken.max(1);
+        let taken = request.taken;
         let job = request.labels.get("job").map(String::as_str);
         let labels = vm::initial_labels(self.name(), tag, job, pool.slots.saturating_sub(taken));
         let mut failures = Vec::new();

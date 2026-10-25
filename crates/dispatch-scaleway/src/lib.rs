@@ -285,6 +285,7 @@ pub async fn respond(
     )
     .with_dispatch_url(env.dispatch_url.clone())
     .with_ledger(backends.ledger.clone())
+    .with_records(backends.records.clone())
     .with_group_wait(env.group_wait);
     let response = dispatcher
         .handle_request(
