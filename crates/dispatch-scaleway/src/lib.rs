@@ -1,9 +1,10 @@
-//! Scaleway Serverless Function entry: `handle` receives the GitLab webhook, the VM agents'
-//! `POST /vm` and `POST /terminate`, and the sweep cron, and hands method, path, headers, body
-//! and the current time to `ciburst_core::dispatch::Dispatcher::handle_request` with a
-//! `Scaleway` provider and, with an S3 cache, the burst ledger in the cache bucket, both
-//! built from the function's environment. The variable names are
-//! `ciburst_scaleway::host::vars`, the ones the host sets.
+//! Scaleway Serverless Function entry: `handle` receives the GitLab webhook (job and pipeline
+//! events), the VM agents' `POST /vm` and `POST /terminate`, and the sweep cron, and hands
+//! method, path, headers, body and the current time to
+//! `ciburst_core::dispatch::Dispatcher::handle_request` with a `Scaleway` provider and, with an
+//! S3 cache, the burst ledger and the warm start records in the cache bucket, all built from the
+//! function's environment. The variable names are `ciburst_scaleway::host::vars`, the ones the
+//! host sets.
 //!
 //! A cron trigger arrives as `POST /` with its arguments as the JSON body (Scaleway docs, "Add a
 //! trigger to a function"), so the sweep is recognized by its body, not by its path.
@@ -19,7 +20,7 @@ use ciburst_core::composite::Composite;
 use ciburst_core::config::{CacheType, Config, parse_config};
 use ciburst_core::dispatch::Dispatcher;
 use ciburst_core::http::{HttpClient, ReqwestClient};
-use ciburst_core::ledger::{GROUP_WAIT_S, Ledger};
+use ciburst_core::ledger::{GROUP_WAIT_S, Ledger, PipelineRecords};
 use ciburst_core::log::Log;
 use ciburst_core::types::{KeyPair, Provider, Secrets};
 use ciburst_hetzner::Hetzner;
@@ -27,9 +28,11 @@ use ciburst_scaleway::client::{Credentials, ScalewayClient};
 use ciburst_scaleway::host::vars;
 use ciburst_scaleway::ledger::ScalewayLedger;
 use ciburst_scaleway::provider::{Scaleway, VmStart};
+use ciburst_scaleway::records::ScalewayPipelineRecords;
 use http::{Request, Response, StatusCode};
 
-/// GitLab job events are a few kilobytes, VM reports and cron arguments less.
+/// GitLab job events are a few kilobytes, VM reports and cron arguments less. A pipeline event
+/// lists every job of the pipeline in under 1 KB each, so this holds more than a thousand jobs.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// What the function reads from its environment.
@@ -58,6 +61,8 @@ pub struct Backends {
     pub provider: Arc<dyn Provider>,
     /// The burst ledger in the cache bucket (M4 rule R13); `None` without an S3 cache key.
     pub ledger: Option<Arc<dyn Ledger>>,
+    /// The warm start records beside it (M6.1 rule R5); `None` without an S3 cache key.
+    pub records: Option<Arc<dyn PipelineRecords>>,
 }
 
 impl Backends {
@@ -65,11 +70,17 @@ impl Backends {
         Backends {
             provider,
             ledger: None,
+            records: None,
         }
     }
 
     pub fn with_ledger(mut self, ledger: Option<Arc<dyn Ledger>>) -> Backends {
         self.ledger = ledger;
+        self
+    }
+
+    pub fn with_records(mut self, records: Option<Arc<dyn PipelineRecords>>) -> Backends {
+        self.records = records;
         self
     }
 }
@@ -170,7 +181,7 @@ impl Env {
         Env::from_lookup(|name| std::env::var(name).ok())
     }
 
-    /// Provider and ledger on the real HTTP client.
+    /// Provider, ledger and records on the real HTTP client.
     pub fn backends(&self, log: Log) -> Result<Backends, EnvError> {
         let http: Arc<dyn HttpClient> = Arc::new(
             ReqwestClient::new().map_err(|_| EnvError::Invalid("http client".to_string()))?,
@@ -179,7 +190,7 @@ impl Env {
     }
 
     /// The `Scaleway` provider, in a [`Composite`] with Hetzner when the config adds it
-    /// (spec D35), and the ledger, both on `http`.
+    /// (spec D35), the ledger and the records, all on `http`.
     pub fn backends_on(&self, http: Arc<dyn HttpClient>, log: Log) -> Backends {
         let client = ScalewayClient::new(http.clone(), self.credentials.clone(), &self.region);
         let main: Arc<dyn Provider> = Arc::new(
@@ -188,8 +199,11 @@ impl Env {
                 .with_vm_start(self.vm_start.clone()),
         );
         let ledger = self.ledger_on(http.clone());
+        let records = self.records_on(http.clone());
         let Some(token) = &self.hetzner_token else {
-            return Backends::new(main).with_ledger(ledger);
+            return Backends::new(main)
+                .with_ledger(ledger)
+                .with_records(records);
         };
         let hetzner: Arc<dyn Provider> = Arc::new(Hetzner::new(
             self.config.clone(),
@@ -203,18 +217,16 @@ impl Env {
             vec![(ciburst_hetzner::RUNTIME.to_string(), hetzner)],
             log,
         );
-        Backends::new(Arc::new(composite)).with_ledger(ledger)
+        Backends::new(Arc::new(composite))
+            .with_ledger(ledger)
+            .with_records(records)
     }
 
     /// The burst ledger in the cache bucket `<name>-cache-<CIBURST_PROJECT_ID>` of
     /// `CIBURST_REGION`, signed with the cache key; `None` unless the cache is S3 and both cache
     /// keys are set.
     pub fn ledger_on(&self, http: Arc<dyn HttpClient>) -> Option<Arc<dyn Ledger>> {
-        if self.config.cache.kind != CacheType::S3 {
-            return None;
-        }
-        let key = self.secrets.cache.as_ref()?;
-        let project_id = self.credentials.default_project_id.as_deref()?;
+        let (key, project_id) = self.cache_bucket()?;
         Some(Arc::new(ScalewayLedger::in_cache_bucket(
             http,
             &self.config,
@@ -222,6 +234,29 @@ impl Env {
             &self.region,
             key,
         )))
+    }
+
+    /// The warm start records in the ledger's bucket, under the same key and condition.
+    pub fn records_on(&self, http: Arc<dyn HttpClient>) -> Option<Arc<dyn PipelineRecords>> {
+        let (key, project_id) = self.cache_bucket()?;
+        Some(Arc::new(ScalewayPipelineRecords::in_cache_bucket(
+            http,
+            &self.config,
+            project_id,
+            &self.region,
+            key,
+        )))
+    }
+
+    /// The cache key and the project of the cache bucket, when the cache is S3 and both cache
+    /// keys are set.
+    fn cache_bucket(&self) -> Option<(&KeyPair, &str)> {
+        if self.config.cache.kind != CacheType::S3 {
+            return None;
+        }
+        let key = self.secrets.cache.as_ref()?;
+        let project_id = self.credentials.default_project_id.as_deref()?;
+        Some((key, project_id))
     }
 }
 
@@ -741,6 +776,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(parse(&bytes), json!({ "result": "error" }));
+    }
+
+    /// A pipeline event lists every job of the pipeline (M6.1 rule R2): one of a thousand jobs,
+    /// each with the fields GitLab sends, fits the body limit and reaches the dispatcher.
+    #[tokio::test]
+    async fn a_pipeline_event_of_a_thousand_jobs_reaches_the_dispatcher() {
+        let env = env_from(&vars_map()).unwrap();
+        let provider = fake_provider(&env).await;
+        let build = |id: u64| {
+            json!({
+                "id": id, "stage": "test", "name": format!("job-{id}"), "status": "created",
+                "created_at": "2026-10-25 08:00:00 UTC", "started_at": null,
+                "finished_at": null, "duration": null, "queued_duration": null,
+                "failure_reason": null, "when": "on_success", "manual": false,
+                "allow_failure": false,
+                "user": {
+                    "id": 1, "name": "Maria Muster", "username": "muster",
+                    "avatar_url": "https://gitlab.example/uploads/-/system/user/avatar/1/avatar.png",
+                    "email": "[REDACTED]"
+                },
+                "runner": {
+                    "id": 12, "description": "ci-7-vm", "runner_type": "project_type",
+                    "active": true, "is_shared": false, "tags": ["vm"]
+                },
+                "artifacts_file": { "filename": null, "size": null },
+                "environment": null
+            })
+        };
+        let event = |builds: u64| {
+            json!({
+                "object_kind": "pipeline",
+                "object_attributes": { "id": 9, "status": "pending" },
+                "project": { "id": 7 },
+                "builds": (1..=builds).map(build).collect::<Vec<_>>()
+            })
+            .to_string()
+            .into_bytes()
+        };
+        let headers = [
+            ("x-gitlab-token", "hook-secret"),
+            ("x-gitlab-event", "Pipeline Hook"),
+        ];
+        let body = event(1000);
+        assert!(body.len() < MAX_BODY_BYTES, "{}", body.len());
+        let (status, _, answer) =
+            http(&env, provider.clone(), "POST", "/", &headers, &body, NOW).await;
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+        let body = event(2000);
+        assert!(body.len() > MAX_BODY_BYTES, "{}", body.len());
+        let (status, _, answer) = http(&env, provider, "POST", "/", &headers, &body, NOW).await;
+        assert_eq!(
+            (status, parse(&answer)),
+            (400, json!({ "result": "bad_request" }))
+        );
     }
 
     #[tokio::test]

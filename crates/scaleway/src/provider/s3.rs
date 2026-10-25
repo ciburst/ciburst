@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ciburst_core::http::{HttpClient, Request, Response};
 use ciburst_core::time::parse_rfc3339;
+use ciburst_core::types::KeyPair;
 use ciburst_core::{Error, Result};
 use md5::{Digest, Md5};
 
@@ -20,7 +21,8 @@ pub const LIFECYCLE_RULE_ID: &str = "ciburst-expire";
 
 /// Rule id and prefix of every expiring part of the bucket (D38): the runner cache with
 /// `--cache-shared` (`project/<id>/<key>`) and without (`runner/<token>/project/...`), and the
-/// burst intents. The agent below `ciburst/agent/` never expires.
+/// burst intents with the warm start records below them. The agent below `ciburst/agent/` never
+/// expires.
 pub const LIFECYCLE_RULES: [(&str, &str); 3] = [
     ("ciburst-expire-project", "project/"),
     ("ciburst-expire-runner", "runner/"),
@@ -72,6 +74,16 @@ pub struct ListPage {
 }
 
 impl S3 {
+    /// A client signed with `key`, such as the cache key the function holds.
+    pub fn with_key(http: Arc<dyn HttpClient>, region: &str, key: &KeyPair) -> S3 {
+        S3 {
+            http,
+            region: region.to_string(),
+            access_key: key.access_key.clone(),
+            secret_key: key.secret_key.clone(),
+        }
+    }
+
     async fn send(
         &self,
         method: &str,
@@ -230,6 +242,19 @@ impl S3 {
             200..=299 => Ok(true),
             404 => Ok(false),
             _ => Err(s3_error("HEAD", &path, &response)),
+        }
+    }
+
+    /// GetObject: the bytes of `key`, `None` when the bucket has no such key (`404 NoSuchKey`;
+    /// a missing bucket stays an error).
+    pub async fn get_object(&self, bucket: &str, key: &str) -> Result<Option<Vec<u8>>> {
+        let (path, response) = self
+            .send("GET", bucket, Some(key), &[], Vec::new(), &[])
+            .await?;
+        match response.status {
+            200..=299 => Ok(Some(response.body)),
+            404 if first(&response.text(), "Code").as_deref() == Some("NoSuchKey") => Ok(None),
+            _ => Err(s3_error("GET", &path, &response)),
         }
     }
 

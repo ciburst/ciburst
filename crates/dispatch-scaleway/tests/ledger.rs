@@ -1,8 +1,9 @@
-//! The function against the fake Scaleway: the burst ledger (M4 rule R13), built from the cache
-//! key, project and region, absent without them, and written by `respond` for a pending job of a
-//! VM pool that finds no free slot; the agent of `CIBURST_AGENT_SHA256` (D38) and the pinned
-//! runner of the cache bucket (M6 rule R6) in the user data of the VMs it starts; and the
-//! Scaleway calls of such a start with and without the variables of M7 hardening rule R3.
+//! The function against the fake Scaleway: the burst ledger (M4 rule R13) and the warm start
+//! records beside it (M6.1 rule R5), built from the cache key, project and region, absent
+//! without them, the ledger written by `respond` for a pending job of a VM pool that finds no
+//! free slot; the agent of `CIBURST_AGENT_SHA256` (D38) and the pinned runner of the cache bucket
+//! (M6 rule R6) in the user data of the VMs it starts; and the Scaleway calls of such a start
+//! with and without the variables of M7 hardening rule R3.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use std::time::Duration;
 use ciburst_core::cloud_init::RUNNER_SHA256;
 use ciburst_core::config::{CacheType, parse_config};
 use ciburst_core::http::{HttpClient, Request};
-use ciburst_core::ledger::Intent;
+use ciburst_core::ledger::{Intent, VmJobs};
 use ciburst_core::log::Log;
 use ciburst_core::types::Provider;
 use ciburst_dispatch_scaleway::{Env, EnvError, Incoming, respond};
@@ -115,22 +116,19 @@ fn bucket(vars: &BTreeMap<String, String>) -> String {
     format!("demo-cache-{}", vars[vars::PROJECT_ID])
 }
 
-/// `respond` on the pending event of job 42, through provider and ledger on the fake.
-async fn pending_job(backend: &Arc<ScalewayFake>, env: &Env) -> (u16, Value) {
+/// `respond` on a webhook of kind `event` (`Job Hook`, `Pipeline Hook`), through provider,
+/// ledger and records on the fake.
+async fn hook(backend: &Arc<ScalewayFake>, env: &Env, event: &str, body: &Value) -> (u16, Value) {
     let backends = env.backends_on(backend.clone(), Log::silent());
     let headers: Vec<(String, String)> = [
         ("x-gitlab-token", "hook-secret"),
-        ("x-gitlab-event", "Job Hook"),
+        ("x-gitlab-event", event),
         ("host", HOST),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
     .collect();
-    let body = json!({
-        "object_kind": "build", "build_id": 42, "build_stage": "test",
-        "build_status": "pending", "pipeline_id": 9, "project_id": 7
-    })
-    .to_string();
+    let body = body.to_string();
     let request = Incoming {
         method: "POST",
         path: "/",
@@ -140,6 +138,19 @@ async fn pending_job(backend: &Arc<ScalewayFake>, env: &Env) -> (u16, Value) {
     };
     let (status, body) = respond(env, &backends, Log::silent(), &request).await;
     (status, serde_json::from_slice(&body).unwrap())
+}
+
+/// The pending event of job `job` of pipeline 9.
+fn job_event(job: u64) -> Value {
+    json!({
+        "object_kind": "build", "build_id": job, "build_name": format!("job-{job}"),
+        "build_stage": "test", "build_status": "pending", "pipeline_id": 9, "project_id": 7
+    })
+}
+
+/// `respond` on the pending event of job 42, through provider and ledger on the fake.
+async fn pending_job(backend: &Arc<ScalewayFake>, env: &Env) -> (u16, Value) {
+    hook(backend, env, "Job Hook", &job_event(42)).await
 }
 
 #[tokio::test]
@@ -178,11 +189,9 @@ async fn no_ledger_without_both_cache_keys_or_an_s3_cache() {
         partial.remove(key);
         let env = env(&partial);
         assert!(env.ledger_on(backend.clone()).is_none(), "{key}");
-        assert!(
-            env.backends_on(backend.clone(), Log::silent())
-                .ledger
-                .is_none()
-        );
+        assert!(env.records_on(backend.clone()).is_none(), "{key}");
+        let backends = env.backends_on(backend.clone(), Log::silent());
+        assert!(backends.ledger.is_none() && backends.records.is_none());
     }
     // A config with pools always has an S3 cache (M6 rule R1); the function still builds no
     // ledger from cache keys when the cache is not S3.
@@ -192,6 +201,107 @@ async fn no_ledger_without_both_cache_keys_or_an_s3_cache() {
     config.cache.kind = CacheType::None;
     no_cache.config = Arc::new(config);
     assert!(no_cache.ledger_on(backend.clone()).is_none());
+    assert!(no_cache.records_on(backend.clone()).is_none());
+}
+
+/// The warm start records (M6.1 rule R5) beside the intents, under the cache key IAM scoped to
+/// the deployment's project.
+#[tokio::test]
+async fn the_records_live_beside_the_ledger_under_the_cache_key() {
+    let (backend, vars) = deployed("instances").await;
+    let env = env(&vars);
+    let records = env.records_on(backend.clone()).expect("records");
+    let jobs: VmJobs = [("vm".to_string(), vec!["41".to_string(), "42".to_string()])].into();
+    assert!(records.open("9", &jobs).await.unwrap());
+    assert!(!records.open("9", &jobs).await.unwrap());
+    records.seen("9", "41").await.unwrap();
+    assert_eq!(records.vm_jobs("9").await.unwrap(), Some(jobs));
+    assert_eq!(records.seen_jobs("9").await.unwrap(), ["41"]);
+    assert_eq!(
+        intents(&backend, &vars),
+        [
+            (
+                "ciburst/intents/_pipelines/9/seen/41".to_string(),
+                Vec::new()
+            ),
+            (
+                "ciburst/intents/_pipelines/9/vm-jobs.json".to_string(),
+                br#"{"vm":["41","42"]}"#.to_vec()
+            ),
+        ]
+    );
+    records.close("9").await.unwrap();
+    assert!(intents(&backend, &vars).is_empty());
+    assert!(
+        env.backends_on(backend.clone(), Log::silent())
+            .records
+            .is_some()
+    );
+}
+
+/// A pipeline event of pipeline 9 with `status` and the builds `(id, stage, status)`.
+fn pipeline_event(status: &str, builds: &[(u64, &str, &str)]) -> Value {
+    let builds: Vec<Value> = builds
+        .iter()
+        .map(|(id, stage, status)| {
+            json!({
+                "id": id, "name": format!("job-{id}"), "stage": stage, "status": status,
+                "when": "on_success", "manual": false
+            })
+        })
+        .collect();
+    json!({
+        "object_kind": "pipeline",
+        "object_attributes": { "id": 9, "status": status },
+        "project": { "id": 7 },
+        "builds": builds
+    })
+}
+
+/// The records' keys in the cache bucket.
+fn record_keys(backend: &ScalewayFake, vars: &BTreeMap<String, String>) -> Vec<String> {
+    intents(backend, vars)
+        .into_iter()
+        .map(|(key, _)| key)
+        .filter(|key| key.starts_with("ciburst/intents/_pipelines/"))
+        .collect()
+}
+
+/// M6.1 rules R3 to R5 through the function: the warm step writes the record, a VM job's
+/// pending event its marker, the final status deletes both.
+#[tokio::test]
+#[ignore = "needs Dispatcher::with_records in respond (M6.1 agent A)"]
+async fn pipeline_events_keep_their_records_in_the_cache_bucket() {
+    let (backend, vars) = deployed("instances").await;
+    let env = env(&vars);
+    let builds = [(41, "test", "pending"), (42, "build", "created")];
+    let (status, body) = hook(
+        &backend,
+        &env,
+        "Pipeline Hook",
+        &pipeline_event("pending", &builds),
+    )
+    .await;
+    assert_eq!((status, &body["result"]), (200, &json!("warm")), "{body}");
+    assert_eq!(body["pools"][0]["action"], "started", "{body}");
+    let records = env.records_on(backend.clone()).unwrap();
+    let mut jobs = records.vm_jobs("9").await.unwrap().expect("record")["vm"].clone();
+    jobs.sort();
+    assert_eq!(jobs, ["41", "42"]);
+
+    let (status, body) = hook(&backend, &env, "Job Hook", &job_event(41)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(records.seen_jobs("9").await.unwrap(), ["41"]);
+
+    let (status, body) = hook(
+        &backend,
+        &env,
+        "Pipeline Hook",
+        &pipeline_event("success", &builds),
+    )
+    .await;
+    assert_eq!((status, &body["result"]), (200, &json!("closed")), "{body}");
+    assert!(record_keys(&backend, &vars).is_empty());
 }
 
 #[tokio::test]
