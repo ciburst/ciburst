@@ -1,7 +1,7 @@
 //! The user data `cloud-init` of a VM, the contract between provider and agent (rule 6 of M3,
-//! D38): `/etc/ciburst/vm.env`, the pinned `gitlab-runner`, the agent downloaded from the cache
-//! bucket, and the agent's systemd unit. The template and rendering live in
-//! `ciburst_core::cloud_init`.
+//! D38, M6 rule R6): `/etc/ciburst/vm.env`, the pinned `gitlab-runner` and the agent, both
+//! downloaded from the cache bucket, and the agent's systemd unit. The template and rendering
+//! live in `ciburst_core::cloud_init`.
 
 use std::collections::BTreeMap;
 
@@ -12,7 +12,8 @@ use super::agent::agent_key;
 use super::{PROVIDER_NAME, jobs, s3};
 
 pub use ciburst_core::cloud_init::{
-    AGENT_SHA256_KEY, AGENT_URL_KEY, DISPATCH_URL, RUN_ID, VM_TOKEN, render,
+    AGENT_SHA256_KEY, AGENT_URL_KEY, DISPATCH_URL, Download, RUN_ID, RUNNER_URL_KEY, VM_TOKEN,
+    render,
 };
 
 /// `vm.env` without the run id and token, which exist only once the server does. Fails before
@@ -81,6 +82,8 @@ pub fn agent_url(config: &Config, region: &str, project_id: &str, sha256: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::runner::runner_url;
+    use ciburst_core::cloud_init::RUNNER_SHA256;
     use ciburst_core::testing::contract::contract_config;
 
     const SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -121,14 +124,30 @@ mod tests {
     }
 
     #[test]
-    fn the_agent_url_is_the_public_object_in_the_cache_bucket() {
+    fn agent_and_runner_urls_are_public_objects_in_the_cache_bucket() {
         let config = contract_config();
         let url = agent_url(&config, "nl-ams", "p-1", SHA);
         assert_eq!(
             url,
             format!("https://contract-cache-p-1.s3.nl-ams.scw.cloud/ciburst/agent/{SHA}")
         );
-        let text = render(&BTreeMap::new(), &url, SHA, false).unwrap();
+        let runner = runner_url(&config, "nl-ams", "p-1", RUNNER_SHA256);
+        let text = render(
+            &BTreeMap::new(),
+            Download {
+                url: &runner,
+                sha256: RUNNER_SHA256,
+            },
+            Download {
+                url: &url,
+                sha256: SHA,
+            },
+            false,
+        )
+        .unwrap();
         assert!(text.contains(&format!("curl -fsSL -o /tmp/ciburst-vm-agent {url} ")));
+        assert!(text.contains(&format!(
+            "curl -fsSL -o /tmp/gitlab-runner https://contract-cache-p-1.s3.nl-ams.scw.cloud/ciburst/runner/{RUNNER_SHA256} "
+        )));
     }
 }

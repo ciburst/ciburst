@@ -1,6 +1,7 @@
 //! The provider's fake Scaleway: Account, IAM, Serverless Jobs, Container Registry, Instances
 //! with the Marketplace, and S3 (path-style and virtual-hosted) behind one `HttpClient` that
-//! routes by host and path, plus the helpers the fakes share.
+//! routes by host and path, plus the public download host of the runner (M6 rule R6) and the
+//! helpers the fakes share.
 
 use std::sync::Arc;
 
@@ -10,11 +11,13 @@ use ciburst_core::http::{HttpClient, Request, Response};
 use serde_json::{Value, json};
 
 use super::account_api::FakeAccount;
+use super::downloads_api::FakeDownloads;
 use super::iam_api::FakeIam;
 use super::instance_api::FakeInstance;
 use super::jobs_api::FakeJobs;
 use super::registry_api::FakeRegistry;
 use super::s3_api::FakeS3;
+use super::{RUNNER_FIXTURE, RUNNER_FIXTURE_URL};
 use crate::client::{Credentials, ScalewayClient};
 
 pub const FAKE_SECRET_KEY: &str = "11111111-2222-4333-8444-555555555555";
@@ -184,7 +187,8 @@ pub fn fake_time(n: u64) -> String {
     )
 }
 
-/// The provider's backend: one fake per API, routed by host and path.
+/// The provider's backend: one fake per API, routed by host and path. `downloads` serves
+/// [`RUNNER_FIXTURE`] at [`RUNNER_FIXTURE_URL`] from the start.
 pub struct ScalewayFake {
     pub account: FakeAccount,
     pub iam: FakeIam,
@@ -192,6 +196,7 @@ pub struct ScalewayFake {
     pub registry: FakeRegistry,
     pub instance: FakeInstance,
     pub s3: FakeS3,
+    pub downloads: FakeDownloads,
 }
 
 impl Default for ScalewayFake {
@@ -202,6 +207,8 @@ impl Default for ScalewayFake {
 
 impl ScalewayFake {
     pub fn new() -> ScalewayFake {
+        let downloads = FakeDownloads::new();
+        downloads.serve(RUNNER_FIXTURE_URL, RUNNER_FIXTURE);
         ScalewayFake {
             account: FakeAccount::new(),
             iam: FakeIam::new(),
@@ -209,6 +216,7 @@ impl ScalewayFake {
             registry: FakeRegistry::new(),
             instance: FakeInstance::new(),
             s3: FakeS3::new(),
+            downloads,
         }
     }
 
@@ -268,6 +276,8 @@ impl HttpClient for ScalewayFake {
             && url.host.ends_with(".scw.cloud")
         {
             return self.s3.send(request).await;
+        } else if self.downloads.serves_host(&url.host) {
+            return self.downloads.send(request).await;
         }
         Ok(api_error(
             404,

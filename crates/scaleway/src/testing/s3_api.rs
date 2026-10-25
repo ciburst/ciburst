@@ -147,7 +147,9 @@ fn key_of_token(token: &str) -> Option<String> {
         .map(String::from)
 }
 
-fn base64_decode(text: &str) -> Option<Vec<u8>> {
+/// Standard base64 with padding, decoded on its own rather than by the provider's encoder;
+/// `None` for anything else.
+pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     if text.is_empty() || !text.len().is_multiple_of(4) {
         return None;

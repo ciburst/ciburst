@@ -1,18 +1,19 @@
 //! Provider `scaleway`. A pool runs on Scaleway Instances (`instances`, the default: one VM per
 //! run with its own Docker daemon, spec section 6.1) or on Serverless Jobs (`jobs`: one job
-//! definition per pool, one job run per pending job). Shared resources: project, IAM
-//! applications and keys, cache bucket with lifecycle and the VM agent (D38), the optional
-//! registry namespace; per runtime the VM security group or the job definitions. Every
-//! resource is looked up by name or tag; nothing is stored locally.
+//! definition per pool, one job run per pending job, the lanes of D45). Shared resources:
+//! project, IAM applications and keys, cache bucket with lifecycle, the runner (M6 rule R6) and
+//! the VM agent (D38) in it, the optional registry namespace; per runtime the VM security group
+//! or the job definitions. Every resource is looked up by name or tag; nothing is stored
+//! locally.
 //!
 //! Pools whose runtime is a key of the config's `providers` belong to another provider (spec
 //! D35): this one plans, starts and lists nothing for them and answers their runs with the agent
-//! URL and cache location of [`Provider::shared_env`].
+//! and runner URLs and cache location of [`Provider::shared_env`].
 //!
 //! Modules: `steps` plans and applies the resources, `keys` the IAM keys, `bucket` the cache
-//! bucket, `agent` the VM agent in it, `registry` the registry namespace, `servers` the VM
-//! runtime, `jobs` the Serverless Jobs runtime; `iam`, `instance`, `s3` and `sigv4` are the API
-//! clients.
+//! bucket, `runner` the runner in it, `agent` the VM agent in it, `registry` the registry
+//! namespace, `servers` the VM runtime, `jobs` the Serverless Jobs runtime; `iam`, `instance`,
+//! `s3` and `sigv4` are the API clients.
 
 mod agent;
 mod bucket;
@@ -22,6 +23,7 @@ mod instance;
 mod jobs;
 mod keys;
 mod registry;
+mod runner;
 pub mod s3;
 mod servers;
 pub mod sigv4;
@@ -44,6 +46,7 @@ use serde_json::{Value, json};
 
 use crate::client::ScalewayClient;
 use instance::InstanceApi;
+use runner::RunnerSource;
 
 pub use jobs::bucket_name;
 
@@ -101,6 +104,8 @@ pub struct Scaleway {
     agent: Option<PathBuf>,
     /// `CIBURST_AGENT_SHA256` of the function's environment.
     agent_sha256: Option<String>,
+    /// The runner that `apply` copies into the cache bucket (M6 rule R6).
+    runner: RunnerSource,
 }
 
 impl Scaleway {
@@ -121,6 +126,7 @@ impl Scaleway {
             zone,
             agent: None,
             agent_sha256: None,
+            runner: RunnerSource::default(),
         }
     }
 

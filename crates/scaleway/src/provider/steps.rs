@@ -1,6 +1,6 @@
 //! Plan, apply, preflight and destroy: the steps `project`, `key:dispatch`, `key:cache`,
-//! `bucket`, `registry`, `vm:agent`, `vm:security-group` and `definition:<tag>`, each found by
-//! name before it is planned.
+//! `bucket`, `runner-binary`, `registry`, `vm:agent`, `vm:security-group` and
+//! `definition:<tag>`, each found by name before it is planned.
 
 use std::time::Duration;
 
@@ -13,6 +13,7 @@ use super::agent::{AGENT_STEP, NO_AGENT, NO_CACHE};
 use super::iam::{self, AppState};
 use super::keys::KeyKind;
 use super::registry::{self, NamespaceState};
+use super::runner::RUNNER_STEP;
 use super::s3::LIFECYCLE_RULES;
 use super::servers::SECURITY_GROUP_STEP;
 use super::{PROVIDER_NAME, Runtime, Scaleway, jobs};
@@ -119,6 +120,12 @@ impl Scaleway {
                 }
             };
             steps.push(step);
+            if self.needs_runner() {
+                steps.push(
+                    self.runner_step(&observed.project, observed.bucket.is_some())
+                        .await?,
+                );
+            }
         } else {
             if observed.cache.is_some() {
                 steps.push(Step::new(
@@ -182,7 +189,13 @@ impl Scaleway {
                 .find(|d| self.definition_tag(d) == Some(pool.tag.as_str()));
             let step = match (current, &observed.project) {
                 (Some(current), Some(project_id)) => {
-                    let desired = jobs::desired_definition(&self.config, pool, region, project_id);
+                    let desired = jobs::desired_definition(
+                        &self.config,
+                        pool,
+                        region,
+                        project_id,
+                        self.runner_sha256(),
+                    );
                     let changed = jobs::differences(&desired, current);
                     if changed.is_empty() {
                         Step::new(id, Action::Noop, resource)
@@ -271,6 +284,7 @@ impl Scaleway {
                     }
                 }
                 "bucket" => self.apply_bucket(step.action, &project).await?,
+                RUNNER_STEP => self.apply_runner(&project).await?,
                 "registry" => {
                     if step.action == Action::Delete {
                         self.delete_registry(&project).await?;

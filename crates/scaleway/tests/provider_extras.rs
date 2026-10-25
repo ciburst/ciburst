@@ -7,8 +7,10 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use ciburst_core::Result;
+use ciburst_core::cloud_init::RUNNER_SHA256;
 use ciburst_core::composite::Composite;
 use ciburst_core::config::{CacheType, Config};
+use ciburst_core::http::{HttpClient, Request};
 use ciburst_core::log::Log;
 use ciburst_core::testing::contract::contract_config;
 use ciburst_core::types::{
@@ -16,7 +18,9 @@ use ciburst_core::types::{
 };
 use ciburst_scaleway::provider::Scaleway;
 use ciburst_scaleway::testing::scaleway_fake::{FAKE_ACCESS_KEY, ScalewayFake};
-use ciburst_scaleway::testing::{agent_fixture, agent_fixture_sha256};
+use ciburst_scaleway::testing::{
+    RUNNER_FIXTURE, RUNNER_FIXTURE_URL, agent_fixture, agent_fixture_sha256, runner_fixture_sha256,
+};
 use serde_json::Map;
 
 /// The contract config (S3 cache); the `build` pool belongs to `hetzner`.
@@ -32,12 +36,20 @@ fn provider(config: Arc<Config>, backend: &Arc<ScalewayFake>, log: Log) -> Scale
     Scaleway::new(config, backend.client(), log)
         .with_s3_access_key(FAKE_ACCESS_KEY)
         .with_agent(Some(agent_fixture()))
+        .with_runner_source(RUNNER_FIXTURE_URL, runner_fixture_sha256())
 }
 
 fn agent_url(project_id: &str) -> String {
     format!(
         "https://contract-cache-{project_id}.s3.fr-par.scw.cloud/ciburst/agent/{}",
         agent_fixture_sha256()
+    )
+}
+
+fn runner_url(project_id: &str) -> String {
+    format!(
+        "https://contract-cache-{project_id}.s3.fr-par.scw.cloud/ciburst/runner/{}",
+        runner_fixture_sha256()
     )
 }
 
@@ -92,10 +104,11 @@ async fn pools_of_other_providers_get_no_steps_no_warning_and_no_runs() {
             "key:dispatch",
             "key:cache",
             "bucket",
+            "runner-binary",
             "vm:agent",
             "definition:ci"
         ],
-        "the hetzner pool's VMs fetch the agent from this bucket"
+        "the hetzner pool's VMs fetch runner and agent from this bucket"
     );
     assert!(
         lines.lock().unwrap().is_empty(),
@@ -245,9 +258,11 @@ async fn shared_env_is_the_agent_and_the_cache_location_of_vm_env() {
     let bucket = format!("contract-cache-{project_id}");
     let url = agent_url(&project_id);
     let sha = agent_fixture_sha256();
+    let runner = runner_url(&project_id);
     let expected: BTreeMap<String, String> = [
         ("CIBURST_AGENT_URL", url.as_str()),
         ("CIBURST_AGENT_SHA256", sha.as_str()),
+        ("CIBURST_RUNNER_URL", runner.as_str()),
         ("CACHE_TYPE", "s3"),
         ("CACHE_S3_SERVER_ADDRESS", "s3.fr-par.scw.cloud"),
         ("CACHE_S3_BUCKET_NAME", bucket.as_str()),
@@ -269,13 +284,29 @@ async fn shared_env_is_the_agent_and_the_cache_location_of_vm_env() {
         );
     }
     assert!(user_data.contains(&format!("curl -fsSL -o /tmp/ciburst-vm-agent {url} ")));
+    assert!(user_data.contains(&format!("curl -fsSL -o /tmp/gitlab-runner {runner} ")));
+    let anonymous = backend
+        .send(Request::new("GET", runner.as_str()))
+        .await
+        .unwrap();
+    assert_eq!(
+        (anonymous.status, anonymous.body.as_slice()),
+        (200, RUNNER_FIXTURE),
+        "VMs of every provider read the runner without credentials"
+    );
 
     let dispatcher = Scaleway::new(plain, backend.client(), Log::silent())
         .with_agent_sha256(Some("e".repeat(64)));
+    let shared = dispatcher.shared_env().await.unwrap();
     assert_eq!(
-        dispatcher.shared_env().await.unwrap()["CIBURST_AGENT_SHA256"],
+        shared["CIBURST_AGENT_SHA256"],
         "e".repeat(64),
         "the function's environment wins"
+    );
+    assert_eq!(
+        shared["CIBURST_RUNNER_URL"],
+        format!("https://{bucket}.s3.fr-par.scw.cloud/ciburst/runner/{RUNNER_SHA256}"),
+        "the function names the pinned runner"
     );
 }
 
@@ -368,6 +399,7 @@ async fn a_composite_start_on_another_provider_carries_the_shared_env() {
     let env = &started[0].env;
     assert_eq!(env["CIBURST_AGENT_URL"], agent_url(&project_id));
     assert_eq!(env["CIBURST_AGENT_SHA256"], agent_fixture_sha256());
+    assert_eq!(env["CIBURST_RUNNER_URL"], runner_url(&project_id));
     assert_eq!(
         env["CACHE_S3_BUCKET_NAME"],
         format!("contract-cache-{project_id}")

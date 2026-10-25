@@ -3,7 +3,7 @@
 //! [`public_url`].
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ciburst_core::http::{HttpClient, Request, Response};
 use ciburst_core::time::parse_rfc3339;
@@ -28,6 +28,12 @@ pub const LIFECYCLE_RULES: [(&str, &str); 3] = [
 
 /// The canned ACL that lets anybody read an object without credentials.
 pub const PUBLIC_READ: &str = "public-read";
+
+/// How long the transfer of a binary may take: the runner has about 120 MB, which the HTTP
+/// client's own timeout of 30 s would cut off below 4 MB/s (M6 rule R6).
+pub const TRANSFER_TIMEOUT: Duration = Duration::from_secs(600);
+/// Request bodies above this size are transfers and get [`TRANSFER_TIMEOUT`].
+pub const LARGE_BODY: usize = 1024 * 1024;
 
 pub fn host(region: &str) -> String {
     format!("s3.{region}.scw.cloud")
@@ -115,6 +121,9 @@ impl S3 {
         // an empty body.
         if method == "PUT" && key.is_some() {
             request = request.header("content-length", length.to_string());
+        }
+        if length > LARGE_BODY {
+            request = request.timeout(TRANSFER_TIMEOUT);
         }
         if !body.is_empty() {
             request.body = Some(body);
