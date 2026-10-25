@@ -5,6 +5,7 @@ use std::sync::Arc;
 use ciburst::{Env, agent_path};
 use ciburst_core::check::LintJob;
 use ciburst_core::config::{Config, parse_config};
+use ciburst_core::gitlab::Gitlab;
 use ciburst_core::http::HttpClient;
 use ciburst_core::log::Log;
 use ciburst_core::testing::gitlab_fake::{FAKE_TOKEN, FakeGitlab};
@@ -406,6 +407,186 @@ async fn check_suggest_prints_lanes_for_docker_free_jobs() {
     assert_eq!(
         out,
         "project 1: pipeline invalid: jobs config should contain at least one visible job\n"
+    );
+}
+
+#[tokio::test]
+async fn check_suggest_gives_parallel_and_matrix_jobs_one_tags_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, local) = paths(dir.path());
+    std::fs::write(&config, SCALEWAY_CONFIG).unwrap();
+    std::fs::create_dir_all(&local).unwrap();
+    std::fs::write(
+        local.join("gitlab.env"),
+        format!("GITLAB_TOKEN={FAKE_TOKEN}\n"),
+    )
+    .unwrap();
+    let yaml = r#"---
+".node":
+  image: node:24-bookworm-slim
+e2e:
+  extends: ".node"
+  parallel:
+    matrix:
+    - PLATFORM:
+      - android
+      - ios
+  script:
+  - npm run e2e
+unit:
+  extends: ".node"
+  parallel: 2
+  script:
+  - npm test
+unit-smoke:
+  image: alpine:3.21
+  script:
+  - "true"
+"#;
+    let job = |name: &str, tag: &str| LintJob {
+        name: name.into(),
+        stage: Some("test".into()),
+        tag_list: vec![tag.into()],
+    };
+    let fake = Arc::new(FakeGitlab::new());
+    fake.set_jobs(
+        1,
+        vec![
+            job("e2e: [android]", "vm"),
+            job("e2e: [ios]", "vm"),
+            job("unit 1/2", "vm"),
+            job("unit 2/2", "vm"),
+            job("unit-smoke", "saas-linux-small-amd64"),
+        ],
+    );
+    fake.set_merged_yaml(1, yaml);
+    let local = local.display().to_string();
+    let args = ["--config", &config, "--local", &local, "check", "--suggest"];
+    let (code, out) = run(env(Some(fake.clone())), &args).await;
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(
+        out,
+        concat!(
+            "project 1: lane node-24 for node:24-bookworm-slim\n",
+            r#"  { "tag": "node-24", "runtime": "jobs", "image": "node:24-bookworm-slim", "jobs": ["e2e*", "unit 1/2", "unit 2/2"], "vcpu": 2, "memoryMiB": 4096 }"#,
+            "\n",
+            "  job e2e: tags: [node-24]\n",
+            "  job unit: tags: [node-24]\n",
+        )
+    );
+}
+
+/// A delivery as GitLab's hook events list shows it.
+fn delivery(id: u64, request: serde_json::Value, response: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "url": "https://demo-dispatch.fake.invalid/",
+        "trigger": "job_hooks",
+        "request_data": request,
+        "response_body": response,
+        "response_status": "200",
+        "execution_duration": 0.5,
+        "created_at": format!("2026-10-25T12:00:0{id}.000Z"),
+    })
+}
+
+#[tokio::test]
+async fn status_lists_the_deliveries_and_check_a_disabled_hook() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.json"), FAKE_CONFIG).unwrap();
+    let (code, out) = ciburst(dir.path(), &["apply"]).await;
+    assert_eq!(code, 0, "{out}");
+    let (config, local) = paths(dir.path());
+    std::fs::write(
+        local.join("gitlab.env"),
+        format!("GITLAB_TOKEN={FAKE_TOKEN}\n"),
+    )
+    .unwrap();
+    let fake = Arc::new(FakeGitlab::new());
+    let gitlab = Gitlab::new("https://gitlab.com", FAKE_TOKEN, fake.clone());
+    let hook = gitlab
+        .create_hook(1, "https://demo-dispatch.fake.invalid/", "t")
+        .await
+        .unwrap()
+        .id;
+    fake.add_hook_event(
+        hook,
+        delivery(
+            1,
+            serde_json::json!({ "object_kind": "build", "build_name": "e2e: [ios]" }),
+            r#"{"result":"started","pool":"ci","runId":"fake-1","ms":5120}"#,
+        ),
+    );
+    fake.add_hook_event(
+        hook,
+        delivery(
+            2,
+            serde_json::json!({ "object_kind": "pipeline", "object_attributes": { "id": 901 } }),
+            r#"{"result":"ignored","reason":"not_job_event"}"#,
+        ),
+    );
+    let local = local.display().to_string();
+    let status = ["--config", &config, "--local", &local, "status"];
+    let (code, out) = run(env(Some(fake.clone())), &status).await;
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(
+        out,
+        format!(
+            concat!(
+                "dispatcher: https://demo-dispatch.fake.invalid/\n",
+                "pool ci: 0 live of 10\n",
+                "pool build: 0 live of 2\n",
+                "hook {hook}: executable\n",
+                "delivery 2026-10-25T12:00:01Z e2e: [ios] 200 started ci 5120\n",
+                "delivery 2026-10-25T12:00:02Z pipeline 901 200 ignored - -\n",
+            ),
+            hook = hook
+        )
+    );
+    let (code, out) = run(
+        env(Some(fake.clone())),
+        &[&status[..4], &["--skip-gitlab", "status"]].concat(),
+    )
+    .await;
+    assert_eq!(code, 0, "{out}");
+    assert!(!out.contains("hook"), "--skip-gitlab: {out}");
+
+    fake.set_jobs(
+        1,
+        vec![LintJob {
+            name: "unit".into(),
+            stage: Some("test".into()),
+            tag_list: vec!["ci".into()],
+        }],
+    );
+    let check = ["--config", &config, "--local", &local, "check"];
+    let (code, out) = run(env(Some(fake.clone())), &check).await;
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out, "project 1: every job matches the stage map\n");
+    fake.disable_hook(hook, "temporarily_disabled", Some("2026-10-25T12:10:00Z"));
+    let (code, out) = run(env(Some(fake.clone())), &check).await;
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(
+        out,
+        concat!(
+            "project 1: webhook temporarily_disabled until 2026-10-25T12:10:00Z: run ciburst-setup to enable it again\n",
+            "project 1: every job matches the stage map\n",
+        )
+    );
+    let (code, out) = run(env(Some(fake.clone())), &status).await;
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains(&format!(
+            "hook {hook}: temporarily_disabled until 2026-10-25T12:10:00Z\n"
+        )),
+        "{out}"
+    );
+    gitlab.delete_hook(1, hook).await.unwrap();
+    let (code, out) = run(env(Some(fake.clone())), &status).await;
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.ends_with("project 1: no hook to the dispatcher\n"),
+        "{out}"
     );
 }
 

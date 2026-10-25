@@ -102,11 +102,20 @@ impl Pipeline {
         if let Some(job) = self.jobs.get(name) {
             return Some(job);
         }
+        self.jobs.get(self.parallel_of(name)?)
+    }
+
+    /// The job whose copy `name` is: `unit` of `unit 1/3` and of `unit: [a, b]`, when the
+    /// pipeline has that job and no job of the copy's own name.
+    pub fn parallel_of<'a>(&self, name: &'a str) -> Option<&'a str> {
+        if self.jobs.contains_key(name) {
+            return None;
+        }
         let base = match name.rsplit_once(' ') {
             Some((base, index)) if is_index(index) => base,
             _ => name.strip_suffix(']')?.rsplit_once(": [")?.0,
         };
-        self.jobs.get(base)
+        self.jobs.contains_key(base).then_some(base)
     }
 
     /// `text` with `$NAME` and `${NAME}` replaced by top-level variables, whose values expand
@@ -500,6 +509,11 @@ mod tests {
         assert_eq!(image("unit x/3"), None);
         assert_eq!(image("unit 2/"), None);
         assert_eq!(image("other"), None);
+        assert_eq!(pipeline.parallel_of("unit 2/3"), Some("unit"));
+        assert_eq!(pipeline.parallel_of("unit: [android, 13]"), Some("unit"));
+        assert_eq!(pipeline.parallel_of("unit 1/3"), None, "a job of its own");
+        assert_eq!(pipeline.parallel_of("unit"), None);
+        assert_eq!(pipeline.parallel_of("other 1/2"), None);
     }
 
     #[test]

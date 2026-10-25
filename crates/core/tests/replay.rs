@@ -329,3 +329,46 @@ async fn replayed_jobs_reach_the_dispatcher() {
     assert_eq!(runs[0].labels["job"], "11");
     assert_eq!(runs[0].labels["project"], "7");
 }
+
+#[tokio::test]
+async fn a_disabled_hook_is_enabled_before_the_replay() {
+    let mut s = Setup::new();
+    let recorder = Recorder::new(started);
+    s.provisioner(true, Some(recorder.clone()))
+        .apply(&[])
+        .await
+        .unwrap();
+    let hook = s.fake.hooks()[0].0;
+    s.fake
+        .disable_hook(hook, "temporarily_disabled", Some(&at(0)));
+    waiting_jobs(&s.fake);
+    s.provisioner(true, Some(recorder.clone()))
+        .apply(&[])
+        .await
+        .unwrap();
+    let calls: Vec<String> = s
+        .fake
+        .calls()
+        .into_iter()
+        .map(|c| format!("{} {}", c.method, c.path))
+        .collect();
+    let test = calls
+        .iter()
+        .position(|c| *c == format!("POST /projects/7/hooks/{hook}/test/push_events"))
+        .unwrap();
+    let jobs = calls
+        .iter()
+        .rposition(|c| c == "GET /projects/7/jobs")
+        .unwrap();
+    assert!(test < jobs, "{calls:?}");
+    let lines = s.lines("info");
+    let reenabled = lines
+        .iter()
+        .position(|l| l == r#"info hook_reenabled project="7""#)
+        .unwrap();
+    let replayed = lines
+        .iter()
+        .position(|l| l.starts_with("info replayed"))
+        .unwrap();
+    assert!(reenabled < replayed, "{lines:?}");
+}

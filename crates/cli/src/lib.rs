@@ -243,6 +243,37 @@ impl Modules {
         Ok(Arc::new(Gitlab::new(&self.config.gitlab.url, token, http)))
     }
 
+    /// GitLab when a token is at hand, for commands that work without one.
+    async fn gitlab_if_token(&mut self) -> Result<Option<Arc<Gitlab>>> {
+        let present = match &self.mode {
+            Mode::Ci { .. } => self.input(ci_vars::GITLAB_TOKEN).is_ok(),
+            Mode::Local(local) => {
+                self.input("GITLAB_TOKEN").is_ok()
+                    || read_env_file(&local.join("gitlab.env"))
+                        .await?
+                        .get("GITLAB_TOKEN")
+                        .is_some_and(|token| !token.is_empty())
+            }
+        };
+        if !present {
+            return Ok(None);
+        }
+        self.gitlab().await.map(Some)
+    }
+
+    /// The dispatcher's URL from the outputs of an earlier `apply`: the job's variables in
+    /// pipeline mode, `outputs.env` otherwise.
+    async fn dispatch_url(&self) -> Result<Option<String>> {
+        let outputs = match &self.mode {
+            Mode::Ci { .. } => self.vars.clone(),
+            Mode::Local(local) => read_env_file(&local.join("outputs.env")).await?,
+        };
+        Ok(outputs
+            .get(keys::DISPATCH_URL)
+            .filter(|url| !url.is_empty())
+            .cloned())
+    }
+
     async fn hetzner_token(&self) -> Result<String> {
         match &self.mode {
             Mode::Ci { .. } => self.input(ci_vars::HCLOUD_TOKEN),
@@ -508,7 +539,13 @@ pub async fn run_with_env(args: Vec<String>, env: Env, out: &mut dyn Write) -> R
             suggest,
         } => {
             let gitlab = modules.gitlab().await?;
-            let report = provision::check(&config, &gitlab, content_ref.as_deref()).await?;
+            let url = if *suggest {
+                None
+            } else {
+                modules.dispatch_url().await?
+            };
+            let report =
+                provision::check(&config, &gitlab, content_ref.as_deref(), url.as_deref()).await?;
             if *suggest {
                 return write_suggestions(out, &report);
             }
@@ -517,11 +554,16 @@ pub async fn run_with_env(args: Vec<String>, env: Env, out: &mut dyn Write) -> R
         Command::Status => {
             let provider = modules.provider().await?;
             let host = modules.host().await?;
+            let gitlab = if cli.skip_gitlab {
+                None
+            } else {
+                modules.gitlab_if_token().await?
+            };
             let provisioner = Provisioner::new(
                 config.clone(),
                 provider,
                 host,
-                None,
+                gitlab,
                 Arc::new(MemoryOutputs::new()),
                 log,
             );
@@ -625,12 +667,43 @@ async fn write_status(out: &mut dyn Write, provisioner: &Provisioner) -> Result<
             run.labels.get("job").map(String::as_str).unwrap_or("")
         )?;
     }
+    for project in provisioner.hook_deliveries(status.url.as_deref()).await? {
+        let Some(hook) = &project.hook else {
+            writeln!(
+                out,
+                "project {}: no hook to the dispatcher",
+                project.project_id
+            )?;
+            continue;
+        };
+        if hook.is_executable() {
+            writeln!(out, "hook {}: {}", hook.id, hook.alert_status)?;
+        } else {
+            writeln!(out, "hook {}: {}", hook.id, hook.disabled())?;
+        }
+        for d in &project.deliveries {
+            writeln!(
+                out,
+                "delivery {} {} {} {} {} {}",
+                d.time, d.subject, d.status, d.result, d.pool, d.ms
+            )?;
+        }
+    }
     Ok(0)
 }
 
 fn write_check(out: &mut dyn Write, report: &[ProjectReport]) -> Result<i32> {
     let mut failed = false;
     for project in report {
+        if let Some(hook) = project.hook.as_ref().filter(|hook| !hook.is_executable()) {
+            failed = true;
+            writeln!(
+                out,
+                "project {}: webhook {}: run ciburst-setup to enable it again",
+                project.project_id,
+                hook.disabled()
+            )?;
+        }
         if !project.valid {
             failed = true;
             writeln!(
@@ -683,7 +756,7 @@ fn write_suggestions(out: &mut dyn Write, report: &[ProjectReport]) -> Result<i3
         for lane in &project.suggestions {
             writeln!(out, "project {id}: lane {} for {}", lane.tag, lane.image)?;
             writeln!(out, "  {}", lane_entry(lane))?;
-            for job in &lane.jobs {
+            for job in &lane.tagged {
                 writeln!(out, "  job {job}: tags: [{}]", lane.tag)?;
             }
         }

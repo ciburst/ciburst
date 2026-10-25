@@ -2,10 +2,11 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::check::LintJob;
 use crate::http::{Headers, HttpClient, Request, Response, header_value};
+use crate::time::{parse_rfc3339, rfc3339};
 use crate::{Error, Result};
 
 /// Page size of every paginated list; GitLab's maximum.
@@ -26,10 +27,141 @@ pub struct CreatedRunner {
     pub token: String,
 }
 
+/// `alert_status` of a hook GitLab delivers to.
+pub const EXECUTABLE: &str = "executable";
+
+/// The test delivery `apply` sends to enable a hook again (D51); the dispatcher answers a push
+/// event 200 `ignored`.
+pub const REENABLE_TRIGGER: &str = "push_events";
+
+/// Deliveries `ciburst status` reads per hook (D52).
+pub const DELIVERIES: usize = 20;
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Hook {
     pub id: u64,
     pub url: String,
+    /// `executable`, `temporarily_disabled` after four failed deliveries in a row, or
+    /// `disabled`; GitLab delivers nothing to a hook that is not `executable` (D51).
+    #[serde(default = "executable")]
+    pub alert_status: String,
+    /// RFC 3339 end of a temporary disable.
+    #[serde(default)]
+    pub disabled_until: Option<String>,
+}
+
+fn executable() -> String {
+    EXECUTABLE.to_string()
+}
+
+impl Hook {
+    pub fn is_executable(&self) -> bool {
+        self.alert_status == EXECUTABLE
+    }
+
+    /// `<alert_status> until <time or never>`, the time as `YYYY-MM-DDTHH:MM:SSZ`.
+    pub fn disabled(&self) -> String {
+        let until = match self.disabled_until.as_deref().filter(|t| !t.is_empty()) {
+            Some(text) => parse_rfc3339(text)
+                .map(rfc3339)
+                .unwrap_or_else(|| text.to_string()),
+            None => "never".to_string(),
+        };
+        format!("{} until {until}", self.alert_status)
+    }
+}
+
+/// A delivery of a project hook as `GET /projects/:id/hooks/:hook_id/events` lists it. GitLab
+/// writes the bodies as JSON or as text, and the HTTP status as text, `internal error` for a
+/// request that got no answer.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct HookEvent {
+    #[serde(default)]
+    pub id: u64,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub request_data: Value,
+    #[serde(default)]
+    pub response_status: Value,
+    #[serde(default)]
+    pub response_body: Value,
+}
+
+/// One delivery as `ciburst status` prints it (D52). `result`, `pool` and `ms` come from the
+/// dispatcher's answer: `-` where the answer lacks the key, `?` where the body is unreadable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delivery {
+    /// `YYYY-MM-DDTHH:MM:SSZ`, or `?`.
+    pub time: String,
+    /// The job name of a job event, `pipeline <id>` of a pipeline event, else the event's
+    /// `object_kind`; `?` for an unreadable body.
+    pub subject: String,
+    pub status: String,
+    pub result: String,
+    pub pool: String,
+    pub ms: String,
+}
+
+impl HookEvent {
+    pub fn delivery(&self) -> Delivery {
+        let time = self
+            .created_at
+            .as_deref()
+            .and_then(parse_rfc3339)
+            .map(rfc3339)
+            .unwrap_or_else(|| "?".to_string());
+        let request = json_object(&self.request_data);
+        let subject = match request.as_ref() {
+            None => "?".to_string(),
+            Some(event) => match event.get("object_kind").and_then(Value::as_str) {
+                Some("build") => text_of(event.get("build_name")).unwrap_or_else(|| "?".into()),
+                Some("pipeline") => {
+                    match text_of(event.get("object_attributes").and_then(|a| a.get("id"))) {
+                        Some(id) => format!("pipeline {id}"),
+                        None => "pipeline ?".to_string(),
+                    }
+                }
+                Some(kind) => kind.to_string(),
+                None => "?".to_string(),
+            },
+        };
+        let status = text_of(Some(&self.response_status)).unwrap_or_else(|| "?".into());
+        let answer = json_object(&self.response_body);
+        let field = |key: &str| match &answer {
+            None => "?".to_string(),
+            Some(answer) => text_of(answer.get(key)).unwrap_or_else(|| "-".into()),
+        };
+        Delivery {
+            time,
+            subject,
+            status,
+            result: field("result"),
+            pool: field("pool"),
+            ms: field("ms"),
+        }
+    }
+}
+
+/// A JSON object, or a text that holds one.
+fn json_object(value: &Value) -> Option<Map<String, Value>> {
+    match value {
+        Value::Object(map) => Some(map.clone()),
+        Value::String(text) => match serde_json::from_str(text) {
+            Ok(Value::Object(map)) => Some(map),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A string or number as text; `None` for anything else, an empty string included.
+fn text_of(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(text) if !text.is_empty() => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -336,6 +468,33 @@ impl Gitlab {
         )
         .await?;
         Ok(())
+    }
+
+    /// Sends the hook a test delivery of `trigger`, such as [`REENABLE_TRIGGER`]; GitLab
+    /// enables a disabled hook again when the delivery succeeds and answers 422 otherwise.
+    pub async fn test_hook(&self, project_id: u64, hook_id: u64, trigger: &str) -> Result<()> {
+        self.call(
+            "POST",
+            &format!("/projects/{project_id}/hooks/{hook_id}/test/{trigger}"),
+            &[],
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// The newest `count` deliveries of a hook, newest first, as GitLab lists them.
+    pub async fn hook_events(
+        &self,
+        project_id: u64,
+        hook_id: u64,
+        count: usize,
+    ) -> Result<Vec<HookEvent>> {
+        self.get(
+            &format!("/projects/{project_id}/hooks/{hook_id}/events"),
+            &[("per_page", count.to_string())],
+        )
+        .await
     }
 
     /// Lints the pipeline at `content_ref` (branch, tag or commit), the default branch when
@@ -827,6 +986,184 @@ mod tests {
         assert_eq!(fake.hook_token(hook.id), Some("t2".into()));
         gitlab.delete_hook(7, hook.id).await.unwrap();
         assert!(gitlab.list_hooks(7).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_test_delivery_enables_a_disabled_hook() {
+        let fake = Arc::new(FakeGitlab::new());
+        let gitlab = client(&fake);
+        let hook = gitlab
+            .create_hook(7, "https://d.example/", "t1")
+            .await
+            .unwrap();
+        assert!(hook.is_executable());
+        assert_eq!(hook.disabled(), "executable until never");
+        fake.disable_hook(
+            hook.id,
+            "temporarily_disabled",
+            Some("2026-10-25T12:34:56.789+02:00"),
+        );
+        let listed = gitlab.list_hooks(7).await.unwrap().remove(0);
+        assert!(!listed.is_executable());
+        assert_eq!(
+            listed.disabled(),
+            "temporarily_disabled until 2026-10-25T10:34:56Z"
+        );
+
+        assert_eq!(
+            status_of(gitlab.test_hook(7, hook.id, "build_events").await),
+            400
+        );
+        assert_eq!(
+            status_of(gitlab.test_hook(8, hook.id, REENABLE_TRIGGER).await),
+            404
+        );
+        fake.fail_hook_tests();
+        assert_eq!(
+            status_of(gitlab.test_hook(7, hook.id, REENABLE_TRIGGER).await),
+            422
+        );
+        assert_eq!(
+            fake.hook_alert(hook.id).unwrap().0,
+            "temporarily_disabled",
+            "a failed test leaves the hook disabled"
+        );
+
+        let fake = Arc::new(FakeGitlab::new());
+        let gitlab = client(&fake);
+        let hook = gitlab
+            .create_hook(7, "https://d.example/", "t1")
+            .await
+            .unwrap();
+        fake.disable_hook(hook.id, "disabled", None);
+        assert_eq!(
+            gitlab.list_hooks(7).await.unwrap()[0].disabled(),
+            "disabled until never"
+        );
+        gitlab
+            .test_hook(7, hook.id, REENABLE_TRIGGER)
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.hook_alert(hook.id),
+            Some(("executable".to_string(), None))
+        );
+        let call = fake.calls().pop().unwrap();
+        assert_eq!(
+            (call.method.as_str(), call.path),
+            (
+                "POST",
+                format!("/projects/7/hooks/{}/test/push_events", hook.id)
+            )
+        );
+    }
+
+    #[test]
+    fn hooks_without_alert_fields_are_executable() {
+        let hook: Hook =
+            serde_json::from_value(json!({ "id": 1, "url": "https://d.example/" })).unwrap();
+        assert!(hook.is_executable());
+        let hook: Hook = serde_json::from_value(json!({
+            "id": 1, "url": "https://d.example/", "alert_status": "temporarily_disabled",
+            "disabled_until": "not a time"
+        }))
+        .unwrap();
+        assert_eq!(hook.disabled(), "temporarily_disabled until not a time");
+    }
+
+    fn event(id: u64, request: Value, status: Value, response: Value) -> Value {
+        json!({
+            "id": id,
+            "url": "https://d.example/",
+            "trigger": "job_hooks",
+            "request_headers": { "X-Gitlab-Event": "Job Hook" },
+            "request_data": request,
+            "response_headers": { "Content-Type": "application/json" },
+            "response_body": response,
+            "execution_duration": 0.4,
+            "response_status": status,
+            "created_at": format!("2026-10-25T12:00:{:02}.123Z", id % 60),
+        })
+    }
+
+    #[tokio::test]
+    async fn deliveries_read_the_job_and_the_dispatchers_answer() {
+        let fake = Arc::new(FakeGitlab::new());
+        let gitlab = client(&fake);
+        let hook = gitlab
+            .create_hook(7, "https://d.example/", "t1")
+            .await
+            .unwrap();
+        let job = json!({ "object_kind": "build", "build_name": "e2e: [ios]", "build_status": "pending" });
+        let pipeline = json!({ "object_kind": "pipeline", "object_attributes": { "id": 901 } });
+        for (id, request, status, response) in [
+            (
+                1,
+                job.clone(),
+                json!("200"),
+                json!(r#"{"result":"started","pool":"vm","runId":"r","ms":5120}"#),
+            ),
+            (
+                2,
+                Value::String(job.to_string()),
+                json!(200),
+                json!({ "result": "claimed", "pool": "vm", "lane": "node-24", "ms": 812 }),
+            ),
+            (
+                3,
+                pipeline,
+                json!("200"),
+                json!(r#"{"result":"ignored","reason":"not_job_event"}"#),
+            ),
+            (4, json!({ "object_kind": "push" }), json!("401"), json!("")),
+            (
+                5,
+                json!("{not json"),
+                json!("internal error"),
+                json!("Net::ReadTimeout"),
+            ),
+            (6, Value::Null, Value::Null, Value::Null),
+        ] {
+            fake.add_hook_event(hook.id, event(id, request, status, response));
+        }
+        let events = gitlab.hook_events(7, hook.id, DELIVERIES).await.unwrap();
+        let ids: Vec<u64> = events.iter().map(|e| e.id).collect();
+        assert_eq!(ids, [6, 5, 4, 3, 2, 1], "newest first");
+        let call = fake.calls().pop().unwrap();
+        assert_eq!(call.path, format!("/projects/7/hooks/{}/events", hook.id));
+        assert_eq!(call.query, "per_page=20");
+        let lines: Vec<String> = events
+            .iter()
+            .rev()
+            .map(|event| {
+                let d = event.delivery();
+                format!(
+                    "{} {} {} {} {} {}",
+                    d.time, d.subject, d.status, d.result, d.pool, d.ms
+                )
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "2026-10-25T12:00:01Z e2e: [ios] 200 started vm 5120",
+                "2026-10-25T12:00:02Z e2e: [ios] 200 claimed vm 812",
+                "2026-10-25T12:00:03Z pipeline 901 200 ignored - -",
+                "2026-10-25T12:00:04Z push 401 ? ? ?",
+                "2026-10-25T12:00:05Z ? internal error ? ? ?",
+                "2026-10-25T12:00:06Z ? ? ? ? ?",
+            ]
+        );
+        assert_eq!(
+            status_of(gitlab.hook_events(8, hook.id, DELIVERIES).await),
+            404
+        );
+        for id in 7..=30 {
+            fake.add_hook_event(hook.id, event(id, Value::Null, Value::Null, Value::Null));
+        }
+        let newest = gitlab.hook_events(7, hook.id, DELIVERIES).await.unwrap();
+        assert_eq!(newest.len(), DELIVERIES);
+        assert_eq!((newest[0].id, newest[19].id), (30, 11));
     }
 
     #[tokio::test]

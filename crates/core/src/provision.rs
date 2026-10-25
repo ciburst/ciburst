@@ -11,7 +11,7 @@ use crate::check::{Problem, Suggestion};
 use crate::check::{check_jobs, suggest_lanes};
 use crate::config::{CacheType, Config, Pool};
 use crate::fake::Clock;
-use crate::gitlab::{Gitlab, Job};
+use crate::gitlab::{DELIVERIES, Delivery, Gitlab, Hook, Job, REENABLE_TRIGGER};
 use crate::http::{HttpClient, Request};
 use crate::log::Log;
 #[cfg(feature = "pipeline")]
@@ -176,6 +176,18 @@ pub struct ProjectReport {
     pub problems: Vec<Problem>,
     /// Lanes for the Docker-free jobs on VM pools (D46).
     pub suggestions: Vec<Suggestion>,
+    /// The project's hook to the dispatcher; `None` when the dispatcher's URL is unknown or
+    /// the project has no hook to it (D51).
+    pub hook: Option<Hook>,
+}
+
+/// The dispatcher's hook of a project and its newest deliveries, oldest first (D52).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookStatus {
+    pub project_id: u64,
+    /// `None` when the project has no hook to the dispatcher.
+    pub hook: Option<Hook>,
+    pub deliveries: Vec<Delivery>,
 }
 
 /// Orchestrates provider, GitLab and host steps. GitLab is optional for plan and apply.
@@ -335,8 +347,7 @@ impl Provisioner {
             let hooks = gitlab.list_hooks(project_id).await?;
             let existing = url
                 .as_ref()
-                .map(|u| hooks.iter().any(|h| &h.url == u))
-                .unwrap_or(false);
+                .and_then(|u| hooks.iter().find(|h| &h.url == u));
             let mut step = Step::new(
                 format!("hook:{project_id}"),
                 Action::Create,
@@ -345,11 +356,21 @@ impl Provisioner {
             if url.is_none() {
                 step.detail = Some("url known after the dispatcher is deployed".into());
             }
-            if existing && rotate {
-                step.action = Action::Update;
-                step.detail = Some("new token".into());
-            } else if existing {
-                step.action = Action::Noop;
+            if let Some(hook) = existing {
+                // D51: GitLab delivers nothing to a disabled hook until a test delivery succeeds.
+                let mut changes = Vec::new();
+                if rotate {
+                    changes.push("new token".to_string());
+                }
+                if !hook.is_executable() {
+                    changes.push(format!("re-enable: {}", hook.disabled()));
+                }
+                step.action = if changes.is_empty() {
+                    Action::Noop
+                } else {
+                    Action::Update
+                };
+                step.detail = (!changes.is_empty()).then(|| changes.join(", "));
             }
             steps.push(step);
         }
@@ -454,7 +475,9 @@ impl Provisioner {
         Ok(())
     }
 
-    async fn apply_hooks(&self, steps: &[Step], hook_token: &str) -> Result<()> {
+    /// Creates missing hooks, gives existing ones a rotated token, and enables a disabled one
+    /// again with a test delivery (D51).
+    async fn apply_hooks(&self, steps: &[Step], hook_token: &str, rotate: bool) -> Result<()> {
         let Some(gitlab) = &self.gitlab else {
             return Ok(());
         };
@@ -472,19 +495,28 @@ impl Provisioner {
                 .strip_prefix("hook:")
                 .and_then(|p| p.parse().ok())
                 .ok_or_else(|| Error::other("bad step id"))?;
+            let project = project_id.to_string();
             let hooks = gitlab.list_hooks(project_id).await?;
             match hooks.iter().find(|h| h.url == url) {
                 Some(existing) => {
-                    gitlab
-                        .update_hook(project_id, existing.id, &url, hook_token)
-                        .await?;
+                    if rotate {
+                        gitlab
+                            .update_hook(project_id, existing.id, &url, hook_token)
+                            .await?;
+                        self.log.info("hook", &[("project", &project)]);
+                    }
+                    if !existing.is_executable() {
+                        gitlab
+                            .test_hook(project_id, existing.id, REENABLE_TRIGGER)
+                            .await?;
+                        self.log.info("hook_reenabled", &[("project", &project)]);
+                    }
                 }
                 None => {
                     gitlab.create_hook(project_id, &url, hook_token).await?;
+                    self.log.info("hook", &[("project", &project)]);
                 }
             }
-            self.log
-                .info("hook", &[("project", &project_id.to_string())]);
         }
         Ok(())
     }
@@ -616,8 +648,9 @@ impl Provisioner {
         self.outputs.write(&host_outputs, true).await?;
         applied.extend(host_steps);
 
-        let hook_steps = self.hook_steps(rotate.contains(&Rotation::Hook)).await?;
-        self.apply_hooks(&hook_steps, &hook_token).await?;
+        let hook_steps = self.hook_steps(rotate_hook).await?;
+        self.apply_hooks(&hook_steps, &hook_token, rotate_hook)
+            .await?;
         applied.extend(hook_steps);
         self.replay(&hook_token).await;
         Ok(applied)
@@ -770,28 +803,68 @@ impl Provisioner {
         })
     }
 
-    /// See [`check`].
+    /// Per project the hook to the dispatcher at `url` and its newest [`DELIVERIES`]; nothing
+    /// without GitLab or a URL (D52).
+    pub async fn hook_deliveries(&self, url: Option<&str>) -> Result<Vec<HookStatus>> {
+        let (Some(gitlab), Some(url)) = (&self.gitlab, url) else {
+            return Ok(Vec::new());
+        };
+        let mut status = Vec::new();
+        for &project_id in &self.config.gitlab.project_ids {
+            let hook = dispatcher_hook(gitlab, project_id, url).await?;
+            let mut deliveries = Vec::new();
+            if let Some(hook) = &hook {
+                let mut events = gitlab.hook_events(project_id, hook.id, DELIVERIES).await?;
+                events.truncate(DELIVERIES);
+                events.sort_by_key(|event| event.id);
+                deliveries = events.iter().map(|event| event.delivery()).collect();
+            }
+            status.push(HookStatus {
+                project_id,
+                hook,
+                deliveries,
+            });
+        }
+        Ok(status)
+    }
+
+    /// See [`check`]; the hooks checked are those to the host's URL.
     #[cfg(feature = "pipeline")]
     pub async fn check(&self, content_ref: Option<&str>) -> Result<Vec<ProjectReport>> {
         let gitlab = self
             .gitlab
             .as_ref()
             .ok_or_else(|| Error::other("check needs a GitLab token"))?;
-        check(&self.config, gitlab, content_ref).await
+        let url = self.host.url().await?;
+        check(&self.config, gitlab, content_ref, url.as_deref()).await
     }
 }
 
+/// The hook of project `project_id` that delivers to `url`.
+async fn dispatcher_hook(gitlab: &Gitlab, project_id: u64, url: &str) -> Result<Option<Hook>> {
+    Ok(gitlab
+        .list_hooks(project_id)
+        .await?
+        .into_iter()
+        .find(|hook| hook.url == url))
+}
+
 /// Lints every project's pipeline at `content_ref` (the default branch when `None`), compares
-/// its jobs with the routing of the config and proposes lanes (D46). Needs only the config and
-/// GitLab.
+/// its jobs with the routing of the config and proposes lanes (D46). With the dispatcher's
+/// `url` it also reads each project's hook to it (D51). Needs only the config and GitLab.
 #[cfg(feature = "pipeline")]
 pub async fn check(
     config: &Config,
     gitlab: &Gitlab,
     content_ref: Option<&str>,
+    url: Option<&str>,
 ) -> Result<Vec<ProjectReport>> {
     let mut report = Vec::new();
     for &project_id in &config.gitlab.project_ids {
+        let hook = match url {
+            Some(url) => dispatcher_hook(gitlab, project_id, url).await?,
+            None => None,
+        };
         let lint = gitlab.lint_jobs(project_id, content_ref).await?;
         let (problems, suggestions) = if lint.valid {
             let pipeline = match &lint.merged_yaml {
@@ -812,6 +885,7 @@ pub async fn check(
             errors: lint.errors,
             problems,
             suggestions,
+            hook,
         });
     }
     Ok(report)
