@@ -35,12 +35,12 @@ A host registers in `Modules::host` and `HOSTS` of the CLI and needs its own fun
 | `capacity(pool)` | VM providers: every VM of the pool as `VmCapacity { run_id, state, free, seen, created_at }`; `None` (default) for one-job runtimes, whose live runs the dispatcher counts |
 | `claim(run_id)` | lowers a VM's free slots by one, not below zero |
 | `report(run_id, report, now)` | stores a VM's `VmReport { state, free, slots }` with `now` as last seen, and the drain time when it turns `draining` |
-| `shared_env()` | main provider only: what VMs of added providers need, `CIBURST_AGENT_URL`, `CIBURST_AGENT_SHA256` and the cache location (`CACHE_TYPE`, `CACHE_S3_SERVER_ADDRESS`, `CACHE_S3_BUCKET_NAME`, `CACHE_S3_BUCKET_LOCATION`, `CACHE_SHARED`); never a secret |
+| `shared_env()` | main provider only: what VMs of added providers need, `CIBURST_AGENT_URL`, `CIBURST_AGENT_SHA256`, `CIBURST_RUNNER_URL` and the cache location (`CACHE_TYPE`, `CACHE_S3_SERVER_ADDRESS`, `CACHE_S3_BUCKET_NAME`, `CACHE_S3_BUCKET_LOCATION`, `CACHE_SHARED`); never a secret |
 | `sweep(now)` | ends the VMs for which `ciburst_core::vm::sweep_reason` gives a reason; returns their ids |
 
 ## Step ids, run ids, runtime names
 
-- Step ids are stable across plans. A one-job runtime names its pool definitions `definition:<tag>`; shared resources have fixed ids such as `project`, `bucket`, `vm:agent`, `vm:security-group`.
+- Step ids are stable across plans. A one-job runtime names its pool definitions `definition:<tag>`; shared resources have fixed ids such as `project`, `bucket`, `runner-binary`, `vm:agent`, `vm:security-group`.
 - An added provider starts every step id and run id with `<runtime>:` (`hetzner:firewall`, `hetzner:<server name>`) and ignores pools of other runtimes; `Composite` routes `apply`, `stop`, `claim` and `report` by that prefix.
 - Reserved, so not a runtime name: `instances`, `jobs`, `vm`, `key`, `definition`, `bucket`, `registry`, `project`, `iam`, `hook`, `runner`, `runner-enable`, `function`, `namespace`, `cron`.
 
@@ -51,15 +51,33 @@ A host registers in `Modules::host` and `HOSTS` of the CLI and needs its own fun
 - Return a secret only from the call that created or rotated it; a later call without it keeps the stored value.
 - `PROVIDER_ENV` keys (`HCLOUD_TOKEN`) reach the function as secret environment variables, `DISPATCHER_ENV` keys (`CIBURST_AGENT_SHA256`) as plain ones (`provision::secrets_from_outputs`). With `--ci` the `PROVIDER_ENV` keys stay in memory.
 
+## Runner object
+
+Step `runner-binary`, present whenever the config has a pool: the object `ciburst/runner/<ciburst_core::cloud_init::RUNNER_SHA256>` in the cache bucket, public-read. `apply` downloads `cloud_init::RUNNER_URL`, refuses a SHA-256 other than `RUNNER_SHA256` and uploads the binary; the step is `noop` when the object exists. VMs of every provider and every lane run download `gitlab-runner` from it and check the hash; `shared_env()` hands its URL to added providers as `CIBURST_RUNNER_URL`.
+
 ## VM providers
 
 `StartRequest.env` of a VM pool holds `RUNNER_TOKEN`, `CIBURST_VM_SECRET`, `CIBURST_DISPATCH_URL` and, with an S3 cache, `CACHE_S3_ACCESS_KEY` and `CACHE_S3_SECRET_KEY`. An added provider also gets the main provider's `shared_env()`; keys already in the request win.
 
-The provider adds `CIBURST_RUN_ID` (chosen before create, so the token fits into the user data) and `CIBURST_VM_TOKEN`, which is `ciburst_core::vm::token(<CIBURST_VM_SECRET>, <run id>)`, and renders the user data with `ciburst_core::cloud_init::render`. The VM secret never enters user data.
+The provider adds `CIBURST_RUN_ID` (chosen before create, so the token fits into the user data) and `CIBURST_VM_TOKEN`, which is `ciburst_core::vm::token(<CIBURST_VM_SECRET>, <run id>)`, and renders the user data with `ciburst_core::cloud_init::render`. The user data downloads the runner object and the agent object (an added provider takes their URLs from `shared_env()`) and checks each against its SHA-256. The VM secret never enters user data.
 
 `/etc/ciburst/vm.env`, read by the agent: `CIBURST_RUN_ID`, `CIBURST_VM_TOKEN`, `CIBURST_DISPATCH_URL`, `CI_SERVER_URL`, `RUNNER_TOKEN`, `CIBURST_POOL`, `CIBURST_SLOTS`, `CIBURST_DEFAULT_IMAGE` (the pool's `image`), `CIBURST_TIMEOUT_S`; with an S3 cache also `CACHE_TYPE=s3`, `CACHE_S3_SERVER_ADDRESS`, `CACHE_S3_BUCKET_NAME`, `CACHE_S3_BUCKET_LOCATION`, `CACHE_S3_ACCESS_KEY`, `CACHE_S3_SECRET_KEY`, `CACHE_SHARED`. The agent exits 64 naming a missing key.
 
 A VM's state, free slots, last report and drain time live with the server (tags on Scaleway, labels on Hetzner), so the function stays stateless.
+
+## Lane runs
+
+A lane (`runtime: jobs` on Scaleway) is a one-job runtime that runs the job's own image (D45). Its definition carries:
+
+| Field | Value |
+|---|---|
+| image | the lane's `image` |
+| command | `ciburst_core::lane::COMMAND`: `/bin/sh -c` with one argument without spaces (Scaleway splits a command at spaces and ignores quotes), which decodes `CIBURST_LANE` with `base64 -d` and evaluates it |
+| environment | `CIBURST_LANE` (base64 of `ciburst_core::lane::BOOTSTRAP`, the script `lane-bootstrap.sh`), `CIBURST_RUNNER_URL` (the runner object's public URL), `CIBURST_RUNNER_SHA256` (`cloud_init::RUNNER_SHA256`), `CIBURST_POOL`, `CI_SERVER_URL`, `RUNNER_WAIT_TIMEOUT` (`waitTimeoutS`) and, with an S3 cache, `CACHE_TYPE`, `CACHE_S3_SERVER_ADDRESS`, `CACHE_S3_BUCKET_NAME`, `CACHE_S3_BUCKET_LOCATION`, `CACHE_SHARED` |
+
+`plan` updates a definition when any of these changes. `StartRequest.env` of a lane holds `RUNNER_TOKEN` and, with an S3 cache, `CACHE_S3_ACCESS_KEY` and `CACHE_S3_SECRET_KEY`, never `CIBURST_VM_SECRET`; the run also gets the labels as `CIBURST_PROJECT`, `CIBURST_PIPELINE`, `CIBURST_JOB` and `CIBURST_STAGE`.
+
+The bootstrap needs `CI_SERVER_URL`, `RUNNER_TOKEN`, `CIBURST_RUNNER_URL` and `CIBURST_RUNNER_SHA256`, and with `CACHE_TYPE=s3` the cache location and key. As root it installs missing `git`, `curl` and CA certificates with `apk` or `apt-get` (spec section 6.3); then it downloads and checks the runner, unsets the token and cache keys and execs `gitlab-runner run-single` with the shell executor. Optional: `CIBURST_BUILDS_DIR` (`/builds`), `CIBURST_CACHE_DIR` (`/cache`); `CIBURST_LANE_DRY_RUN=1` installs, skips the download and prints the command with secrets masked. A failed check prints `ciburst-lane: <reason>` to stderr and exits 64 (`docs/RUNBOOK.md`, Failure modes).
 
 ## Tests
 
@@ -91,4 +109,4 @@ A wrong or missing token answers `401` without a body. The host also needs a sch
 
 ## Apply order
 
-`preflight`, provider steps, GitLab runners (one per pool, enabled in every further project), host, GitLab webhooks, replay of waiting jobs. Outputs go to `.local/outputs.env`, or with `--ci` to project variables.
+`preflight`, provider steps, GitLab runners (one per pool, enabled in every further project; the runner of the VM pool that lanes borrow slots from also carries their tags), host, GitLab webhooks, replay of waiting jobs. Outputs go to `.local/outputs.env`, or with `--ci` to project variables.
