@@ -21,7 +21,7 @@ Status: M4 cost done 2026-10-24 (Hetzner drill waits for the owner's token); M5 
 | D13 | 2026-10-23 | License Apache-2.0. |
 | D14 | 2026-10-23 | v1 pools: `ci` (node 24, default), `rust`, `playwright`. |
 | D15 | 2026-10-23 | `ciburst check` lints every consumer pipeline against the stage map (CI lint API, owner token) so a job never waits for a pool that will not take it. A scheduled sweep for lost deliveries is backlog. |
-| D16 | 2026-10-23 | Region `fr-par`. Drill consumer: the drill consumer project, its id in `.local/` only. |
+| D16 | 2026-10-23 | Region `fr-par`. Drill consumer: a project whose id lives in `.local/` only. |
 | D17 | 2026-10-24 | The dispatcher is a Scaleway Serverless Function on runtime `rust196`. Scaleway compiles the uploaded source, so the workspace is pinned to Rust 1.96.0 (`rust-toolchain.toml`) and CI builds with the same version. A runtime bump is a one-line change plus a redeploy. |
 | D18 | 2026-10-24 | Few audited dependencies instead of none: tokio, reqwest with rustls, serde, clap, async-trait, sha2, subtle, rand, thiserror. `cargo deny` gates licenses, advisories and sources in CI. The HTTP seam is one trait, so every API client is tested against in-memory fakes. |
 | D19 | 2026-10-24 | Pool images pin `gitlab/gitlab-runner:v18.11.4`; every `run-single` flag was verified against its help text. A move to 19.x follows the M2 drill. |
