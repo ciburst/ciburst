@@ -39,12 +39,7 @@ impl ScalewayLedger {
         key: &KeyPair,
     ) -> ScalewayLedger {
         ScalewayLedger {
-            s3: S3 {
-                http,
-                region: region.to_string(),
-                access_key: key.access_key.clone(),
-                secret_key: key.secret_key.clone(),
-            },
+            s3: S3::with_key(http, region, key),
             bucket: bucket.into(),
         }
     }
@@ -81,14 +76,18 @@ pub fn pool_prefix(pool: &str) -> Result<String> {
     Ok(format!("{INTENT_PREFIX}{pool}/"))
 }
 
-/// The object key of an intent. The job id is a number without leading zeros, as GitLab sends
-/// it, so that the key reads back as the same id.
+/// Whether `id` is a GitLab id as GitLab sends it: a number of at most 20 digits without
+/// leading zeros, so that a key made of it reads back as the same id.
+pub fn is_id(id: &str) -> bool {
+    (1..=JOB_DIGITS).contains(&id.len())
+        && id.bytes().all(|b| b.is_ascii_digit())
+        && (id == "0" || !id.starts_with('0'))
+}
+
+/// The object key of an intent; the job id is an [`is_id`] number.
 pub fn intent_key(pool: &str, at: u64, job: &str) -> Result<String> {
     let prefix = pool_prefix(pool)?;
-    let canonical = (1..=JOB_DIGITS).contains(&job.len())
-        && job.bytes().all(|b| b.is_ascii_digit())
-        && (job == "0" || !job.starts_with('0'));
-    if !canonical {
+    if !is_id(job) {
         return Err(invalid(format!("job id {job:?} is not a number")));
     }
     if at.to_string().len() > AT_DIGITS {
