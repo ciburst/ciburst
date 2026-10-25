@@ -93,11 +93,16 @@ Where to look when a job waits:
 | 200 | `grouped` (`leader`) | rides on the VM its leader's delivery starts; any polling slot of the pool takes it, GitLab does not bind it to that VM |
 | 200 | `duplicate` | GitLab delivered this job's pending event again within 30 s; nothing started |
 | 200 | `at_capacity` | `maxRuns` reached; the job waits for a free slot or run |
-| 200 | `ignored`, reason `not_job_event` | not a job event |
+| 200 | `ignored`, reason `not_job_event` | neither a job nor a pipeline event |
 | 200 | `ignored`, reason `status` (`status`) | a job event other than `pending` |
 | 200 | `ignored`, reason `project` | a project not in `gitlab.projectIds` |
 | 200 | `ignored`, reason `unmapped_stage` (`stage`) | no `jobs` pattern matches the job's name, no pool lists its stage and there is no `defaultPool` |
 | 200 | `ignored`, reason `own_job` | a job named `ciburst-*`, the component's own jobs |
+| 200 | `ignored`, reason `ignore_jobs` | a job named in `ignoreJobs`, which runs on other runners |
+| 200 | `warm` (`pipeline`, `pools[]` with `pool`, `action`, `vmJobs`, `runId`) | a pipeline event: per VM pool `started` (a warm VM boots with every slot free), `capacity` (a VM with a free slot exists or one is starting), `at_capacity`, `disabled` (`warmStart` false) |
+| 200 | `ignored`, reason `no_vm_jobs` | a pipeline event whose open jobs all run in lanes or elsewhere |
+| 200 | `duplicate` (`pipeline`) | a pipeline event for a pipeline whose record exists; nothing started |
+| 200 | `closed` (`pipeline`) | a pipeline event with a final status; the pipeline's records are deleted |
 | 200 | `reported`, `terminated`, `swept` (`runs`) | a VM report, a VM's termination, the cron sweep |
 | 400 | `bad_request` | the body is not JSON, or a VM report is malformed |
 | 401 | no body | wrong or missing hook, VM or sweep token |
@@ -174,6 +179,8 @@ Inspect a pool's intents:
    Check: a cold burst of N jobs at `slots` S shows N keys within about 2 s and `ceil(N / S)` new servers.
 3. Never delete intents by hand. A key outside the format is ignored; a forged key in the format costs at most one VM-hour.
 
+Warm start (spec section 6.1): a warm intent is `<unix seconds>-warm-<pipeline id, 20 digits>`, and the pipeline's records live in `ciburst/intents/_pipelines/<pipeline>/` (`vm-jobs.json`, `seen/<job>`) until its final status. Check: after a pipeline event with VM jobs `vm-jobs.json` exists; after the pipeline the folder is gone.
+
 Known limits, each at most one VM-hour: a VM created in the 2 to 3 s after its intent left the 30 s window counts neither as old nor by rank, so a new burst at that instant can pass `maxRuns` by one; a repeated delivery within the same second is not recognised as a duplicate.
 
 ## Hetzner
@@ -240,6 +247,7 @@ A lane with `vmFirst` (the default when the config has a VM pool) borrows the sl
 - A lane run whose job a VM slot took first idles `waitTimeoutS` and exits; those seconds are billed.
 - A lane job whose claimed slot another job took first waits for the next free VM slot or a lane run that still polls.
 - A failed claim or capacity read logs `warn claim_failed` with `lane` and starts a lane run instead.
+- While the lane job's pipeline still has VM jobs that have not gone pending, it leaves that many free slots, at most one VM's `slots`, for them (warm start reservation); its decision line then carries `reserve`.
 
 ### Lane bootstrap
 
@@ -402,6 +410,33 @@ Measured:
    Result (2026-10-25): with one idle VM, `lane-node` answered `{"lane":"node24","pool":"vm","result":"claimed"}` and ran on `<name>-vm` after 1.4 s in the queue; `lane-rust` (`vmFirst` false) answered `started` and ran in its lane after 6.8 s. Before the setup, the old dispatcher had routed both lane jobs by stage and started a VM, which took the node job as soon as the setup added `node24` to its runner. Finding: the delivery that started the VM answered after 10.4 s, beyond GitLab.com's 10 s webhook timeout, and counted as failed although the VM started (spec section 13, risks).
 4. The drill consumer: `ciburst check --suggest`, the proposed lanes in `ciburst.json` and the `tags:` in its pipeline, `ciburst-setup`, a pipeline.
    Check: `ciburst-check` passes; every job passes; wall clock and cost against its 18-minute warm VM pipeline.
+   Result: ____
+
+### M7 hardening drill
+
+1. Demo deployment: `ciburst-setup` with the hardened `cli:edge`.
+   Check: the plan shows `update  function <name>-dispatch  (settings, config or secrets changed)`; the function has `memory_limit` 1024 and the plain variables `CIBURST_VM_SECURITY_GROUP` and `CIBURST_VM_IMAGES`; the next setup plans only `noop`.
+   Result: ____
+2. A VM start right after the deploy, then three on a warm function (`[one-vm]` pipelines while no VM runs).
+   Check: every delivery carries `ms`; the first start answers within 9 s, the warm ones within 6 s; no `start_lookup`.
+   Result: ____
+3. `ciburst status` with the owner token.
+   Check: `hook <id>: executable` and the newest deliveries with result, pool and `ms`.
+   Result: ____
+
+### M6.1 warm start drill
+
+1. Demo deployment: `ciburst-setup` after the M6.1 code.
+   Check: the plan shows `update  gitlab hook in project <id>  (pipeline events)`; the hook's pipeline events are on.
+   Result: ____
+2. A pipeline with a lane stage of about 60 s before a Docker job, no VM running, `warmStart` on.
+   Check: the pipeline event answers `warm` with `started`; `vm-jobs.json` exists; the Docker job queues under 10 s and leaves `seen/<job>`; after the pipeline the records are gone.
+   Result: ____
+3. The same pipeline with `"warmStart": false`.
+   Check: `warm` with `disabled`; the Docker job queues 60 to 100 s.
+   Result: ____
+4. The drill consumer, once with `warmStart` true and once false, each from a cold start.
+   Check: wall clock, VMs started, VM-hours, lane seconds and cost per pipeline.
    Result: ____
 
 ## `run-single` flags

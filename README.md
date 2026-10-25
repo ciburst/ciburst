@@ -10,11 +10,12 @@ Status: pre-release. `ciburst/ciburst` stays private until v1.0.0; the component
 
 ## How it works
 
-1. GitLab sends every job event of the project to the dispatcher.
-2. The job's name, else its stage, selects its pool: the VM pool, or a lane of `ciburst.json`.
-3. A pending job claims a free slot on a running VM, a lane job too unless its lane sets `"vmFirst": false`. Without a free slot a VM job starts a VM, and jobs that wait together share VMs (two slots each, so five jobs start three VMs); a lane job starts a Serverless Job, which runs it and exits after 60 idle seconds.
-4. Each VM runs one `gitlab-runner run-single` per slot and reports its state to the dispatcher. An idle VM ends at minute 55; a sweep every 30 minutes removes VMs that stopped reporting.
-5. Setup, check and teardown run in your own pipeline on GitLab's hosted runners, from three manual jobs of the CI/CD component.
+1. GitLab sends every job and pipeline event of the project to the dispatcher.
+2. The job's name, else its stage, selects its pool: the VM pool, or a lane of `ciburst.json`. Jobs in `ignoreJobs` run on other runners and start nothing.
+3. When a pipeline starts and any of its jobs will need a VM, one VM boots right away if none has a free slot, so a Docker job in a later stage finds it ready (`warmStart`, on by default; it costs one VM-hour, 0.03 EUR, when the pipeline ends before that job runs). Lane jobs of the pipeline leave the slots its VM jobs still need.
+4. A pending job claims a free slot on a running VM, a lane job too unless its lane sets `"vmFirst": false`. Without a free slot a VM job starts a VM, and jobs that wait together share VMs (two slots each, so five jobs start three VMs); a lane job starts a Serverless Job, which runs it and exits after 60 idle seconds.
+5. Each VM runs one `gitlab-runner run-single` per slot and reports its state to the dispatcher. An idle VM ends at minute 55; a sweep every 30 minutes removes VMs that stopped reporting.
+6. Setup, check and teardown run in your own pipeline on GitLab's hosted runners, from three manual jobs of the CI/CD component.
 
 ## Cost and limits
 
@@ -111,7 +112,7 @@ unit-api:
 
 Lane images: `linux/amd64` with `/bin/sh`, public or in the deployment's Scaleway registry. RPM-based images (UBI, Fedora) and images that run as a non-root user must already contain `git` and `curl`. A run gets up to 6 vCPU, 16 GB memory, 10 GB disk and 24 hours, with at most 400 runs per organization at once; it has no Docker daemon and no privileged mode, and `/tmp` lives in memory.
 
-`ciburst check --suggest` proposes lanes: per image of the Docker-free jobs on the VM pool, a lane block for `ciburst.json` and the `tags:` line each job needs. `ciburst check` and the `ciburst-check` job report a lane job with `services:`, a Docker image, a `docker` command, or an image other than its lane's. Details: `docs/RUNBOOK.md`, Lanes.
+`ciburst check --suggest` proposes lanes: per image of the Docker-free jobs on the VM pool, a lane block for `ciburst.json` and the `tags:` line each job needs, and the `ignoreJobs` list of the jobs that run on other runners. `ciburst check` and the `ciburst-check` job report a lane job with `services:`, a Docker image, a `docker` command, or an image other than its lane's. Details: `docs/RUNBOOK.md`, Lanes.
 
 ## With an AI assistant
 
