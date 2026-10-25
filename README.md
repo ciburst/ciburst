@@ -14,9 +14,9 @@ Design: `docs/SPEC.md`. Operations: `docs/RUNBOOK.md`. Providers: `docs/PROVIDER
 - A job without `image:` runs in `ubuntu:24.04` (GitLab's hosted runners default to `ruby:3.1`).
 - Optional: Hetzner Cloud CX33 VMs at about half the price, and fast lanes on Scaleway Serverless Jobs for jobs that need no Docker daemon (`docs/RUNBOOK.md`, sections Hetzner and Fast lanes).
 
-## Adopt in about twenty minutes
+## Adopt in under half an hour
 
-About 12 minutes of work, then a one-time wait of about 7 minutes while Scaleway compiles the dispatcher. While `ciburst/ciburst` is private (until v1.0.0), the adopting user needs access to it and the adopting project needs an entry in its CI/CD job token allowlist.
+About 12 minutes of work, then a one-time wait of 5 to 15 minutes while Scaleway compiles the dispatcher. While `ciburst/ciburst` is private (until v1.0.0), the adopting user needs access to it and the adopting project needs an entry in its CI/CD job token allowlist.
 
 1. Scaleway API key (4 minutes). Console, IAM: create an application with a policy on the organization holding `IAMManager`, `ProjectManager`, `InstancesFullAccess`, `ServerlessJobsFullAccess`, `FunctionsFullAccess` and `ObjectStorageFullAccess` (add `ContainerRegistryFullAccess` only with `"registry": true`), then an API key for it.
    Check: you hold the access key, the secret key and the organization id (Organization settings).
@@ -31,7 +31,7 @@ About 12 minutes of work, then a one-time wait of about 7 minutes while Scaleway
    ```
    It sets `default: tags: [vm]`, so every job goes to the VM pool; Docker-in-Docker jobs extend `.ciburst-docker`. Inputs: `pool` (default `vm`), `version` (the `cli` image tag, default `edge`), `hosted_tag` (default `saas-linux-small-amd64`).
    Check: the pipeline shows the manual jobs `ciburst-setup`, `ciburst-check` and `ciburst-destroy`; the other jobs wait for a runner.
-5. Setup (1 minute, then about 7 minutes). Run `ciburst-setup`. On a GitLab hosted runner it creates the Scaleway resources, the GitLab runner and the webhook, waits for the dispatcher's deploy and posts the jobs that wait to it.
+5. Setup (1 minute, then 5 to 15 minutes). Run `ciburst-setup`. On a GitLab hosted runner it creates the Scaleway resources, the GitLab runner and the webhook, waits for the dispatcher's deploy and posts the jobs that wait to it.
    Check: the waiting jobs start; done when jobs show the runner `ci-<project id>-vm`. A second `ciburst-setup` plans only `noop`.
 
 Change the setup with `ciburst.json` at the repository root, then run `ciburst-setup` again. Each top-level key replaces the default's whole value (`docs/SPEC.md` section 5.4), so one slot per VM reads:

@@ -18,7 +18,7 @@ Rules and design: `docs/SPEC.md`. Below, `ciburst` stands for the release binary
 | VM network | VMs need IPv4: `registry.gitlab.com` and the Scaleway APIs have no IPv6 address (2026-10-24); a VM accepts no inbound connection |
 | Instance quotas | per organization, zone and commercial type, resource `cp_servers_type_<TYPE>` with `_` for `-` (`cp_servers_type_DEV1_M`); read with `GET https://api.scaleway.com/iam/v1alpha1/quota/cp_servers_type_<TYPE>?organization_id=<org id>` |
 | Serverless Jobs limits | 6 vCPU, 16 GB, 24 h per run, 400 parallel runs per organization, `linux/amd64`, images under 2 GB recommended; `/tmp` counts against the run's memory |
-| Function | a deploy takes about 5 minutes, Scaleway compiles the zip; Cockpit holds no function logs (2026-10-24) |
+| Function | a deploy takes 5 to 13 minutes, Scaleway compiles the zip; Cockpit holds no function logs (2026-10-24) |
 | Hetzner | firewall `<name>-vm`, servers `<name>-<tag>-<8 hex>` with labels `ciburst-*`, run ids `hetzner:<server name>`; API limit 3600 requests per hour per project |
 
 ## Developer setup
@@ -242,6 +242,7 @@ Add a toolchain:
 | `ciburst-setup` cannot pull `registry.gitlab.com/ciburst/ciburst/cli:<version>`, or the include fails | while `ciburst/ciburst` is private: no access to it, or the project is missing from its job token allowlist | ask its maintainers for access and the allowlist entry |
 | `ciburst-setup` fails with 403 on `POST /user/runners`, naming `create_runner` and the Owner role | the token lacks the scope, or its user is not an Owner of the project | a new token of a project Owner with `api` and `create_runner` in `CIBURST_GITLAB_TOKEN` |
 | setup log `output_unmasked key=<key>` | GitLab refused to mask that value | none; the variable stays protected and scoped to `ciburst` |
+| apply log `replay_failed ... 403` | the token cannot list jobs (a fine-grained token without read access to jobs) | retry the waiting jobs by hand; use a token with the scope `api` |
 | `apply` stops: the zone has no quota for the pool's types | Instance quota 0 for every type of the pool in the zone | set `provider.zone` to a zone the message names, or ask Scaleway support to raise the quota; `ciburst apply`; delete the security group `<name>-vm` of the old zone (console, Instances, Security groups) |
 | `apply` stops naming `--agent` and `scripts/agent-binary.sh` | no agent binary given and no agent object in the bucket | developer path: `scripts/agent-binary.sh`, then `ciburst apply`; pipeline mode: the `cli` image carries the agent, check the component's `version` input |
 | Jobs stay pending, the webhook shows failures | GitLab disabled the webhook after four failures | re-enable it; `ciburst apply` re-verifies it and replays waiting jobs |
@@ -292,7 +293,7 @@ Measured:
 
 | Measure | Value |
 |---|---|
-| VM boot: first VM job pending to running, DEV1-M | 47 to 66 s |
+| VM boot: first VM job pending to running, DEV1-M | 47 to 96 s |
 | Queue on warm VMs | about 3 s |
 | Cold burst of five VM jobs at two slots | three VMs |
 | Cold plus warm pipeline within one hour | 0.09 EUR |
@@ -300,13 +301,13 @@ Measured:
 | Fast-lane job, pending to running | 3.5 to 38.6 s, slowest on the first pull of a large image |
 | Dispatcher answer, warm | 0.1 to 0.4 s |
 | Cache restore on the next pipeline | 0.3 s |
-| Function deploy | about 5 minutes |
+| Function deploy | 5 to 13 minutes |
 
 ### M5 drill
 
 1. Dev deployment on the agent object: `scripts/agent-binary.sh`, `ciburst apply`, then steps 1 to 3 of the acceptance drill.
    Check: the first apply creates the agent object, the next plan prints only `noop`; every VM downloads the agent and reaches `idle` or `busy`; the cold pipeline passes.
-   Result: ____
+   Result (2026-10-25): apply uploaded the agent (3.5 MB) and moved the bucket to three lifecycle rules; the deploy took 12 min 46 s; the next plan was 15 `noop`. The object answers an anonymous GET with the uploaded hash; the bucket listing and unknown keys answer 403. A cold pipeline passed 7 of 7: five VM jobs on three VMs created 14 s after the pipeline, `idle` 61 to 92 s after creation, VM jobs queued 67 to 96 s. `replay_failed` with 403 on the fine-grained owner token (no read access to jobs).
 2. Adoption drill in a fresh project: push a pipeline, then README, Adopt, steps 1 to 5.
    Check: the minutes of each README step; the hosted-runner minutes of `ciburst-setup`; the jobs pushed before the setup start after it; a second `ciburst-setup` plans only `noop`; `ciburst-check` passes.
    Result, minutes per step: ____
