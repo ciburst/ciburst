@@ -162,7 +162,16 @@ impl Modules {
             .get(key)
             .filter(|value| !value.is_empty())
             .cloned()
-            .ok_or_else(|| Error::other(format!("{key} missing")))
+            .ok_or_else(|| {
+                let workstation = workstation_name(key)
+                    .filter(|name| self.vars.get(*name).is_some_and(|v| !v.is_empty()));
+                Error::other(match workstation {
+                    Some(name) => format!(
+                        "{key} missing; the job has {name}, but pipeline mode reads only CIBURST_* variables: rename it to {key}"
+                    ),
+                    None => format!("{key} missing"),
+                })
+            })
     }
 
     async fn scaleway_credentials(&self) -> Result<Credentials> {
@@ -388,6 +397,19 @@ pub fn agent_path(
         .into_iter()
         .chain(exe.and_then(Path::parent).map(|dir| dir.join(AGENT_FILE)))
         .find(|path| path.is_file()))
+}
+
+/// The workstation name of a pipeline input, which an adopter may have copied by mistake.
+fn workstation_name(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "CIBURST_SCW_ACCESS_KEY" => "SCW_ACCESS_KEY",
+        "CIBURST_SCW_SECRET_KEY" => "SCW_SECRET_KEY",
+        "CIBURST_SCW_ORGANIZATION_ID" => "SCW_DEFAULT_ORGANIZATION_ID",
+        "CIBURST_SCW_PROJECT_ID" => "SCW_DEFAULT_PROJECT_ID",
+        "CIBURST_GITLAB_TOKEN" => "GITLAB_TOKEN",
+        "CIBURST_HCLOUD_TOKEN" => "HCLOUD_TOKEN",
+        _ => return None,
+    })
 }
 
 /// The project and GitLab URL of a `--ci` run; refuses unless the ref is protected, because

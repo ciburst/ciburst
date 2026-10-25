@@ -134,7 +134,10 @@ async fn names_a_missing_input() {
     vars.remove("CIBURST_GITLAB_TOKEN");
     vars.insert("GITLAB_TOKEN".into(), FAKE_TOKEN.into());
     let run = ciburst(vars, fake.clone(), &["--config", &fake_modules, "plan"]).await;
-    assert_eq!(run.out, "CIBURST_GITLAB_TOKEN missing");
+    assert_eq!(
+        run.out,
+        "CIBURST_GITLAB_TOKEN missing; the job has GITLAB_TOKEN, but pipeline mode reads only CIBURST_* variables: rename it to CIBURST_GITLAB_TOKEN"
+    );
 
     let hetzner = config_file(
         dir.path(),
@@ -144,7 +147,21 @@ async fn names_a_missing_input() {
     let mut vars = job_vars("true");
     vars.insert("HCLOUD_TOKEN".into(), "a-local-token".into());
     let run = ciburst(vars, fake.clone(), &["--config", &hetzner, "plan"]).await;
-    assert_eq!(run.out, "CIBURST_HCLOUD_TOKEN missing");
+    assert_eq!(
+        run.out,
+        "CIBURST_HCLOUD_TOKEN missing; the job has HCLOUD_TOKEN, but pipeline mode reads only CIBURST_* variables: rename it to CIBURST_HCLOUD_TOKEN"
+    );
+
+    let mut vars = job_vars("true");
+    vars.insert("SCW_ACCESS_KEY".into(), "SCWACCESS".into());
+    let run = ciburst(vars, fake.clone(), &["--config", &absent, "plan"]).await;
+    assert!(
+        run.out.starts_with(
+            "CIBURST_SCW_ACCESS_KEY missing; the job has SCW_ACCESS_KEY, but pipeline mode"
+        ),
+        "{}",
+        run.out
+    );
 
     let run = ciburst(job_vars("true"), fake.clone(), &["--skip-gitlab", "plan"]).await;
     assert_eq!(
