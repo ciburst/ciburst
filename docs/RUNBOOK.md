@@ -6,18 +6,20 @@ Rules and design: `docs/SPEC.md`. Below, `ciburst` stands for the release binary
 
 | Item | Value |
 |---|---|
-| Region | `provider.region` (default `fr-par`) holds the dispatcher, the cache bucket, the agent object and the VMs; `provider.zone` defaults to `<region>-1` and must lie in the region |
-| Scaleway resources | project `<name>`, IAM applications `<name>-dispatch` and `<name>-cache`, bucket `<name>-cache-<project id>`, namespace `<name>`, function `<name>-dispatch`, cron `<name>-sweep`; with VM pools the security group `<name>-vm` and servers `<name>-<tag>-<8 hex>`; with fast lanes job definitions `<name>-<tag>`; with `provider.registry` the registry namespace `<name>` |
-| GitLab resources | runner `<name>-<tag>` per pool in the first project, enabled in the others; a webhook to the function URL in every project |
+| Region | `provider.region` (default `fr-par`) holds the dispatcher, the cache bucket, the agent and runner objects, the VMs and the lane runs; `provider.zone` defaults to `<region>-1` and must lie in the region |
+| Scaleway resources | project `<name>`, IAM applications `<name>-dispatch` and `<name>-cache`, bucket `<name>-cache-<project id>`, namespace `<name>`, function `<name>-dispatch`, cron `<name>-sweep`; with VM pools the security group `<name>-vm` and servers `<name>-<tag>-<8 hex>`; with lanes job definitions `<name>-<tag>`; with `provider.registry` the registry namespace `<name>` |
+| GitLab resources | runner `<name>-<tag>` per pool in the first project, enabled in the others; the runner of the VM pool that lanes borrow slots from also carries their tags; a webhook to the function URL in every project |
 | Agent object | `ciburst/agent/<sha256>` in the cache bucket, public read: the musl `ciburst-vm-agent` |
+| Runner object | `ciburst/runner/<sha256>` in the cache bucket, public read: `gitlab-runner` 18.11.4, which VMs and lane runs download and check against its sha256 |
 | Burst intents | empty objects `ciburst/intents/<pool>/<unix s, 10 digits>-<job id, 20 digits>` in the cache bucket, expired by its lifecycle rules |
-| Images | `registry.gitlab.com/ciburst/ciburst/cli` (the setup jobs, with `ciburst` and `ciburst-vm-agent`) and the fast-lane images `registry.gitlab.com/ciburst/ciburst/{base,node,rust,playwright}`; `edge` from `main`, `X.Y.Z`, `X.Y`, `X` and `latest` from a tag `vX.Y.Z` |
+| Image | `registry.gitlab.com/ciburst/ciburst/cli` (the setup jobs, with `ciburst` and `ciburst-vm-agent`); `edge` from `main`, `X.Y.Z`, `X.Y`, `X` and `latest` from a tag `vX.Y.Z` |
 | Binary | `ciburst-x86_64-unknown-linux-musl` in the framework project's generic package registry, linked from each release |
-| Runner | `gitlab-runner` 18.11.4, `run-single`. VM pools: Docker executor, `slots` processes per VM. Fast lanes: shell executor, one run per pending job, exits after `waitTimeoutS` idle seconds |
+| Runner | `gitlab-runner` 18.11.4, `run-single`. VM pools: Docker executor, `slots` processes per VM. Lanes: shell executor in the lane's image, one run per pending job that found no free VM slot, exits after `waitTimeoutS` idle seconds |
 | VM cost | DEV1-M 0.0272 EUR per hour by price list (VM 0.020196, IPv4 0.005, 40 GB local SSD 0.00196), about 0.030 in practice because the SSD bills per clock hour; Hetzner CX33 0.0144 with IPv4 |
 | VM network | VMs need IPv4: `registry.gitlab.com` and the Scaleway APIs have no IPv6 address (2026-10-24); a VM accepts no inbound connection |
 | Instance quotas | per organization, zone and commercial type, resource `cp_servers_type_<TYPE>` with `_` for `-` (`cp_servers_type_DEV1_M`); read with `GET https://api.scaleway.com/iam/v1alpha1/quota/cp_servers_type_<TYPE>?organization_id=<org id>` |
-| Serverless Jobs limits | 6 vCPU, 16 GB, 24 h per run, 400 parallel runs per organization, `linux/amd64`, images under 2 GB recommended; `/tmp` counts against the run's memory |
+| Serverless Jobs limits | 6 vCPU, 16 GB, 10 GB disk, 24 h per run, 400 parallel runs per organization, `linux/amd64`, images under 2 GB recommended; no privileged mode, no Docker daemon; `/tmp` lives in memory and counts against the run's memory |
+| Serverless Jobs cost | 0.00001 EUR per vCPU-second and 0.000002 EUR per GB-second, billed per second: about 0.10 EUR per hour at 2 vCPU and 4 GB, 0.20 at 4 vCPU and 8 GB; free each month: 200,000 vCPU-seconds and 400,000 GB-seconds. A run bills its bootstrap and its idle `waitTimeoutS` too |
 | Function | a deploy takes 5 to 13 minutes, Scaleway compiles the zip; Cockpit holds no function logs (2026-10-24) |
 | Hetzner | firewall `<name>-vm`, servers `<name>-<tag>-<8 hex>` with labels `ciburst-*`, run ids `hetzner:<server name>`; API limit 3600 requests per hour per project |
 
@@ -31,12 +33,12 @@ Rules and design: `docs/SPEC.md`. Below, `ciburst` stands for the release binary
    Check: `ciburst plan --config .local/config.json` prints runner and hook steps.
 4. Hetzner, only for pools with `runtime: "hetzner"`: section Hetzner.
 5. Agent: `scripts/agent-binary.sh` writes the Linux musl agent to `.local/ciburst-vm-agent`.
-   Check: the plan lists the agent object as `create`, or `noop` when this build is already uploaded.
+   Check: the plan lists the agent object as `create`, or `noop` when this build is already uploaded; the runner object (`runner-binary`) as `create`, or `noop` once uploaded.
 6. `ciburst apply --config .local/config.json`.
    Check: exits 0; `.local/outputs.env` holds `CIBURST_DISPATCH_URL`.
 7. `ciburst plan --config .local/config.json`.
    Check: only `noop` lines.
-8. `ciburst check --config .local/config.json` (`--ref <branch>` lints a branch before it is merged).
+8. `ciburst check --config .local/config.json` (`--ref <branch>` lints a branch before it is merged; `--suggest` proposes lanes, section Lanes).
    Check: `every job matches the stage map` for every project.
 9. `ciburst status --config .local/config.json`.
    Check: the dispatcher URL and a line per pool.
@@ -72,34 +74,36 @@ Project variables after a setup, environment `ciburst`, protected, raw: the keys
 
 Where to look when a job waits:
 
-1. The job's tags. A job without the pool tag waits for another runner; `ciburst-check` names it.
+1. The job's tags. A job without the tag of the pool its name or stage selects waits for another runner; `ciburst-check` names it.
 2. The webhook's recent events (Settings, Webhooks, Edit, Recent events): the job's pending delivery and its answer (section Dispatcher answers). No delivery: the webhook is missing or disabled; `ciburst-setup` re-verifies it and replays waiting jobs.
-3. `started` or `grouped`: a VM boots in about a minute; its tags go from `starting` to `idle` or `busy`.
-4. `claimed`: a polling slot of the pool takes the job within seconds once one is free; if none does, read the VMs' tags (section VM runtime and the sweep).
-5. `at_capacity`: `maxRuns` VMs run; the job starts when a slot frees.
-6. `500`: the start failed; section Failure modes.
-7. Jobs created before the first setup: `ciburst-setup` replays jobs pending for more than 60 s.
+3. `started` or `grouped` for a VM pool: a VM boots in about a minute; its tags go from `starting` to `idle` or `busy`.
+4. `started` for a lane: the run takes the job within 5 to 28 s (93 s at 6 vCPU) plus its bootstrap. A job still pending after a minute: `ciburst status` shows the run; a `Failed` run's log names the cause with `ciburst-lane:` (section Failure modes).
+5. `claimed`, with `lane` for a lane job: a polling slot of the VM pool takes the job within seconds once one is free; if none does, read the VMs' tags (section VM runtime and the sweep).
+6. `at_capacity`: `maxRuns` VMs or lane runs run; the job starts when a slot or run frees.
+7. `500`: the start failed; section Failure modes.
+8. Jobs created before the first setup: `ciburst-setup` replays jobs pending for more than 60 s.
 
 ## Dispatcher answers
 
 | Status | `result` | Meaning |
 |---|---|---|
 | 200 | `claimed` (`runId`) | a free slot on a VM created more than 30 s ago; `runId` names the VM |
-| 200 | `started` (`runId`) | VM pool: the job leads its burst group and started a VM with the group's slots taken; fast lane: a run started |
+| 200 | `claimed` (`runId`, `lane`) | a lane job on a free slot of the lane's VM pool (VM slots first); `pool` names the VM pool, `lane` the lane; no lane run starts |
+| 200 | `started` (`runId`) | VM pool: the job leads its burst group and started a VM with the group's slots taken; lane: a lane run started, `runId` names it |
 | 200 | `grouped` (`leader`) | rides on the VM its leader's delivery starts; any polling slot of the pool takes it, GitLab does not bind it to that VM |
 | 200 | `duplicate` | GitLab delivered this job's pending event again within 30 s; nothing started |
 | 200 | `at_capacity` | `maxRuns` reached; the job waits for a free slot or run |
 | 200 | `ignored`, reason `not_job_event` | not a job event |
 | 200 | `ignored`, reason `status` (`status`) | a job event other than `pending` |
 | 200 | `ignored`, reason `project` | a project not in `gitlab.projectIds` |
-| 200 | `ignored`, reason `unmapped_stage` (`stage`) | no pool lists the stage and there is no `defaultPool` |
+| 200 | `ignored`, reason `unmapped_stage` (`stage`) | no `jobs` pattern matches the job's name, no pool lists its stage and there is no `defaultPool` |
 | 200 | `ignored`, reason `own_job` | a job named `ciburst-*`, the component's own jobs |
 | 200 | `reported`, `terminated`, `swept` (`runs`) | a VM report, a VM's termination, the cron sweep |
 | 400 | `bad_request` | the body is not JSON, or a VM report is malformed |
 | 401 | no body | wrong or missing hook, VM or sweep token |
 | 500 | `error` | the provider failed (start, report, terminate, sweep) or the function's environment is incomplete; the body carries nothing more |
 
-Every 200 answer of a job event except `ignored` also names the `pool`. A `grouped` job depends on its leader's delivery: `started` (the VM boots), `at_capacity` (the group waits for a slot) or 500 (the group waits for the next VM).
+Every 200 answer of a job event except `ignored` also names the `pool`. A `grouped` job depends on its leader's delivery: `started` (the VM boots), `at_capacity` (the group waits for a slot) or 500 (the group waits for the next VM). Lane jobs never answer `grouped` or `duplicate`: lanes do not use the burst ledger.
 
 ## Logs
 
@@ -107,26 +111,27 @@ Every line reads `<level> <message> key="value" ...` and never holds a secret.
 
 | Source | Where | Lines |
 |---|---|---|
-| Dispatcher | the function's stderr, which Cockpit does not show (2026-10-24): read the answers on the webhook's recent events instead | `info` `claimed`, `started`, `grouped`, `duplicate`, `at_capacity` with `project`, `pipeline`, `job`, `stage`, `pool`, `run`; `warn` `claim_failed`, `ledger_failed`, `unauthorized`; `error` `start_failed`, `report_failed`, `terminate_failed`, `sweep_failed`, and `env` naming a missing variable |
+| Dispatcher | the function's stderr, which Cockpit does not show (2026-10-24): read the answers on the webhook's recent events instead | `info` `claimed` (with `lane` for a lane job on a VM slot), `started`, `grouped`, `duplicate`, `at_capacity` with `project`, `pipeline`, `job`, `stage`, `pool`, `run`; `warn` `claim_failed`, `ledger_failed`, `unauthorized`; `error` `start_failed`, `report_failed`, `terminate_failed`, `sweep_failed`, and `env` naming a missing variable |
 | CLI | stderr; in pipeline mode the `ciburst-setup` job log | one line per action; `plan` warns `vm pools cannot start pool="<tag>" reason="..."`; `apply` logs `replayed` per replayed job, `replay_failed` and `output_unmasked` |
+| Lane run | the job run's stdout and stderr on Serverless Jobs; `ciburst status` lists the run and its state | `ciburst-lane: <reason>` before the bootstrap exits 64 (section Failure modes), then `gitlab-runner`'s own lines |
 | VM agent | the VM's journal, `journalctl -u ciburst-vm-agent`, through the provider's console view only | `agent started`, `state from=... to=...` (`starting`, `idle`, `busy`, `draining`, `quitting`), `slot started`, `slot exited`, `report failed`, `terminate accepted`, `terminate failed`, `terminate gave up` |
 
 ## Rotation and updates
 
 | Command | Replaces | Note |
 |---|---|---|
-| `ciburst rotate runner` | every pool's runner and token (deleted and recreated) | VMs started before hold the old token: rotate while no VM runs |
+| `ciburst rotate runner` | every pool's runner and token (deleted and recreated) | VMs and lane runs started before hold the old token: rotate while none runs |
 | `ciburst rotate hook` | the hook token and the sweep token | updates the webhooks, the function and the cron |
 | `ciburst rotate key` | the dispatch key | the old key is deleted, the function redeployed |
-| `ciburst rotate cache` | the cache key | the old key is deleted; VMs started before lose the cache: rotate while no VM runs |
+| `ciburst rotate cache` | the cache key | the old key is deleted; VMs and lane runs started before lose the cache: rotate while none runs |
 | `ciburst rotate vm` | the VM secret | refused while VMs run, because their tokens would stop working |
 
 Check after each: `ciburst plan` prints only `noop`; a test pipeline passes.
 
 1. Yearly runtime bump: the new Rust version in `rust-toolchain.toml` and the host runtime (`RUNTIME` in `crates/scaleway/src/host.rs`), then in every file `scripts/check-pins.sh` lists (it runs in the `lint` job); tag a release; `ciburst apply`.
    Check: `lint` passes; the function is `ready`; a test pipeline passes.
-2. Upstream images: bump the tags in `images/*/Dockerfile`.
-   Check: `images/test/check-tags.sh` and the image jobs pass.
+2. Runner bump: the new version and its sha256 (from the release's `release.sha256`) in `RUNNER_URL` and `RUNNER_SHA256` of `crates/core/src/cloud_init.rs`, then in every file `scripts/check-pins.sh` lists; `ciburst apply`.
+   Check: the plan shows `create` for the runner object (`runner-binary`) and `update` for every `definition:<tag>`; VMs created and lane runs started afterwards run the new version.
 3. Agent: after a change in `crates/vm-agent`, `scripts/agent-binary.sh`, then `ciburst apply`; in pipeline mode a new `cli` image carries the agent and `ciburst-setup` uploads it. VMs created afterwards download the new object.
    Check: `CIBURST_AGENT_SHA256` in the outputs changed.
 
@@ -134,7 +139,7 @@ Check after each: `ciburst plan` prints only `noop`; a test pipeline passes.
 
 Lifecycle rules: spec section 6.1.
 
-- cloud-init writes `/etc/ciburst/vm.env`, installs `gitlab-runner` 18.11.4, downloads the agent object and checks its sha256, then starts `ciburst-vm-agent.service` (`Restart=on-failure`, 5 s).
+- cloud-init writes `/etc/ciburst/vm.env`, downloads `gitlab-runner` 18.11.4 from the runner object and the agent from the agent object, checks each sha256, then starts `ciburst-vm-agent.service` (`Restart=on-failure`, 5 s).
 - The agent reports on every change and every 10 minutes; a failed report is retried every 5 s without limit. After the drain it posts `/terminate`, retried for 10 minutes (2 s doubling to 60 s); then it exits 1 and systemd restarts it.
 - A slot that pulls its job's image has no labelled container yet and counts as free, 10 to 50 s per job in the drill.
 - Tags: `ciburst-state:<state>`, `ciburst-free:<n>`, `ciburst-seen:<unix time>` and, once draining, `ciburst-drain:<unix time>`, beside `ciburst`, `<name>`, `pool:<tag>`, `job:<id>`. Read them in the console (Instances, the server, Tags) or with `GET https://api.scaleway.com/instance/v1/zones/<zone>/servers?tags=<name>` and the header `X-Auth-Token: <secret key>`.
@@ -184,53 +189,81 @@ End a VM by hand: Console, the server, Delete; or `DELETE https://api.hetzner.cl
 
 Cost (hetzner.com/cloud/cost-optimized, 2026-10-24): CX33 (4 vCPU, 8 GB, 80 GB) 0.0144 EUR per hour; the price page includes the IPv4 while the invoice lists the Primary IP as its own line; every started hour is billed, IPv6 is free.
 
-## Fast lanes
+## Lanes
 
-A fast lane is a Serverless Jobs pool for jobs that need no Docker daemon: it starts in seconds and bills per second, but it ignores `image:` (the pool's image is the job's environment) and reserves its stages, so a job in such a stage must carry the pool's tag and a job with the tag must use such a stage.
+Rules: spec D45 to D47, sections 5.4 and 6.3. A lane is a pool with `runtime: jobs`: a job that needs no Docker daemon runs in its own image on Scaleway Serverless Jobs, billed per second, or first on a free slot of the VM pool.
 
-1. Config, in `ciburst.json` or `.local/config.json`:
+Add lanes:
+
+1. Proposal: `ciburst check --suggest` (developer path: `--config .local/config.json`).
+   Check: exits 0 and prints, per image of the Docker-free jobs routed to a VM pool, a lane block for the config and the `tags:` line of each job.
+2. Config, in `ciburst.json` or `.local/config.json`, the VM pool and the lanes:
    ```json
    {
-     "provider": { "type": "scaleway", "region": "fr-par", "registry": true, "registryPublic": true },
      "pools": [
        { "tag": "vm", "runtime": "instances", "image": "ubuntu:24.04", "stages": [], "slots": 2, "instanceTypes": ["DEV1-M", "DEV1-L"], "maxRuns": 4 },
-       { "tag": "rust", "runtime": "jobs", "image": "<registry endpoint>/rust:edge", "stages": ["rust"], "vcpu": 4, "memoryMiB": 8192, "maxRuns": 4 }
+       { "tag": "node24", "runtime": "jobs", "image": "node:24-bookworm-slim", "jobs": ["lint", "typecheck", "unit-*"], "vcpu": 2, "memoryMiB": 4096, "maxRuns": 10 }
      ]
    }
    ```
-   The image must be pullable without credentials, or live in the deployment's registry namespace, whose endpoint is the output `CIBURST_REGISTRY_ENDPOINT`. A job definition is refused while its image is missing: with `provider.registry`, `apply`, push the image, `apply` again.
-   Check: `ciburst plan` lists `job definition <name>-rust`.
-2. Jobs set both the stage and the tag, and `stages:` lists the stage:
+   `jobs`: job names with `*` (any characters) and `?` (one character), matched before `stages`; a pattern belongs to one pool. `"vmFirst": false` keeps a lane's jobs off the VM slots. `image`: `linux/amd64` with `/bin/sh` and coreutils or BusyBox (`base64`, `sha256sum`), pullable without credentials (section Private lane images).
+   Check: `ciburst plan` lists `job definition <name>-node24` and the runner `<name>-node24`; on an existing deployment it also updates the runner `<name>-vm`, whose tags gain `node24`.
+3. Jobs: `tags: [<lane tag>]`, and `image:` exactly the lane's `image`:
    ```yaml
-   clippy:
-     stage: rust
-     tags: [rust]
+   lint:
+     image: node:24-bookworm-slim
+     tags: [node24]
      script:
-       - cargo clippy --all-targets -- -D warnings
+       - npm ci
+       - npm run lint
    ```
-   Check: `ciburst check` reports no problem; the job runs on the runner `<name>-rust`.
-
-### Fast-lane images
-
-| Image | From | Toolchain | User |
-|---|---|---|---|
-| `base` | `debian:bookworm-20261020-slim` | git, git-lfs, curl, bash | `runner` |
-| `node` | `node:24.22.1-bookworm-slim` | Node 24 | `runner` |
-| `rust` | `rust:1.96.0-bookworm` | Rust 1.96.0, rustfmt, clippy | `runner` |
-| `playwright` | `mcr.microsoft.com/playwright:v1.64.1-noble` | Node, Playwright 1.64.1 browsers (pin `@playwright/test` to 1.64.1) | `runner` |
-
-Every image adds `gitlab-runner` from `gitlab/gitlab-runner:v18.11.4` and `images/base/entrypoint.sh` as `ciburst-entrypoint`. The entrypoint needs `CI_SERVER_URL` and `RUNNER_TOKEN`; with `CACHE_TYPE=s3` also `CACHE_S3_SERVER_ADDRESS`, `CACHE_S3_BUCKET_NAME`, `CACHE_S3_BUCKET_LOCATION`, `CACHE_S3_ACCESS_KEY`, `CACHE_S3_SECRET_KEY`. A missing one exits 64 and names it. `CIBURST_DRY_RUN=1` prints the command with the token and the cache keys masked. With arguments the entrypoint runs them instead.
-
-Add a toolchain:
-
-1. `images/<image>/Dockerfile`: `FROM` the official image, then the runner `COPY`, the entrypoint `COPY`, the `runner` user without `.bash_logout`, `/etc/profile.d/ciburst-path.sh`, `/builds` and `/cache`, as in `images/node/Dockerfile`.
-   Check: `images/test/check-tags.sh` prints `ok` for every `FROM`.
-2. Add the image to the `case` in `images/test/smoke.sh` and an image job to `.gitlab-ci.yml`.
-   Check: `images/test/smoke.sh <image>` ends with `smoke passed`; `images/test/smoke-all.sh` checks every image.
-3. Merge to the default branch.
-   Check: `registry.gitlab.com/ciburst/ciburst/<image>:edge` exists.
-4. Add a fast lane with the image and its stages; `ciburst apply`.
    Check: `ciburst check` reports no problem.
+4. `ciburst apply`, or `ciburst-setup` in pipeline mode.
+   Check: Settings, CI/CD, Runners lists `<name>-node24` with the tag `node24` and `<name>-vm` with `vm` and `node24`; a lane job's delivery answers `started` (a lane run) or `claimed` with `lane` (a VM slot), and the job passes.
+
+### VM slots first
+
+A lane with `vmFirst` (the default when the config has a VM pool) borrows the slots of `defaultPool` when that is a VM pool, else of the first VM pool; that pool's runner carries the lane's tag.
+
+- A pending lane job claims a free slot by the VM rule (spec section 6.1): `200 {"result":"claimed","pool":"vm","lane":"node24","runId":"<server id>"}`, logged as `claimed` with `lane="node24"`. The VM runs the job in its `image:` with the Docker executor.
+- Without a free slot the dispatcher starts a lane run below the lane's `maxRuns` (`started`), else answers `at_capacity`. A lane job never starts a VM and never joins the burst ledger.
+- A lane run whose job a VM slot took first idles `waitTimeoutS` and exits; those seconds are billed.
+- A lane job whose claimed slot another job took first waits for the next free VM slot or a lane run that still polls.
+
+### Lane bootstrap
+
+Every lane run executes `crates/core/src/lane-bootstrap.sh` (spec section 6.3) as the image's user:
+
+| Image | Bootstrap |
+|---|---|
+| contains `git`, `curl` or `wget`, and CA certificates | installs nothing |
+| Alpine, user root | `apk add` of what is missing: 2 to 4 s |
+| Debian or Ubuntu, user root | `apt-get update` and `install` of what is missing, with lists and archives under `/tmp/ciburst-apt` and `APT::Sandbox::User=root`, because the sandbox drops root's capabilities: about 21 s on slim images |
+| RPM-based (UBI, Fedora), or a non-root user | installs nothing; fails unless the image contains the tools |
+
+Then it downloads `gitlab-runner` from `CIBURST_RUNNER_URL` to `/usr/local/bin` (`$HOME/.ciburst/bin` when that is not writable), checks it against `CIBURST_RUNNER_SHA256`, unsets the token and cache keys and execs `run-single` with the shell executor (`bash`, else `sh`), builds in `/builds`, cache in `/cache`.
+
+Try an image before it becomes a lane, from the repository root:
+
+1. Dry run with every capability dropped, as in the sandbox:
+   ```sh
+   docker run --rm --platform linux/amd64 --cap-drop=ALL --entrypoint /bin/sh \
+     -e CI_SERVER_URL=https://gitlab.com -e RUNNER_TOKEN=dry -e CIBURST_RUNNER_URL=dry \
+     -e CIBURST_RUNNER_SHA256=dry -e CIBURST_LANE_DRY_RUN=1 \
+     -v "$PWD/crates/core/src/lane-bootstrap.sh:/lane.sh:ro" <image> /lane.sh
+   ```
+   Check: the output ends with the `gitlab-runner run-single` command line, `--token [masked]` included; otherwise a `ciburst-lane:` line names what fails (section Failure modes).
+
+### Private lane images
+
+Serverless Jobs pull without credentials, so a lane image is public or lives in the deployment's registry namespace.
+
+1. Config: `"provider": { "type": "scaleway", "region": "<region>", "registry": true }`, without the lane yet; the owner key needs `ContainerRegistryFullAccess`. `ciburst apply`.
+   Check: the output `CIBURST_REGISTRY_ENDPOINT` names the namespace.
+2. Push the image to `<CIBURST_REGISTRY_ENDPOINT>/<image>:<tag>` with a Scaleway key that may write to the registry.
+   Check: the console lists the image under Container Registry, namespace `<name>`.
+3. Add the lane with that `image`, give its jobs the same `image:`, `ciburst apply`. A job definition is refused while its image is missing.
+   Check: `ciburst plan` prints only `noop`.
 
 ## Failure modes
 
@@ -248,36 +281,47 @@ Add a toolchain:
 | `apply` stops: the zone has no quota for the pool's types | Instance quota 0 for every type of the pool in the zone | set `provider.region` (or `provider.zone` within it) to one the message names, or ask Scaleway support to raise the quota; `ciburst apply`; delete the security group `<name>-vm` of the old zone (console, Instances, Security groups) |
 | `apply` stops naming `--agent` and `scripts/agent-binary.sh` | no agent binary given and no agent object in the bucket | developer path: `scripts/agent-binary.sh`, then `ciburst apply`; pipeline mode: the `cli` image carries the agent, check the component's `version` input |
 | Jobs stay pending, the webhook shows failures | GitLab disabled the webhook after four failures | re-enable it; `ciburst apply` re-verifies it and replays waiting jobs |
-| Deliveries answer 500, no server appears | the start failed: quota used up by other servers, provider credentials, or an incomplete Scaleway side (`scaleway: shared environment: ...` for added providers) | `ciburst plan` shows repairs; `ciburst apply`; quota as above |
-| VMs stay `starting` until the sweep ends them | cloud-init failed: runner or agent download, a hash mismatch, or an incomplete `vm.env` (the agent exits 64 naming the key) | fix the cause, `ciburst apply`, re-run the job |
-| A VM job stays pending while VMs of the pool idle | the job's stage maps to a fast lane | move the job to a stage of the VM pool; `ciburst check` |
-| VMs start or slots get claimed for jobs that run on GitLab's hosted runners | the dispatcher sees no tags; those jobs' stages fall to the default pool, a VM pool | remove `defaultPool` (unmapped stages then start nothing) or list the hosted jobs' stages in a fast lane; started VMs end at minute 55 |
+| Deliveries answer 500, no server or lane run appears | the start failed: quota used up by other servers, provider credentials, a lane without its job definition, or an incomplete Scaleway side (`scaleway: shared environment: ...` for added providers) | `ciburst plan` shows repairs; `ciburst apply`; quota as above |
+| VMs stay `starting` until the sweep ends them | cloud-init failed: runner object or agent download, a hash mismatch, or an incomplete `vm.env` (the agent exits 64 naming the key) | fix the cause, `ciburst apply`, re-run the job; for a hash mismatch as in the row `gitlab-runner does not match its SHA-256` |
+| A VM job stays pending while VMs of the pool idle | the job's name or stage routes it to a lane | remove the name from the lane's `jobs` or the stage from its `stages`; `ciburst check` |
+| VMs start or slots get claimed for jobs that run on GitLab's hosted runners | the dispatcher sees no tags; those jobs fall to the default pool, a VM pool | remove `defaultPool` (jobs no pool takes then start nothing) and route the ciburst jobs with `jobs` patterns or `stages`; started VMs end at minute 55 |
 | A cold burst starts one VM per job; no delivery answers `grouped` | the ledger failed (`ledger_failed`): cache bucket missing, cache key rotated without `apply`, or more than 20 pages of intents | `ciburst apply` |
 | A draining VM takes minutes to end | a slot cut off from GitLab waits 300 s between job requests, and `SIGQUIT` does not shorten that wait | none; the VM keeps reporting `draining` until its slots exit |
-| Fast lane: job pending, a run started and exited idle | the stage maps to a pool the job is not tagged for | fix config or tags, `ciburst apply`, `ciburst check`, re-run |
-| Fast lane: run `failed` right after start, job pending | image pull failure | fix the image or its tag, `ciburst apply`, re-run the job |
-| Fast lane: run logs `missing environment variable` | job definition or run environment incomplete | `ciburst apply`; for keys `ciburst rotate cache` |
-| Fast lane: run ends `out of memory` | files in `/tmp` count against memory | raise `memoryMiB` or write to the builds dir |
-| Fast lane: costs beyond the free tier | Serverless Jobs free tier exceeded | consumption page; per-second prices apply |
+| `ciburst plan` reports a config error for a `jobs` pattern in two pools, or for `vmFirst` | each pattern belongs to one pool; `vmFirst` is valid on lanes only | fix `ciburst.json`, run `ciburst-setup` (or `ciburst apply`) |
+| `ciburst check` names a lane job with `services:`, a `docker` image or a `docker ` script line | the job needs a Docker daemon, which lanes lack | keep the job on the VM pool: remove it from the lane's `jobs`, give it the VM pool's tag |
+| `ciburst check` names a lane job whose `image:` differs from the lane's, or an unresolvable variable in it | a VM slot would run the job in another image than a lane run | set `image:` to the lane's `image`, or define the variable in the pipeline's top-level `variables:` |
+| Lane: job pending, a run started and exited idle | the job lacks the lane's tag; a run that exits idle because a VM slot took its job is no failure | fix the job's `tags:` or the lane's `jobs`, `ciburst apply`, `ciburst check`, re-run |
+| Lane: run `failed` right after start without a `ciburst-lane:` line, job pending | the image cannot be pulled (missing, private outside the deployment's registry, not `linux/amd64`), or it has no `/bin/sh` or `base64` | fix the lane's `image` and the jobs' `image:`, `ciburst apply`, re-run the job |
+| `ciburst-lane: missing environment variable <NAME>` | job definition or run environment incomplete | `ciburst apply`; for the cache keys `ciburst rotate cache` |
+| `ciburst-lane: the image lacks <tools> and runs as a non-root user` | the image misses `git`, `curl` or CA certificates, and its user cannot install packages | a root image, or one that contains the tools, as the lane's `image` and the jobs' `image:`; `ciburst apply` |
+| `ciburst-lane: apk could not install <tools>` | `apk add` failed: Alpine mirror unreachable, or the packages missing for the image's release | re-run the job; if it persists, an image that contains the tools |
+| `ciburst-lane: apt-get could not install <tools>` | `apt-get update` or `install` failed: mirror unreachable, or the image's release archived | re-run the job; if it persists, a current release of the image or one that contains the tools |
+| `ciburst-lane: the image lacks <tools>; RPM-based images must contain them, RPM cannot install in the sandbox` | an RPM-based image (UBI, Fedora) without `git`, `curl` or CA certificates | an image that contains them, for example one built on it and pushed to the deployment's registry (section Private lane images) |
+| `ciburst-lane: the image lacks <tools> and has no apk, apt-get, microdnf or dnf` | no known package manager to install the tools with | an image that contains `git`, `curl` and CA certificates |
+| `ciburst-lane: cannot download gitlab-runner` | the runner object is missing (deleted, or `apply` stopped before the `runner-binary` step) or the bucket is unreachable | `ciburst plan` shows `runner-binary` as `create`; `ciburst apply`; re-run the job |
+| `ciburst-lane: gitlab-runner does not match its SHA-256` | the object at `CIBURST_RUNNER_URL` is not the pinned runner, for example overwritten by a job, which holds the cache key | delete `ciburst/runner/<sha256>` from the cache bucket, `ciburst apply`, re-run the job |
+| `ciburst-lane: RUNNER_WAIT_TIMEOUT must be a whole number of seconds`, or `ciburst-lane: CACHE_TYPE must be s3 or empty` | the job definition's environment was edited outside ciburst | `ciburst apply` restores it |
+| Lane: run ends `out of memory` | files in `/tmp` count against memory | raise `memoryMiB` or write to the builds dir |
+| Lane: costs beyond the free tier | Serverless Jobs free tier exceeded | consumption page; per-second prices apply (section Facts) |
 | Function deploy fails with an unknown runtime | Scaleway retired `rust196` | runtime bump (Rotation and updates) |
 | `hetzner: pool X: no server type started (cx33: resource_unavailable ...)` | the location is out of stock for every type | add types to `instanceTypes` or set `providers.hetzner.location` |
 | Hetzner `resource_limit_exceeded` | the project's server or core limit | ask Hetzner for a higher limit or lower `maxRuns` |
 | Hetzner `unauthorized` (401) or `forbidden` (403) | token deleted or read-only | a new Read & Write token, `ciburst apply` |
 | Hetzner `rate_limit_exceeded` (429) | 3600 requests per hour per project | wait; look for report storms |
 | `hetzner: pool X is not provisioned` | firewall missing or without its selector | `ciburst plan` shows the repair, `ciburst apply` |
-| Hetzner VM swept from `starting` | cloud-init failed (agent download, GitLab unreachable); no SSH | the server's Console view: `/var/log/cloud-init-output.log`, `journalctl -u ciburst-vm-agent` |
+| Hetzner VM swept from `starting` | cloud-init failed (runner or agent download, GitLab unreachable); no SSH | the server's Console view: `/var/log/cloud-init-output.log`, `journalctl -u ciburst-vm-agent` |
 | Primary IPs left after VMs ended | the automatic IPv4 was not deleted with its server | delete them under Primary IPs; they bill hourly |
 
 ## Acceptance drill
 
-Config: the default pool `vm` (`runtime: instances`, `slots` 2, `maxRuns` 4) in a zone with quota, the fast lane `ci` (`runtime: jobs`) for stage `test`. Pipeline: `test/drill/gitlab-ci.yml` as the `.gitlab-ci.yml` of the drill consumer's branch `ciburst-drill`.
+Config: the default pool `vm` (`runtime: instances`, `slots` 2, `maxRuns` 4) in a zone with quota, the lane `ci` (`runtime: jobs`, `image` `node:24-bookworm-slim`, `stages` `["test"]`, `"vmFirst": false`). Pipeline: `test/drill/gitlab-ci.yml` as the `.gitlab-ci.yml` of the drill consumer's branch `ciburst-drill`. VM slots first is drilled in the M6 drill.
 
 1. `ciburst apply`, then `ciburst plan`.
-   Check: only `noop`; the security group `<name>-vm`, the cron `<name>-sweep` and the agent object exist.
+   Check: only `noop`; the security group `<name>-vm`, the cron `<name>-sweep`, the agent object and the runner object exist.
 2. `ciburst check --ref ciburst-drill`.
    Check: `every job matches the stage map`.
 3. Cold pipeline: push an empty commit to `ciburst-drill` while no VM runs.
-   Check: the five VM jobs start three VMs (deliveries `started` three times, `grouped` twice); `node`, `rust`, `postgres`, `dind` and `docker-build` pass on the runner `<name>-vm`, `fast-lane` on `<name>-ci`, `hosted` on a GitLab runner; `$CI_REGISTRY_IMAGE/ciburst-drill:<short sha>` exists.
+   Check: the five VM jobs start three VMs (deliveries `started` three times, `grouped` twice); `node`, `rust`, `postgres`, `dind` and `docker-build` pass on the runner `<name>-vm`, `fast-lane` in a lane run on `<name>-ci`, `hosted` on a GitLab runner; `$CI_REGISTRY_IMAGE/ciburst-drill:<short sha>` exists.
 4. Tags while the pipeline runs.
    Check: `starting`, then `idle` or `busy` with `ciburst-free` and a fresh `ciburst-seen`.
 5. Warm pipeline within the VMs' paid hour.
@@ -300,7 +344,7 @@ Measured:
 | Cold burst of five VM jobs at two slots | three VMs |
 | Cold plus warm pipeline within one hour | 0.09 EUR |
 | Idle VM | `draining` at minute 55, gone within 2 minutes |
-| Fast-lane job, pending to running | 3.5 to 38.6 s, slowest on the first pull of a large image |
+| Serverless Jobs job, pending to running (M2 drill) | 3.5 to 38.6 s, slowest on the first pull of a large image |
 | Dispatcher answer, warm | 0.1 to 0.4 s |
 | Cache restore on the next pipeline | 0.3 s |
 | Function deploy | 5 to 13 minutes |
@@ -328,15 +372,30 @@ Measured:
    Check: three CX33 servers with the labels; the firewall applied (`public_net.firewalls[].status` `applied`); the jobs pass; the drain at minute 55 deletes every server; Primary IPs empty afterwards.
    Result: ____
 
+### M6 drill
+
+1. Dev deployment with two lanes, from `node:24-bookworm-slim` and from `rust:1.99.0-bookworm`, each with `jobs` patterns for the lane jobs of a demo pipeline; `vmFirst` default. `ciburst apply`, then `ciburst plan`.
+   Check: the apply creates the runner object, both job definitions and their runners, and updates the runner `<name>-vm` with both lane tags; the plan prints only `noop`.
+   Result: ____
+2. Demo pipeline while no VM runs.
+   Check: every lane job's delivery answers `started`; the jobs pass on the lanes' runners; the Debian slim run spends about 21 s in the bootstrap, the Rust run none.
+   Result: ____
+3. Demo pipeline while a VM of the pool is `idle` with free slots and older than 30 s.
+   Check: the lane jobs answer `claimed` with `lane` and pass on the runner `<name>-vm`; no lane run starts.
+   Result: ____
+4. The drill consumer: `ciburst check --suggest`, the proposed lanes in `ciburst.json` and the `tags:` in its pipeline, `ciburst-setup`, a pipeline.
+   Check: `ciburst-check` passes; every job passes; wall clock and cost against its 18-minute warm VM pipeline.
+   Result: ____
+
 ## `run-single` flags
 
 Source: `gitlab-runner run-single --help` in `gitlab/gitlab-runner:v18.11.4` (`images/test/runner-help.sh`) and `commands/single.go` at `v18.11.4`; every flag below is present there.
 
-| Flag | VM slot | Fast lane | Note |
+| Flag | VM slot | Lane | Note |
 |---|---|---|---|
 | `--url`, `--token` | yes | yes | the runner does not read `RUNNER_TOKEN`, so the token is a flag |
 | `--executor` | `docker` | `shell` | |
-| `--shell bash` | | yes | |
+| `--shell` | | `bash`, else `sh` | the lane image's shell |
 | `--builds-dir /builds`, `--cache-dir /cache` | | yes | |
 | `--docker-image` | the pool's `image` | | for jobs without `image:` |
 | `--docker-privileged` | yes | | Docker-in-Docker |
@@ -346,7 +405,7 @@ Source: `gitlab-runner run-single --help` in `gitlab/gitlab-runner:v18.11.4` (`i
 | `--max-builds 0` | yes | yes | no build limit |
 | `--wait-timeout` | `0` | `waitTimeoutS` | 0 never exits for idleness (`checkFinishedConditions` tests `WaitTimeout > 0`); otherwise the timer restarts after every build |
 | `--cache-type s3`, `--cache-shared`, `--cache-s3-server-address`, `--cache-s3-bucket-name`, `--cache-s3-bucket-location`, `--cache-s3-access-key`, `--cache-s3-secret-key` | yes | yes | with an S3 cache |
-| `--env` | `FF_USE_FASTZIP=true`, `CACHE_COMPRESSION_LEVEL=fastest`, with an S3 cache | | D44: parallel cache archives with the fastest compression |
+| `--env` | `FF_USE_FASTZIP=true`, `CACHE_COMPRESSION_LEVEL=fastest`, with an S3 cache | the same | D44: parallel cache archives with the fastest compression |
 
 Job containers: the Docker executor labels build and service containers with `com.gitlab.gitlab-runner.job.id` (`executors/docker/internal/labels/labels.go`). A slot requests a job every 2 to 3 s and exits about three seconds after `SIGQUIT`, logging `Requested quit, waiting for builds to finish` (`images/test/run-single-slot.sh`). A runner whose requests fail waits `NotHealthyCheckInterval` (300 s) between requests (`common/consts.go`).
 
@@ -354,7 +413,7 @@ Job containers: the Docker executor labels build and service containers with `co
 
 | Date | Decision |
 |---|---|
-| 2026-10-24 | The fast-lane entrypoint passes every value as a flag and unsets `RUNNER_TOKEN`, `CACHE_S3_ACCESS_KEY` and `CACHE_S3_SECRET_KEY` before `exec`, so job scripts do not inherit them. |
+| 2026-10-25 | The lane bootstrap passes every value as a flag and unsets `RUNNER_TOKEN`, `CACHE_S3_ACCESS_KEY` and `CACHE_S3_SECRET_KEY` before `exec`, so job scripts do not inherit them. |
 | 2026-10-24 | Releases use `glab release create` in `registry.gitlab.com/gitlab-org/cli:v1.124.0` with `GLAB_ENABLE_CI_AUTOLOGIN`; `release-cli` is deprecated since GitLab 18.0. |
 | 2026-10-24 | Framework image builds use `docker:27.5.1` with `docker:27.5.1-dind`. |
 | 2026-10-24 | VM slots mount `/certs/client` besides `/cache`, so Docker-in-Docker with TLS (`DOCKER_TLS_CERTDIR: "/certs"`) works as on GitLab's hosted runners. |

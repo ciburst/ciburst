@@ -2,27 +2,31 @@
 
 GitLab CI runners that exist only while your jobs run, in your own cloud account.
 
-A job webhook reaches a small dispatcher, a Scaleway Function. The dispatcher puts each waiting job on a VM with a free slot, or starts a VM. The VM runs the job with GitLab's Docker executor and ends itself when it is idle at minute 55 of its paid hour. Nothing runs between pipelines, and jobs keep GitLab's full feature set: `image:`, `services:`, Docker-in-Docker and `docker build`.
+A job webhook reaches a small dispatcher, a Scaleway Function. The dispatcher puts each waiting job on a VM with a free slot, or starts a VM. The VM runs the job with GitLab's Docker executor and ends itself when it is idle at minute 55 of its paid hour, so jobs keep GitLab's full feature set: `image:`, `services:`, Docker-in-Docker and `docker build`. Jobs that need no Docker daemon can run in lanes instead: Scaleway Serverless Jobs in the job's own image, billed per second. Nothing runs between pipelines.
 
 Design: `docs/SPEC.md`. Operations: `docs/RUNBOOK.md`. Providers: `docs/PROVIDERS.md`. AI agents: `AGENTS.md`.
 
-Status: pre-release. `ciburst/ciburst` stays private until v1.0.0; the component and images track `main` (`@main`, image tag `edge`).
+Status: pre-release. `ciburst/ciburst` stays private until v1.0.0; the component and the `cli` image track `main` (`@main`, image tag `edge`).
 
 ## How it works
 
 1. GitLab sends every job event of the project to the dispatcher.
-2. A pending job claims a free slot on a running VM. Without one it starts a VM; jobs that wait together share VMs (two slots each, so five jobs start three VMs).
-3. Each VM runs one `gitlab-runner run-single` per slot and reports its state to the dispatcher. An idle VM ends at minute 55; a sweep every 30 minutes removes VMs that stopped reporting.
-4. Setup, check and teardown run in your own pipeline on GitLab's hosted runners, from three manual jobs of the CI/CD component.
+2. The job's name, else its stage, selects its pool: the VM pool, or a lane of `ciburst.json`.
+3. A pending job claims a free slot on a running VM, a lane job too unless its lane sets `"vmFirst": false`. Without a free slot a VM job starts a VM, and jobs that wait together share VMs (two slots each, so five jobs start three VMs); a lane job starts a Serverless Job, which runs it and exits after 60 idle seconds.
+4. Each VM runs one `gitlab-runner run-single` per slot and reports its state to the dispatcher. An idle VM ends at minute 55; a sweep every 30 minutes removes VMs that stopped reporting.
+5. Setup, check and teardown run in your own pipeline on GitLab's hosted runners, from three manual jobs of the CI/CD component.
 
 ## Cost and limits
 
-- About 0.03 EUR per Scaleway DEV1-M VM hour (VM, IPv4, disk), billed per started hour. A cold pipeline with five jobs costs about 0.09 EUR; pipelines within the same hour reuse the VMs.
+- VMs: about 0.03 EUR per Scaleway DEV1-M hour (VM, IPv4, disk), billed per started hour. A cold pipeline with five jobs costs about 0.09 EUR; pipelines within the same hour reuse the VMs.
 - A cold job waits 60 to 100 s for its VM; on a running VM about 3 s.
-- The first setup takes 6 to 15 hosted-runner minutes while Scaleway compiles the dispatcher; later setups take under a minute.
-- DEV1-M: 3 vCPU and 4 GB shared by two slots, plus 4 GB swap. A job without `image:` runs in `ubuntu:24.04`. `linux/amd64` only.
+- DEV1-M: 3 vCPU and 4 GB shared by two slots, plus 4 GB swap. A job without `image:` runs in `ubuntu:24.04`.
 - DEV1 vCPUs are shared: CPU-bound jobs (compiles, lint and typecheck, browser tests) take 1.3 to 4 times as long as on GitLab's small hosted runner, even on a DEV1-L of their own; network-bound and short jobs are on par.
-- Optional: Hetzner CX33 VMs at about half the price, and fast lanes on Scaleway Serverless Jobs (`docs/RUNBOOK.md`).
+- Lanes: 0.00001 EUR per vCPU-second and 0.000002 EUR per GB-second, so about 0.0017 EUR per minute at 2 vCPU and 4 GB (0.10 EUR per hour) and 0.0034 EUR per minute at 4 vCPU and 8 GB (0.20 EUR per hour). A run also bills its bootstrap and its idle `waitTimeoutS` (60 s by default) before it exits. The first 200,000 vCPU-seconds and 400,000 GB-seconds of each month are free, about 28 hours at 2 vCPU and 4 GB.
+- A lane run starts in 5 to 12 s for small images, 19 to 28 s for Rust and Playwright images, 93 s at 6 vCPU. Installing missing `git` and `curl` adds 2 to 4 s on Alpine and about 21 s on Debian and Ubuntu slim images.
+- Lane speed: a Rust compile at 2 vCPU takes as long as on GitLab's small hosted runner, at 4 vCPU about half as long; a TypeScript check is within 12 %.
+- The first setup takes 6 to 15 hosted-runner minutes while Scaleway compiles the dispatcher; later setups take under a minute.
+- `linux/amd64` only. Optional: Hetzner CX33 VMs at about half the price (`docs/RUNBOOK.md`, Hetzner).
 
 ## Adopt
 
@@ -56,7 +60,41 @@ Customize with `ciburst.json` at the repository root, then run `ciburst-setup` a
 ```
 
 Undo: add the project variable `CIBURST_DESTROY` with the deployment's name (`ci-<project id>` unless `ciburst.json` sets `name`), protected, environment scope `ciburst`, then run `ciburst-destroy`.
-Check: the log ends with `destroyed <name>`; the webhook, the runner, the output variables and the Scaleway project are gone. Then remove the include and `ciburst.json`, and delete the five variables. Removing the include first leaves the webhook behind, and every later job still starts a VM.
+Check: the log ends with `destroyed <name>`; the webhook, the runners, the output variables and the Scaleway project are gone. Then remove the include and `ciburst.json`, and delete the five variables. Removing the include first leaves the webhook behind, and every later job still starts a VM.
+
+## Lanes
+
+A lane is a pool on Scaleway Serverless Jobs for jobs that need no Docker daemon. Each run starts from the job's own image, installs `git` and `curl` when the image lacks them, fetches the pinned `gitlab-runner` from the deployment's bucket and runs the job with the shell executor.
+
+- Keep on the VM pool: jobs with `services:`, Docker-in-Docker, `docker build` or testcontainers, and steady load that keeps paid VM hours busy.
+- Move to a lane: Docker-free jobs (lint, type checks, unit tests, compiles, browser tests) that would leave a VM idle for most of its paid hour, or that need more CPU than a DEV1 slot has.
+- A lane job takes a free slot on a running VM first, so paid VM hours fill before lane seconds are billed.
+
+Example `ciburst.json`: the VM pool plus a lane for the jobs `lint`, `typecheck` and every `unit-*`.
+
+```json
+{
+  "pools": [
+    { "tag": "vm", "runtime": "instances", "image": "ubuntu:24.04", "stages": [], "slots": 2, "instanceTypes": ["DEV1-M", "DEV1-L"], "maxRuns": 4 },
+    { "tag": "node24", "runtime": "jobs", "image": "node:24-bookworm-slim", "jobs": ["lint", "typecheck", "unit-*"], "vcpu": 2, "memoryMiB": 4096, "maxRuns": 10 }
+  ]
+}
+```
+
+`jobs` patterns match the job name (`*` any characters, `?` one character) and win over `stages`. Each lane job carries the lane's tag instead of the component's default, and its `image:` equals the lane's `image`, because on a VM slot it runs in its `image:`:
+
+```yaml
+unit-api:
+  image: node:24-bookworm-slim
+  tags: [node24]
+  script:
+    - npm ci
+    - npm test
+```
+
+Lane images: `linux/amd64` with `/bin/sh`, public or in the deployment's Scaleway registry. RPM-based images (UBI, Fedora) and images that run as a non-root user must already contain `git` and `curl`. A run gets up to 6 vCPU, 16 GB memory, 10 GB disk and 24 hours, with at most 400 runs per organization at once; it has no Docker daemon and no privileged mode, and `/tmp` lives in memory.
+
+`ciburst check --suggest` proposes lanes: per image of the Docker-free jobs on the VM pool, a lane block for `ciburst.json` and the `tags:` line each job needs. `ciburst check` and the `ciburst-check` job report a lane job with `services:`, a Docker image, a `docker` command, or an image other than its lane's. Details: `docs/RUNBOOK.md`, Lanes.
 
 ## With an AI assistant
 
@@ -77,7 +115,7 @@ Without a cloud: `cargo run -p ciburst -- apply --config test/config.fake.json -
 | `plan` | every step `apply` would run |
 | `apply` | checks that each pool can start, creates or updates everything, then starts the jobs that wait |
 | `status` | dispatcher URL, live runs per pool, the last 20 runs |
-| `check [--ref <ref>]` | lints each project's pipeline against the pools; exits 1 on a problem |
+| `check [--ref <ref>] [--suggest]` | lints each project's pipeline against the pools and exits 1 on a problem; `--suggest` prints lanes for the Docker-free jobs and exits 0 |
 | `rotate runner\|hook\|key\|cache\|vm` | replaces that secret and redeploys |
 | `destroy --yes <name>` | removes every resource of the deployment |
 
