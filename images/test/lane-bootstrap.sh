@@ -46,7 +46,7 @@ lane="$(base64 < "$src/lane-bootstrap.sh" | tr -d '\n')"
 token="glrt-lane-test-token"
 secret="lane-test-secret-key"
 access="SCWLANETESTACCESSKEY"
-dry_run=(
+dry_run_env=(
   -e CIBURST_LANE_DRY_RUN=1
   -e CI_SERVER_URL=https://gitlab.example.com
   -e "CIBURST_RUNNER_SHA256=$runner_sha"
@@ -125,8 +125,11 @@ report() {
   fi
 }
 
-dry_run_passes() {
-  bootstrap "$1" "${dry_run[@]}"
+# A dry run in <image> with extra `docker run` options: it passes and masks the secrets.
+dry_run() {
+  local image="$1"
+  shift
+  bootstrap "$image" "$@" "${dry_run_env[@]}"
   expect_status 0
   expect_text "gitlab-runner run-single"
   expect_text "--url https://gitlab.example.com"
@@ -136,25 +139,30 @@ dry_run_passes() {
   expect_no_text "$token"
   expect_no_text "$access"
   expect_no_text "$secret"
-  report "dry run on $1"
 }
 
 for image in alpine:3.21 debian:bookworm-slim node:24-bookworm-slim ubuntu:24.04; do
-  dry_run_passes "$image"
+  dry_run "$image"
+  report "dry run on $image"
 done
+
+# An image with git and curl runs as its own user, with the builds in its home.
+dry_run node:24-bookworm --user node
+expect_text "--builds-dir /home/node/builds"
+report "dry run on node:24-bookworm as user node"
 
 bootstrap alpine:3.21 -e CIBURST_LANE_DRY_RUN=1 -e CI_SERVER_URL=https://gitlab.example.com
 expect_status 64
 expect_text "ciburst-lane: missing environment variable CIBURST_RUNNER_SHA256"
 report "refused without CIBURST_RUNNER_SHA256"
 
-bootstrap registry.access.redhat.com/ubi9/ubi-minimal "${dry_run[@]}"
+bootstrap registry.access.redhat.com/ubi9/ubi-minimal "${dry_run_env[@]}"
 expect_status 64
 expect_text "ciburst-lane: the image lacks"
 expect_text "RPM-based images must contain them"
 report "refused on registry.access.redhat.com/ubi9/ubi-minimal"
 
-bootstrap node:24-bookworm-slim --user node "${dry_run[@]}"
+bootstrap node:24-bookworm-slim --user node "${dry_run_env[@]}"
 expect_status 64
 expect_text "ciburst-lane: the image lacks"
 expect_text "runs as a non-root user"
