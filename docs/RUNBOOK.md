@@ -354,6 +354,7 @@ Measured:
 | Serverless Jobs `nl-ams`, start request to first command (2026-10-25) | 5 to 12 s small images, 19 to 28 s Rust and Playwright, 93 s at 6 vCPU |
 | Same workloads: GitLab's small hosted runner, DEV1-M `nl-ams-1`, Serverless Job 2 vCPU, 4 vCPU | `cargo install ripgrep`: 56, 54, 52, 30 s; three TypeScript checks: 8.5, 14.3, 9.5 to 10.9 s; `npm install`: 1.4, 2.5, 2.7 to 3.0 s |
 | Lane bootstrap in a Serverless Job | `apk add git` 2 to 4 s; `apt-get` with its own lists and archives directories (the sandbox drops root's capabilities) 21 s; images with `git` and `curl` need none |
+| `CIBURST_LANE` size, the lane `COMMAND` in `nl-ams` (2026-10-25) | job definitions with 6,728 to 87,528 characters accepted; dry runs on `alpine:3.21` and `node:24-bookworm-slim` succeeded |
 
 ### M5 drill
 
