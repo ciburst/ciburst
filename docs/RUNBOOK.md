@@ -123,7 +123,7 @@ Every line reads `<level> <message> key="value" ...` and never holds a secret.
 
 Check after each: `ciburst plan` prints only `noop`; a test pipeline passes.
 
-1. Yearly runtime bump: the new Rust version in `rust-toolchain.toml` and the host runtime (`RUNTIME` in `crates/scaleway/src/host.rs`), then in every file the pin check of the `lint` job names; tag a release; `ciburst apply`.
+1. Yearly runtime bump: the new Rust version in `rust-toolchain.toml` and the host runtime (`RUNTIME` in `crates/scaleway/src/host.rs`), then in every file `scripts/check-pins.sh` lists (it runs in the `lint` job); tag a release; `ciburst apply`.
    Check: `lint` passes; the function is `ready`; a test pipeline passes.
 2. Upstream images: bump the tags in `images/*/Dockerfile`.
    Check: `images/test/check-tags.sh` and the image jobs pass.

@@ -89,7 +89,7 @@ The second plan prints only `noop` lines. State lives in `.local/state.json`.
 Rust 1.96 (`rust-toolchain.toml`).
 
 - `cargo test --workspace --all-features`; `scripts/test-linux.sh` runs the same command in `rust:1.96.0-bookworm`, Linux-only tests included (the VM agent's process test).
-- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo deny check`, `scripts/shellcheck.sh`.
+- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo deny check`, `scripts/shellcheck.sh`, `scripts/check-pins.sh` (Rust and gitlab-runner versions agree everywhere).
 - Fast-lane images: `images/test/smoke.sh <image>` with Docker.
 - New providers and hosts: `docs/PROVIDERS.md`.
 
