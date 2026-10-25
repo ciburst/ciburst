@@ -228,7 +228,7 @@ fn the_binary_runs_slots_and_reports_over_http() {
             .map(String::from)
             .collect();
         assert_eq!(
-            lines[..18],
+            lines[..15],
             [
                 "run-single",
                 "--url",
@@ -244,14 +244,16 @@ fn the_binary_runs_slots_and_reports_over_http() {
                 "/cache",
                 "--docker-volumes",
                 "/certs/client",
-                "--max-builds",
-                "0",
-                "--wait-timeout",
-                "0",
+                "--docker-cache-dir",
             ]
         );
-        assert_eq!(lines.len(), 20);
-        configs.push(lines[19].clone());
+        assert_eq!(
+            lines[16..21],
+            ["--max-builds", "0", "--wait-timeout", "0", "--config"]
+        );
+        assert_eq!(lines.len(), 22);
+        assert_eq!(lines[15], lines[21].replace("config.toml", "volumes"));
+        configs.push(lines[21].clone());
     }
     configs.sort();
     assert_eq!(
