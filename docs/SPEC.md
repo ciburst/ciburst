@@ -396,7 +396,7 @@ Risks:
 
 | Risk | Mitigation |
 |---|---|
-| GitLab disables a webhook after four failed deliveries | the dispatcher answers within 30 s; re-enable the webhook, `ciburst apply` re-verifies it and replays waiting jobs |
+| GitLab disables a webhook after four failed deliveries; GitLab.com counts an answer after 10 s as failed | a VM start answered in 10.4 s once (M6 drill, right after a dispatcher deploy) and the VM still started; M7 brings the start path under 10 s. Re-enable the webhook; `ciburst apply` re-verifies it and replays waiting jobs |
 | No Instance quota for a pool's types in its zone | preflight stops `apply` and names zones with quota; `provider.region` |
 | Scaleway retires the runtime `rust196` | bump `rust-toolchain.toml` and the host runtime, `ciburst apply` |
 | The `v1alpha1` Jobs API changes | client isolated in `crates/scaleway`, fakes pin the shapes |
