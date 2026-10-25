@@ -304,6 +304,8 @@ Measured:
 | Dispatcher answer, warm | 0.1 to 0.4 s |
 | Cache restore on the next pipeline | 0.3 s |
 | Function deploy | 5 to 13 minutes |
+| CPU-bound job, DEV1-L with one slot against GitLab's small hosted runner (drill consumer, 2026-10-25) | 1.3 to 4 times as long: rust-check 135 s against 84 s, ts-check 245 s against 62 s, e2e 482 to 494 s against 231 to 299 s, image build 409 s against 303 s; lighthouse 80 s against 105 s |
+| Cache transfer, bucket in the VMs' region | restore and archive of a Rust job in seconds; across regions 555 s for the same job (D43) |
 
 ### M5 drill
 
@@ -316,7 +318,9 @@ Measured:
 3. Destroy in that project: the project variable `CIBURST_DESTROY=<name>`, then `ciburst-destroy`.
    Check: `destroyed <name>`; no output variable, webhook, runner, server or Scaleway project `<name>` remains.
    Result (2026-10-25): GitLab refused `CIBURST_DESTROY` as a manual-job variable (403, pipeline variables off in new projects), so it became a project variable. The first destroy took 72 s and left the security group and project behind (VMs still terminating, fixed); a second run removed both in 13 s. Webhook, runner and output variables were gone after the first run.
-4. Hetzner, once `.local/hetzner.env` exists: the `vm` pool on `runtime: "hetzner"`, `apply`, a cold pipeline.
+4. The drill consumer adopts ciburst through its own pipeline (component, `ciburst.json` with one DEV1-L per job, maxRuns 4), guided by `AGENTS.md`.
+   Result (2026-10-25): the Scaleway inputs were first created under workstation names (the setup now names them); the first deployment split region and zone (`fr-par`, `nl-ams-1`) and spent most of its Rust job time moving caches across regions (D43, D44). After moving to `nl-ams`, every job of the pipeline passed on ciburst, Playwright e2e, image build with Docker-in-Docker, compose stack test and deploy included: 28.6 minutes wall clock with a cold cache and a 6-minute setup. Two of its unit tests had timing assumptions that the slower vCPUs exposed; fixed in the consumer.
+5. Hetzner, once `.local/hetzner.env` exists: the `vm` pool on `runtime: "hetzner"`, `apply`, a cold pipeline.
    Check: three CX33 servers with the labels; the firewall applied (`public_net.firewalls[].status` `applied`); the jobs pass; the drain at minute 55 deletes every server; Primary IPs empty afterwards.
    Result: ____
 

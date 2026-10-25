@@ -21,6 +21,7 @@ Status: pre-release. `ciburst/ciburst` stays private until v1.0.0; the component
 - A cold job waits 60 to 100 s for its VM; on a running VM about 3 s.
 - The first setup takes 6 to 15 hosted-runner minutes while Scaleway compiles the dispatcher; later setups take under a minute.
 - DEV1-M: 3 vCPU and 4 GB shared by two slots, plus 4 GB swap. A job without `image:` runs in `ubuntu:24.04`. `linux/amd64` only.
+- DEV1 vCPUs are shared: CPU-bound jobs (compiles, lint and typecheck, browser tests) take 1.3 to 4 times as long as on GitLab's small hosted runner, even on a DEV1-L of their own; network-bound and short jobs are on par.
 - Optional: Hetzner CX33 VMs at about half the price, and fast lanes on Scaleway Serverless Jobs (`docs/RUNBOOK.md`).
 
 ## Adopt
