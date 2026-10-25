@@ -44,7 +44,7 @@ Change the setup with `ciburst.json` at the repository root, then run `ciburst-s
 }
 ```
 
-Undo: run `ciburst-destroy` with the variable `CIBURST_DESTROY=<name>` (`ci-<project id>` unless `ciburst.json` sets `name`).
+Undo: add the project variable `CIBURST_DESTROY` with the deployment's name (`ci-<project id>` unless `ciburst.json` sets `name`), protected, environment scope `ciburst`, then run `ciburst-destroy`. GitLab refuses variables typed into a manual job unless the project allows pipeline variables, so the name travels as a project variable.
 Check: the job log ends with `destroyed <name>`; the webhook, the runner, the output variables and the Scaleway project `<name>` are gone. The four input variables stay until you delete them.
 
 ## Run from a workstation

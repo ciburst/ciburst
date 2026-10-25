@@ -2,6 +2,8 @@
 //! `bucket`, `registry`, `vm:agent`, `vm:security-group` and `definition:<tag>`, each found by
 //! name before it is planned.
 
+use std::time::Duration;
+
 use ciburst_core::provision::keys;
 use ciburst_core::types::{Action, Outputs, Rotation, Step};
 use ciburst_core::{Error, Result};
@@ -14,6 +16,10 @@ use super::registry::{self, NamespaceState};
 use super::s3::LIFECYCLE_RULES;
 use super::servers::SECURITY_GROUP_STEP;
 use super::{PROVIDER_NAME, Runtime, Scaleway, jobs};
+
+/// How long `destroy` waits for terminated servers to disappear, and how often it looks.
+const TEARDOWN_WAIT: Duration = Duration::from_secs(300);
+const TEARDOWN_POLL: Duration = Duration::from_secs(5);
 
 /// The cache bucket as found: `None` when it does not exist, else its lifecycle days.
 type BucketState = Option<Option<u32>>;
@@ -40,7 +46,7 @@ impl Scaleway {
         let mut definitions = Vec::new();
         if let Some(project_id) = &project {
             if self.cache_on() || self.s3_access_key.is_some() {
-                let s3 = self.s3()?;
+                let s3 = self.s3(project_id)?;
                 let name = self.bucket(project_id);
                 if s3.bucket_exists(&name).await? {
                     bucket = Some(s3.lifecycle_days(&name).await?);
@@ -315,16 +321,36 @@ impl Scaleway {
         Ok(outputs)
     }
 
-    pub(super) async fn destroy_all(&self) -> Result<()> {
-        let project = self.client.find_project(self.name()).await?;
-        if let Some(project_id) = &project {
-            let api = self.instances();
+    /// Ends every server of the deployment and waits until Scaleway has removed them: a
+    /// terminated server stays `stopping` for a while and holds the security group meanwhile.
+    async fn end_servers(&self, project_id: &str) -> Result<()> {
+        let api = self.instances();
+        let mut waited = Duration::ZERO;
+        loop {
             for server in self.servers(project_id).await? {
                 if self.remove_server(&api, &server).await? {
                     let id = server["id"].as_str().unwrap_or_default();
                     self.log.info("terminated server", &[("id", id)]);
                 }
             }
+            let left = self.servers(project_id).await?.len();
+            if left == 0 {
+                return Ok(());
+            }
+            if waited >= TEARDOWN_WAIT {
+                self.log
+                    .warn("servers still ending", &[("count", &left.to_string())]);
+                return Ok(());
+            }
+            tokio::time::sleep(TEARDOWN_POLL).await;
+            waited += TEARDOWN_POLL;
+        }
+    }
+
+    pub(super) async fn destroy_all(&self) -> Result<()> {
+        let project = self.client.find_project(self.name()).await?;
+        if let Some(project_id) = &project {
+            self.end_servers(project_id).await?;
             if let Err(error) = self.delete_security_group(project_id).await {
                 self.log.warn(
                     "security group not deleted",

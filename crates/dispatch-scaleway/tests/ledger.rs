@@ -40,7 +40,8 @@ fn config(cache: &str, runtime: &str) -> String {
 }
 
 /// The fake Scaleway after the provider's apply with the agent fixture, the S3 fake accepting
-/// the cache key IAM made, and the function's variables for that deployment.
+/// the cache key IAM made (scoped to the deployment's project, as Scaleway scopes a key to its
+/// preferred project), and the function's variables for that deployment.
 async fn deployed(cache: &str, runtime: &str) -> (Arc<ScalewayFake>, BTreeMap<String, String>) {
     let backend = Arc::new(ScalewayFake::new());
     let text = config(cache, runtime);
@@ -76,7 +77,9 @@ async fn deployed(cache: &str, runtime: &str) -> (Arc<ScalewayFake>, BTreeMap<St
         outputs.get("CIBURST_CACHE_ACCESS_KEY"),
         outputs.get("CIBURST_CACHE_SECRET_KEY"),
     ) {
-        backend.s3.add_key(access, secret);
+        backend
+            .s3
+            .add_key_in(access, secret, &outputs["CIBURST_PROJECT_ID"]);
         vars.insert(vars::CACHE_ACCESS_KEY.to_string(), access.clone());
         vars.insert(vars::CACHE_SECRET_KEY.to_string(), secret.clone());
     }

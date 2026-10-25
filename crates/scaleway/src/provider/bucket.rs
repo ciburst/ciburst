@@ -18,7 +18,7 @@ impl Scaleway {
             return Ok(());
         }
         let project_id = self.require_project(project)?;
-        let s3 = self.s3()?;
+        let s3 = self.s3(project_id)?;
         let name = self.bucket(project_id);
         if !s3.bucket_exists(&name).await? {
             s3.create_bucket(&name).await?;
@@ -36,7 +36,7 @@ impl Scaleway {
     }
 
     pub(super) async fn delete_bucket(&self, project_id: &str) -> Result<()> {
-        let s3 = self.s3()?;
+        let s3 = self.s3(project_id)?;
         let name = self.bucket(project_id);
         if s3.bucket_exists(&name).await? {
             s3.empty_and_delete(&name).await?;

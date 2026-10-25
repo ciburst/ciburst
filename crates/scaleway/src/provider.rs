@@ -238,8 +238,10 @@ impl Scaleway {
         Ok(pools)
     }
 
-    fn s3(&self) -> Result<s3::S3> {
-        let access_key = self.s3_access_key.clone().ok_or_else(|| {
+    /// Object Storage scoped to `project_id`: Scaleway creates and finds buckets in the API
+    /// key's preferred project unless the access key names another as `<access key>@<project>`.
+    fn s3(&self, project_id: &str) -> Result<s3::S3> {
+        let access_key = self.s3_access_key.as_deref().ok_or_else(|| {
             Error::provider(format!(
                 "{PROVIDER_NAME}: the cache bucket needs the access key of SCW_SECRET_KEY"
             ))
@@ -247,7 +249,7 @@ impl Scaleway {
         Ok(s3::S3 {
             http: self.client.http(),
             region: self.client.region().to_string(),
-            access_key,
+            access_key: format!("{access_key}@{project_id}"),
             secret_key: self.client.secret_key().to_string(),
         })
     }

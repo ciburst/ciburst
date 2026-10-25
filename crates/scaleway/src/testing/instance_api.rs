@@ -8,7 +8,9 @@
 //!
 //! Lifecycle: a created server is `stopped`; `poweron` makes it `starting`, and a read after
 //! that shows it `running`; `terminate` removes it with its local volumes; deleting a stopped
-//! server leaves its volumes. The marketplace answers without a token, like the real one.
+//! server leaves its volumes. With [`FakeInstance::set_slow_terminate`] a terminated server stays
+//! `stopping`, holding its security group, until a read has shown it so, as Scaleway keeps it
+//! for a while. The marketplace answers without a token, like the real one.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -46,6 +48,9 @@ struct Inner {
     out_of_stock: BTreeSet<String>,
     over_quota: BTreeSet<String>,
     poweron_out_of_stock: BTreeSet<String>,
+    slow_terminate: bool,
+    /// Servers terminated in slow mode; `true` once a read has shown them `stopping`.
+    terminating: BTreeMap<String, bool>,
     clock: u64,
     next: u64,
     calls: Vec<Call>,
@@ -67,7 +72,43 @@ impl Inner {
         if server["state"] == "starting" {
             self.servers[index]["state"] = json!("running");
         }
+        if let Some(id) = server["id"].as_str()
+            && let Some(seen) = self.terminating.get_mut(id)
+        {
+            *seen = true;
+        }
         server
+    }
+
+    /// Removes the server at `index` with its local volumes and user data.
+    fn remove(&mut self, index: usize) {
+        let removed = self.servers.remove(index);
+        let id = removed["id"].as_str().unwrap_or_default().to_string();
+        let local: Vec<Value> = removed["volumes"]
+            .as_object()
+            .into_iter()
+            .flat_map(|v| v.values())
+            .filter(|v| v["volume_type"] == "l_ssd")
+            .map(|v| v["id"].clone())
+            .collect();
+        self.volumes.retain(|v| !local.contains(&v["id"]));
+        self.user_data.retain(|(server, _), _| *server != id);
+        self.terminating.remove(&id);
+    }
+
+    /// Slowly terminated servers that a read has shown are gone.
+    fn purge(&mut self) {
+        let shown: Vec<String> = self
+            .terminating
+            .iter()
+            .filter(|(_, seen)| **seen)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in shown {
+            if let Some(index) = self.server_index(&id) {
+                self.remove(index);
+            }
+        }
     }
 }
 
@@ -124,6 +165,8 @@ impl FakeInstance {
                 out_of_stock: BTreeSet::new(),
                 over_quota: BTreeSet::new(),
                 poweron_out_of_stock: BTreeSet::new(),
+                slow_terminate: false,
+                terminating: BTreeMap::new(),
                 clock: FAKE_CLOCK,
                 next: 0,
                 calls: Vec::new(),
@@ -179,6 +222,11 @@ impl FakeInstance {
     }
 
     /// Powering on a server of `commercial_type` fails with `out_of_stock`.
+    /// Terminated servers stay `stopping` until a read has shown them.
+    pub fn set_slow_terminate(&self, slow: bool) {
+        self.lock().slow_terminate = slow;
+    }
+
     pub fn set_poweron_out_of_stock(&self, commercial_type: &str) {
         self.lock()
             .poweron_out_of_stock
@@ -456,16 +504,15 @@ impl FakeInstance {
                 if state == "stopped" {
                     return api_error(400, "invalid_request_error", "server is stopped");
                 }
-                let removed = inner.servers.remove(index);
-                let local: Vec<Value> = removed["volumes"]
-                    .as_object()
-                    .into_iter()
-                    .flat_map(|v| v.values())
-                    .filter(|v| v["volume_type"] == "l_ssd")
-                    .map(|v| v["id"].clone())
-                    .collect();
-                inner.volumes.retain(|v| !local.contains(&v["id"]));
-                inner.user_data.retain(|(server, _), _| *server != id);
+                if inner.slow_terminate {
+                    if inner.terminating.contains_key(&id) {
+                        return api_error(400, "invalid_request_error", "server is stopping");
+                    }
+                    inner.servers[index]["state"] = json!("stopping");
+                    inner.terminating.insert(id.clone(), false);
+                } else {
+                    inner.remove(index);
+                }
             }
             _ => return invalid("action not supported by the fake"),
         }
@@ -479,6 +526,7 @@ impl HttpClient for FakeInstance {
         let url = Url::parse(&request.url);
         let mut inner = self.lock();
         inner.calls.push(call_of(&request, &url));
+        inner.purge();
         let segments = url.segments();
         let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
         if request.method == "GET" && segments == ["marketplace", "v2", "local-images"] {

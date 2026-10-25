@@ -8,6 +8,12 @@
 //! Lifecycle writes need `Content-MD5` as Scaleway documents, object writes a `Content-Length`
 //! as S3 does. A PutObject may carry a canned ACL in `x-amz-acl`; unknown ACLs are refused.
 //!
+//! Buckets belong to a project, as on Scaleway: a bucket is created in the signing key's
+//! preferred project, or in the project the access key names as `<access key>@<project>`; a
+//! request for a bucket of another project is `403 AccessDenied`. The owner key's preferred
+//! project is [`FAKE_PREFERRED_PROJECT`]; keys added with [`FakeS3::add_key`] reach every
+//! bucket, keys added with [`FakeS3::add_key_in`] only their project's.
+//!
 //! Anonymous requests (no authorization header) may only GET or HEAD an object whose ACL is
 //! `public-read` or `public-read-write`; anything else, a missing key included, is `403
 //! AccessDenied`, as for a reader without list permission.
@@ -37,6 +43,8 @@ pub const MAX_PAGE: usize = 1000;
 pub const MAX_KEY_BYTES: usize = 1024;
 /// 2026-10-24T00:00:00Z, the first `LastModified` until a test sets the clock.
 pub const FAKE_CLOCK: u64 = 1_792_800_000;
+/// The owner key's preferred project, where its buckets land without an `@<project>` suffix.
+pub const FAKE_PREFERRED_PROJECT: &str = "fake-preferred-project";
 /// The canned ACLs of the S3 API.
 pub const CANNED_ACLS: [&str; 6] = [
     "private",
@@ -64,6 +72,8 @@ impl Object {
 
 #[derive(Debug, Clone, Default)]
 struct Bucket {
+    /// `None` when an unscoped key created it.
+    project: Option<String>,
     lifecycle: Option<String>,
     objects: BTreeMap<String, Object>,
 }
@@ -73,6 +83,8 @@ struct Inner {
     calls: Vec<Call>,
     /// Further access keys and their secrets, besides the owner key.
     keys: BTreeMap<String, String>,
+    /// Preferred projects of the further keys that have one.
+    key_projects: BTreeMap<String, String>,
     page: Option<usize>,
     clock: u64,
 }
@@ -199,6 +211,7 @@ impl FakeS3 {
                 buckets: BTreeMap::new(),
                 calls: Vec::new(),
                 keys: BTreeMap::new(),
+                key_projects: BTreeMap::new(),
                 page: None,
                 clock: FAKE_CLOCK,
             }),
@@ -209,13 +222,35 @@ impl FakeS3 {
         self.inner.lock().expect("fake s3").calls.clone()
     }
 
-    /// Accepts requests signed with this key pair too, as the cache key's.
+    /// Accepts requests signed with this key pair too, for buckets of every project.
     pub fn add_key(&self, access_key: &str, secret_key: &str) {
         self.inner
             .lock()
             .expect("fake s3")
             .keys
             .insert(access_key.to_string(), secret_key.to_string());
+    }
+
+    /// Accepts requests signed with this key pair, whose preferred project is `project`.
+    pub fn add_key_in(&self, access_key: &str, secret_key: &str, project: &str) {
+        let mut inner = self.inner.lock().expect("fake s3");
+        inner
+            .keys
+            .insert(access_key.to_string(), secret_key.to_string());
+        inner
+            .key_projects
+            .insert(access_key.to_string(), project.to_string());
+    }
+
+    /// The project a bucket was created in.
+    pub fn bucket_project(&self, bucket: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("fake s3")
+            .buckets
+            .get(bucket)?
+            .project
+            .clone()
     }
 
     /// Keys per ListObjectsV2 page without `max-keys`, [`DEFAULT_PAGE`] unless set.
@@ -297,14 +332,15 @@ impl FakeS3 {
             .map(|o| o.acl.clone())
     }
 
-    /// `None` when the request is signed correctly, else the error response.
+    /// The project the request acts in when it is signed correctly (`None` for a key that
+    /// reaches every project), else the error response.
     fn verify(
-        keys: &BTreeMap<String, String>,
+        inner: &Inner,
         request: &Request,
         url: &Url,
         region: &str,
-    ) -> Option<Response> {
-        let denied = |code: &str| Some(s3_error(403, code, "signature check failed"));
+    ) -> std::result::Result<Option<String>, Response> {
+        let denied = |code: &str| Err(s3_error(403, code, "signature check failed"));
         let Some(authorization) = request.header_value("authorization") else {
             return denied("AccessDenied");
         };
@@ -313,13 +349,21 @@ impl FakeS3 {
         else {
             return denied("AuthorizationHeaderMalformed");
         };
-        let secret_key = if access_key == FAKE_ACCESS_KEY {
-            FAKE_SECRET_KEY
-        } else if let Some(secret_key) = keys.get(&access_key) {
-            secret_key.as_str()
+        let (access_key, named_project) = match access_key.split_once('@') {
+            Some((key, project)) => (key.to_string(), Some(project.to_string())),
+            None => (access_key, None),
+        };
+        let (secret_key, preferred) = if access_key == FAKE_ACCESS_KEY {
+            (FAKE_SECRET_KEY, Some(FAKE_PREFERRED_PROJECT.to_string()))
+        } else if let Some(secret_key) = inner.keys.get(&access_key) {
+            (
+                secret_key.as_str(),
+                inner.key_projects.get(&access_key).cloned(),
+            )
         } else {
             return denied("InvalidAccessKeyId");
         };
+        let project = named_project.or(preferred);
         let Some(amz_date) = request.header_value("x-amz-date") else {
             return denied("AccessDenied");
         };
@@ -329,7 +373,7 @@ impl FakeS3 {
         let body = request.body.clone().unwrap_or_default();
         let payload_hash = sigv4::sha256_hex(&body);
         if request.header_value("x-amz-content-sha256") != Some(payload_hash.as_str()) {
-            return Some(s3_error(400, "XAmzContentSHA256Mismatch", "payload hash"));
+            return Err(s3_error(400, "XAmzContentSHA256Mismatch", "payload hash"));
         }
         let signed_names: BTreeSet<&str> = signed.split(';').collect();
         let unsigned = request.headers.iter().any(|(name, _)| {
@@ -337,7 +381,7 @@ impl FakeS3 {
             name.starts_with("x-amz-") && !signed_names.contains(name.as_str())
         });
         if unsigned {
-            return Some(s3_error(
+            return Err(s3_error(
                 403,
                 "AccessDenied",
                 "There were headers present in the request which were not signed",
@@ -369,7 +413,7 @@ impl FakeS3 {
         if expected != signature {
             return denied("SignatureDoesNotMatch");
         }
-        None
+        Ok(project)
     }
 }
 
@@ -577,11 +621,23 @@ impl HttpClient for FakeS3 {
                 _ => access_denied(),
             });
         }
-        if let Some(denied) = FakeS3::verify(&inner.keys, &request, &url, &region) {
-            return Ok(denied);
-        }
+        let project = match FakeS3::verify(&inner, &request, &url, &region) {
+            Ok(project) => project,
+            Err(denied) => return Ok(denied),
+        };
         if bucket.is_empty() {
             return Ok(s3_error(405, "MethodNotAllowed", "service level request"));
+        }
+        let elsewhere = inner.buckets.get(&bucket).is_some_and(
+            |b| matches!((&project, &b.project), (Some(mine), Some(theirs)) if mine != theirs),
+        );
+        if elsewhere {
+            let create = method == "PUT" && key.is_none() && url.query.is_empty();
+            return Ok(if create {
+                s3_error(409, "BucketAlreadyExists", "bucket name taken")
+            } else {
+                access_denied()
+            });
         }
         let has = |name: &str| url.query.iter().any(|(k, _)| k == name);
         let page = inner.page.unwrap_or(DEFAULT_PAGE);
@@ -594,7 +650,13 @@ impl HttpClient for FakeS3 {
                 if inner.buckets.contains_key(&bucket) {
                     return Ok(s3_error(409, "BucketAlreadyOwnedByYou", "bucket exists"));
                 }
-                inner.buckets.insert(bucket, Bucket::default());
+                inner.buckets.insert(
+                    bucket,
+                    Bucket {
+                        project,
+                        ..Bucket::default()
+                    },
+                );
                 Ok(Response::empty(200))
             }
             ("PUT", Some(key)) if url.query.is_empty() => {

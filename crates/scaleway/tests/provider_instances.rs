@@ -1208,24 +1208,54 @@ async fn destroy_removes_servers_and_the_security_group() {
     );
 }
 
-#[tokio::test]
-async fn destroy_keeps_going_when_the_security_group_is_still_in_use() {
+#[tokio::test(start_paused = true)]
+async fn destroy_keeps_going_when_a_server_never_ends() {
     let (log, lines) = Log::memory();
     let (backend, provider, project_id) = provisioned(plain(), log).await;
     let group = backend.instance.security_groups()[0]["id"].clone();
     let id = provider.start(request(&plain(), "ci")).await.unwrap();
     backend.instance.set_state(&id, "stopping");
+    let started = tokio::time::Instant::now();
     provider.destroy().await.unwrap();
+    assert!(started.elapsed() >= std::time::Duration::from_secs(300));
     assert_eq!(backend.instance.security_groups()[0]["id"], group);
     assert!(backend.iam.applications().is_empty());
+    let logged = lines.lock().unwrap().clone();
     assert!(
-        lines
-            .lock()
-            .unwrap()
+        logged
+            .iter()
+            .any(|l| l == r#"warn servers still ending count="1""#),
+        "{logged:?}"
+    );
+    assert!(
+        logged
             .iter()
             .any(|l| l.starts_with("warn security group not deleted") && l.contains("in use"))
     );
     let _ = project_id;
+}
+
+#[tokio::test(start_paused = true)]
+async fn destroy_waits_for_terminated_servers_before_the_security_group_and_project() {
+    let (log, lines) = Log::memory();
+    let (backend, provider, _) = provisioned(plain(), log).await;
+    for _ in 0..2 {
+        provider.start(request(&plain(), "ci")).await.unwrap();
+    }
+    backend.instance.set_slow_terminate(true);
+    provider.destroy().await.unwrap();
+    assert!(backend.instance.servers().is_empty());
+    assert!(backend.instance.security_groups().is_empty());
+    assert!(backend.account.projects().is_empty());
+    let logged = lines.lock().unwrap().clone();
+    assert!(!logged.iter().any(|l| l.starts_with("warn")), "{logged:?}");
+    assert_eq!(
+        logged
+            .iter()
+            .filter(|l| l.starts_with("info terminated server"))
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]

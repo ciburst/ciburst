@@ -109,7 +109,7 @@ impl Scaleway {
         let Some(project_id) = project else {
             return Ok(None);
         };
-        let s3 = self.s3()?;
+        let s3 = self.s3(project_id)?;
         let bucket = self.bucket(project_id);
         if !s3.bucket_exists(&bucket).await? {
             return Ok(None);
@@ -128,7 +128,7 @@ impl Scaleway {
         if let Some(binary) = self.binary()? {
             let present = match project {
                 Some(project_id) if bucket_exists => {
-                    self.s3()?
+                    self.s3(project_id)?
                         .object_exists(&self.bucket(project_id), &agent_key(&binary.sha256))
                         .await?
                 }
@@ -166,7 +166,7 @@ impl Scaleway {
     /// Uploads the binary as a public object unless it is there; answers the agent's SHA-256.
     pub(super) async fn apply_agent(&self, project: &Option<String>) -> Result<String> {
         let project_id = self.require_project(project)?;
-        let s3 = self.s3()?;
+        let s3 = self.s3(project_id)?;
         let bucket = self.bucket(project_id);
         let Some(binary) = self.binary()? else {
             return self

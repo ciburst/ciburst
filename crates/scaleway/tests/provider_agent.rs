@@ -12,7 +12,7 @@ use ciburst_core::testing::contract::contract_config;
 use ciburst_core::types::{Action, Provider, Rotation, Step};
 use ciburst_scaleway::provider::Scaleway;
 use ciburst_scaleway::provider::s3::{S3, lifecycle_xml};
-use ciburst_scaleway::testing::s3_api::FAKE_CLOCK;
+use ciburst_scaleway::testing::s3_api::{FAKE_CLOCK, FAKE_PREFERRED_PROJECT};
 use ciburst_scaleway::testing::scaleway_fake::{
     FAKE_ACCESS_KEY, FAKE_REGION, FAKE_SECRET_KEY, ScalewayFake,
 };
@@ -108,6 +108,22 @@ async fn the_binary_is_uploaded_once_as_a_public_object() {
             .all(|c| c.method != "PUT"),
         "nothing uploaded on the same hash"
     );
+}
+
+#[tokio::test]
+async fn the_bucket_lives_in_the_deployment_project_not_the_keys_preferred_one() {
+    let backend = Arc::new(ScalewayFake::new());
+    let first = provider(&backend, Some(agent_fixture()));
+    let outputs = first.apply(&first.plan(&[]).await.unwrap()).await.unwrap();
+    let project_id = outputs["CIBURST_PROJECT_ID"].clone();
+    assert_ne!(project_id, FAKE_PREFERRED_PROJECT);
+    assert_eq!(
+        backend.s3.bucket_project(&bucket(&project_id)).as_deref(),
+        Some(project_id.as_str())
+    );
+    let again = provider(&backend, Some(agent_fixture()));
+    let steps = again.plan(&[]).await.unwrap();
+    assert!(steps.iter().all(Step::is_noop), "{steps:?}");
 }
 
 #[tokio::test]

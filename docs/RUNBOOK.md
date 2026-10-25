@@ -65,8 +65,8 @@ The adopter follows README, Adopt. The operator's view:
    Check: the log prints the plan and a `replayed` line per waiting job; those jobs run on the runner `<name>-vm`; a second run prints only `noop`. Note the job's duration: it counts against the hosted-runner minutes.
 4. Run `ciburst-check`.
    Check: `every job matches the stage map`.
-5. Undo: run `ciburst-destroy` with the variable `CIBURST_DESTROY=<name>`.
-   Check: `destroyed <name>`; no output variable, webhook or runner remains.
+5. Undo: the project variable `CIBURST_DESTROY=<name>` (protected, environment scope `ciburst`), then run `ciburst-destroy`.
+   Check: `destroyed <name>`; no output variable, webhook or runner remains; delete `CIBURST_DESTROY` afterwards. A `warn` line names what is left; a second run removes it.
 
 Project variables after a setup, environment `ciburst`, protected, raw: the keys of `outputs.env` above except `HCLOUD_TOKEN`, which stays in memory. Tokens, secrets and secret keys are masked and hidden where GitLab allows; ids, URLs and the agent hash stay readable in job logs.
 
@@ -242,6 +242,8 @@ Add a toolchain:
 | `ciburst-setup` cannot pull `registry.gitlab.com/ciburst/ciburst/cli:<version>`, or the include fails | while `ciburst/ciburst` is private: no access to it, or the project is missing from its job token allowlist | ask its maintainers for access and the allowlist entry |
 | `ciburst-setup` fails with 403 on `POST /user/runners`, naming `create_runner` and the Owner role | the token lacks the scope, or its user is not an Owner of the project | a new token of a project Owner with `api` and `create_runner` in `CIBURST_GITLAB_TOKEN` |
 | setup log `output_unmasked key=<key>` | GitLab refused to mask that value | none; the variable stays protected and scoped to `ciburst` |
+| Running `ciburst-destroy` with a variable is refused (403), or the UI offers no variable form | new projects allow no pipeline variables, which include variables typed into a manual job | set `CIBURST_DESTROY` as a project variable instead |
+| destroy log `warn servers still ending`, `security group not deleted` or `project not deleted` | a VM was still terminating after 5 minutes | run `ciburst-destroy` (or `ciburst destroy`) again |
 | apply log `replay_failed ... 403` | the token cannot list jobs (a fine-grained token without read access to jobs) | retry the waiting jobs by hand; use a token with the scope `api` |
 | `apply` stops: the zone has no quota for the pool's types | Instance quota 0 for every type of the pool in the zone | set `provider.zone` to a zone the message names, or ask Scaleway support to raise the quota; `ciburst apply`; delete the security group `<name>-vm` of the old zone (console, Instances, Security groups) |
 | `apply` stops naming `--agent` and `scripts/agent-binary.sh` | no agent binary given and no agent object in the bucket | developer path: `scripts/agent-binary.sh`, then `ciburst apply`; pipeline mode: the `cli` image carries the agent, check the component's `version` input |
@@ -310,13 +312,10 @@ Measured:
    Result (2026-10-25): apply uploaded the agent (3.5 MB) and moved the bucket to three lifecycle rules; the deploy took 12 min 46 s; the next plan was 15 `noop`. The object answers an anonymous GET with the uploaded hash; the bucket listing and unknown keys answer 403. A cold pipeline passed 7 of 7: five VM jobs on three VMs created 14 s after the pipeline, `idle` 61 to 92 s after creation, VM jobs queued 67 to 96 s. `replay_failed` with 403 on the fine-grained owner token (no read access to jobs).
 2. Adoption drill in a fresh project: push a pipeline, then README, Adopt, steps 1 to 5.
    Check: the minutes of each README step; the hosted-runner minutes of `ciburst-setup`; the jobs pushed before the setup start after it; a second `ciburst-setup` plans only `noop`; `ciburst-check` passes.
-   Result, minutes per step: ____
-   Result, minutes per setup: ____
-   Result, second setup: ____
-   Result, waiting jobs: ____
-3. Destroy in that project: `ciburst-destroy` with `CIBURST_DESTROY=<name>`.
+   Result (2026-10-25, `ciburst/ciburst-adopt-demo`): the owner set the four variables by hand; the component resolved from `ciburst/ciburst@main` after the job token allowlist entry. First setup 6.1 hosted minutes including the dispatcher deploy; second setup 16 s, 12 `noop`; `ciburst-check` 9 s, passes. The three jobs pushed before the setup were replayed (`started`) and passed (node 20 s, postgres 23 s, docker build 38 s). A cold pipeline queued 61 to 80 s. Findings, fixed: the cache bucket landed in the setup key's preferred project instead of `ci-<project id>`, so the cache key got 403 (no burst grouping, no job cache); the setup masked ids and the agent hash in its log.
+3. Destroy in that project: the project variable `CIBURST_DESTROY=<name>`, then `ciburst-destroy`.
    Check: `destroyed <name>`; no output variable, webhook, runner, server or Scaleway project `<name>` remains.
-   Result: ____
+   Result (2026-10-25): GitLab refused `CIBURST_DESTROY` as a manual-job variable (403, pipeline variables off in new projects), so it became a project variable. The first destroy took 72 s and left the security group and project behind (VMs still terminating, fixed); a second run removed both in 13 s. Webhook, runner and output variables were gone after the first run.
 4. Hetzner, once `.local/hetzner.env` exists: the `vm` pool on `runtime: "hetzner"`, `apply`, a cold pipeline.
    Check: three CX33 servers with the labels; the firewall applied (`public_net.firewalls[].status` `applied`); the jobs pass; the drain at minute 55 deletes every server; Primary IPs empty afterwards.
    Result: ____
