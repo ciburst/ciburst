@@ -136,7 +136,7 @@ Global options: `--ci` (pipeline mode), `--config <path>`, `--local <dir>`, `--a
 
 ## Development
 
-Rust 1.96.0 (`rust-toolchain.toml`). Before a commit: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features`, `cargo deny check`, `scripts/shellcheck.sh`, `scripts/check-pins.sh`; `scripts/test-linux.sh` for Linux-only code. New providers: `docs/PROVIDERS.md`.
+Rust 1.96.0 (`rust-toolchain.toml`). Before a commit: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features`, `cargo deny check`, `scripts/shellcheck.sh`, `scripts/check-pins.sh`; `scripts/test-linux.sh` for Linux-only code, `images/test/lane-bootstrap.sh` after a change to the lane bootstrap. New providers: `docs/PROVIDERS.md`.
 
 ## License
 

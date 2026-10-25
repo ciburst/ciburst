@@ -56,7 +56,8 @@ cargo test --workspace --all-features
 cargo deny check
 scripts/shellcheck.sh
 scripts/check-pins.sh
-scripts/test-linux.sh        # Linux-only code, such as the VM agent's process test
+scripts/test-linux.sh          # Linux-only code, such as the VM agent's process test
+images/test/lane-bootstrap.sh  # Docker, after a change to the lane bootstrap
 ```
 
 Rules:
