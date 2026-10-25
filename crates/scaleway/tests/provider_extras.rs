@@ -1,6 +1,6 @@
-//! The Scaleway provider as the main member of a composite (spec D35, M4 rules R8, R11, R13):
-//! pools of other providers are none of its business, and its `shared_env` hands their VMs the
-//! agent image and the cache location.
+//! The Scaleway provider as the main member of a composite (spec D35, D38, M4 rules R8, R11,
+//! R13): pools of other providers are none of its business, and its `shared_env` hands their
+//! VMs the agent's URL and SHA-256 and the cache location.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -12,22 +12,16 @@ use ciburst_core::config::{CacheType, Config};
 use ciburst_core::log::Log;
 use ciburst_core::testing::contract::contract_config;
 use ciburst_core::types::{
-    Billing, Capabilities, Outputs, Provider, Rotation, Run, StartRequest, Step,
+    Action, Billing, Capabilities, Outputs, Provider, Rotation, Run, StartRequest, Step,
 };
 use ciburst_scaleway::provider::Scaleway;
 use ciburst_scaleway::testing::scaleway_fake::{FAKE_ACCESS_KEY, ScalewayFake};
-use serde_json::{Map, json};
+use ciburst_scaleway::testing::{agent_fixture, agent_fixture_sha256};
+use serde_json::Map;
 
-const AGENT_IMAGE: &str = "rg.fr-par.scw.cloud/contract/vm-agent:edge";
-
-/// The contract config with a public registry; the `build` pool belongs to `hetzner`.
+/// The contract config (S3 cache); the `build` pool belongs to `hetzner`.
 fn config(change: impl FnOnce(&mut Config)) -> Arc<Config> {
     let mut config = (*contract_config()).clone();
-    config.provider.extra.insert("registry".into(), json!(true));
-    config
-        .provider
-        .extra
-        .insert("registryPublic".into(), json!(true));
     config.providers.insert("hetzner".into(), Map::new());
     config.pools[1].runtime = Some("hetzner".into());
     change(&mut config);
@@ -35,7 +29,16 @@ fn config(change: impl FnOnce(&mut Config)) -> Arc<Config> {
 }
 
 fn provider(config: Arc<Config>, backend: &Arc<ScalewayFake>, log: Log) -> Scaleway {
-    Scaleway::new(config, backend.client(), log).with_s3_access_key(FAKE_ACCESS_KEY)
+    Scaleway::new(config, backend.client(), log)
+        .with_s3_access_key(FAKE_ACCESS_KEY)
+        .with_agent(Some(agent_fixture()))
+}
+
+fn agent_url(project_id: &str) -> String {
+    format!(
+        "https://contract-cache-{project_id}.s3.fr-par.scw.cloud/ciburst/agent/{}",
+        agent_fixture_sha256()
+    )
 }
 
 async fn provisioned(config: Arc<Config>) -> (Arc<ScalewayFake>, Scaleway, String) {
@@ -89,9 +92,10 @@ async fn pools_of_other_providers_get_no_steps_no_warning_and_no_runs() {
             "key:dispatch",
             "key:cache",
             "bucket",
-            "registry",
+            "vm:agent",
             "definition:ci"
-        ]
+        ],
+        "the hetzner pool's VMs fetch the agent from this bucket"
     );
     assert!(
         lines.lock().unwrap().is_empty(),
@@ -184,32 +188,59 @@ async fn the_runtime_name_of_another_provider_is_unknown_without_its_provider() 
 }
 
 #[tokio::test]
-async fn the_registry_warning_covers_vms_of_other_providers() {
+async fn vms_of_other_providers_need_the_agent_and_the_s3_cache() {
     let backend = Arc::new(ScalewayFake::new());
-    let private = config(|c| {
-        c.pools[0].runtime = Some("jobs".into());
-        c.provider
-            .extra
-            .insert("registryPublic".into(), json!(false));
-    });
+    let jobs_and_hetzner = config(|c| c.pools[0].runtime = Some("jobs".into()));
     let (log, lines) = Log::memory();
-    provider(private, &backend, log).plan(&[]).await.unwrap();
-    let lines = lines.lock().unwrap();
-    assert_eq!(lines.len(), 1, "{lines:?}");
+    let without_agent = Scaleway::new(jobs_and_hetzner.clone(), backend.client(), log);
+    let steps = without_agent.plan(&[]).await.unwrap();
+    let agent = steps.iter().find(|s| s.id == "vm:agent").unwrap();
+    assert_eq!(agent.action, Action::Create);
+    let logged = lines.lock().unwrap().clone();
+    assert_eq!(logged.len(), 1, "{logged:?}");
     assert!(
-        lines[0].starts_with("warn vm pools cannot start"),
-        "{lines:?}"
+        logged[0].starts_with("warn vm pools cannot start"),
+        "{logged:?}"
     );
+    assert!(without_agent.preflight().await.is_err());
+
+    let no_cache = config(|c| {
+        c.pools[0].runtime = Some("jobs".into());
+        c.cache.kind = CacheType::None;
+    });
+    let error = provider(no_cache, &backend, Log::silent())
+        .plan(&[])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error,
+        "scaleway: VM pools need cache.type s3: VMs fetch their agent from the cache bucket"
+    );
+    let only_jobs = config(|c| {
+        c.providers.clear();
+        c.pools[0].runtime = Some("jobs".into());
+        c.pools[1].runtime = Some("jobs".into());
+        c.cache.kind = CacheType::None;
+    });
+    let steps = provider(only_jobs, &backend, Log::silent())
+        .plan(&[])
+        .await
+        .unwrap();
+    assert!(steps.iter().all(|s| s.id != "vm:agent"), "{steps:?}");
 }
 
 #[tokio::test]
-async fn shared_env_is_the_agent_image_and_the_cache_location_of_vm_env() {
+async fn shared_env_is_the_agent_and_the_cache_location_of_vm_env() {
     let plain = config(|_| {});
     let (backend, scaleway, project_id) = provisioned(plain.clone()).await;
     let shared = scaleway.shared_env().await.unwrap();
     let bucket = format!("contract-cache-{project_id}");
+    let url = agent_url(&project_id);
+    let sha = agent_fixture_sha256();
     let expected: BTreeMap<String, String> = [
-        ("CIBURST_AGENT_IMAGE", AGENT_IMAGE),
+        ("CIBURST_AGENT_URL", url.as_str()),
+        ("CIBURST_AGENT_SHA256", sha.as_str()),
         ("CACHE_TYPE", "s3"),
         ("CACHE_S3_SERVER_ADDRESS", "s3.fr-par.scw.cloud"),
         ("CACHE_S3_BUCKET_NAME", bucket.as_str()),
@@ -220,6 +251,7 @@ async fn shared_env_is_the_agent_image_and_the_cache_location_of_vm_env() {
     .map(|(k, v)| (k.to_string(), v.to_string()))
     .collect();
     assert_eq!(shared, expected);
+    assert!(!shared.contains_key("CIBURST_AGENT_IMAGE"));
 
     let id = scaleway.start(request(&plain, "ci")).await.unwrap();
     let user_data = backend.instance.user_data(&id, "cloud-init").unwrap();
@@ -229,18 +261,19 @@ async fn shared_env_is_the_agent_image_and_the_cache_location_of_vm_env() {
             "{key}={value} as in vm.env"
         );
     }
-    assert!(user_data.contains(&format!("docker create {AGENT_IMAGE} ")));
+    assert!(user_data.contains(&format!("curl -fsSL -o /tmp/ciburst-vm-agent {url} ")));
 
-    let no_cache = config(|c| c.cache.kind = CacheType::None);
-    let (_, scaleway, _) = provisioned(no_cache).await;
+    let dispatcher = Scaleway::new(plain, backend.client(), Log::silent())
+        .with_agent_sha256(Some("e".repeat(64)));
     assert_eq!(
-        scaleway.shared_env().await.unwrap(),
-        BTreeMap::from([("CIBURST_AGENT_IMAGE".to_string(), AGENT_IMAGE.to_string())])
+        dispatcher.shared_env().await.unwrap()["CIBURST_AGENT_SHA256"],
+        "e".repeat(64),
+        "the function's environment wins"
     );
 }
 
 #[tokio::test]
-async fn shared_env_refuses_an_agent_image_vms_cannot_pull() {
+async fn shared_env_names_what_is_missing() {
     let empty = Arc::new(ScalewayFake::new());
     let error = provider(config(|_| {}), &empty, Log::silent())
         .shared_env()
@@ -251,32 +284,16 @@ async fn shared_env_refuses_an_agent_image_vms_cannot_pull() {
         error,
         "scaleway: shared environment: project contract does not exist"
     );
-
-    let off = config(|c| {
-        c.provider.extra.insert("registry".into(), json!(false));
-    });
-    let (_, scaleway, _) = provisioned(off).await;
-    let error = scaleway.shared_env().await.unwrap_err().to_string();
+    let (backend, _, _) = provisioned(config(|_| {})).await;
+    let error = Scaleway::new(config(|_| {}), backend.client(), Log::silent())
+        .shared_env()
+        .await
+        .unwrap_err()
+        .to_string();
     assert_eq!(
         error,
-        "scaleway: shared environment: VMs pull their agent from the registry namespace; set \
-         provider.registry"
+        "scaleway: shared environment: CIBURST_AGENT_SHA256 missing"
     );
-
-    let private = config(|c| {
-        c.provider
-            .extra
-            .insert("registryPublic".into(), json!(false));
-    });
-    let (backend, scaleway, project_id) = provisioned(private).await;
-    let error = scaleway.shared_env().await.unwrap_err().to_string();
-    assert_eq!(
-        error,
-        "scaleway: shared environment: VMs pull the agent image without credentials; set \
-         provider.registryPublic"
-    );
-    assert!(!project_id.is_empty());
-    assert_eq!(backend.registry.namespaces().len(), 1);
 }
 
 /// An added member that only records what it is asked to start.
@@ -342,7 +359,8 @@ async fn a_composite_start_on_another_provider_carries_the_shared_env() {
     assert_eq!(backend.writes().len(), writes, "no Scaleway server");
     let started = recorder.started.lock().unwrap();
     let env = &started[0].env;
-    assert_eq!(env["CIBURST_AGENT_IMAGE"], AGENT_IMAGE);
+    assert_eq!(env["CIBURST_AGENT_URL"], agent_url(&project_id));
+    assert_eq!(env["CIBURST_AGENT_SHA256"], agent_fixture_sha256());
     assert_eq!(
         env["CACHE_S3_BUCKET_NAME"],
         format!("contract-cache-{project_id}")

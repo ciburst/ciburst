@@ -7,7 +7,8 @@
 //! The function environment is exactly what `ciburst_dispatch_scaleway::Env` reads, named in
 //! [`vars`]:
 //! - plain: `CIBURST_CONFIG` (config JSON), `CIBURST_ORGANIZATION_ID`, `CIBURST_PROJECT_ID`,
-//!   `CIBURST_REGION` (Scaleway reserves the `SCW_` prefix);
+//!   `CIBURST_REGION` (Scaleway reserves the `SCW_` prefix), and every variable of
+//!   `Secrets::dispatcher_env` under its own name (`CIBURST_AGENT_SHA256`, D38);
 //! - secret: `HOOK_TOKEN`, `CIBURST_DISPATCH_KEY` (the dispatch key), `RUNNER_TOKEN_<TAG>` per pool,
 //!   `CACHE_S3_ACCESS_KEY` and `CACHE_S3_SECRET_KEY` when a cache key exists, `CIBURST_VM_SECRET`
 //!   and `CIBURST_SWEEP_TOKEN` when the provisioner made them, and every credential of an added
@@ -74,6 +75,8 @@ pub mod vars {
     pub const VM_SECRET: &str = "CIBURST_VM_SECRET";
     pub const SWEEP_TOKEN: &str = "CIBURST_SWEEP_TOKEN";
     pub const CODE_DIGEST: &str = "CIBURST_CODE_DIGEST";
+    /// The agent VMs download (D38), from `Secrets::dispatcher_env`.
+    pub const AGENT_SHA256: &str = ciburst_core::provision::keys::AGENT_SHA256;
 
     /// Whether `name` can carry a credential of an added provider (`Secrets::provider_env`,
     /// for example `HCLOUD_TOKEN`): upper-case letters, digits and `_`, not starting with a
@@ -86,6 +89,34 @@ pub mod vars {
                 .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
         let taken = [HOOK_TOKEN, CACHE_ACCESS_KEY, CACHE_SECRET_KEY].contains(&name)
             || ["CIBURST_", "RUNNER_TOKEN_", "SCW_"]
+                .iter()
+                .any(|prefix| name.starts_with(prefix));
+        shaped && !taken
+    }
+
+    /// Whether `name` can carry a plain variable of the dispatcher (`Secrets::dispatcher_env`,
+    /// for example `CIBURST_AGENT_SHA256`): upper-case like a provider variable, outside the
+    /// names of this module, `RUNNER_TOKEN_<TAG>` and Scaleway's reserved `SCW_`.
+    pub fn dispatcher_name_ok(name: &str) -> bool {
+        let shaped = name.starts_with(|c: char| c.is_ascii_uppercase())
+            && name
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+        let taken = [
+            CONFIG,
+            ORGANIZATION_ID,
+            PROJECT_ID,
+            REGION,
+            HOOK_TOKEN,
+            SECRET_KEY,
+            CACHE_ACCESS_KEY,
+            CACHE_SECRET_KEY,
+            VM_SECRET,
+            SWEEP_TOKEN,
+            CODE_DIGEST,
+        ]
+        .contains(&name)
+            || ["RUNNER_TOKEN_", "SCW_"]
                 .iter()
                 .any(|prefix| name.starts_with(prefix));
         shaped && !taken
@@ -215,7 +246,13 @@ impl ScalewayFunction {
     }
 
     fn settings(&self, project_id: &str, secrets: &Secrets) -> Result<Settings> {
-        let environment_variables = BTreeMap::from([
+        check_dispatcher_env(secrets)?;
+        let mut environment_variables: BTreeMap<String, String> = secrets
+            .dispatcher_env
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        environment_variables.extend([
             (
                 vars::CONFIG.to_string(),
                 serde_json::to_string(&*self.config)?,
@@ -480,6 +517,7 @@ impl ScalewayFunction {
 impl Host for ScalewayFunction {
     async fn plan(&self, secrets: &Secrets) -> Result<Vec<Step>> {
         check_provider_env(secrets)?;
+        check_dispatcher_env(secrets)?;
         let found = self.find().await?;
         let function_name = self.function_name();
         let namespace = Step::new(
@@ -544,6 +582,7 @@ impl Host for ScalewayFunction {
 
     async fn apply(&self, steps: &[Step], secrets: &Secrets) -> Result<Outputs> {
         check_provider_env(secrets)?;
+        check_dispatcher_env(secrets)?;
         if let Some(step) = steps.iter().find(|s| {
             ![STEP_NAMESPACE, STEP_FUNCTION, STEP_CODE, STEP_CRON].contains(&s.id.as_str())
         }) {
@@ -692,6 +731,21 @@ fn check_provider_env(secrets: &Secrets) -> Result<()> {
     {
         Some(name) => Err(Error::provider(format!(
             "{HOST_NAME}: provider variable {name} is reserved or not an upper-case name"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Refuses a plain dispatcher variable that would shadow one of the function's own variables or
+/// a provider credential, before anything is read or written.
+fn check_dispatcher_env(secrets: &Secrets) -> Result<()> {
+    match secrets
+        .dispatcher_env
+        .keys()
+        .find(|name| !vars::dispatcher_name_ok(name) || secrets.provider_env.contains_key(*name))
+    {
+        Some(name) => Err(Error::provider(format!(
+            "{HOST_NAME}: dispatcher variable {name} is reserved or not an upper-case name"
         ))),
         None => Ok(()),
     }

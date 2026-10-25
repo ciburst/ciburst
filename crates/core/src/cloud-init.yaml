@@ -27,5 +27,5 @@ write_files:
 runcmd:
   - 'test -f /swapfile || (fallocate -l {{SWAP}} /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile)'
 {{INSTALL_DOCKER}}  - 'curl -fsSL -o /tmp/gitlab-runner {{RUNNER_URL}} && echo "{{RUNNER_SHA256}}  /tmp/gitlab-runner" | sha256sum -c - && install -m 0755 /tmp/gitlab-runner /usr/local/bin/gitlab-runner && rm -f /tmp/gitlab-runner'
-  - 'systemctl start docker && id=$(docker create {{AGENT_IMAGE}} /ciburst-vm-agent) && docker cp "$id:/ciburst-vm-agent" /usr/local/bin/ciburst-vm-agent && docker rm "$id"'
+  - 'curl -fsSL -o /tmp/ciburst-vm-agent {{AGENT_URL}} && echo "{{AGENT_SHA256}}  /tmp/ciburst-vm-agent" | sha256sum -c - && install -m 0755 /tmp/ciburst-vm-agent /usr/local/bin/ciburst-vm-agent && rm -f /tmp/ciburst-vm-agent'
   - 'systemctl daemon-reload && systemctl enable --now ciburst-vm-agent.service'

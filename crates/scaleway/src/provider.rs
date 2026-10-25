@@ -1,18 +1,20 @@
 //! Provider `scaleway`. A pool runs on Scaleway Instances (`instances`, the default: one VM per
 //! run with its own Docker daemon, spec section 6.1) or on Serverless Jobs (`jobs`: one job
 //! definition per pool, one job run per pending job). Shared resources: project, IAM
-//! applications and keys, cache bucket with lifecycle, registry namespace; per runtime the VM
-//! security group or the job definitions. Every resource is looked up by name or tag; nothing
-//! is stored locally.
+//! applications and keys, cache bucket with lifecycle and the VM agent (D38), the optional
+//! registry namespace; per runtime the VM security group or the job definitions. Every
+//! resource is looked up by name or tag; nothing is stored locally.
 //!
 //! Pools whose runtime is a key of the config's `providers` belong to another provider (spec
 //! D35): this one plans, starts and lists nothing for them and answers their runs with the agent
-//! image and cache location of [`Provider::shared_env`].
+//! URL and cache location of [`Provider::shared_env`].
 //!
 //! Modules: `steps` plans and applies the resources, `keys` the IAM keys, `bucket` the cache
-//! bucket, `registry` the registry namespace, `servers` the VM runtime, `jobs` the Serverless
-//! Jobs runtime; `iam`, `instance`, `s3` and `sigv4` are the API clients.
+//! bucket, `agent` the VM agent in it, `registry` the registry namespace, `servers` the VM
+//! runtime, `jobs` the Serverless Jobs runtime; `iam`, `instance`, `s3` and `sigv4` are the API
+//! clients.
 
+mod agent;
 mod bucket;
 mod cloud_init;
 mod iam;
@@ -95,8 +97,10 @@ pub struct Scaleway {
     log: Log,
     s3_access_key: Option<String>,
     zone: String,
-    /// The Linux musl build of `ciburst-vm-agent` that `apply` uploads (M5 rule R3).
+    /// The Linux musl build of `ciburst-vm-agent` that `apply` uploads (D38).
     agent: Option<PathBuf>,
+    /// `CIBURST_AGENT_SHA256` of the function's environment.
+    agent_sha256: Option<String>,
 }
 
 impl Scaleway {
@@ -116,6 +120,7 @@ impl Scaleway {
             s3_access_key,
             zone,
             agent: None,
+            agent_sha256: None,
         }
     }
 
@@ -328,6 +333,12 @@ impl Provider for Scaleway {
                 Billing::PerSecond
             },
         }
+    }
+
+    /// D42: a VM pool without quota for any of its types in the zone, or no agent, fails
+    /// before `apply` changes anything.
+    async fn preflight(&self) -> Result<()> {
+        self.preflight_checks().await
     }
 
     async fn plan(&self, rotate: &[Rotation]) -> Result<Vec<Step>> {

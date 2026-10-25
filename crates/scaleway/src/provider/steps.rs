@@ -1,14 +1,17 @@
-//! Plan, apply and destroy: the steps `project`, `key:dispatch`, `key:cache`, `bucket`,
-//! `registry`, `vm:security-group` and `definition:<tag>`, each found by name before it is
-//! planned.
+//! Plan, apply, preflight and destroy: the steps `project`, `key:dispatch`, `key:cache`,
+//! `bucket`, `registry`, `vm:agent`, `vm:security-group` and `definition:<tag>`, each found by
+//! name before it is planned.
 
+use ciburst_core::provision::keys;
 use ciburst_core::types::{Action, Outputs, Rotation, Step};
 use ciburst_core::{Error, Result};
 use serde_json::Value;
 
+use super::agent::{AGENT_STEP, NO_AGENT};
 use super::iam::{self, AppState};
 use super::keys::KeyKind;
 use super::registry::{self, NamespaceState};
+use super::s3::LIFECYCLE_RULES;
 use super::servers::SECURITY_GROUP_STEP;
 use super::{PROVIDER_NAME, Runtime, Scaleway, jobs};
 
@@ -68,8 +71,13 @@ impl Scaleway {
     pub(super) async fn plan_steps(&self, rotate: &[Rotation]) -> Result<Vec<Step>> {
         self.default_runtime()?;
         let runtimes = self.own_runtimes()?;
-        // Pools of other providers run VMs that pull the agent from this registry too.
-        let other_pools = runtimes.len() < self.config.pools.len();
+        let needs_agent = self.needs_agent()?;
+        if needs_agent && !self.cache_on() {
+            return Err(Error::provider(format!(
+                "{PROVIDER_NAME}: VM pools need cache.type s3: VMs fetch their agent from the \
+                 cache bucket"
+            )));
+        }
         let observed = self.observe().await?;
         let name = self.name();
         let mut steps = vec![Step::new(
@@ -94,8 +102,13 @@ impl Scaleway {
                 Some(Some(days)) if days == expire_days => {
                     Step::new("bucket", Action::Noop, bucket_resource)
                 }
-                Some(_) => Step::new("bucket", Action::Update, bucket_resource)
-                    .with_detail(format!("lifecycle {expire_days} days")),
+                Some(_) => {
+                    let prefixes: Vec<&str> = LIFECYCLE_RULES.iter().map(|(_, p)| *p).collect();
+                    Step::new("bucket", Action::Update, bucket_resource).with_detail(format!(
+                        "lifecycle {expire_days} days on {}",
+                        prefixes.join(", ")
+                    ))
+                }
             };
             steps.push(step);
         } else {
@@ -125,18 +138,14 @@ impl Scaleway {
         } else if observed.registry.is_some() {
             steps.push(Step::new("registry", Action::Delete, registry_resource));
         }
-        let group_resource = format!("security group {}", self.security_group_name());
-        let own_vms = runtimes.iter().any(|(_, r)| *r == Runtime::Instances);
-        if (own_vms || other_pools) && (!self.registry_on() || !self.registry_public()) {
-            self.log.warn(
-                "vm pools cannot start",
-                &[(
-                    "reason",
-                    "VMs pull their agent from a public registry namespace: set \
-                     provider.registry and provider.registryPublic",
-                )],
+        if needs_agent {
+            steps.push(
+                self.agent_step(&observed.project, observed.bucket.is_some())
+                    .await?,
             );
         }
+        let group_resource = format!("security group {}", self.security_group_name());
+        let own_vms = runtimes.iter().any(|(_, r)| *r == Runtime::Instances);
         if own_vms {
             self.warn_without_quota(&runtimes).await;
             let action = if observed.security_group.is_some() {
@@ -195,9 +204,34 @@ impl Scaleway {
         Ok(steps)
     }
 
+    /// D42: what would keep a VM pool from starting after `apply`, as one error.
+    pub(super) async fn preflight_checks(&self) -> Result<()> {
+        let runtimes = self.own_runtimes()?;
+        let mut problems: Vec<String> = self
+            .quota_problems(&runtimes)
+            .await
+            .into_iter()
+            .map(|(tag, reason)| format!("pool {tag}: {reason}"))
+            .collect();
+        if self.needs_agent()? && !self.agent_available().await? {
+            problems.push(NO_AGENT.to_string());
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::provider(format!(
+                "{PROVIDER_NAME}: {}",
+                problems.join("; ")
+            )))
+        }
+    }
+
+    /// Applies `steps` in order. Every call with a VM pool answers the current agent as
+    /// `CIBURST_AGENT_SHA256`, so the dispatcher's environment follows it (D38).
     pub(super) async fn apply_steps(&self, steps: &[Step]) -> Result<Outputs> {
         let mut project = self.client.find_project(self.name()).await?;
         let mut outputs = Outputs::new();
+        let mut agent = None;
         for step in steps {
             if step.is_noop() {
                 continue;
@@ -244,6 +278,7 @@ impl Scaleway {
                         self.ensure_security_group(project_id).await?;
                     }
                 }
+                AGENT_STEP => agent = Some(self.apply_agent(&project).await?),
                 id => {
                     let tag = id.strip_prefix("definition:").ok_or_else(|| {
                         Error::provider(format!("{PROVIDER_NAME}: unknown step {id}"))
@@ -258,6 +293,14 @@ impl Scaleway {
                         }
                     }
                 }
+            }
+        }
+        if self.needs_agent()? {
+            if agent.is_none() {
+                agent = self.current_agent(&project).await?;
+            }
+            if let Some(sha256) = agent {
+                outputs.insert(keys::AGENT_SHA256.to_string(), sha256);
             }
         }
         if let Some(project_id) = project {

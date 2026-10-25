@@ -11,8 +11,8 @@ use ciburst_core::{Error, Result};
 use serde_json::{Value, json};
 
 use super::instance::{self, ApiError, DOCKER_IMAGE_LABEL, FALLBACK_IMAGE_LABEL, InstanceApi};
+use super::vm;
 use super::{PROVIDER_NAME, Runtime, Scaleway, USER_DATA_KEY, cloud_init, iam, instance_types};
-use super::{registry, vm};
 
 pub(super) const SECURITY_GROUP_STEP: &str = "vm:security-group";
 
@@ -27,11 +27,15 @@ impl Scaleway {
         format!("{}-vm", self.name())
     }
 
-    /// Warns for each VM pool none of whose instance types has quota in the zone, as the
-    /// dispatcher could start no VM for it. Quotas are per organization, zone and type; a
-    /// failed lookup only logs.
-    pub(super) async fn warn_without_quota(&self, runtimes: &[(&Pool, Runtime)]) {
+    /// The VM pools none of whose instance types has quota in the zone, as tag and reason: the
+    /// dispatcher could start no VM for them. Quotas are per organization, zone and type; a
+    /// failed lookup only logs and ends the check.
+    pub(super) async fn quota_problems(
+        &self,
+        runtimes: &[(&Pool, Runtime)],
+    ) -> Vec<(String, String)> {
         let mut limits: BTreeMap<String, Vec<(String, u64)>> = BTreeMap::new();
+        let mut problems = Vec::new();
         for (pool, runtime) in runtimes {
             if *runtime != Runtime::Instances {
                 continue;
@@ -51,7 +55,7 @@ impl Scaleway {
                                 "quota check skipped",
                                 &[("quota", &name), ("error", &error.to_string())],
                             );
-                            return;
+                            return problems;
                         }
                     }
                 }
@@ -78,11 +82,19 @@ impl Scaleway {
                     self.zone,
                     types.join(", "),
                 );
-                self.log.warn(
-                    "vm pools cannot start",
-                    &[("pool", &pool.tag), ("reason", &reason)],
-                );
+                problems.push((pool.tag.clone(), reason));
             }
+        }
+        problems
+    }
+
+    /// Warns for each pool of [`Scaleway::quota_problems`].
+    pub(super) async fn warn_without_quota(&self, runtimes: &[(&Pool, Runtime)]) {
+        for (tag, reason) in self.quota_problems(runtimes).await {
+            self.log.warn(
+                "vm pools cannot start",
+                &[("pool", &tag), ("reason", &reason)],
+            );
         }
     }
 
@@ -124,12 +136,12 @@ impl Scaleway {
                     keys::VM_SECRET
                 ))
             })?;
-        if !self.registry_on() {
-            return Err(Error::provider(format!(
-                "{PROVIDER_NAME}: pool {tag}: the instances runtime pulls its agent from the \
-                 registry namespace; set provider.registry"
-            )));
-        }
+        let agent = self.start_agent()?.ok_or_else(|| {
+            Error::provider(format!(
+                "{PROVIDER_NAME}: pool {tag}: {} missing",
+                cloud_init::AGENT_SHA256_KEY
+            ))
+        })?;
         let not_provisioned =
             || Error::provider(format!("{PROVIDER_NAME}: pool {tag} is not provisioned"));
         let project_id = self
@@ -137,15 +149,8 @@ impl Scaleway {
             .find_project(self.name())
             .await?
             .ok_or_else(not_provisioned)?;
-        let namespace = registry::find_namespace(&self.client, &project_id, self.name())
-            .await?
-            .ok_or_else(not_provisioned)?;
-        if !namespace.is_public {
-            return Err(Error::provider(format!(
-                "{PROVIDER_NAME}: pool {tag}: VMs pull the agent image without credentials; \
-                 set provider.registryPublic"
-            )));
-        }
+        let agent_url =
+            cloud_init::agent_url(&self.config, self.client.region(), &project_id, &agent);
         let api = self.instances();
         let security_group = api
             .find_security_group(&project_id, &self.security_group_name())
@@ -220,7 +225,7 @@ impl Scaleway {
                     &id,
                     secret,
                     &base,
-                    &namespace.endpoint,
+                    (&agent_url, &agent),
                     install_docker,
                 )
                 .await
@@ -254,14 +259,15 @@ impl Scaleway {
         )))
     }
 
-    /// User data, then power on. The VM gets its token, never the secret behind it.
+    /// User data, then power on. The VM gets its token, never the secret behind it, and the
+    /// agent's URL and SHA-256.
     async fn boot(
         &self,
         api: &InstanceApi<'_>,
         id: &str,
         secret: &str,
         base: &BTreeMap<String, String>,
-        registry_endpoint: &str,
+        (agent_url, agent_sha256): (&str, &str),
         install_docker: bool,
     ) -> Result<Attempt> {
         let mut env = base.clone();
@@ -270,7 +276,7 @@ impl Scaleway {
             cloud_init::VM_TOKEN.to_string(),
             ciburst_core::vm::token(secret, id),
         );
-        let user_data = cloud_init::render(&env, registry_endpoint, install_docker)?;
+        let user_data = cloud_init::render(&env, agent_url, agent_sha256, install_docker)?;
         api.set_user_data(id, USER_DATA_KEY, &user_data).await?;
         match api.action(id, "poweron").await? {
             Ok(()) => Ok(Attempt::Started),
@@ -444,36 +450,28 @@ impl Scaleway {
             .await
     }
 
-    /// M4 rule R11: the agent image in the registry namespace, which VMs of every provider pull
-    /// without credentials, and with an S3 cache the bucket's location. No secret.
+    /// D38: the URL and SHA-256 of the agent in the cache bucket, which VMs of every provider
+    /// download without credentials, and with an S3 cache the bucket's location. No secret.
     pub(super) async fn vm_shared_env(&self) -> Result<BTreeMap<String, String>> {
         let unusable = |reason: String| {
             Error::provider(format!("{PROVIDER_NAME}: shared environment: {reason}"))
         };
-        if !self.registry_on() {
-            return Err(unusable(
-                "VMs pull their agent from the registry namespace; set provider.registry".into(),
-            ));
-        }
+        let agent = self
+            .start_agent()?
+            .ok_or_else(|| unusable(format!("{} missing", cloud_init::AGENT_SHA256_KEY)))?;
         let project_id = self
             .client
             .find_project(self.name())
             .await?
             .ok_or_else(|| unusable(format!("project {} does not exist", self.name())))?;
-        let namespace = registry::find_namespace(&self.client, &project_id, self.name())
-            .await?
-            .ok_or_else(|| {
-                unusable(format!("registry namespace {} does not exist", self.name()))
-            })?;
-        if !namespace.is_public {
-            return Err(unusable(
-                "VMs pull the agent image without credentials; set provider.registryPublic".into(),
-            ));
-        }
-        let mut env = BTreeMap::from([(
-            cloud_init::AGENT_IMAGE_KEY.to_string(),
-            cloud_init::agent_image(&namespace.endpoint)?,
-        )]);
+        let region = self.client.region();
+        let mut env = BTreeMap::from([
+            (
+                cloud_init::AGENT_URL_KEY.to_string(),
+                cloud_init::agent_url(&self.config, region, &project_id, &agent),
+            ),
+            (cloud_init::AGENT_SHA256_KEY.to_string(), agent),
+        ]);
         if self.cache_on() {
             env.extend(cloud_init::cache_location(
                 &self.config,

@@ -1,6 +1,6 @@
 //! The provider's fake Scaleway: Account, IAM, Serverless Jobs, Container Registry, Instances
-//! with the Marketplace, and S3 behind one `HttpClient` that routes by host and path, plus the
-//! helpers the fakes share.
+//! with the Marketplace, and S3 (path-style and virtual-hosted) behind one `HttpClient` that
+//! routes by host and path, plus the helpers the fakes share.
 
 use std::sync::Arc;
 
@@ -264,7 +264,9 @@ impl HttpClient for ScalewayFake {
             if url.path.starts_with("/instance/") || url.path.starts_with("/marketplace/") {
                 return self.instance.send(request).await;
             }
-        } else if url.host.starts_with("s3.") && url.host.ends_with(".scw.cloud") {
+        } else if (url.host.starts_with("s3.") || url.host.contains(".s3."))
+            && url.host.ends_with(".scw.cloud")
+        {
             return self.s3.send(request).await;
         }
         Ok(api_error(

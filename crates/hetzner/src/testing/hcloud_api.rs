@@ -1,4 +1,5 @@
-//! Fake of the Hetzner Cloud API (`https://api.hetzner.cloud/v1`) for servers and firewalls.
+//! Fake of the Hetzner Cloud API (`https://api.hetzner.cloud/v1`) for servers and firewalls,
+//! and the locations and server types a preflight reads.
 //! Shapes from the OpenAPI document at `docs.hetzner.cloud/cloud.spec.json` and hcloud-go v2
 //! (`schema/server.go`, `schema/firewall.go`, `schema/action.go`, `schema/meta.go`,
 //! `schema/error.go`), checked 2026-10-24. It answers only fields the real API answers; user
@@ -53,6 +54,8 @@ const LOCATIONS: [(&str, &str, &str, &str); 4] = [
     ("hel1", "Helsinki", "FI", "eu-central"),
     ("ash", "Ashburn, VA", "US", "us-east"),
 ];
+/// The locations that offer the server types above: the cost optimized types are European.
+const OFFERED_IN: [&str; 3] = ["fsn1", "nbg1", "hel1"];
 
 const SERVER_FIELDS: [&str; 15] = [
     "name",
@@ -603,6 +606,29 @@ impl FakeHetzner {
 fn server_type(name: &str) -> Option<Value> {
     let (index, (name, cores, memory, disk, arch)) =
         SERVER_TYPES.iter().enumerate().find(|(_, t)| t.0 == name)?;
+    let offered: Vec<(usize, &str)> = LOCATIONS
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| OFFERED_IN.contains(&l.0))
+        .map(|(i, l)| (i, l.0))
+        .collect();
+    let prices: Vec<Value> = offered
+        .iter()
+        .map(|(_, location)| {
+            let hourly = format!("0.{:04}", 30 * cores);
+            json!({
+                "location": location,
+                "price_hourly": { "net": hourly, "gross": hourly },
+                "price_monthly": { "net": "9.9900", "gross": "9.9900" },
+                "included_traffic": 21_990_232_555_520u64,
+                "price_per_tb_traffic": { "net": "1.0000", "gross": "1.0000" },
+            })
+        })
+        .collect();
+    let locations: Vec<Value> = offered
+        .iter()
+        .map(|(i, location)| json!({ "id": 1 + i, "name": location, "deprecation": null }))
+        .collect();
     Some(json!({
         "id": 100 + index,
         "name": name,
@@ -611,13 +637,13 @@ fn server_type(name: &str) -> Option<Value> {
         "memory": memory,
         "disk": disk,
         "deprecated": false,
-        "prices": [],
+        "prices": prices,
         "storage_type": "local",
         "cpu_type": "shared",
         "category": "cost_optimized",
         "architecture": arch,
         "deprecation": null,
-        "locations": [],
+        "locations": locations,
     }))
 }
 
@@ -1100,6 +1126,24 @@ impl FakeHetzner {
                 reply(200, json!({ "firewalls": items, "meta": meta }))
             }
             ("POST", ["firewalls"]) => FakeHetzner::create_firewall(inner, &body),
+            ("GET", ["locations"]) => {
+                let items: Vec<Value> = LOCATIONS
+                    .iter()
+                    .filter(|l| url.get("name").is_none_or(|n| l.0 == n))
+                    .filter_map(|l| location(l.0))
+                    .collect();
+                let (items, meta) = page(items, url, inner.page_cap);
+                reply(200, json!({ "locations": items, "meta": meta }))
+            }
+            ("GET", ["server_types"]) => {
+                let items: Vec<Value> = SERVER_TYPES
+                    .iter()
+                    .filter(|t| url.get("name").is_none_or(|n| t.0 == n))
+                    .filter_map(|t| server_type(t.0))
+                    .collect();
+                let (items, meta) = page(items, url, inner.page_cap);
+                reply(200, json!({ "server_types": items, "meta": meta }))
+            }
             (method, ["firewalls", firewall_id]) => {
                 let Some(index) = id(firewall_id).and_then(|i| inner.firewall_index(i)) else {
                     return not_found("firewall");

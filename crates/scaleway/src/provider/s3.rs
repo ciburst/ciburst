@@ -1,19 +1,45 @@
 //! The cache bucket on the Object Storage S3 endpoint `s3.<region>.scw.cloud`, path-style,
-//! signed with SigV4.
+//! signed with SigV4. Public objects are read anonymously at the virtual-hosted URL
+//! [`public_url`].
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ciburst_core::http::{HttpClient, Request, Response};
+use ciburst_core::time::parse_rfc3339;
 use ciburst_core::{Error, Result};
 use md5::{Digest, Md5};
 
 use super::sigv4;
+use crate::ledger::INTENT_PREFIX;
 
+/// The single rule of M4, which expired every object; a bucket that still has it gets the
+/// rules of [`LIFECYCLE_RULES`] instead.
 pub const LIFECYCLE_RULE_ID: &str = "ciburst-expire";
+
+/// Rule id and prefix of every expiring part of the bucket (D38): the runner cache with
+/// `--cache-shared` (`project/<id>/<key>`) and without (`runner/<token>/project/...`), and the
+/// burst intents. The agent below `ciburst/agent/` never expires.
+pub const LIFECYCLE_RULES: [(&str, &str); 3] = [
+    ("ciburst-expire-project", "project/"),
+    ("ciburst-expire-runner", "runner/"),
+    ("ciburst-expire-intents", INTENT_PREFIX),
+];
+
+/// The canned ACL that lets anybody read an object without credentials.
+pub const PUBLIC_READ: &str = "public-read";
 
 pub fn host(region: &str) -> String {
     format!("s3.{region}.scw.cloud")
+}
+
+/// The anonymous, virtual-hosted URL of an object: `https://<bucket>.s3.<region>.scw.cloud/<key>`.
+pub fn public_url(bucket: &str, region: &str, key: &str) -> String {
+    format!(
+        "https://{bucket}.{}/{}",
+        host(region),
+        sigv4::uri_encode(key, false)
+    )
 }
 
 pub struct S3 {
@@ -23,10 +49,17 @@ pub struct S3 {
     pub secret_key: String,
 }
 
+/// One object of a listing: its key and `LastModified` in Unix seconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub key: String,
+    pub modified: Option<u64>,
+}
+
 /// One page of a ListObjectsV2 answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListPage {
-    pub keys: Vec<String>,
+    pub objects: Vec<Listed>,
     /// `NextContinuationToken` of a truncated listing.
     pub next: Option<String>,
 }
@@ -126,7 +159,8 @@ impl S3 {
             .map(drop)
     }
 
-    /// Expiration days of the ciburst rule, `None` when the bucket has no such rule.
+    /// Expiration days of the ciburst rules, `None` when the bucket lacks one of them or still
+    /// has the rule of M4 ([`parse_lifecycle_days`]).
     pub async fn lifecycle_days(&self, bucket: &str) -> Result<Option<u32>> {
         let (path, response) = self
             .send("GET", bucket, None, &[("lifecycle", "")], Vec::new(), &[])
@@ -160,6 +194,53 @@ impl S3 {
         self.expect_ok("PUT", bucket, Some(key), &[], body, &[])
             .await
             .map(drop)
+    }
+
+    /// PutObject with the canned ACL `public-read`: anybody may GET it without credentials.
+    pub async fn put_public_object(&self, bucket: &str, key: &str, body: Vec<u8>) -> Result<()> {
+        let headers = [
+            ("content-type", "application/octet-stream".to_string()),
+            ("x-amz-acl", PUBLIC_READ.to_string()),
+        ];
+        self.expect_ok("PUT", bucket, Some(key), &[], body, &headers)
+            .await
+            .map(drop)
+    }
+
+    /// HeadObject: whether `key` exists.
+    pub async fn object_exists(&self, bucket: &str, key: &str) -> Result<bool> {
+        let (path, response) = self
+            .send("HEAD", bucket, Some(key), &[], Vec::new(), &[])
+            .await?;
+        match response.status {
+            200..=299 => Ok(true),
+            404 => Ok(false),
+            _ => Err(s3_error("HEAD", &path, &response)),
+        }
+    }
+
+    /// Every object below `prefix`, page after page, at most `max_pages` pages.
+    pub async fn list_all(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        max_pages: usize,
+    ) -> Result<Vec<Listed>> {
+        let mut objects = Vec::new();
+        let mut token: Option<String> = None;
+        for _ in 0..max_pages {
+            let page = self
+                .list_page(bucket, prefix, None, token.as_deref())
+                .await?;
+            objects.extend(page.objects);
+            match page.next {
+                Some(next) => token = Some(next),
+                None => return Ok(objects),
+            }
+        }
+        Err(Error::provider(format!(
+            "scaleway s3 list {bucket}/{prefix}: more than {max_pages} pages"
+        )))
     }
 
     /// One page of ListObjectsV2 below `prefix`, after the key `start_after`, continued at
@@ -225,53 +306,89 @@ fn s3_error(method: &str, path: &str, response: &Response) -> Error {
     Error::provider(message.trim_end())
 }
 
+/// The lifecycle document of [`LIFECYCLE_RULES`], each expiring after `days`.
 pub fn lifecycle_xml(days: u32) -> String {
+    let rules: String = LIFECYCLE_RULES
+        .iter()
+        .map(|(id, prefix)| {
+            format!(
+                "<Rule><ID>{id}</ID><Filter><Prefix>{}</Prefix></Filter><Status>Enabled</Status>\
+                 <Expiration><Days>{days}</Days></Expiration></Rule>",
+                xml_escape(prefix)
+            )
+        })
+        .collect();
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-         <LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
-         <Rule><ID>{LIFECYCLE_RULE_ID}</ID><Filter><Prefix></Prefix></Filter>\
-         <Status>Enabled</Status><Expiration><Days>{days}</Days></Expiration></Rule>\
+         <LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{rules}\
          </LifecycleConfiguration>"
     )
 }
 
-/// The expiration days of the enabled ciburst rule in a lifecycle document.
+/// The expiration days of the ciburst rules in a lifecycle document: `Some` only when the
+/// rules whose id starts with `ciburst-` are exactly those of [`LIFECYCLE_RULES`], enabled,
+/// on their prefixes and with the same days. The single rule of M4 expired the agent too, so a
+/// document that still has it reads as `None` and plans an update.
 pub fn parse_lifecycle_days(xml: &str) -> Option<u32> {
-    xml_values(xml, "Rule").into_iter().find_map(|rule| {
-        let ours = xml_values(&rule, "ID")
+    let ours: Vec<String> = xml_values(xml, "Rule")
+        .into_iter()
+        .filter(|rule| first(rule, "ID").is_some_and(|id| id.starts_with("ciburst-")))
+        .collect();
+    if ours.len() != LIFECYCLE_RULES.len() {
+        return None;
+    }
+    let mut days = None;
+    for (id, prefix) in LIFECYCLE_RULES {
+        let rule = ours
             .iter()
-            .any(|id| id == LIFECYCLE_RULE_ID);
-        let enabled = xml_values(&rule, "Status").iter().any(|s| s == "Enabled");
-        if !(ours && enabled) {
+            .find(|rule| first(rule, "ID").as_deref() == Some(id))?;
+        let filter = first(rule, "Filter").unwrap_or_default();
+        let found_prefix = first(&filter, "Prefix").or_else(|| first(rule, "Prefix"));
+        if first(rule, "Status").as_deref() != Some("Enabled")
+            || found_prefix.as_deref() != Some(prefix)
+        {
             return None;
         }
-        let expiration = xml_values(&rule, "Expiration").into_iter().next()?;
-        xml_values(&expiration, "Days")
-            .into_iter()
-            .next()?
-            .parse()
-            .ok()
-    })
+        let expiration = first(rule, "Expiration")?;
+        let rule_days: u32 = first(&expiration, "Days")?.parse().ok()?;
+        if days.is_some_and(|d| d != rule_days) {
+            return None;
+        }
+        days = Some(rule_days);
+    }
+    days
 }
 
-/// Keys and continuation of a `ListBucketResult` document (ListObjectsV2).
+fn first(xml: &str, tag: &str) -> Option<String> {
+    xml_values(xml, tag).into_iter().next()
+}
+
+/// Objects and continuation of a `ListBucketResult` document (ListObjectsV2).
 pub fn parse_list_page(xml: &str) -> Result<ListPage> {
     if !xml.contains("<ListBucketResult") {
         return Err(Error::provider(
             "scaleway s3 list: answer without ListBucketResult",
         ));
     }
-    let keys = xml_values(xml, "Contents")
+    let objects = xml_values(xml, "Contents")
         .iter()
-        .filter_map(|contents| xml_values(contents, "Key").into_iter().next())
+        .filter_map(|contents| {
+            Some(Listed {
+                key: first(contents, "Key")?,
+                modified: first(contents, "LastModified").and_then(|t| parse_rfc3339(&t)),
+            })
+        })
         .collect();
     let truncated = xml_values(xml, "IsTruncated").first().map(String::as_str) == Some("true");
     if !truncated {
-        return Ok(ListPage { keys, next: None });
+        return Ok(ListPage {
+            objects,
+            next: None,
+        });
     }
     match xml_values(xml, "NextContinuationToken").into_iter().next() {
         Some(token) if !token.is_empty() => Ok(ListPage {
-            keys,
+            objects,
             next: Some(token),
         }),
         _ => Err(Error::provider(
@@ -356,26 +473,77 @@ fn now_seconds() -> u64 {
 mod tests {
     use super::*;
 
+    /// The document `apply` wrote in M4: one rule over the whole bucket.
+    fn m4_document(days: u32) -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><LifecycleConfiguration \
+             xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule><ID>ciburst-expire</ID>\
+             <Filter><Prefix></Prefix></Filter><Status>Enabled</Status><Expiration><Days>{days}\
+             </Days></Expiration></Rule></LifecycleConfiguration>"
+        )
+    }
+
     #[test]
     fn lifecycle_document_round_trip() {
         let xml = lifecycle_xml(14);
+        let rule = |id: &str, prefix: &str| {
+            format!(
+                "<Rule><ID>{id}</ID><Filter><Prefix>{prefix}</Prefix></Filter><Status>Enabled\
+                 </Status><Expiration><Days>14</Days></Expiration></Rule>"
+            )
+        };
         assert_eq!(
             xml,
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><LifecycleConfiguration \
-             xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule><ID>ciburst-expire</ID>\
-             <Filter><Prefix></Prefix></Filter><Status>Enabled</Status><Expiration><Days>14</Days>\
-             </Expiration></Rule></LifecycleConfiguration>"
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><LifecycleConfiguration \
+                 xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{}{}{}</LifecycleConfiguration>",
+                rule("ciburst-expire-project", "project/"),
+                rule("ciburst-expire-runner", "runner/"),
+                rule("ciburst-expire-intents", "ciburst/intents/"),
+            )
+        );
+        assert!(
+            !xml.contains("<Prefix></Prefix>"),
+            "nothing expires the agent"
         );
         assert_eq!(parse_lifecycle_days(&xml), Some(14));
-        assert_eq!(
-            parse_lifecycle_days(&xml.replace("Enabled", "Disabled")),
-            None
+        for changed in [
+            xml.replacen("Enabled", "Disabled", 1),
+            xml.replace("ciburst-expire-runner", "other"),
+            xml.replace("runner/", "runners/"),
+            xml.replacen("<Days>14</Days>", "<Days>3</Days>", 1),
+            xml.replace(
+                "</LifecycleConfiguration>",
+                "<Rule><ID>ciburst-expire</ID><Filter><Prefix></Prefix></Filter><Status>Enabled\
+                 </Status><Expiration><Days>14</Days></Expiration></Rule></LifecycleConfiguration>",
+            ),
+            m4_document(14),
+            "<LifecycleConfiguration/>".to_string(),
+        ] {
+            assert_eq!(parse_lifecycle_days(&changed), None, "{changed}");
+        }
+        let foreign = xml.replace(
+            "</LifecycleConfiguration>",
+            "<Rule><ID>owner-rule</ID><Filter><Prefix>tmp/</Prefix></Filter><Status>Enabled\
+             </Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>",
         );
         assert_eq!(
-            parse_lifecycle_days(&xml.replace("ciburst-expire", "other")),
-            None
+            parse_lifecycle_days(&foreign),
+            Some(14),
+            "other rules stay theirs"
         );
-        assert_eq!(parse_lifecycle_days("<LifecycleConfiguration/>"), None);
+        let legacy_prefix = xml
+            .replace("<Filter><Prefix>", "<Prefix>")
+            .replace("</Prefix></Filter>", "</Prefix>");
+        assert_eq!(parse_lifecycle_days(&legacy_prefix), Some(14));
+    }
+
+    #[test]
+    fn public_urls_are_virtual_hosted() {
+        assert_eq!(
+            public_url("demo-cache-p-1", "fr-par", "ciburst/agent/ab12"),
+            "https://demo-cache-p-1.s3.fr-par.scw.cloud/ciburst/agent/ab12"
+        );
     }
 
     #[test]
@@ -393,11 +561,24 @@ mod tests {
              <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
              <Name>b</Name><Prefix>p/</Prefix><NextContinuationToken>t+/=</NextContinuationToken>\
              <KeyCount>2</KeyCount><MaxKeys>2</MaxKeys><IsTruncated>true</IsTruncated>\
-             <Contents><Key>p/a&amp;b</Key><Size>0</Size></Contents>\
+             <Contents><Key>p/a&amp;b</Key><LastModified>2026-10-24T00:00:01.000Z</LastModified>\
+             <Size>0</Size></Contents>\
              <Contents><Key>p/c</Key><Size>0</Size></Contents></ListBucketResult>",
         )
         .unwrap();
-        assert_eq!(page.keys, ["p/a&b", "p/c"]);
+        assert_eq!(
+            page.objects,
+            [
+                Listed {
+                    key: "p/a&b".into(),
+                    modified: Some(1_792_800_001)
+                },
+                Listed {
+                    key: "p/c".into(),
+                    modified: None
+                }
+            ]
+        );
         assert_eq!(page.next.as_deref(), Some("t+/="));
         let last = parse_list_page(
             "<ListBucketResult><ContinuationToken>t</ContinuationToken><KeyCount>0</KeyCount>\
@@ -407,7 +588,7 @@ mod tests {
         assert_eq!(
             last,
             ListPage {
-                keys: Vec::new(),
+                objects: Vec::new(),
                 next: None
             }
         );

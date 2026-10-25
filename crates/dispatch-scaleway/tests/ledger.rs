@@ -1,52 +1,56 @@
-//! The function's burst ledger against the fake Scaleway (M4 rule R13): built from the cache
+//! The function against the fake Scaleway: the burst ledger (M4 rule R13), built from the cache
 //! key, project and region, absent without them, and written by `respond` for a pending job of a
-//! VM pool that finds no free slot.
+//! VM pool that finds no free slot; and the agent of `CIBURST_AGENT_SHA256` (D38) in the user
+//! data of the VMs it starts.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use ciburst_core::config::parse_config;
+use ciburst_core::http::{HttpClient, Request};
 use ciburst_core::ledger::Intent;
 use ciburst_core::log::Log;
 use ciburst_core::types::Provider;
-use ciburst_dispatch_scaleway::{Env, Incoming, respond};
+use ciburst_dispatch_scaleway::{Env, EnvError, Incoming, respond};
 use ciburst_scaleway::host::vars;
 use ciburst_scaleway::provider::Scaleway;
 use ciburst_scaleway::testing::scaleway_fake::{
     FAKE_ACCESS_KEY, FAKE_ORGANIZATION_ID, FAKE_SECRET_KEY, ScalewayFake,
 };
+use ciburst_scaleway::testing::{agent_fixture, agent_fixture_sha256};
 use serde_json::{Value, json};
 
 const NOW: u64 = 1_800_000_000;
 const HOST: &str = "demo-dispatch.functions.fnc.fr-par.scw.cloud";
 const INTENT: &str = "ciburst/intents/vm/1800000000-00000000000000000042";
 
-fn config(cache: &str) -> String {
+fn config(cache: &str, runtime: &str) -> String {
     format!(
         r#"{{
           "name": "demo",
           "gitlab": {{ "url": "https://gitlab.example", "projectIds": [7] }},
           "host": {{ "type": "scaleway-function" }},
-          "provider": {{ "type": "scaleway", "registry": true, "registryPublic": true }},
+          "provider": {{ "type": "scaleway" }},
           "defaultPool": "vm",
-          "pools": [ {{ "tag": "vm", "image": "img/docker", "slots": 2 }} ],
+          "pools": [ {{ "tag": "vm", "image": "img/docker", "slots": 2, "runtime": "{runtime}" }} ],
           "cache": {{ "type": "{cache}" }}
         }}"#
     )
 }
 
-/// The fake Scaleway after the provider's apply, the S3 fake accepting the cache key IAM made,
-/// and the function's variables for that deployment.
-async fn deployed(cache: &str) -> (Arc<ScalewayFake>, BTreeMap<String, String>) {
+/// The fake Scaleway after the provider's apply with the agent fixture, the S3 fake accepting
+/// the cache key IAM made, and the function's variables for that deployment.
+async fn deployed(cache: &str, runtime: &str) -> (Arc<ScalewayFake>, BTreeMap<String, String>) {
     let backend = Arc::new(ScalewayFake::new());
-    let text = config(cache);
+    let text = config(cache, runtime);
     let provider = Scaleway::new(
         Arc::new(parse_config(&text).unwrap()),
         backend.client(),
         Log::silent(),
     )
-    .with_s3_access_key(FAKE_ACCESS_KEY);
+    .with_s3_access_key(FAKE_ACCESS_KEY)
+    .with_agent(Some(agent_fixture()));
     let outputs = provider
         .apply(&provider.plan(&[]).await.unwrap())
         .await
@@ -76,7 +80,20 @@ async fn deployed(cache: &str) -> (Arc<ScalewayFake>, BTreeMap<String, String>) 
         vars.insert(vars::CACHE_ACCESS_KEY.to_string(), access.clone());
         vars.insert(vars::CACHE_SECRET_KEY.to_string(), secret.clone());
     }
+    if let Some(sha256) = outputs.get(vars::AGENT_SHA256) {
+        vars.insert(vars::AGENT_SHA256.to_string(), sha256.clone());
+    }
     (backend, vars)
+}
+
+/// The intents in the cache bucket, without the agent next to them.
+fn intents(backend: &ScalewayFake, vars: &BTreeMap<String, String>) -> Vec<(String, Vec<u8>)> {
+    backend
+        .s3
+        .objects(&bucket(vars))
+        .into_iter()
+        .filter(|(key, _)| key.starts_with("ciburst/intents/"))
+        .collect()
 }
 
 fn env(vars: &BTreeMap<String, String>) -> Env {
@@ -118,14 +135,11 @@ async fn pending_job(backend: &Arc<ScalewayFake>, env: &Env) -> (u16, Value) {
 
 #[tokio::test]
 async fn the_ledger_lives_in_the_cache_bucket_under_the_cache_key() {
-    let (backend, vars) = deployed("s3").await;
+    let (backend, vars) = deployed("s3", "instances").await;
     let env = env(&vars);
     let ledger = env.ledger_on(backend.clone()).expect("ledger");
     ledger.record("vm", NOW, "42").await.unwrap();
-    assert_eq!(
-        backend.s3.objects(&bucket(&vars)),
-        [(INTENT.to_string(), Vec::new())]
-    );
+    assert_eq!(intents(&backend, &vars), [(INTENT.to_string(), Vec::new())]);
     assert_eq!(
         ledger.since("vm", NOW - 30).await.unwrap(),
         [Intent {
@@ -149,7 +163,7 @@ async fn the_ledger_lives_in_the_cache_bucket_under_the_cache_key() {
 
 #[tokio::test]
 async fn no_ledger_without_both_cache_keys_or_an_s3_cache() {
-    let (backend, vars) = deployed("s3").await;
+    let (backend, vars) = deployed("s3", "instances").await;
     for key in [vars::CACHE_ACCESS_KEY, vars::CACHE_SECRET_KEY] {
         let mut partial = vars.clone();
         partial.remove(key);
@@ -161,7 +175,7 @@ async fn no_ledger_without_both_cache_keys_or_an_s3_cache() {
                 .is_none()
         );
     }
-    let (backend, mut vars) = deployed("none").await;
+    let (backend, mut vars) = deployed("none", "jobs").await;
     vars.insert(vars::CACHE_ACCESS_KEY.to_string(), "SCWSTRAY".to_string());
     vars.insert(vars::CACHE_SECRET_KEY.to_string(), "stray".to_string());
     assert!(env(&vars).ledger_on(backend.clone()).is_none());
@@ -169,7 +183,7 @@ async fn no_ledger_without_both_cache_keys_or_an_s3_cache() {
 
 #[tokio::test]
 async fn a_pending_vm_job_without_a_free_slot_starts_a_vm_with_one_slot_taken() {
-    let (backend, vars) = deployed("s3").await;
+    let (backend, vars) = deployed("s3", "instances").await;
     let (status, body) = pending_job(&backend, &env(&vars)).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["result"], "started", "{body}");
@@ -189,15 +203,56 @@ async fn a_pending_vm_job_without_a_free_slot_starts_a_vm_with_one_slot_taken() 
 
 #[tokio::test]
 async fn a_pending_vm_job_without_a_free_slot_records_its_intent() {
-    let (backend, vars) = deployed("s3").await;
+    let (backend, vars) = deployed("s3", "instances").await;
     let (status, body) = pending_job(&backend, &env(&vars)).await;
     assert_eq!(
         (status, &body["result"]),
         (200, &json!("started")),
         "{body}"
     );
+    assert_eq!(intents(&backend, &vars), [(INTENT.to_string(), Vec::new())]);
+}
+
+#[tokio::test]
+async fn the_function_hands_its_agent_to_the_vms_it_starts() {
+    let (backend, vars) = deployed("s3", "instances").await;
+    let sha = agent_fixture_sha256();
+    assert_eq!(vars[vars::AGENT_SHA256], sha, "apply reported the agent");
+    let (status, body) = pending_job(&backend, &env(&vars)).await;
     assert_eq!(
-        backend.s3.objects(&bucket(&vars)),
-        [(INTENT.to_string(), Vec::new())]
+        (status, &body["result"]),
+        (200, &json!("started")),
+        "{body}"
+    );
+    let id = body["runId"].as_str().unwrap();
+    let user_data = backend.instance.user_data(id, "cloud-init").unwrap();
+    let url = format!(
+        "https://{}.s3.fr-par.scw.cloud/ciburst/agent/{sha}",
+        bucket(&vars)
+    );
+    assert!(user_data.contains(&format!("curl -fsSL -o /tmp/ciburst-vm-agent {url} ")));
+    assert!(user_data.contains(&format!("echo \"{sha}  /tmp/ciburst-vm-agent\"")));
+
+    let download = backend
+        .send(Request::new("GET", url.as_str()))
+        .await
+        .unwrap();
+    assert_eq!(download.status, 200, "the VM downloads without credentials");
+    assert_eq!(
+        download.body,
+        std::fs::read(agent_fixture()).unwrap(),
+        "the bytes cloud-init checks"
+    );
+
+    let mut without = vars.clone();
+    without.remove(vars::AGENT_SHA256);
+    let (status, body) = pending_job(&backend, &env(&without)).await;
+    assert_eq!((status, &body["result"]), (500, &json!("error")), "{body}");
+
+    let mut invalid = vars.clone();
+    invalid.insert(vars::AGENT_SHA256.to_string(), "not-a-hash".to_string());
+    assert_eq!(
+        Env::from_lookup(|name| invalid.get(name).cloned()).err(),
+        Some(EnvError::Invalid(vars::AGENT_SHA256.to_string()))
     );
 }

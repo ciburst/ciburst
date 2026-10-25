@@ -400,6 +400,96 @@ async fn provider_credentials_cannot_take_the_functions_own_names() {
 }
 
 #[tokio::test]
+async fn dispatcher_variables_are_plain_and_a_change_updates_the_function() {
+    let fake = Arc::new(FakeFunctions::new());
+    let host = host(two_pools(), &fake);
+    let first = "a".repeat(64);
+    let mut with_agent = secrets();
+    with_agent
+        .dispatcher_env
+        .insert(vars::AGENT_SHA256.into(), first.clone());
+    host.apply(&host.plan(&with_agent).await.unwrap(), &with_agent)
+        .await
+        .unwrap();
+    let function = fake.function(FUNCTION).unwrap();
+    assert_eq!(
+        function["environment_variables"][vars::AGENT_SHA256],
+        first.as_str()
+    );
+    assert!(
+        !fake
+            .secret_keys(FUNCTION)
+            .contains(&vars::AGENT_SHA256.to_string()),
+        "plain, not secret"
+    );
+    assert!(
+        host.plan(&with_agent)
+            .await
+            .unwrap()
+            .iter()
+            .all(Step::is_noop)
+    );
+
+    let second = "b".repeat(64);
+    let mut newer = with_agent.clone();
+    newer
+        .dispatcher_env
+        .insert(vars::AGENT_SHA256.into(), second.clone());
+    let plan = host.plan(&newer).await.unwrap();
+    assert_eq!(
+        actions(&plan),
+        [
+            ("namespace", Action::Noop),
+            ("function", Action::Update),
+            ("code", Action::Noop),
+            ("cron", Action::Noop)
+        ]
+    );
+    host.apply(&plan, &newer).await.unwrap();
+    let env = fake.function(FUNCTION).unwrap()["environment_variables"].clone();
+    assert_eq!(env[vars::AGENT_SHA256], second.as_str());
+    assert_eq!(env[vars::CODE_DIGEST], embedded_code_digest(), "code kept");
+    assert!(host.plan(&newer).await.unwrap().iter().all(Step::is_noop));
+
+    let plan = host.plan(&secrets()).await.unwrap();
+    assert_eq!(plan[1].action, Action::Update);
+    host.apply(&plan, &secrets()).await.unwrap();
+    let env = fake.function(FUNCTION).unwrap()["environment_variables"].clone();
+    assert!(env.get(vars::AGENT_SHA256).is_none(), "{env}");
+}
+
+#[tokio::test]
+async fn dispatcher_variables_cannot_take_the_functions_own_names() {
+    let fake = Arc::new(FakeFunctions::new());
+    let host = host(two_pools(), &fake);
+    for name in [
+        vars::CONFIG,
+        vars::PROJECT_ID,
+        vars::CODE_DIGEST,
+        "HOOK_TOKEN",
+        "RUNNER_TOKEN_CI",
+        "SCW_DEFAULT_PROJECT_ID",
+        "HCLOUD_TOKEN",
+        "lower",
+    ] {
+        let mut bad = secrets();
+        bad.provider_env
+            .insert("HCLOUD_TOKEN".into(), "hcloud".into());
+        bad.dispatcher_env.insert(name.into(), "value".into());
+        let error = host.plan(&bad).await.unwrap_err().to_string();
+        assert_eq!(
+            error,
+            format!(
+                "scaleway-function: dispatcher variable {name} is reserved or not an upper-case name"
+            )
+        );
+        let error = host.apply(&[], &bad).await.unwrap_err().to_string();
+        assert!(error.contains(name), "{error}");
+    }
+    assert_eq!(fake.namespace_count(), 0, "refused before any write");
+}
+
+#[tokio::test]
 async fn new_code_and_failed_builds_redeploy() {
     let fake = Arc::new(FakeFunctions::new());
     let host = host(two_pools(), &fake);

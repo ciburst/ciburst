@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ciburst_core::cloud_init::{AGENT_IMAGE_KEY, DISPATCH_URL, RUN_ID, VM_TOKEN};
+use ciburst_core::cloud_init::{AGENT_SHA256_KEY, AGENT_URL_KEY, DISPATCH_URL, RUN_ID, VM_TOKEN};
 use ciburst_core::config::{CacheType, Config, Pool};
 use ciburst_core::http::HttpClient;
 use ciburst_core::log::Log;
@@ -65,6 +65,12 @@ const CACHE_KEYS: [&str; 6] = [
     "CACHE_S3_SECRET_KEY",
 ];
 const CACHE_SHARED: &str = "CACHE_SHARED";
+
+/// Where a VM downloads the agent and the SHA-256 cloud-init checks it against.
+struct Agent {
+    url: String,
+    sha256: String,
+}
 
 /// The settings of `providers.hetzner`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -486,13 +492,14 @@ impl Hetzner {
         }
     }
 
-    /// `vm.env` of a new VM without its run id and token, the VM secret and the agent image.
-    /// Fails before anything is created when the request lacks a value, naming the key.
+    /// `vm.env` of a new VM without its run id and token, the VM secret, and the agent's URL
+    /// and SHA-256 (D38, from the main provider's `shared_env`). Fails before anything is
+    /// created when the request lacks a value, naming the key.
     fn base_env(
         &self,
         pool: &Pool,
         request: &BTreeMap<String, String>,
-    ) -> Result<(BTreeMap<String, String>, String, String)> {
+    ) -> Result<(BTreeMap<String, String>, String, Agent)> {
         let required = |key: &str| {
             request
                 .get(key)
@@ -505,7 +512,10 @@ impl Hetzner {
         let runner_token = required("RUNNER_TOKEN")?;
         let secret = required(keys::VM_SECRET)?;
         let dispatch_url = required(DISPATCH_URL)?;
-        let agent_image = required(AGENT_IMAGE_KEY)?;
+        let agent = Agent {
+            url: required(AGENT_URL_KEY)?,
+            sha256: required(AGENT_SHA256_KEY)?,
+        };
         let mut env = BTreeMap::from([
             (DISPATCH_URL.to_string(), dispatch_url),
             ("CI_SERVER_URL".to_string(), self.config.gitlab.url.clone()),
@@ -529,7 +539,7 @@ impl Hetzner {
                 env.insert(CACHE_SHARED.to_string(), shared.clone());
             }
         }
-        Ok((env, secret, agent_image))
+        Ok((env, secret, agent))
     }
 
     /// Rule R12: the first server type with capacity runs the VM; the name is chosen first, so
@@ -544,7 +554,7 @@ impl Hetzner {
             .position(|p| p.tag == *tag)
             .unwrap_or_default();
         let settings = self.checked(&[(index, pool)])?;
-        let (mut env, secret, agent_image) = self.base_env(pool, &request.env)?;
+        let (mut env, secret, agent) = self.base_env(pool, &request.env)?;
         let not_provisioned =
             || Error::provider(format!("{RUNTIME}: pool {tag} is not provisioned"));
         let firewall = self.find_firewall().await?.ok_or_else(not_provisioned)?;
@@ -558,7 +568,7 @@ impl Hetzner {
             VM_TOKEN.to_string(),
             ciburst_core::vm::token(&secret, &run_id),
         );
-        let user_data = ciburst_core::cloud_init::render(&env, &agent_image, false)?;
+        let user_data = ciburst_core::cloud_init::render(&env, &agent.url, &agent.sha256, false)?;
         if user_data.len() > MAX_USER_DATA {
             return Err(Error::provider(format!(
                 "{RUNTIME}: pool {tag}: user data is {} bytes, the API takes at most {MAX_USER_DATA}",
@@ -648,6 +658,66 @@ impl Provider for Hetzner {
             max_duration_s: 86_400,
             archs: vec!["amd64".into()],
             billing: Billing::PerHour,
+        }
+    }
+
+    /// D42 in two requests: the location (which proves the token) and the server types, each
+    /// pool needing one that is offered there.
+    async fn preflight(&self) -> Result<()> {
+        let pools = self.pools();
+        if pools.is_empty() {
+            return Ok(());
+        }
+        let settings = self.checked(&pools)?;
+        let location = &settings.location;
+        let query = [("name", location.clone())];
+        let locations = match self.api.send("GET", "/locations", &query, None).await? {
+            Ok(found) => found,
+            Err(error) if error.status == 401 => {
+                return Err(Error::provider(format!(
+                    "{RUNTIME}: the API refuses {TOKEN_VAR}: {error}"
+                )));
+            }
+            Err(error) => return Err(Api::error("GET", "/locations", &error)),
+        };
+        let known = locations["locations"]
+            .as_array()
+            .is_some_and(|all| all.iter().any(|l| l["name"] == location.as_str()));
+        if !known {
+            return Err(Error::provider(format!(
+                "{RUNTIME}: location {location} does not exist; set providers.{RUNTIME}.location"
+            )));
+        }
+        let types = self.api.list("/server_types", &[], "server_types").await?;
+        let offered = |name: &str| {
+            types.iter().any(|t| {
+                t["name"] == name
+                    && t["deprecated"] != true
+                    && t["prices"]
+                        .as_array()
+                        .is_some_and(|p| p.iter().any(|p| p["location"] == location.as_str()))
+            })
+        };
+        let problems: Vec<String> = pools
+            .iter()
+            .filter_map(|(_, pool)| {
+                let wanted = server_types(pool);
+                (!wanted.iter().any(|name| offered(name))).then(|| {
+                    format!(
+                        "pool {}: none of {} is offered in {location}",
+                        pool.tag,
+                        wanted.join(", ")
+                    )
+                })
+            })
+            .collect();
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::provider(format!(
+                "{RUNTIME}: {}",
+                problems.join("; ")
+            )))
         }
     }
 
