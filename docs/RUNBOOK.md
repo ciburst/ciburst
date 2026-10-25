@@ -241,7 +241,7 @@ Every lane run executes `crates/core/src/lane-bootstrap.sh` (spec section 6.3) a
 | Debian or Ubuntu, user root | `apt-get update` and `install` of what is missing, with lists and archives under `/tmp/ciburst-apt` and `APT::Sandbox::User=root`, because the sandbox drops root's capabilities: about 21 s on slim images |
 | RPM-based (UBI, Fedora), or a non-root user | installs nothing; fails unless the image contains the tools |
 
-Then it downloads `gitlab-runner` from `CIBURST_RUNNER_URL` to `/usr/local/bin` (`$HOME/.ciburst/bin` when that is not writable), checks it against `CIBURST_RUNNER_SHA256`, unsets the token and cache keys and execs `run-single` with the shell executor (`bash`, else `sh`), builds in `/builds`, cache in `/cache`.
+Then it downloads `gitlab-runner` from `CIBURST_RUNNER_URL` to `/usr/local/bin` (`$HOME/.ciburst/bin` when that is not writable), checks it against `CIBURST_RUNNER_SHA256`, unsets the token and cache keys and execs `run-single` with the shell executor (`bash`, else `sh`), builds in `/builds`, cache in `/cache`; a non-root user builds in `$HOME/builds` and caches in `$HOME/cache`, without a writable home under `/tmp`.
 
 Try an image before it becomes a lane, from the repository root:
 
