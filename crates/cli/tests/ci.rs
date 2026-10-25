@@ -266,7 +266,6 @@ async fn apply_stores_the_outputs_and_destroy_clears_them() {
         keys::HOOK_TOKEN,
         keys::VM_SECRET,
         keys::SWEEP_TOKEN,
-        keys::DISPATCH_URL,
         keys::DISPATCH_SECRET_KEY,
         keys::CACHE_SECRET_KEY,
     ] {
@@ -276,13 +275,16 @@ async fn apply_stores_the_outputs_and_destroy_clears_them() {
     }
     assert!(job_env[&keys::runner_token("vm")].starts_with("glrt-"));
     let runner_id = keys::runner_id("vm");
-    assert!(!stored.iter().find(|v| v.key == runner_id).unwrap().masked);
+    for key in [keys::DISPATCH_URL, runner_id.as_str()] {
+        let variable = stored.iter().find(|v| v.key == key).unwrap();
+        assert!(variable.protected && !variable.masked, "{variable:?}");
+    }
     assert_eq!(
         run.lines
             .iter()
             .filter(|l| l.contains("output_unmasked"))
-            .collect::<Vec<_>>(),
-        [&format!(r#"warn output_unmasked key="{runner_id}""#)]
+            .count(),
+        0
     );
 
     let mut vars = job_vars("true");

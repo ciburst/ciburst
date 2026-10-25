@@ -57,6 +57,21 @@ pub mod keys {
         AGENT_SHA256,
     ];
 
+    /// Outputs that grant access; only these are stored masked and hidden. Ids, URLs and the
+    /// agent hash stay readable in job logs.
+    pub fn is_secret(key: &str) -> bool {
+        [
+            HOOK_TOKEN,
+            VM_SECRET,
+            SWEEP_TOKEN,
+            DISPATCH_SECRET_KEY,
+            CACHE_SECRET_KEY,
+        ]
+        .contains(&key)
+            || PROVIDER_ENV.contains(&key)
+            || key.starts_with("CIBURST_RUNNER_TOKEN_")
+    }
+
     /// Keys a provider answers from every `apply` call; they replace stored values.
     pub fn is_refreshed(key: &str) -> bool {
         PROVIDER_ENV.contains(&key) || DISPATCHER_ENV.contains(&key)

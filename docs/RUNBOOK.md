@@ -68,7 +68,7 @@ The adopter follows README, Adopt. The operator's view:
 5. Undo: run `ciburst-destroy` with the variable `CIBURST_DESTROY=<name>`.
    Check: `destroyed <name>`; no output variable, webhook or runner remains.
 
-Project variables after a setup, environment `ciburst`, protected, raw, masked and hidden where GitLab allows: the keys of `outputs.env` above except `HCLOUD_TOKEN`, which stays in memory.
+Project variables after a setup, environment `ciburst`, protected, raw: the keys of `outputs.env` above except `HCLOUD_TOKEN`, which stays in memory. Tokens, secrets and secret keys are masked and hidden where GitLab allows; ids, URLs and the agent hash stay readable in job logs.
 
 Where to look when a job waits:
 

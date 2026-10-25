@@ -239,16 +239,17 @@ impl GitlabOutputs {
         Ok(listed)
     }
 
-    /// A 400 to the masked create is GitLab refusing to mask the value; the unmasked create
-    /// that follows reports any other cause.
+    /// Secrets are created masked and hidden; a 400 to that create is GitLab refusing to mask
+    /// the value, and the unmasked create that follows reports any other cause.
     async fn store(&self, key: &str, value: &str, exists: bool) -> Result<()> {
+        let secret = keys::is_secret(key);
         let spec = VariableSpec {
             key,
             value,
             environment_scope: OUTPUTS_SCOPE,
             protected: true,
             raw: true,
-            masked_and_hidden: true,
+            masked_and_hidden: secret,
         };
         if exists {
             self.gitlab.update_variable(self.project_id, &spec).await?;
@@ -256,7 +257,7 @@ impl GitlabOutputs {
         }
         match self.gitlab.create_variable(self.project_id, &spec).await {
             Ok(_) => {}
-            Err(Error::Gitlab { status: 400, .. }) => {
+            Err(Error::Gitlab { status: 400, .. }) if secret => {
                 let unmasked = VariableSpec {
                     masked_and_hidden: false,
                     ..spec
@@ -445,7 +446,8 @@ mod tests {
             for variable in &stored {
                 assert_eq!(variable.environment_scope, "ciburst");
                 assert!(variable.protected && variable.raw);
-                assert!(variable.masked && variable.hidden, "{variable:?}");
+                let secret = variable.key == keys::HOOK_TOKEN;
+                assert_eq!(variable.masked && variable.hidden, secret, "{variable:?}");
             }
             assert!(s.lines.lock().unwrap().is_empty());
             assert_eq!(s.outputs.read().await.unwrap(), written);
@@ -494,13 +496,13 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_value_gitlab_cannot_mask_is_stored_unmasked_and_logged() {
+        async fn a_secret_gitlab_cannot_mask_is_stored_unmasked_and_logged() {
             let s = setup(&[]);
-            let key = keys::runner_id("vm");
-            s.outputs.write(&one(&key, "101"), false).await.unwrap();
+            let key = keys::HOOK_TOKEN;
+            s.outputs.write(&one(key, "short"), false).await.unwrap();
             let stored = s.fake.variables(PROJECT);
             assert_eq!(stored.len(), 1);
-            assert_eq!(stored[0].value, "101");
+            assert_eq!(stored[0].value, "short");
             assert!(!stored[0].masked && !stored[0].hidden);
             assert!(stored[0].protected && stored[0].raw);
             assert_eq!(stored[0].environment_scope, "ciburst");
@@ -508,6 +510,22 @@ mod tests {
                 *s.lines.lock().unwrap(),
                 [format!(r#"warn output_unmasked key="{key}""#)]
             );
+        }
+
+        #[tokio::test]
+        async fn ids_urls_and_the_agent_hash_are_stored_readable() {
+            let s = setup(&[]);
+            for key in [keys::runner_id("vm"), keys::AGENT_SHA256.to_string()] {
+                s.outputs
+                    .write(&one(&key, "0a1b2c3d4e5f"), false)
+                    .await
+                    .unwrap();
+            }
+            for variable in s.fake.variables(PROJECT) {
+                assert!(!variable.masked && !variable.hidden, "{variable:?}");
+                assert!(variable.protected && variable.raw);
+            }
+            assert!(s.lines.lock().unwrap().is_empty());
         }
 
         #[tokio::test]
