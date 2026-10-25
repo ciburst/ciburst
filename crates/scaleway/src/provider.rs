@@ -240,6 +240,23 @@ impl Scaleway {
 
     /// Object Storage scoped to `project_id`: Scaleway creates and finds buckets in the API
     /// key's preferred project unless the access key names another as `<access key>@<project>`.
+    /// D43: VMs, cache bucket, agent object and dispatcher share one region, so job caches never
+    /// cross regions; a zone outside the provider's region is a config error.
+    fn zone_in_region(&self) -> Result<()> {
+        let region = self.client.region();
+        if self.zone.starts_with(&format!("{region}-")) {
+            return Ok(());
+        }
+        let wanted = self
+            .zone
+            .rsplit_once('-')
+            .map_or(self.zone.as_str(), |(r, _)| r);
+        Err(Error::provider(format!(
+            "{PROVIDER_NAME}: provider.zone {} lies outside provider.region {region}: set provider.region to {wanted}; the zone defaults to {wanted}-1",
+            self.zone
+        )))
+    }
+
     fn s3(&self, project_id: &str) -> Result<s3::S3> {
         let access_key = self.s3_access_key.as_deref().ok_or_else(|| {
             Error::provider(format!(
@@ -340,10 +357,12 @@ impl Provider for Scaleway {
     /// D42: a VM pool without quota for any of its types in the zone, or no agent, fails
     /// before `apply` changes anything.
     async fn preflight(&self) -> Result<()> {
+        self.zone_in_region()?;
         self.preflight_checks().await
     }
 
     async fn plan(&self, rotate: &[Rotation]) -> Result<Vec<Step>> {
+        self.zone_in_region()?;
         self.plan_steps(rotate).await
     }
 

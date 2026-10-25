@@ -48,6 +48,8 @@ Status: M5 roundup done 2026-10-25 (adoption drill in `docs/RUNBOOK.md`); the He
 | D40 | 2026-10-25 | The consumer include becomes the CI/CD component `templates/ciburst.yml` (`include: component: gitlab.com/ciburst/ciburst/ciburst@<version>`) with inputs for the pool tag, the cli image version and the hosted runner tag, and manual jobs `ciburst-setup`, `ciburst-check` and `ciburst-destroy` on the protected default branch. Fast lanes and `.ciburst-image-build` leave it; Docker jobs extend `.ciburst-docker`. |
 | D41 | 2026-10-25 | The dispatcher ignores pending jobs named `ciburst-*` (the component's own jobs run on hosted runners), and `apply` ends by replaying every job that waits for a pool tag, so the pipeline that ran the setup continues. The CLI calls GitLab; the dispatcher still never does (D10). |
 | D42 | 2026-10-25 | `apply` changes nothing when a pool could not start a run (no Instance quota for its types in the zone, no agent): `Provider::preflight`. `plan` only warns. |
+| D43 | 2026-10-25 | One region per deployment: the dispatcher, the cache bucket, the agent object and the VMs live in `provider.region`, and a `provider.zone` outside it is refused. The drill consumer's first pipelines ran VMs in `nl-ams-1` against a cache bucket in `fr-par`: in a warm Rust test job, moving the caches took 555 s and the script 277 s. Scaleway offers `rust196` in every region. |
+| D44 | 2026-10-25 | VM slots archive caches with `FF_USE_FASTZIP=true` and `CACHE_COMPRESSION_LEVEL=fastest` (run-single `--env`): the bucket is in the VM's region, so bytes are cheap and compressing was the slow part. |
 
 ## 1. Purpose and scope
 
@@ -140,7 +142,7 @@ Pipeline mode reads `ciburst.json` and merges it over the defaults by top-level 
 | `name` | prefix of every cloud resource; 2 to 20 lowercase letters, digits or hyphens, starting with a letter, so the bucket name `<name>-cache-<project id>` stays within the S3 limit of 63 |
 | `gitlab` | `url` (https) and `projectIds`; runners belong to the first project and are enabled in the others, every project gets a webhook |
 | `host` | `type` `scaleway-function`, `region` |
-| `provider` | `type` `scaleway`, `region`; optional `zone` (Instances, default `<region>-1`), `registry` and `registryPublic` (a registry namespace for fast-lane images) |
+| `provider` | `type` `scaleway`, `region` (every resource); optional `zone` (Instances, default `<region>-1`, must lie in `region`), `registry` and `registryPublic` (a registry namespace for fast-lane images) |
 | `providers` | added providers by runtime name, for example `{"hetzner": {"location": "nbg1", "image": "docker-ce"}}` |
 | `defaultPool` | pool of the stages no pool lists; without it such jobs start nothing |
 | `pools[]`, VM | `tag`, `runtime` (`instances` by default, or a key of `providers`), `image` (the job image when a job names none), `stages`, `slots` (default 2), `instanceTypes` (default `DEV1-M`, `DEV1-L`; Hetzner `cx33`, `cx43`), `maxRuns` (VMs, default 10) |
@@ -360,7 +362,7 @@ Risks:
 | Risk | Mitigation |
 |---|---|
 | GitLab disables a webhook after four failed deliveries | the dispatcher answers within 30 s; re-enable the webhook, `ciburst apply` re-verifies it and replays waiting jobs |
-| No Instance quota for a pool's types in its zone | preflight stops `apply` and names zones with quota; `provider.zone` |
+| No Instance quota for a pool's types in its zone | preflight stops `apply` and names zones with quota; `provider.region` |
 | Scaleway retires the runtime `rust196` | bump `rust-toolchain.toml` and the host runtime, `ciburst apply` |
 | The `v1alpha1` Jobs API changes | client isolated in `crates/scaleway`, fakes pin the shapes |
 | Stage map and tags disagree | `ciburst check` and the `ciburst-check` job |

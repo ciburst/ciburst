@@ -192,6 +192,21 @@ async fn the_zone_comes_from_the_provider_section() {
 }
 
 #[tokio::test]
+async fn a_zone_outside_the_region_is_refused_before_any_change() {
+    let backend = Arc::new(ScalewayFake::new());
+    let split = config(|c| {
+        c.provider.extra.insert("zone".into(), json!("nl-ams-1"));
+    });
+    let provider = provider(split, &backend, Log::silent());
+    let expected = "scaleway: provider.zone nl-ams-1 lies outside provider.region fr-par: set provider.region to nl-ams; the zone defaults to nl-ams-1";
+    let planned = provider.plan(&[]).await.unwrap_err().to_string();
+    assert!(planned.ends_with(expected), "{planned}");
+    let checked = provider.preflight().await.unwrap_err().to_string();
+    assert!(checked.ends_with(expected), "{checked}");
+    assert!(backend.writes().is_empty());
+}
+
+#[tokio::test]
 async fn start_creates_the_server_of_rule_four_then_user_data_then_poweron() {
     let (log, lines) = Log::memory();
     let (backend, provider, project_id) = provisioned(plain(), log).await;

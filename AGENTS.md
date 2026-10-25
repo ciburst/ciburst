@@ -17,7 +17,7 @@ Goal: the project's jobs run on ciburst VMs. You change the project's repository
 4. Jobs that must stay on GitLab's hosted runners keep or get `tags: [saas-linux-small-amd64]`. Their pending events still wake a VM, so keep them few.
 5. A job with its own `tags:` runs where those tags point, not on ciburst: remove `tags:` from jobs that should move. A tag no runner serves leaves the job waiting forever.
 6. Only when the defaults do not fit, add `ciburst.json` at the root. Each top-level key replaces the default's whole value (`docs/SPEC.md` section 5.4). Typical changes:
-   - `provider.zone` when the Scaleway organization has no Instance quota in `fr-par-1`.
+   - `provider.region` when the Scaleway organization has no Instance quota in `fr-par-1`, for example `"provider": { "type": "scaleway", "region": "nl-ams" }`. The whole deployment moves with the region, so caches stay next to the VMs; a `zone` outside the region is refused.
    - Pool size. The default, two slots on DEV1-M (3 vCPU, 4 GB, 4 GB swap), suits jobs of up to about 2 GB: unit tests, linters, small builds. Use `"slots": 1` with `"instanceTypes": ["DEV1-L", "DEV1-M"]` (8 GB, 4 vCPU per job) when a job does release builds with fat LTO, runs a browser together with a server, or runs Playwright with more than one worker. `maxRuns` caps VMs, so `slots` times `maxRuns` jobs run at once; the rest queue.
 7. If the project guards secret variable names (a check that fails when a protected secret is visible to the wrong jobs), add the four `CIBURST_*` names with their scope `ciburst`.
 8. Hand the human this list, unchanged:

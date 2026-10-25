@@ -43,11 +43,11 @@ You need a Scaleway account with a payment method and the Owner role in the GitL
 5. Setup. Run `ciburst-setup`.
    Check: the waiting jobs start on the runner `ci-<project id>-vm`. Running it again changes nothing.
 
-Customize with `ciburst.json` at the repository root, then run `ciburst-setup` again. Each top-level key replaces the default's whole value (`docs/SPEC.md` section 5.4). Example, another zone and one job per VM:
+Customize with `ciburst.json` at the repository root, then run `ciburst-setup` again. Each top-level key replaces the default's whole value (`docs/SPEC.md` section 5.4). Example, the Amsterdam region and one job per VM:
 
 ```json
 {
-  "provider": { "type": "scaleway", "region": "fr-par", "zone": "nl-ams-1" },
+  "provider": { "type": "scaleway", "region": "nl-ams" },
   "pools": [
     { "tag": "vm", "runtime": "instances", "image": "ubuntu:24.04", "stages": [], "slots": 1, "instanceTypes": ["DEV1-M", "DEV1-L"], "maxRuns": 4 }
   ]

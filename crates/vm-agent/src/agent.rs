@@ -69,6 +69,12 @@ pub fn slot_command(config: &Config, slot: u32) -> SlotCommand {
         if cache.shared {
             args.push("--cache-shared".to_string());
         }
+        // D44: cache archives in parallel with the fastest compression; the bucket is in the
+        // VM's region, so bytes are cheap and archiving was the slow part.
+        for variable in ["FF_USE_FASTZIP=true", "CACHE_COMPRESSION_LEVEL=fastest"] {
+            args.push("--env".to_string());
+            args.push(variable.to_string());
+        }
     }
     SlotCommand {
         slot,
@@ -790,6 +796,10 @@ mod tests {
                 "--cache-s3-secret-key",
                 "cache-secret-key",
                 "--cache-shared",
+                "--env",
+                "FF_USE_FASTZIP=true",
+                "--env",
+                "CACHE_COMPRESSION_LEVEL=fastest",
             ]
         );
 

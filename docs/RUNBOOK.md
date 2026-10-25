@@ -6,7 +6,7 @@ Rules and design: `docs/SPEC.md`. Below, `ciburst` stands for the release binary
 
 | Item | Value |
 |---|---|
-| Region | `fr-par` (provider and host); Instances in `provider.zone`, default `fr-par-1` |
+| Region | `provider.region` (default `fr-par`) holds the dispatcher, the cache bucket, the agent object and the VMs; `provider.zone` defaults to `<region>-1` and must lie in the region |
 | Scaleway resources | project `<name>`, IAM applications `<name>-dispatch` and `<name>-cache`, bucket `<name>-cache-<project id>`, namespace `<name>`, function `<name>-dispatch`, cron `<name>-sweep`; with VM pools the security group `<name>-vm` and servers `<name>-<tag>-<8 hex>`; with fast lanes job definitions `<name>-<tag>`; with `provider.registry` the registry namespace `<name>` |
 | GitLab resources | runner `<name>-<tag>` per pool in the first project, enabled in the others; a webhook to the function URL in every project |
 | Agent object | `ciburst/agent/<sha256>` in the cache bucket, public read: the musl `ciburst-vm-agent` |
@@ -245,7 +245,7 @@ Add a toolchain:
 | Running `ciburst-destroy` with a variable is refused (403), or the UI offers no variable form | new projects allow no pipeline variables, which include variables typed into a manual job | set `CIBURST_DESTROY` as a project variable instead |
 | destroy log `warn servers still ending`, `security group not deleted` or `project not deleted` | a VM was still terminating after 5 minutes | run `ciburst-destroy` (or `ciburst destroy`) again |
 | apply log `replay_failed ... 403` | the token cannot list jobs (a fine-grained token without read access to jobs) | retry the waiting jobs by hand; use a token with the scope `api` |
-| `apply` stops: the zone has no quota for the pool's types | Instance quota 0 for every type of the pool in the zone | set `provider.zone` to a zone the message names, or ask Scaleway support to raise the quota; `ciburst apply`; delete the security group `<name>-vm` of the old zone (console, Instances, Security groups) |
+| `apply` stops: the zone has no quota for the pool's types | Instance quota 0 for every type of the pool in the zone | set `provider.region` (or `provider.zone` within it) to one the message names, or ask Scaleway support to raise the quota; `ciburst apply`; delete the security group `<name>-vm` of the old zone (console, Instances, Security groups) |
 | `apply` stops naming `--agent` and `scripts/agent-binary.sh` | no agent binary given and no agent object in the bucket | developer path: `scripts/agent-binary.sh`, then `ciburst apply`; pipeline mode: the `cli` image carries the agent, check the component's `version` input |
 | Jobs stay pending, the webhook shows failures | GitLab disabled the webhook after four failures | re-enable it; `ciburst apply` re-verifies it and replays waiting jobs |
 | Deliveries answer 500, no server appears | the start failed: quota used up by other servers, provider credentials, or an incomplete Scaleway side (`scaleway: shared environment: ...` for added providers) | `ciburst plan` shows repairs; `ciburst apply`; quota as above |
@@ -338,6 +338,7 @@ Source: `gitlab-runner run-single --help` in `gitlab/gitlab-runner:v18.11.4` (`i
 | `--max-builds 0` | yes | yes | no build limit |
 | `--wait-timeout` | `0` | `waitTimeoutS` | 0 never exits for idleness (`checkFinishedConditions` tests `WaitTimeout > 0`); otherwise the timer restarts after every build |
 | `--cache-type s3`, `--cache-shared`, `--cache-s3-server-address`, `--cache-s3-bucket-name`, `--cache-s3-bucket-location`, `--cache-s3-access-key`, `--cache-s3-secret-key` | yes | yes | with an S3 cache |
+| `--env` | `FF_USE_FASTZIP=true`, `CACHE_COMPRESSION_LEVEL=fastest`, with an S3 cache | | D44: parallel cache archives with the fastest compression |
 
 Job containers: the Docker executor labels build and service containers with `com.gitlab.gitlab-runner.job.id` (`executors/docker/internal/labels/labels.go`). A slot requests a job every 2 to 3 s and exits about three seconds after `SIGQUIT`, logging `Requested quit, waiting for builds to finish` (`images/test/run-single-slot.sh`). A runner whose requests fail waits `NotHealthyCheckInterval` (300 s) between requests (`common/consts.go`).
 
