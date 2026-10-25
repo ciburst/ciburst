@@ -22,6 +22,10 @@
 //! on. ListObjectsV2 pages hold [`DEFAULT_PAGE`] keys unless `max-keys` asks for another size
 //! (at most 1000, as on S3), so every caller meets pagination. The answer has the element order
 //! and names of the AWS documentation; continuation tokens are opaque.
+//!
+//! [`FakeS3::fail_next`] fails the next call of a method on a path once (M7 hardening rule R4),
+//! with the error codes of the AWS documentation: `SlowDown` for 503, `InternalError` for any
+//! other status.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -31,7 +35,9 @@ use ciburst_core::Result;
 use ciburst_core::http::{HttpClient, Request, Response};
 use ciburst_core::time::DateTime;
 
-use super::scaleway_fake::{Call, FAKE_ACCESS_KEY, FAKE_SECRET_KEY, Url, call_of, percent_decode};
+use super::scaleway_fake::{
+    Call, FAKE_ACCESS_KEY, FAKE_SECRET_KEY, Failure, Failures, Url, answer, call_of, percent_decode,
+};
 use crate::provider::s3::{base64, content_md5, xml_escape, xml_values};
 use crate::provider::sigv4;
 
@@ -87,6 +93,7 @@ struct Inner {
     key_projects: BTreeMap<String, String>,
     page: Option<usize>,
     clock: u64,
+    failures: Failures,
 }
 
 impl Inner {
@@ -122,6 +129,13 @@ fn s3_error(status: u16, code: &str, message: &str) -> Response {
              <Message>{message}</Message></Error>"
         ),
     )
+}
+
+fn failure_status(status: u16) -> Response {
+    match status {
+        503 => s3_error(status, "SlowDown", "Please reduce your request rate."),
+        _ => s3_error(status, "InternalError", "We encountered an internal error."),
+    }
 }
 
 fn access_denied() -> Response {
@@ -216,8 +230,19 @@ impl FakeS3 {
                 key_projects: BTreeMap::new(),
                 page: None,
                 clock: FAKE_CLOCK,
+                failures: Failures::default(),
             }),
         }
+    }
+
+    /// The next `method` call on the URL path `path` (a `*` segment stands for any one) fails
+    /// once with `failure`.
+    pub fn fail_next(&self, method: &str, path: &str, failure: Failure) {
+        self.inner
+            .lock()
+            .expect("fake s3")
+            .failures
+            .arm(method, path, failure);
     }
 
     pub fn calls(&self) -> Vec<Call> {
@@ -601,8 +626,20 @@ fn read_object(object: &Object, method: &str) -> Response {
 impl HttpClient for FakeS3 {
     async fn send(&self, request: Request) -> Result<Response> {
         let url = Url::parse(&request.url);
+        let failure = {
+            let mut inner = self.inner.lock().expect("fake s3");
+            inner.calls.push(call_of(&request, &url));
+            inner.failures.take(&request.method, &url.path)
+        };
+        let target = request.url.clone();
+        answer(failure, &target, failure_status, self.respond(request)).await
+    }
+}
+
+impl FakeS3 {
+    async fn respond(&self, request: Request) -> Result<Response> {
+        let url = Url::parse(&request.url);
         let mut inner = self.inner.lock().expect("fake s3");
-        inner.calls.push(call_of(&request, &url));
         let Some((virtual_bucket, region)) = split_host(&url.host) else {
             return Ok(s3_error(400, "InvalidURI", "not an S3 host"));
         };

@@ -12,8 +12,8 @@
 //!
 //! Modules: `steps` plans and applies the resources, `keys` the IAM keys, `bucket` the cache
 //! bucket, `runner` the runner in it, `agent` the VM agent in it, `registry` the registry
-//! namespace, `servers` the VM runtime, `jobs` the Serverless Jobs runtime; `iam`, `instance`,
-//! `s3` and `sigv4` are the API clients.
+//! namespace, `servers` the VM runtime, `vm_start` what a VM start uses without looking it up,
+//! `jobs` the Serverless Jobs runtime; `iam`, `instance`, `s3` and `sigv4` are the API clients.
 
 mod agent;
 mod bucket;
@@ -29,6 +29,7 @@ mod servers;
 pub mod sigv4;
 mod steps;
 pub mod vm;
+mod vm_start;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -49,6 +50,7 @@ use instance::InstanceApi;
 use runner::RunnerSource;
 
 pub use jobs::bucket_name;
+pub use vm_start::{IMAGES_VAR, SECURITY_GROUP_VAR, VmImage, VmStart};
 
 pub const PROVIDER_NAME: &str = "scaleway";
 
@@ -106,6 +108,8 @@ pub struct Scaleway {
     agent_sha256: Option<String>,
     /// The runner that `apply` copies into the cache bucket (M6 rule R6).
     runner: RunnerSource,
+    /// `CIBURST_VM_SECURITY_GROUP` and `CIBURST_VM_IMAGES` of the function's environment.
+    vm_start: VmStart,
 }
 
 impl Scaleway {
@@ -127,6 +131,7 @@ impl Scaleway {
             agent: None,
             agent_sha256: None,
             runner: RunnerSource::default(),
+            vm_start: VmStart::default(),
         }
     }
 

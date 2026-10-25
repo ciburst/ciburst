@@ -2,13 +2,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use ciburst_core::Result;
 use ciburst_core::config::{Config, parse_config};
+use ciburst_core::http::{HttpClient, Request, Response};
 use ciburst_core::log::Log;
-use ciburst_core::types::{Action, Host, KeyPair, Secrets, Step};
+use ciburst_core::types::{Action, Host, KeyPair, Provider, Secrets, Step};
 use ciburst_scaleway::client::{Credentials, ScalewayClient};
 use ciburst_scaleway::host::{ScalewayFunction, embedded_code, embedded_code_digest, vars};
+use ciburst_scaleway::provider::Scaleway;
 use ciburst_scaleway::testing::functions_api::FakeFunctions;
-use serde_json::json;
+use ciburst_scaleway::testing::scaleway_fake::{
+    FAKE_ACCESS_KEY, FAKE_REGION, ScalewayFake, fake_uuid,
+};
+use ciburst_scaleway::testing::{RUNNER_FIXTURE_URL, agent_fixture, runner_fixture_sha256};
+use serde_json::{Value, json};
 
 const FUNCTION: &str = "demo-dispatch";
 const CRON: &str = "demo-sweep";
@@ -112,7 +120,11 @@ async fn plans_applies_and_converges() {
     assert_eq!(function["privacy"], "public");
     assert_eq!(function["min_scale"], 0);
     assert_eq!(function["max_scale"], 5);
-    assert_eq!(function["memory_limit"], 128);
+    assert_eq!(function["memory_limit"], 1024);
+    assert_eq!(
+        function["cpu_limit"], 560,
+        "Scaleway's CPU share of 1024 MB"
+    );
     assert_eq!(function["timeout"], "30s");
     assert_eq!(function["http_option"], "redirected");
     assert!(
@@ -466,6 +478,8 @@ async fn dispatcher_variables_cannot_take_the_functions_own_names() {
         vars::CONFIG,
         vars::PROJECT_ID,
         vars::CODE_DIGEST,
+        vars::VM_SECURITY_GROUP,
+        vars::VM_IMAGES,
         "HOOK_TOKEN",
         "RUNNER_TOKEN_CI",
         "SCW_DEFAULT_PROJECT_ID",
@@ -487,6 +501,122 @@ async fn dispatcher_variables_cannot_take_the_functions_own_names() {
         assert!(error.contains(name), "{error}");
     }
     assert_eq!(fake.namespace_count(), 0, "refused before any write");
+}
+
+/// The Functions API on `FakeFunctions`, every other Scaleway API on the provider's fake.
+struct Apis {
+    functions: Arc<FakeFunctions>,
+    scaleway: Arc<ScalewayFake>,
+}
+
+#[async_trait]
+impl HttpClient for Apis {
+    async fn send(&self, request: Request) -> Result<Response> {
+        if request.url.contains("/functions/v1beta1/") || request.url.contains("/fake-functions/") {
+            self.functions.send(request).await
+        } else {
+            self.scaleway.send(request).await
+        }
+    }
+}
+
+/// M7 hardening rule R3: with a VM pool of the `scaleway` provider the function gets the
+/// security group and per instance type the image a start would look up, and a changed image
+/// plans the function update.
+#[tokio::test]
+async fn vm_pools_hand_their_security_group_and_images_to_the_function() {
+    let config = Arc::new(
+        parse_config(
+            r#"{
+              "name": "demo",
+              "gitlab": { "url": "https://gitlab.example", "projectIds": [7] },
+              "host": { "type": "scaleway-function", "region": "fr-par" },
+              "provider": { "type": "scaleway", "region": "fr-par" },
+              "defaultPool": "ci",
+              "pools": [
+                { "tag": "ci", "image": "img/docker", "instanceTypes": ["DEV1-M", "PLAY2-NANO"] },
+                { "tag": "build-x", "image": "img/docker", "instanceTypes": ["DEV1-L", "DEV1-M"] }
+              ],
+              "cache": { "type": "s3" }
+            }"#,
+        )
+        .unwrap(),
+    );
+    let scaleway = Arc::new(ScalewayFake::new());
+    let provider = Scaleway::new(config.clone(), scaleway.client(), Log::silent())
+        .with_s3_access_key(FAKE_ACCESS_KEY)
+        .with_agent(Some(agent_fixture()))
+        .with_runner_source(RUNNER_FIXTURE_URL, runner_fixture_sha256());
+    provider
+        .apply(&provider.plan(&[]).await.unwrap())
+        .await
+        .unwrap();
+    let functions = Arc::new(FakeFunctions::new());
+    let apis = Arc::new(Apis {
+        functions: functions.clone(),
+        scaleway: scaleway.clone(),
+    });
+    let client = ScalewayClient::new(apis, ScalewayFake::credentials(), FAKE_REGION);
+    let host = ScalewayFunction::new(config, Arc::new(client), Log::silent());
+    host.apply(&host.plan(&secrets()).await.unwrap(), &secrets())
+        .await
+        .unwrap();
+
+    let env = functions.function(FUNCTION).unwrap()["environment_variables"].clone();
+    let group = scaleway.instance.security_groups()[0]["id"].clone();
+    assert_eq!(env[vars::VM_SECURITY_GROUP], group);
+    let images = |env: &Value| -> Value {
+        serde_json::from_str(env[vars::VM_IMAGES].as_str().unwrap()).unwrap()
+    };
+    let docker = fake_uuid(9, 1);
+    assert_eq!(
+        images(&env),
+        json!({
+            "DEV1-L": { "image": docker, "installDocker": false },
+            "DEV1-M": { "image": docker, "installDocker": false },
+        }),
+        "PLAY2-NANO takes no local image, so a start of it looks up"
+    );
+    let secret = functions.secret_keys(FUNCTION);
+    for name in [vars::VM_SECURITY_GROUP, vars::VM_IMAGES] {
+        assert!(!secret.contains(&name.to_string()), "{name} is plain");
+    }
+    let again = host.plan(&secrets()).await.unwrap();
+    assert!(again.iter().all(Step::is_noop), "{again:?}");
+
+    scaleway.instance.remove_local_images("docker");
+    let plan = host.plan(&secrets()).await.unwrap();
+    assert_eq!(
+        actions(&plan),
+        [
+            ("namespace", Action::Noop),
+            ("function", Action::Update),
+            ("code", Action::Noop),
+            ("cron", Action::Noop)
+        ]
+    );
+    assert_eq!(
+        plan[1].detail.as_deref(),
+        Some("settings, config or secrets changed")
+    );
+    host.apply(&plan, &secrets()).await.unwrap();
+    let env = functions.function(FUNCTION).unwrap()["environment_variables"].clone();
+    let ubuntu = fake_uuid(9, 3);
+    assert_eq!(
+        images(&env),
+        json!({
+            "DEV1-L": { "image": ubuntu, "installDocker": true },
+            "DEV1-M": { "image": ubuntu, "installDocker": true },
+        })
+    );
+    assert_eq!(env[vars::CODE_DIGEST], embedded_code_digest(), "code kept");
+    assert!(
+        host.plan(&secrets())
+            .await
+            .unwrap()
+            .iter()
+            .all(Step::is_noop)
+    );
 }
 
 #[tokio::test]

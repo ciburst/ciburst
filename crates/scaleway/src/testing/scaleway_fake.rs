@@ -172,6 +172,68 @@ pub fn paginate(items: Vec<Value>, url: &Url, max_page_size: usize) -> (Vec<Valu
     (page_items, total)
 }
 
+/// A failure a fake answers once in place of a call (M7 hardening rule R4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Failure {
+    /// The call is refused with this status before it has any effect.
+    Status(u16),
+    /// The call takes effect, but its answer never arrives: the client sees a transport error,
+    /// as when its timeout runs out.
+    Timeout,
+}
+
+/// Failures armed for the next call of a method on a path; each fires once. A `*` segment of
+/// an armed path stands for any one segment.
+#[derive(Debug, Default)]
+pub struct Failures(Vec<(String, String, Failure)>);
+
+impl Failures {
+    pub fn arm(&mut self, method: &str, path: &str, failure: Failure) {
+        self.0.push((method.to_string(), path.to_string(), failure));
+    }
+
+    /// The failure armed for this call, which it uses up.
+    pub fn take(&mut self, method: &str, path: &str) -> Option<Failure> {
+        let fits = |pattern: &str| {
+            let wanted: Vec<&str> = pattern.trim_matches('/').split('/').collect();
+            let got: Vec<&str> = path.trim_matches('/').split('/').collect();
+            wanted.len() == got.len() && wanted.iter().zip(&got).all(|(w, g)| *w == "*" || w == g)
+        };
+        let index = self.0.iter().position(|(m, p, _)| m == method && fits(p))?;
+        Some(self.0.remove(index).2)
+    }
+}
+
+/// Answers a call: the armed failure if there is one, else what `handle` answers. A timeout
+/// lets `handle` take effect and drops its answer.
+pub async fn answer(
+    failure: Option<Failure>,
+    url: &str,
+    refused: impl FnOnce(u16) -> Response,
+    handle: impl Future<Output = Result<Response>>,
+) -> Result<Response> {
+    match failure {
+        Some(Failure::Status(status)) => Ok(refused(status)),
+        Some(Failure::Timeout) => {
+            handle.await?;
+            Err(ciburst_core::Error::Http(format!(
+                "error sending request for url ({url}): operation timed out"
+            )))
+        }
+        None => handle.await,
+    }
+}
+
+/// The JSON error body of a failure status. None of them is a capacity error.
+pub fn failure_status(status: u16) -> Response {
+    match status {
+        404 => api_error(status, "not_found", "resource is not found"),
+        429 => api_error(status, "too_many_requests", "rate limit exceeded"),
+        503 => api_error(status, "service_unavailable", "service unavailable"),
+        _ => api_error(status, "internal_error", "internal error"),
+    }
+}
+
 /// Deterministic UUID-shaped ids; `kind` keeps ids of different resources apart.
 pub fn fake_uuid(kind: u32, n: u64) -> String {
     format!("{kind:08x}-0000-4000-8000-{n:012x}")
@@ -237,8 +299,8 @@ impl ScalewayFake {
         ))
     }
 
-    /// Every write request (not GET or HEAD) across the APIs.
-    pub fn writes(&self) -> Vec<Call> {
+    /// Every request across the APIs, API after API, each in the order it arrived.
+    pub fn calls(&self) -> Vec<Call> {
         self.account
             .calls()
             .into_iter()
@@ -247,6 +309,13 @@ impl ScalewayFake {
             .chain(self.registry.calls())
             .chain(self.instance.calls())
             .chain(self.s3.calls())
+            .collect()
+    }
+
+    /// Every write request (not GET or HEAD) across the APIs.
+    pub fn writes(&self) -> Vec<Call> {
+        self.calls()
+            .into_iter()
             .filter(|c| c.method != "GET" && c.method != "HEAD")
             .collect()
     }
@@ -301,5 +370,21 @@ mod tests {
         assert_eq!(url.get("lifecycle"), Some(""));
         assert_eq!(url.segments(), ["iam", "v1alpha1", "policies"]);
         assert_eq!(percent_decode("%2"), "%2");
+    }
+
+    #[test]
+    fn an_armed_failure_fires_once_on_its_method_and_path() {
+        let mut failures = Failures::default();
+        failures.arm("POST", "/z/servers/*/action", Failure::Status(503));
+        failures.arm("POST", "/z/servers", Failure::Timeout);
+        assert_eq!(failures.take("GET", "/z/servers"), None);
+        assert_eq!(failures.take("POST", "/z/servers/1"), None);
+        assert_eq!(
+            failures.take("POST", "/z/servers/1/action"),
+            Some(Failure::Status(503))
+        );
+        assert_eq!(failures.take("POST", "/z/servers/1/action"), None);
+        assert_eq!(failures.take("POST", "/z/servers"), Some(Failure::Timeout));
+        assert_eq!(failures.take("POST", "/z/servers"), None);
     }
 }

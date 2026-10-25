@@ -11,9 +11,10 @@ use ciburst_core::{Error, Result};
 use serde_json::{Value, json};
 
 use super::cloud_init::Download;
-use super::instance::{self, ApiError, DOCKER_IMAGE_LABEL, FALLBACK_IMAGE_LABEL, InstanceApi};
+use super::instance::{ApiError, InstanceApi};
 use super::runner::runner_url;
 use super::vm;
+use super::vm_start::{IMAGES_VAR, Lookups, SECURITY_GROUP_VAR, VmImage};
 use super::{PROVIDER_NAME, Runtime, Scaleway, USER_DATA_KEY, cloud_init, iam, instance_types};
 
 pub(super) const SECURITY_GROUP_STEP: &str = "vm:security-group";
@@ -123,7 +124,10 @@ impl Scaleway {
     }
 
     /// Rule 4 of M3: the first commercial type that has a local image and capacity runs the
-    /// VM; the server id is the run id.
+    /// VM; the server id is the run id. Security group and images come from the function's
+    /// environment; a value missing there or refused by Scaleway is looked up and logged as
+    /// `warn start_lookup` (M7 hardening rule R3). `CIBURST_PROJECT_ID` makes the project
+    /// lookup a no-op in the function.
     pub(super) async fn start_vm(&self, request: StartRequest) -> Result<String> {
         let pool = &request.pool;
         let tag = &pool.tag;
@@ -169,11 +173,6 @@ impl Scaleway {
                 sha256: &agent,
             },
         );
-        let api = self.instances();
-        let security_group = api
-            .find_security_group(&project_id, &self.security_group_name())
-            .await?
-            .ok_or_else(not_provisioned)?;
         let base = cloud_init::base_env(
             &self.config,
             pool,
@@ -181,49 +180,89 @@ impl Scaleway {
             &project_id,
             &request.env,
         )?;
+        let api = self.instances();
+        let group_name = self.security_group_name();
+        let mut lookups = Lookups::default();
+        // A value of the environment that Scaleway refused makes every later value a lookup.
+        let mut stale = false;
+        let (mut security_group, mut group_preset) = match &self.vm_start.security_group {
+            Some(id) => (id.clone(), true),
+            None => {
+                self.start_lookup(tag, None, &format!("{SECURITY_GROUP_VAR} unset"));
+                let found = lookups
+                    .security_group(&api, &project_id, &group_name)
+                    .await?;
+                (found.ok_or_else(not_provisioned)?, false)
+            }
+        };
         let types = instance_types(pool);
         let job = request.labels.get("job").map(String::as_str);
-        let docker_images = api.local_images(DOCKER_IMAGE_LABEL).await?;
-        let mut fallback_images = None;
+        let free = pool.slots.saturating_sub(taken);
         let mut failures = Vec::new();
         for commercial_type in &types {
-            let (image, install_docker) =
-                match instance::compatible(&docker_images, commercial_type) {
-                    Some(image) => (image, false),
-                    None => {
-                        if fallback_images.is_none() {
-                            fallback_images = Some(api.local_images(FALLBACK_IMAGE_LABEL).await?);
-                        }
-                        let fallback = fallback_images.as_deref().unwrap_or_default();
-                        match instance::compatible(fallback, commercial_type) {
-                            Some(image) => (image, true),
-                            None => {
-                                self.log.warn(
-                                    "instance type skipped",
-                                    &[
-                                        ("pool", tag),
-                                        ("type", commercial_type),
-                                        ("reason", "no local image"),
-                                    ],
-                                );
-                                failures.push(format!("{commercial_type}: no local image"));
-                                continue;
-                            }
+            let preset = self
+                .vm_start
+                .images
+                .as_ref()
+                .and_then(|images| images.get(commercial_type))
+                .filter(|_| !stale);
+            let (mut image, image_preset) = match preset {
+                Some(image) => (image.clone(), true),
+                None => {
+                    if !stale {
+                        let reason = match self.vm_start.images {
+                            None => format!("{IMAGES_VAR} unset"),
+                            Some(_) => format!("not in {IMAGES_VAR}"),
+                        };
+                        self.start_lookup(tag, Some(commercial_type), &reason);
+                    }
+                    match lookups.image(&api, commercial_type).await? {
+                        Some(image) => (image, false),
+                        None => {
+                            self.no_local_image(tag, commercial_type, &mut failures);
+                            continue;
                         }
                     }
-                };
+                }
+            };
             let name = vm::server_name(self.name(), tag, job);
-            let body = json!({
-                "name": name,
-                "commercial_type": commercial_type,
-                "image": image,
-                "project": project_id,
-                "dynamic_ip_required": true,
-                "routed_ip_enabled": true,
-                "security_group": security_group,
-                "tags": vm::initial_tags(self.name(), tag, job, pool.slots.saturating_sub(taken)),
-            });
-            let server = match api.create_server(&body).await? {
+            let body = |security_group: &str, image: &VmImage| {
+                json!({
+                    "name": name,
+                    "commercial_type": commercial_type,
+                    "image": image.image,
+                    "project": project_id,
+                    "dynamic_ip_required": true,
+                    "routed_ip_enabled": true,
+                    "security_group": security_group,
+                    "tags": vm::initial_tags(self.name(), tag, job, free),
+                })
+            };
+            let mut created = api.create_server(&body(&security_group, &image)).await?;
+            if let Err(error) = &created
+                && (group_preset || image_preset)
+                && error.is_missing_image_or_group()
+            {
+                stale = true;
+                group_preset = false;
+                let reason = format!("create refused: {} {}", error.status, error.message);
+                self.start_lookup(tag, Some(commercial_type), &reason);
+                let found = lookups
+                    .security_group(&api, &project_id, &group_name)
+                    .await?;
+                let group = found.ok_or_else(not_provisioned)?;
+                let Some(fresh) = lookups.image(&api, commercial_type).await? else {
+                    security_group = group;
+                    self.no_local_image(tag, commercial_type, &mut failures);
+                    continue;
+                };
+                if (&group, &fresh) != (&security_group, &image) {
+                    security_group = group;
+                    image = fresh;
+                    created = api.create_server(&body(&security_group, &image)).await?;
+                }
+            }
+            let server = match created {
                 Ok(server) => server,
                 Err(error) if error.is_capacity() => {
                     self.unavailable(tag, commercial_type, &error);
@@ -238,7 +277,7 @@ impl Scaleway {
                 .map(String::from)
                 .ok_or_else(|| Error::provider("scaleway server: response without id"))?;
             match self
-                .boot(&api, &id, secret, &base, downloads, install_docker)
+                .boot(&api, &id, secret, &base, downloads, image.install_docker)
                 .await
             {
                 Ok(Attempt::Started) => {
@@ -294,6 +333,27 @@ impl Scaleway {
             Err(error) if error.is_capacity() => Ok(Attempt::Unavailable(error)),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// `warn start_lookup`: the start looks up what the function's environment lacks or what
+    /// Scaleway refused (M7 hardening rule R3).
+    fn start_lookup(&self, pool: &str, commercial_type: Option<&str>, reason: &str) {
+        let mut fields = vec![("pool", pool)];
+        fields.extend(commercial_type.map(|t| ("type", t)));
+        fields.push(("reason", reason));
+        self.log.warn("start_lookup", &fields);
+    }
+
+    fn no_local_image(&self, pool: &str, commercial_type: &str, failures: &mut Vec<String>) {
+        self.log.warn(
+            "instance type skipped",
+            &[
+                ("pool", pool),
+                ("type", commercial_type),
+                ("reason", "no local image"),
+            ],
+        );
+        failures.push(format!("{commercial_type}: no local image"));
     }
 
     fn unavailable(&self, pool: &str, commercial_type: &str, error: &ApiError) {

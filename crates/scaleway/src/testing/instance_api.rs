@@ -11,6 +11,9 @@
 //! server leaves its volumes. With [`FakeInstance::set_slow_terminate`] a terminated server stays
 //! `stopping`, holding its security group, until a read has shown it so, as Scaleway keeps it
 //! for a while. The marketplace answers without a token, like the real one.
+//!
+//! [`FakeInstance::fail_next`] fails the next call of a method on a path once (M7 hardening
+//! rule R4).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -21,7 +24,8 @@ use ciburst_core::http::{HttpClient, Request, Response};
 use serde_json::{Value, json};
 
 use super::scaleway_fake::{
-    Call, Url, api_error, authorized, body_json, call_of, fake_uuid, reply, unauthorized,
+    Call, Failure, Failures, Url, answer, api_error, authorized, body_json, call_of,
+    failure_status, fake_uuid, reply, unauthorized,
 };
 use crate::provider::vm::rfc3339;
 
@@ -54,6 +58,7 @@ struct Inner {
     clock: u64,
     next: u64,
     calls: Vec<Call>,
+    failures: Failures,
 }
 
 impl Inner {
@@ -170,8 +175,15 @@ impl FakeInstance {
                 clock: FAKE_CLOCK,
                 next: 0,
                 calls: Vec::new(),
+                failures: Failures::default(),
             }),
         }
+    }
+
+    /// The next `method` call on `path` (a `*` segment stands for any one) fails once with
+    /// `failure`.
+    pub fn fail_next(&self, method: &str, path: &str, failure: Failure) {
+        self.lock().failures.arm(method, path, failure);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -524,8 +536,20 @@ impl FakeInstance {
 impl HttpClient for FakeInstance {
     async fn send(&self, request: Request) -> Result<Response> {
         let url = Url::parse(&request.url);
+        let failure = {
+            let mut inner = self.lock();
+            inner.calls.push(call_of(&request, &url));
+            inner.failures.take(&request.method, &url.path)
+        };
+        let target = request.url.clone();
+        answer(failure, &target, failure_status, self.respond(request)).await
+    }
+}
+
+impl FakeInstance {
+    async fn respond(&self, request: Request) -> Result<Response> {
+        let url = Url::parse(&request.url);
         let mut inner = self.lock();
-        inner.calls.push(call_of(&request, &url));
         inner.purge();
         let segments = url.segments();
         let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
