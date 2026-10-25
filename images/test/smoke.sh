@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Builds one pool image and checks the runner, the toolchain and the entrypoint.
-# Usage: images/test/smoke.sh <base|node|rust|playwright> [image reference]
-# SMOKE_NO_BUILD=1 skips the build and tests an existing reference.
+# Builds one image and checks it: a pool image's runner, toolchain and entrypoint, or the cli
+# image's two static binaries.
+# Usage: images/test/smoke.sh <base|node|rust|playwright|cli> [image reference]
+# SMOKE_NO_BUILD=1 skips the build and tests an existing reference. On a tag vX.Y.Z (CI_COMMIT_TAG)
+# the cli binaries must report X.Y.Z, else the workspace version of Cargo.toml.
 set -euo pipefail
 
 export MSYS_NO_PATHCONV=1
@@ -16,11 +18,13 @@ runner_version="18.11.4"
 
 user="runner"
 builds_dir="/builds"
+context="$root/images"
 case "$name" in
   base) toolchain=(git --version) expect_tool="git version" ;;
   node) toolchain=(node --version) expect_tool="v24." ;;
   rust) toolchain=(cargo --version) expect_tool="cargo 1.96.0" ;;
   playwright) toolchain=(npx --yes playwright@1.64.1 --version) expect_tool="Version 1.64.1" ;;
+  cli) context="$root" ;;
   *) echo "unknown image: $name" >&2; exit 2 ;;
 esac
 
@@ -38,12 +42,64 @@ lacks() {
   if [[ "$haystack" != *"$needle"* ]]; then pass "$label"; else fail "$label: unexpected '$needle'"; fi
 }
 
+equals() {
+  local label="$1" actual="$2" expected="$3"
+  if [ "$actual" = "$expected" ]; then pass "$label"; else fail "$label: expected '$expected', got: $actual"; fi
+}
+
+finish() {
+  if [ "$failures" -ne 0 ]; then
+    echo "$failures check(s) failed for $name" >&2
+    exit 1
+  fi
+  echo "smoke passed for $name"
+}
+
 if [ "${SMOKE_NO_BUILD:-0}" != "1" ]; then
   start=$(date +%s)
-  docker build ${SMOKE_QUIET:+--quiet} --platform linux/amd64 --file "$root/images/$name/Dockerfile" --tag "$ref" "$root/images"
+  docker build ${SMOKE_QUIET:+--quiet} --platform linux/amd64 --file "$root/images/$name/Dockerfile" --tag "$ref" "$context"
   echo "build seconds: $(( $(date +%s) - start ))"
 fi
 echo "image bytes: $(docker image inspect --format '{{.Size}}' "$ref")"
+
+if [ "$name" = "cli" ]; then
+  version="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' "$root/Cargo.toml")"
+  if [[ "${CI_COMMIT_TAG:-}" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+    version="${BASH_REMATCH[1]}"
+  fi
+
+  out="$(docker run --rm "$ref" ciburst --version 2>&1)"
+  equals "ciburst --version" "$out" "ciburst $version"
+  out="$(docker run --rm "$ref" ciburst-vm-agent --version 2>&1)"
+  equals "ciburst-vm-agent --version" "$out" "ciburst-vm-agent $version"
+
+  # GitLab's Docker executor runs job scripts with the image's sh; the CLI finds the agent
+  # next to its own executable.
+  out="$(docker run --rm "$ref" sh -c 'command -v ciburst && command -v ciburst-vm-agent' 2>&1)"
+  equals "sh finds both binaries" "$out" "$(printf '/usr/local/bin/ciburst\n/usr/local/bin/ciburst-vm-agent')"
+
+  status=0
+  out="$(docker run --rm -e CIBURST_VM_ENV=/missing.env "$ref" ciburst-vm-agent 2>&1)" || status=$?
+  equals "agent without env file exits 64" "$status" "64"
+  contains "agent names the missing env file" "$out" 'error config path="/missing.env"'
+
+  # The agent runs on VMs of any distribution and the CLI on any Linux: both must be static.
+  bin_dir="$root/target/smoke-cli"
+  mkdir -p "$bin_dir"
+  id="$(docker create --platform linux/amd64 "$ref")"
+  for bin in ciburst ciburst-vm-agent; do
+    docker cp "$id:/usr/local/bin/$bin" "$bin_dir/$bin"
+  done
+  docker rm "$id" > /dev/null
+  if out="$("$root/scripts/check-static-elf.sh" "$bin_dir/ciburst" "$bin_dir/ciburst-vm-agent" 2>&1)"; then
+    pass "static x86-64 binaries"
+    echo "$out"
+  else
+    fail "static x86-64 binaries: $out"
+  fi
+  finish
+  exit 0
+fi
 
 out="$(docker run --rm "$ref" gitlab-runner --version 2>&1)"
 contains "gitlab-runner --version" "$out" "Version:      $runner_version"
@@ -119,9 +175,4 @@ contains "missing CACHE_S3_SECRET_KEY is named" "$out" "missing environment vari
 out="$(docker run --rm -e CI_SERVER_URL=http://127.0.0.1:9 -e RUNNER_TOKEN=glrt-smoke-token -e RUNNER_WAIT_TIMEOUT=2 "$ref" 2>&1 || true)"
 contains "run-single starts and exits after the idle window" "$out" "has not received a job"
 
-
-if [ "$failures" -ne 0 ]; then
-  echo "$failures check(s) failed for $name" >&2
-  exit 1
-fi
-echo "smoke passed for $name"
+finish

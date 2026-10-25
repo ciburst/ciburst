@@ -9,6 +9,9 @@ variables:
   CARGO_HOME: $CI_PROJECT_DIR/.cargo
   CARGO_TERM_COLOR: always
   RUSTUP_TOOLCHAIN: 1.96.0
+  # pull-push on the default branch only (rules below): merge requests and tags start from the
+  # main cache and upload nothing.
+  CARGO_CACHE_POLICY: pull
 
 workflow:
   rules:
@@ -16,34 +19,122 @@ workflow:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
     - if: $CI_COMMIT_TAG
 
-.rust:
-  cache:
-    key: cargo-$CI_COMMIT_REF_SLUG
-    paths: [.cargo/registry/, .cargo/git/, .cargo/bin/, target/]
+# Inputs of each job for `rules:changes`. Merge requests compare with main, pushes to main with
+# the previous push. Pipelines started without a push (web, API) run every job; tags run lint,
+# deny and test, release tags vX.Y.Z also the images and the release.
+.paths:
+  test: &test-paths
+    - Cargo.toml
+    - Cargo.lock
+    - rust-toolchain.toml
+    - crates/**/*
+    - config.example.json
+    - test/config.fake.json
+    - .gitlab-ci.yml
+  lint: &lint-paths
+    - Cargo.toml
+    - Cargo.lock
+    - rust-toolchain.toml
+    - crates/**/*
+    - config.example.json
+    - test/config.fake.json
+    - .gitlab-ci.yml
+    - scripts/**/*
+    - images/**/*.sh
+    - images/**/Dockerfile
+  deny: &deny-paths
+    - Cargo.toml
+    - Cargo.lock
+    - crates/*/Cargo.toml
+    - deny.toml
+    - scripts/ci-install-cargo-deny.sh
+    - .gitlab-ci.yml
+  pool-image: &pool-image-paths
+    - images/$IMAGE/**/*
+    - images/base/entrypoint.sh
+    - images/test/smoke.sh
+    - scripts/ci-push-image.sh
+    - .gitlab-ci.yml
+  cli-image: &cli-image-paths
+    - Cargo.toml
+    - Cargo.lock
+    - crates/*/Cargo.toml
+    - crates/*/build.rs
+    - crates/*/src/**/*
+    - images/cli/**/*
+    - images/test/smoke.sh
+    - scripts/check-static-elf.sh
+    - scripts/ci-push-image.sh
+    - .gitlab-ci.yml
 
 lint:
-  extends: .rust
   stage: lint
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        paths: *lint-paths
+        compare_to: refs/heads/main
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: *lint-paths
+      variables:
+        CARGO_CACHE_POLICY: pull-push
+  cache:
+    key: lint-$CI_COMMIT_REF_SLUG
+    fallback_keys: [lint-main]
+    paths: [.cargo/registry/, .cargo/git/, target/]
+    policy: $CARGO_CACHE_POLICY
   script:
+    - scripts/check-pins.sh
+    - apt-get update && apt-get install -y --no-install-recommends shellcheck
+    - scripts/shellcheck.sh
     - rustup component add rustfmt clippy
     - cargo fmt --all --check
     - cargo clippy --workspace --all-targets --all-features -- -D warnings
-    - apt-get update && apt-get install -y --no-install-recommends shellcheck
-    - scripts/shellcheck.sh
 
 deny:
-  extends: .rust
   stage: lint
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        paths: *deny-paths
+        compare_to: refs/heads/main
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: *deny-paths
+      variables:
+        CARGO_CACHE_POLICY: pull-push
+  cache:
+    key: deny-$CI_COMMIT_REF_SLUG
+    fallback_keys: [deny-main]
+    paths: [.cargo/bin/, .cargo/registry/, .cargo/git/]
+    policy: $CARGO_CACHE_POLICY
   script:
     - scripts/ci-install-cargo-deny.sh
     - cargo deny check
 
 test:
-  extends: .rust
   stage: test
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        paths: *test-paths
+        compare_to: refs/heads/main
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: *test-paths
+      variables:
+        CARGO_CACHE_POLICY: pull-push
+  cache:
+    key: test-$CI_COMMIT_REF_SLUG
+    fallback_keys: [test-main]
+    paths: [.cargo/registry/, .cargo/git/, target/]
+    policy: $CARGO_CACHE_POLICY
   script:
     - cargo test --workspace --all-features
 
+# Builds and smoke-tests one image; pushes it on main and on release tags only
+# (scripts/ci-push-image.sh), so merge requests build and test without pushing.
 .image:
   stage: images
   image: docker:27.5.1
@@ -51,13 +142,17 @@ test:
     - docker:27.5.1-dind
   variables:
     DOCKER_TLS_CERTDIR: "/certs"
+  needs: []
   rules:
     - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        paths: *pool-image-paths
+        compare_to: refs/heads/main
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      changes: [images/**/*, .gitlab-ci.yml]
+      changes: *pool-image-paths
   before_script:
     - apk add --no-cache bash
-    - echo "$CI_REGISTRY_PASSWORD" | docker login --username "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
   script:
     - images/test/smoke.sh "$IMAGE" "ciburst-ci/$IMAGE:$CI_COMMIT_SHORT_SHA"
     - scripts/ci-push-image.sh "ciburst-ci/$IMAGE:$CI_COMMIT_SHORT_SHA" "$IMAGE"
@@ -82,17 +177,21 @@ image:playwright:
   variables:
     IMAGE: playwright
 
-image:vm-agent:
+image:cli:
   extends: .image
   variables:
-    IMAGE: vm-agent
+    IMAGE: cli
+  needs:
+    - job: test
+      optional: true
   rules:
     - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        paths: *cli-image-paths
+        compare_to: refs/heads/main
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      changes: [images/**/*, .gitlab-ci.yml, Cargo.lock, crates/core/**/*, crates/vm-agent/**/*]
-  script:
-    - images/vm-agent/build.sh "ciburst-ci/$IMAGE:$CI_COMMIT_SHORT_SHA"
-    - scripts/ci-push-image.sh "ciburst-ci/$IMAGE:$CI_COMMIT_SHORT_SHA" "$IMAGE"
+      changes: *cli-image-paths
 
 .release:
   stage: release
@@ -104,18 +203,14 @@ release:binary:
   script:
     - scripts/ci-release-binary.sh
   artifacts:
-    paths: [dist/, release-notes.md]
+    paths: [dist/, release-notes.md, release-assets.json]
     expire_in: 1 week
 
 release:
   extends: .release
   image: registry.gitlab.com/gitlab-org/cli:v1.124.0
-  needs: [release:binary, image:base, image:node, image:rust, image:playwright, image:vm-agent]
+  needs: [release:binary, image:cli, image:base, image:node, image:rust, image:playwright]
   variables:
     GLAB_ENABLE_CI_AUTOLOGIN: "true"
-    BINARY: ciburst-x86_64-unknown-linux-musl
-    PACKAGE_URL: $CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/ciburst/$CI_COMMIT_TAG
   script:
-    - |
-      glab release create "$CI_COMMIT_TAG" --name "ciburst $CI_COMMIT_TAG" --notes-file release-notes.md \
-        --assets-links="[{\"name\":\"${BINARY}\",\"url\":\"${PACKAGE_URL}/${BINARY}\",\"link_type\":\"package\"},{\"name\":\"${BINARY}.sha256\",\"url\":\"${PACKAGE_URL}/${BINARY}.sha256\",\"link_type\":\"other\"}]"
+    - glab release create "$CI_COMMIT_TAG" --name "ciburst $CI_COMMIT_TAG" --notes-file release-notes.md --assets-links "$(cat release-assets.json)"

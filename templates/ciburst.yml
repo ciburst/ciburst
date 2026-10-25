@@ -1,0 +1,87 @@
+# ciburst CI/CD component. Every job of the including pipeline runs on the pool `pool`: a VM
+# with its own Docker daemon and GitLab's Docker executor, so `image:`, `services:` and
+# Docker-in-Docker work as on GitLab's hosted runners. The manual jobs `ciburst-setup`,
+# `ciburst-check` and `ciburst-destroy` run `ciburst --ci` on a hosted runner, on the default
+# branch when it is protected.
+#
+# Usage. `@main` goes with the cli image `edge`; a release `@vX.Y.Z` goes with `version: X.Y.Z`.
+#
+# include:
+#   - component: gitlab.com/ciburst/ciburst/ciburst@main
+#     inputs:
+#       pool: vm
+#       version: edge
+#
+# test:
+#   image: node:24
+#   services: [postgres:16]
+#   variables:
+#     POSTGRES_PASSWORD: example
+#   script:
+#     - npm ci
+#     - npm test
+#
+# container-image:
+#   extends: .ciburst-docker
+#   stage: build
+#   script:
+#     - docker build -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" .
+#     - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+#
+# hosted:
+#   tags: [saas-linux-small-amd64]
+#   image: alpine:3.22
+#   script:
+#     - echo "runs on a GitLab hosted runner"
+
+spec:
+  inputs:
+    pool:
+      description: Runner tag of the pool that runs every job without its own `tags`.
+      default: vm
+    version:
+      description: Tag of the image registry.gitlab.com/ciburst/ciburst/cli for the ciburst jobs.
+      default: edge
+    hosted_tag:
+      description: Runner tag of the GitLab hosted runner for the ciburst jobs.
+      default: saas-linux-small-amd64
+---
+default:
+  tags:
+    - $[[ inputs.pool ]]
+
+.ciburst-docker:
+  image: docker:27
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login --username "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+
+ciburst-setup: &ciburst-job
+  stage: .pre
+  image: registry.gitlab.com/ciburst/ciburst/cli:$[[ inputs.version ]]
+  tags:
+    - $[[ inputs.hosted_tag ]]
+  environment:
+    name: ciburst
+    action: prepare
+  resource_group: ciburst
+  interruptible: false
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"
+      when: manual
+      allow_failure: true
+  script:
+    - ciburst --ci apply
+
+ciburst-check:
+  <<: *ciburst-job
+  script:
+    - ciburst --ci check
+
+ciburst-destroy:
+  <<: *ciburst-job
+  script:
+    - ciburst --ci destroy --yes "$CIBURST_DESTROY"
