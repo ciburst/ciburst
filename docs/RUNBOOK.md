@@ -306,6 +306,7 @@ Measured:
 | Function deploy | 5 to 13 minutes |
 | CPU-bound job, DEV1-L with one slot against GitLab's small hosted runner (drill consumer, 2026-10-25) | 1.3 to 4 times as long: rust-check 135 s against 84 s, ts-check 245 s against 62 s, e2e 482 to 494 s against 231 to 299 s, image build 409 s against 303 s; lighthouse 80 s against 105 s |
 | Cache transfer, bucket in the VMs' region | restore and archive of a Rust job in seconds; across regions 555 s for the same job (D43) |
+| CPU per zone, one VM each at boot (2026-10-25): SHA-256 of 1 GiB on one core, then all cores | DEV1-M `pl-waw-1` and `pl-waw-2` EPYC 7282: 5.3 and 5.5 s; `nl-ams-2` EPYC 7282: 6.4 s; `nl-ams-1` EPYC 7281: 8.6 s; GP1-XS `nl-ams-1` EPYC 7401P: 9.8 s; GitLab's small hosted runner (Xeon 8581C): 5.5 s. `nl-ams-1` mixes both DEV1 hosts; boot to user data 18 to 37 s |
 
 ### M5 drill
 
