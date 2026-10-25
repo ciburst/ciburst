@@ -363,7 +363,7 @@ impl Provider for FakeProvider {
                 run_id: run_id.clone(),
                 pool: run.pool.clone(),
                 state: VmState::Starting,
-                free: request.pool.slots.saturating_sub(request.taken.max(1)),
+                free: request.pool.slots.saturating_sub(request.taken),
                 seen: None,
                 drain: None,
                 created_at,
@@ -639,7 +639,7 @@ mod tests {
             let vms = provider.capacity("vm").await.unwrap().unwrap();
             free.push(vms.iter().find(|v| v.run_id == run).unwrap().free);
         }
-        assert_eq!(free, [1, 1, 0, 0], "slots 2, taken at least 1");
+        assert_eq!(free, [2, 1, 0, 0], "slots 2, the warm VM takes none");
     }
 
     #[tokio::test]

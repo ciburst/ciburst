@@ -103,6 +103,17 @@ pub struct Pool {
     /// Machine types tried in order (VM runtimes); empty means the provider's default list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub instance_types: Vec<String>,
+    /// VM pools: a pipeline that will need the pool starts one VM ahead of its first VM job
+    /// (D48); `None` means yes.
+    #[serde(default, rename = "warmStart", skip_serializing_if = "Option::is_none")]
+    pub warm_start: Option<bool>,
+}
+
+impl Pool {
+    /// D48: whether pipeline events may start a VM of this pool ahead of its jobs.
+    pub fn warm_start(&self) -> bool {
+        self.warm_start != Some(false)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +174,9 @@ pub struct Config {
     /// Further providers by runtime name (spec D35); their pools set `runtime` to the key.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub providers: BTreeMap<String, Map<String, Value>>,
+    /// Job name patterns (`*`, `?`) of jobs that run on other runners; they route nowhere (D49).
+    #[serde(default, rename = "ignoreJobs", skip_serializing_if = "Vec::is_empty")]
+    pub ignore_jobs: Vec<String>,
 }
 
 impl Config {
@@ -197,12 +211,14 @@ impl Config {
                 runtime: Some(INSTANCES_RUNTIME.to_string()),
                 slots: DEFAULT_SLOTS,
                 instance_types: vec!["DEV1-M".to_string(), "DEV1-L".to_string()],
+                warm_start: None,
             }],
             cache: CacheConfig {
                 kind: CacheType::S3,
                 expire_days: DEFAULT_EXPIRE_DAYS,
             },
             providers: BTreeMap::new(),
+            ignore_jobs: Vec::new(),
         }
     }
 
@@ -220,9 +236,20 @@ impl Config {
         self.pools.iter().find(|pool| pool.tag == tag)
     }
 
-    /// D46: the first pool in config order with a `jobs` pattern matching the job name, else
-    /// the pool its stage is mapped to, else the default pool, else none.
+    /// D49: whether `name` matches a pattern of `ignoreJobs`.
+    pub fn ignores(&self, name: &str) -> bool {
+        self.ignore_jobs
+            .iter()
+            .any(|pattern| glob_match(pattern, name))
+    }
+
+    /// D46, D49: none for a job in `ignoreJobs`, else the first pool in config order with a
+    /// `jobs` pattern matching the job name, else the pool its stage is mapped to, else the
+    /// default pool, else none.
     pub fn pool_for(&self, name: &str, stage: Option<&str>) -> Option<&Pool> {
+        if self.ignores(name) {
+            return None;
+        }
         self.pool_by_name(name)
             .or_else(|| {
                 let stage = stage?;
@@ -407,12 +434,21 @@ pub fn validate(mut config: Config) -> Result<Config> {
                     "{where_}.vmFirst: lanes only (runtime {JOBS_RUNTIME})"
                 ));
             }
+            if pool.warm_start.is_some() && !config.is_vm_pool(pool) {
+                errors.push(format!(
+                    "{where_}.warmStart: VM pools only (runtime {INSTANCES_RUNTIME} or a key of providers)"
+                ));
+            }
         }
         if let Some(default) = &config.default_pool
             && !tags.contains(default.as_str())
         {
             errors.push(format!("defaultPool: {default} is not a pool"));
         }
+    }
+
+    if config.ignore_jobs.iter().any(String::is_empty) {
+        errors.push("ignoreJobs: empty pattern".to_string());
     }
 
     for runtime in config.providers.keys() {
@@ -836,6 +872,66 @@ mod tests {
         assert_eq!(back["pools"][2]["vmFirst"], false);
         assert!(back["pools"][0].get("vmFirst").is_none());
         assert!(back["pools"][0].get("jobs").is_none());
+    }
+
+    #[test]
+    fn ignore_jobs_route_nowhere_before_names_and_stages() {
+        let mut raw = lanes();
+        raw["ignoreJobs"] = serde_json::json!(["deploy-*", "lint", "pages"]);
+        let config = parse_config(&raw.to_string()).unwrap();
+        let tag = |name, stage| config.pool_for(name, stage).map(|p| p.tag.as_str());
+        assert_eq!(tag("lint", Some("test")), None, "before the jobs pattern");
+        assert_eq!(tag("deploy-prod", Some("test")), None, "before the stage");
+        assert_eq!(tag("pages", None), None, "before the default pool");
+        assert_eq!(tag("unit-a", Some("test")), Some("node-24"));
+        assert_eq!(tag("deploy", Some("deploy")), Some("vm"));
+        assert!(config.ignores("deploy-") && !config.ignores("Lint"));
+        let back = serde_json::to_value(&config).unwrap();
+        assert_eq!(back["ignoreJobs"], raw["ignoreJobs"]);
+        assert_eq!(merge_config(&config, "{}").unwrap(), config);
+
+        let plain = parse_config(&lanes().to_string()).unwrap();
+        assert!(plain.ignore_jobs.is_empty());
+        assert!(
+            serde_json::to_value(&plain)
+                .unwrap()
+                .get("ignoreJobs")
+                .is_none()
+        );
+
+        raw["ignoreJobs"] = serde_json::json!(["lint", ""]);
+        assert_eq!(errors_of(raw), ["ignoreJobs: empty pattern"]);
+    }
+
+    #[test]
+    fn warm_start_belongs_to_vm_pools_and_defaults_to_true() {
+        let mut raw = lanes();
+        raw["providers"] = serde_json::json!({ "hetzner": {} });
+        let pools = raw["pools"].as_array_mut().unwrap();
+        pools.push(serde_json::json!({ "tag": "hz", "image": "x", "runtime": "hetzner", "warmStart": false }));
+        let config = parse_config(&raw.to_string()).unwrap();
+        let warm = |tag: &str| config.pool_by_tag(tag).unwrap().warm_start();
+        assert!(warm("vm"), "default true");
+        assert!(!warm("hz"));
+        let back = serde_json::to_value(&config).unwrap();
+        assert!(back["pools"][0].get("warmStart").is_none());
+        assert_eq!(back["pools"][4]["warmStart"], false);
+
+        raw["pools"][0]["warmStart"] = true.into();
+        raw["pools"][1]["warmStart"] = true.into();
+        raw["pools"][2]["warmStart"] = false.into();
+        raw["pools"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({ "tag": "plain", "image": "x", "warmStart": true }));
+        assert_eq!(
+            errors_of(raw),
+            [
+                "pools[1].warmStart: VM pools only (runtime instances or a key of providers)",
+                "pools[2].warmStart: VM pools only (runtime instances or a key of providers)",
+                "pools[5].warmStart: VM pools only (runtime instances or a key of providers)",
+            ]
+        );
     }
 
     #[test]

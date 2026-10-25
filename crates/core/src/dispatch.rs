@@ -10,7 +10,7 @@ use tokio::time::Instant;
 
 use crate::check::is_own_job;
 use crate::config::{CacheType, Config, Pool};
-use crate::ledger::{GROUP_WAIT_S, GROUP_WINDOW_S, Intent, Ledger};
+use crate::ledger::{GROUP_WAIT_S, GROUP_WINDOW_S, Intent, Ledger, PipelineRecords, VmJobs};
 use crate::log::Log;
 use crate::provision::keys;
 use crate::types::{Provider, Secrets, StartRequest, VmCapacity, VmReport, VmState};
@@ -21,6 +21,22 @@ use crate::{Error, Result};
 pub const START_RETRY_PAUSE: Duration = Duration::from_millis(300);
 /// M7 rule R4: a retry begins only this long after the request arrived, at the latest.
 pub const START_RETRY_WITHIN: Duration = Duration::from_secs(5);
+
+/// M6.1 rule R4: the burst ledger records a pipeline's warm VM as this prefix and the pipeline
+/// id, where a job records its job id.
+pub const WARM_PREFIX: &str = "warm:";
+
+/// M6.1 rule R4: statuses of the builds a pipeline event counts, jobs yet to run.
+const WAITING_STATUSES: [&str; 5] = [
+    "created",
+    "pending",
+    "waiting_for_resource",
+    "preparing",
+    "scheduled",
+];
+
+/// M6.1 rule R3: the statuses that end a pipeline and its records.
+const FINAL_STATUSES: [&str; 4] = ["success", "failed", "canceled", "skipped"];
 
 /// When a request arrived, on tokio's clock, which tests pause and advance (M7 rule R1).
 #[derive(Debug, Clone, Copy)]
@@ -81,8 +97,8 @@ pub fn run_env(
     Ok(env)
 }
 
-/// Routes one request: GitLab job events, VM reports, VM termination and the sweep trigger.
-/// Pure apart from the provider calls.
+/// Routes one request: GitLab job and pipeline events, VM reports, VM termination and the
+/// sweep trigger. Pure apart from the provider, ledger and record calls.
 pub struct Dispatcher {
     config: Arc<Config>,
     provider: Arc<dyn Provider>,
@@ -91,6 +107,8 @@ pub struct Dispatcher {
     dispatch_url: Option<String>,
     /// Burst intents (M4 rule R3); `None` keeps the M3 rule.
     ledger: Option<Arc<dyn Ledger>>,
+    /// Warm start records (M6.1 rule R5); `None` starts no warm VM and reserves no slot.
+    records: Option<Arc<dyn PipelineRecords>>,
     /// Pause between recording an intent and reading the burst.
     group_wait: Duration,
 }
@@ -109,6 +127,7 @@ impl Dispatcher {
             log,
             dispatch_url: None,
             ledger: None,
+            records: None,
             group_wait: Duration::from_secs(GROUP_WAIT_S),
         }
     }
@@ -116,6 +135,13 @@ impl Dispatcher {
     /// The burst ledger (M4 rule R7).
     pub fn with_ledger(mut self, ledger: Option<Arc<dyn Ledger>>) -> Dispatcher {
         self.ledger = ledger;
+        self
+    }
+
+    /// The warm start records (M6.1 rule R5). Without them a pipeline event answers every VM
+    /// pool `disabled` and a lane job reserves no slot.
+    pub fn with_records(mut self, records: Option<Arc<dyn PipelineRecords>>) -> Dispatcher {
+        self.records = records;
         self
     }
 
@@ -215,9 +241,30 @@ impl Dispatcher {
         let Ok(event) = serde_json::from_slice::<Value>(body) else {
             return reply(400, "bad_request", json!({}));
         };
-        if event.get("object_kind").and_then(Value::as_str) != Some("build") {
-            return ignored("not_job_event", json!({}));
+        match event.get("object_kind").and_then(Value::as_str) {
+            Some("build") => self.job_event(headers, &event, now, at).await,
+            Some("pipeline") => self.pipeline_event(headers, &event, now, at).await,
+            _ => ignored("not_job_event", json!({})),
         }
+    }
+
+    /// The URL VMs call back on: the configured one, else the host of the webhook request.
+    fn callback(&self, headers: &[(String, String)]) -> Option<String> {
+        self.dispatch_url.clone().or_else(|| {
+            header(headers, "x-forwarded-host")
+                .or_else(|| header(headers, "host"))
+                .filter(|h| !h.is_empty())
+                .map(|h| format!("https://{h}"))
+        })
+    }
+
+    async fn job_event(
+        &self,
+        headers: &[(String, String)],
+        event: &Value,
+        now: u64,
+        at: Arrival,
+    ) -> DispatchResponse {
         let status = event
             .get("build_status")
             .and_then(Value::as_str)
@@ -236,6 +283,9 @@ impl Dispatcher {
         if is_own_job(name) {
             return ignored("own_job", json!({ "name": name }));
         }
+        if self.config.ignores(name) {
+            return ignored("ignore_jobs", json!({}));
+        }
 
         let stage = event.get("build_stage").and_then(Value::as_str);
         let Some(pool) = self.config.pool_for(name, stage).cloned() else {
@@ -243,40 +293,55 @@ impl Dispatcher {
         };
         let labels = BTreeMap::from([
             ("project".to_string(), project_id.to_string()),
-            ("pipeline".to_string(), number(&event, "pipeline_id")),
-            ("job".to_string(), number(&event, "build_id")),
+            ("pipeline".to_string(), number(event, "pipeline_id")),
+            ("job".to_string(), number(event, "build_id")),
             ("stage".to_string(), stage.unwrap_or("").to_string()),
         ]);
         let mut fields: Vec<(&str, &str)> = labels
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        if let Some(vm_pool) = self.config.vm_first_pool(&pool)
-            && let Some((run_id, free)) = self
-                .claim_for_lane(vm_pool, &pool, &labels["job"], now, at)
-                .await
+        // Records are keyed by GitLab's numeric pipeline id only.
+        let pipeline = event
+            .get("pipeline_id")
+            .and_then(Value::as_u64)
+            .map(|id| id.to_string());
+        if self.config.is_vm_pool(&pool)
+            && let Some(pipeline) = &pipeline
         {
-            let free = free.to_string();
-            fields.extend([
-                ("pool", vm_pool.tag.as_str()),
-                ("run", run_id.as_str()),
-                ("free", free.as_str()),
-                ("lane", pool.tag.as_str()),
-            ]);
-            self.info(at, "claimed", &fields);
-            return reply(
-                200,
-                "claimed",
-                json!({ "pool": vm_pool.tag, "lane": pool.tag, "runId": run_id }),
-            );
+            self.mark_seen(pipeline, &labels["job"], &pool.tag, at)
+                .await;
+        }
+        let mut reserved = None;
+        if let Some(vm_pool) = self.config.vm_first_pool(&pool) {
+            match self
+                .claim_for_lane(vm_pool, &pool, &labels["job"], pipeline.as_deref(), now, at)
+                .await
+            {
+                LaneClaim::Claimed { run_id, free } => {
+                    let free = free.to_string();
+                    fields.extend([
+                        ("pool", vm_pool.tag.as_str()),
+                        ("run", run_id.as_str()),
+                        ("free", free.as_str()),
+                        ("lane", pool.tag.as_str()),
+                    ]);
+                    self.info(at, "claimed", &fields);
+                    return reply(
+                        200,
+                        "claimed",
+                        json!({ "pool": vm_pool.tag, "lane": pool.tag, "runId": run_id }),
+                    );
+                }
+                LaneClaim::Reserved(reserve) => reserved = Some(reserve.to_string()),
+                LaneClaim::Lane => {}
+            }
         }
         fields.push(("pool", &pool.tag));
-        let callback = self.dispatch_url.clone().or_else(|| {
-            header(headers, "x-forwarded-host")
-                .or_else(|| header(headers, "host"))
-                .filter(|h| !h.is_empty())
-                .map(|h| format!("https://{h}"))
-        });
+        if let Some(reserve) = &reserved {
+            fields.push(("reserve", reserve));
+        }
+        let callback = self.callback(headers);
         match self
             .schedule(&pool, labels.clone(), now, callback.as_deref(), at)
             .await
@@ -385,6 +450,8 @@ impl Dispatcher {
                     }
                     return self.start(pool, labels, true, callback, taken, at).await;
                 }
+                // Only a warm intent is covered; a job with such an id keeps the M3 rule.
+                Ok(Burst::Covered) => {}
                 Err(error) => {
                     let message = error.to_string();
                     self.warn(
@@ -402,19 +469,22 @@ impl Dispatcher {
         self.start(pool, labels, true, callback, 1, at).await
     }
 
-    /// D47: a pending job of `lane` claims a free slot of `vm_pool` when one of its VMs is a
-    /// claim candidate (M4 rules R1, R2); `None` leaves it to the lane. A failed read or claim
-    /// logs `claim_failed` and also leaves it to the lane, which never uses the ledger.
+    /// D47, M6.1 rule R6: a pending job of `lane` claims a free slot of `vm_pool` when the
+    /// claim candidates (M4 rules R1, R2) have more free slots than the reserve of the job's
+    /// pipeline; otherwise it is left to the lane. A failed read or claim logs `claim_failed`
+    /// and also leaves it to the lane, which never uses the ledger.
     async fn claim_for_lane(
         &self,
         vm_pool: &Pool,
         lane: &Pool,
         job: &str,
+        pipeline: Option<&str>,
         now: u64,
         at: Arrival,
-    ) -> Option<(String, u64)> {
+    ) -> LaneClaim {
         let vms = match self.provider.capacity(&vm_pool.tag).await {
-            Ok(vms) => vms?,
+            Ok(Some(vms)) => vms,
+            Ok(None) => return LaneClaim::Lane,
             Err(error) => {
                 let message = error.to_string();
                 self.warn(
@@ -426,12 +496,24 @@ impl Dispatcher {
                         ("error", &message),
                     ],
                 );
-                return None;
+                return LaneClaim::Lane;
             }
         };
-        let (target, free) = claim_target(&vms, job, now)?;
+        let Some((target, free)) = claim_target(&vms, job, now) else {
+            return LaneClaim::Lane;
+        };
+        let reserve = match pipeline {
+            Some(pipeline) => self.reserve(vm_pool, pipeline, at).await,
+            None => 0,
+        };
+        if free <= reserve {
+            return LaneClaim::Reserved(reserve);
+        }
         match self.provider.claim(&target.run_id).await {
-            Ok(()) => Some((target.run_id.clone(), free)),
+            Ok(()) => LaneClaim::Claimed {
+                run_id: target.run_id.clone(),
+                free,
+            },
             Err(error) => {
                 let message = error.to_string();
                 self.warn(
@@ -443,9 +525,313 @@ impl Dispatcher {
                         ("error", &message),
                     ],
                 );
-                None
+                LaneClaim::Lane
             }
         }
+    }
+
+    /// M6.1 rule R6: the slots of `vm_pool` the VM jobs of `pipeline` still need, its VM jobs
+    /// in the record without a seen marker, at most one VM's slots; 0 without a record.
+    async fn reserve(&self, vm_pool: &Pool, pipeline: &str, at: Arrival) -> u64 {
+        let Some(records) = &self.records else {
+            return 0;
+        };
+        let jobs = match records.vm_jobs(pipeline).await {
+            Ok(Some(jobs)) => jobs,
+            Ok(None) => return 0,
+            Err(error) => {
+                self.records_failed(at, "vm_jobs", pipeline, &error);
+                return 0;
+            }
+        };
+        let Some(ids) = jobs.get(&vm_pool.tag).filter(|ids| !ids.is_empty()) else {
+            return 0;
+        };
+        let seen = match records.seen_jobs(pipeline).await {
+            Ok(seen) => seen,
+            Err(error) => {
+                self.records_failed(at, "seen_jobs", pipeline, &error);
+                return 0;
+            }
+        };
+        let unseen = ids.iter().filter(|id| !seen.contains(id)).count();
+        (unseen as u64).min(u64::from(vm_pool.slots))
+    }
+
+    /// M6.1 rule R5: marks a pending VM job of `pool` that its pipeline's record lists.
+    async fn mark_seen(&self, pipeline: &str, job: &str, pool: &str, at: Arrival) {
+        let Some(records) = &self.records else {
+            return;
+        };
+        match records.vm_jobs(pipeline).await {
+            Ok(Some(jobs))
+                if jobs
+                    .get(pool)
+                    .is_some_and(|ids| ids.iter().any(|id| id == job)) =>
+            {
+                if let Err(error) = records.seen(pipeline, job).await {
+                    self.records_failed(at, "seen", pipeline, &error);
+                }
+            }
+            Ok(_) => {}
+            Err(error) => self.records_failed(at, "vm_jobs", pipeline, &error),
+        }
+    }
+
+    /// M6.1 rule R5: a failed record call never fails an answer; the caller goes on as without
+    /// records.
+    fn records_failed(&self, at: Arrival, op: &str, pipeline: &str, error: &Error) {
+        let message = error.to_string();
+        self.warn(
+            at,
+            "records_failed",
+            &[("op", op), ("pipeline", pipeline), ("error", &message)],
+        );
+    }
+
+    /// M6.1 rules R3 and R4: a pending or running pipeline gets the warm step, a final status
+    /// deletes the pipeline's records.
+    async fn pipeline_event(
+        &self,
+        headers: &[(String, String)],
+        event: &Value,
+        now: u64,
+        at: Arrival,
+    ) -> DispatchResponse {
+        let project_id = event
+            .get("project")
+            .and_then(|project| project.get("id"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if !self.config.gitlab.project_ids.contains(&project_id) {
+            return ignored("project", json!({}));
+        }
+        let attributes = event.get("object_attributes");
+        let Some(id) = attributes.and_then(|a| a.get("id")).and_then(Value::as_u64) else {
+            return reply(400, "bad_request", json!({}));
+        };
+        let status = attributes
+            .and_then(|a| a.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let pipeline = id.to_string();
+        let project = project_id.to_string();
+        let names = [
+            ("pipeline", pipeline.as_str()),
+            ("project", project.as_str()),
+        ];
+        if FINAL_STATUSES.contains(&status) {
+            if let Some(records) = &self.records
+                && let Err(error) = records.close(&pipeline).await
+            {
+                self.records_failed(at, "close", &pipeline, &error);
+            }
+            self.info(at, "closed", &names);
+            return reply(200, "closed", json!({ "pipeline": id }));
+        }
+        if status != "pending" && status != "running" {
+            return ignored("status", json!({ "status": status }));
+        }
+        let vm_jobs = self.vm_jobs_of(event);
+        if vm_jobs.is_empty() {
+            return ignored("no_vm_jobs", json!({}));
+        }
+        let enabled = match &self.records {
+            None => false,
+            Some(records) => match records.open(&pipeline, &vm_jobs).await {
+                Ok(true) => true,
+                Ok(false) => {
+                    self.info(at, "duplicate", &names);
+                    return reply(200, "duplicate", json!({ "pipeline": id }));
+                }
+                Err(error) => {
+                    self.records_failed(at, "open", &pipeline, &error);
+                    false
+                }
+            },
+        };
+        let callback = self.callback(headers);
+        match self
+            .warm(&names, &vm_jobs, enabled, callback.as_deref(), now, at)
+            .await
+        {
+            Ok(pools) => reply(200, "warm", json!({ "pipeline": id, "pools": pools })),
+            Err(response) => response,
+        }
+    }
+
+    /// M6.1 rule R4: the jobs of a pipeline event that will go pending, by VM pool: waiting,
+    /// neither manual nor `on_failure`, neither own nor in `ignoreJobs`, and routed to a VM
+    /// pool.
+    fn vm_jobs_of(&self, event: &Value) -> VmJobs {
+        let mut jobs = VmJobs::new();
+        let builds = event.get("builds").and_then(Value::as_array);
+        for build in builds.into_iter().flatten() {
+            let text = |key: &str| build.get(key).and_then(Value::as_str).unwrap_or("");
+            let name = text("name");
+            let counted = WAITING_STATUSES.contains(&text("status"))
+                && !matches!(text("when"), "manual" | "on_failure")
+                && build.get("manual").and_then(Value::as_bool) != Some(true)
+                && !is_own_job(name);
+            let Some(id) = build.get("id").and_then(Value::as_u64).filter(|_| counted) else {
+                continue;
+            };
+            let stage = build.get("stage").and_then(Value::as_str);
+            if let Some(pool) = self
+                .config
+                .pool_for(name, stage)
+                .filter(|pool| self.config.is_vm_pool(pool))
+            {
+                jobs.entry(pool.tag.clone())
+                    .or_default()
+                    .push(id.to_string());
+            }
+        }
+        jobs
+    }
+
+    /// M6.1 rule R4 for each VM pool with VM jobs, in config order: `disabled` without records
+    /// or with `warmStart` false; `capacity` with a claim candidate, or with an intent ranked
+    /// before the warm intent after the ledger's wait; `at_capacity` at `maxRuns` live VMs;
+    /// else `started`, a VM with every slot free that leads its burst group. One wait serves
+    /// every pool. A failed capacity read or start answers 500.
+    async fn warm(
+        &self,
+        names: &[(&str, &str); 2],
+        vm_jobs: &VmJobs,
+        enabled: bool,
+        callback: Option<&str>,
+        now: u64,
+        at: Arrival,
+    ) -> std::result::Result<Vec<Value>, DispatchResponse> {
+        let warm_job = format!("{WARM_PREFIX}{}", names[0].1);
+        let pools: Vec<(&Pool, usize)> = self
+            .config
+            .pools
+            .iter()
+            .filter_map(|pool| Some((pool, vm_jobs.get(&pool.tag)?.len())))
+            .filter(|(_, count)| *count > 0)
+            .collect();
+        let mut steps = Vec::new();
+        for (pool, _) in &pools {
+            let step = if !enabled || !pool.warm_start() {
+                Warm::Done("disabled")
+            } else {
+                match self.provider.capacity(&pool.tag).await {
+                    Err(error) => return Err(self.warm_failed(names, pool, &error, at)),
+                    Ok(None) => Warm::Done("disabled"),
+                    Ok(Some(vms)) if !claim_candidates(&vms, now).is_empty() => {
+                        Warm::Done("capacity")
+                    }
+                    Ok(Some(vms)) => {
+                        let ranked = match &self.ledger {
+                            None => false,
+                            Some(ledger) => match ledger.record(&pool.tag, now, &warm_job).await {
+                                Ok(()) => true,
+                                Err(error) => {
+                                    self.ledger_failed(pool, &warm_job, &error, at);
+                                    false
+                                }
+                            },
+                        };
+                        Warm::Ranking { vms, ranked }
+                    }
+                }
+            };
+            steps.push(step);
+        }
+        let waits = steps
+            .iter()
+            .any(|step| matches!(step, Warm::Ranking { ranked: true, .. }));
+        if waits && !self.group_wait.is_zero() {
+            tokio::time::sleep(self.group_wait).await;
+        }
+        let mut answers = Vec::new();
+        for ((pool, count), step) in pools.into_iter().zip(steps) {
+            let (action, run_id) = match step {
+                Warm::Done(action) => (action, None),
+                Warm::Ranking { vms, ranked } => {
+                    let live = vms.iter().filter(|v| v.state != VmState::Draining).count();
+                    if ranked && self.warm_covered(pool, &warm_job, now, at).await {
+                        ("capacity", None)
+                    } else if live >= pool.max_runs as usize {
+                        ("at_capacity", None)
+                    } else {
+                        let labels = BTreeMap::from([
+                            ("project".to_string(), names[1].1.to_string()),
+                            ("pipeline".to_string(), names[0].1.to_string()),
+                            ("job".to_string(), warm_job.clone()),
+                        ]);
+                        match self.start_run(pool, labels, true, callback, 0, at).await {
+                            Ok(run_id) => ("started", Some(run_id)),
+                            Err(error) => return Err(self.warm_failed(names, pool, &error, at)),
+                        }
+                    }
+                }
+            };
+            let count_text = count.to_string();
+            let mut fields = names.to_vec();
+            fields.extend([("pool", pool.tag.as_str()), ("action", action)]);
+            if let Some(run_id) = &run_id {
+                fields.push(("run", run_id));
+            }
+            fields.push(("vm_jobs", &count_text));
+            self.info(at, "warm", &fields);
+            let mut answer = json!({ "pool": pool.tag, "action": action, "vmJobs": count });
+            if let Some(run_id) = run_id {
+                answer["runId"] = run_id.into();
+            }
+            answers.push(answer);
+        }
+        Ok(answers)
+    }
+
+    /// Whether an intent of the window ranks before the warm intent `warm` just recorded, so
+    /// that the VMs of the window take the pipeline's jobs (M6.1 rule R4). A failed read counts
+    /// as none, as a failed ledger falls back to starting (M4 rule R4).
+    async fn warm_covered(&self, pool: &Pool, warm: &str, now: u64, at: Arrival) -> bool {
+        let Some(ledger) = &self.ledger else {
+            return false;
+        };
+        let ranked = ledger
+            .since(&pool.tag, now.saturating_sub(GROUP_WINDOW_S))
+            .await
+            .and_then(|intents| {
+                rank_burst(&intents, warm, now, pool.slots)
+                    .ok_or_else(|| Error::other("the ledger lacks the intent just recorded"))
+            });
+        match ranked {
+            Ok(Burst::Leader { .. }) => false,
+            Ok(_) => true,
+            Err(error) => {
+                self.ledger_failed(pool, warm, &error, at);
+                false
+            }
+        }
+    }
+
+    fn ledger_failed(&self, pool: &Pool, job: &str, error: &Error, at: Arrival) {
+        let message = error.to_string();
+        self.warn(
+            at,
+            "ledger_failed",
+            &[("pool", &pool.tag), ("job", job), ("error", &message)],
+        );
+    }
+
+    /// A failed warm step logs `start_failed` and answers 500, as a job event does.
+    fn warm_failed(
+        &self,
+        names: &[(&str, &str); 2],
+        pool: &Pool,
+        error: &Error,
+        at: Arrival,
+    ) -> DispatchResponse {
+        let message = error.to_string();
+        let mut fields = names.to_vec();
+        fields.extend([("pool", pool.tag.as_str()), ("error", message.as_str())]);
+        self.error(at, "start_failed", &fields);
+        reply(500, "error", json!({}))
     }
 
     /// M4 rule R3: records the intent, waits for the rest of the burst and ranks the intents of
@@ -474,6 +860,22 @@ impl Dispatcher {
         taken: u32,
         at: Arrival,
     ) -> Result<Decision> {
+        let run_id = self
+            .start_run(pool, labels, vm, callback, taken, at)
+            .await?;
+        Ok(Decision::Started { run_id, taken })
+    }
+
+    /// See [`Dispatcher::start`]; answers the run id.
+    async fn start_run(
+        &self,
+        pool: &Pool,
+        labels: BTreeMap<String, String>,
+        vm: bool,
+        callback: Option<&str>,
+        taken: u32,
+        at: Arrival,
+    ) -> Result<String> {
         let mut env = run_env(&self.config, &self.secrets, pool, vm)?;
         if vm && let Some(url) = callback {
             env.insert("CIBURST_DISPATCH_URL".to_string(), url.to_string());
@@ -502,7 +904,7 @@ impl Dispatcher {
             }
             Err(error) => return Err(error),
         };
-        Ok(Decision::Started { run_id, taken })
+        Ok(run_id)
     }
 
     /// The run id of a request that carries a valid capability token.
@@ -616,6 +1018,28 @@ enum Decision {
     Duplicate,
 }
 
+/// What a lane job found on the VM pool it claims slots of (D47, M6.1 rule R6).
+enum LaneClaim {
+    Claimed {
+        run_id: String,
+        free: u64,
+    },
+    /// The candidates' free slots do not exceed the reserve of the job's pipeline.
+    Reserved(u64),
+    /// No candidate, or a failed read or claim.
+    Lane,
+}
+
+/// A VM pool of the warm step between the capacity read and the read of the burst window.
+enum Warm {
+    Done(&'static str),
+    /// No claim candidate; `ranked` when the warm intent is in the ledger.
+    Ranking {
+        vms: Vec<VmCapacity>,
+        ranked: bool,
+    },
+}
+
 /// Seconds after its last report that a VM still counts as capacity: two heartbeats and a
 /// minute, so one lost report does not matter but a hung VM stops absorbing claims.
 pub const CAPACITY_FRESH_S: u64 = 2 * vm::HEARTBEAT_S + 60;
@@ -685,6 +1109,11 @@ impl JobKey {
             .map(JobKey::Number)
             .unwrap_or_else(|_| JobKey::Text(job.to_string()))
     }
+
+    /// The warm intent of a pipeline (M6.1 rule R4).
+    fn is_warm(&self) -> bool {
+        matches!(self, JobKey::Text(text) if text.starts_with(WARM_PREFIX))
+    }
 }
 
 impl fmt::Display for JobKey {
@@ -696,19 +1125,25 @@ impl fmt::Display for JobKey {
     }
 }
 
-/// A job's place in its burst (M4 rule R3).
+/// A job's place in its burst (M4 rule R3, M6.1 rule R4).
 #[derive(Debug, PartialEq, Eq)]
 enum Burst {
     /// The job's earliest intent is older than this event.
     Duplicate,
-    /// Rank `r % slots != 0`: the job rides on the VM of the job at rank `r - r % slots`.
+    /// The job takes an open position of the current group and rides on its leader's VM.
     Follower { leader: String },
-    /// Rank `r % slots == 0`: group `r / slots` starts a VM with `taken` slots assigned.
+    /// Group `group` starts a VM with `taken` slots assigned: the leader and its followers, or
+    /// none for a warm intent.
     Leader { group: usize, taken: u32 },
+    /// A warm intent behind other intents: the window's VMs take the pipeline's jobs.
+    Covered,
 }
 
 /// Ranks `job` among the intents of the window `[now - GROUP_WINDOW_S, ..]`: each job's
-/// earliest intent, ordered by time, then job id. `None` when the job has no intent there.
+/// earliest intent, ordered by time, then job id, numbers before other ids. A job takes an
+/// open position of the current group, or leads a new group of `slots` positions and takes
+/// one. A warm intent first in the window leads group 0 and takes no position; behind other
+/// intents it is covered and takes no part. `None` when the job has no intent there.
 fn rank_burst(intents: &[Intent], job: &str, now: u64, slots: u32) -> Option<Burst> {
     let since = now.saturating_sub(GROUP_WINDOW_S);
     let mut earliest: BTreeMap<JobKey, u64> = BTreeMap::new();
@@ -724,19 +1159,49 @@ fn rank_burst(intents: &[Intent], job: &str, now: u64, slots: u32) -> Option<Bur
     }
     let mut order: Vec<(u64, JobKey)> = earliest.into_iter().map(|(job, at)| (at, job)).collect();
     order.sort();
-    let rank = order.iter().position(|(_, job)| *job == mine)?;
     let slots = slots.max(1) as usize;
-    let leader = rank - rank % slots;
-    if leader != rank {
-        return Some(Burst::Follower {
-            leader: order[leader].1.to_string(),
-        });
+    // Per group its leader and the positions still open.
+    let mut groups: Vec<(&JobKey, usize)> = Vec::new();
+    let mut placed = None;
+    for (rank, (_, key)) in order.iter().enumerate() {
+        let place = if key.is_warm() {
+            if rank == 0 {
+                groups.push((key, slots));
+                Burst::Leader { group: 0, taken: 0 }
+            } else {
+                Burst::Covered
+            }
+        } else {
+            match groups.last_mut() {
+                Some((leader, open)) if *open > 0 => {
+                    *open -= 1;
+                    Burst::Follower {
+                        leader: leader.to_string(),
+                    }
+                }
+                _ => {
+                    groups.push((key, slots - 1));
+                    Burst::Leader {
+                        group: groups.len() - 1,
+                        taken: 0,
+                    }
+                }
+            }
+        };
+        if *key == mine {
+            placed = Some(place);
+        }
     }
-    let taken = (order.len() - rank).min(slots);
-    Some(Burst::Leader {
-        group: rank / slots,
-        taken: u32::try_from(taken).unwrap_or(u32::MAX),
-    })
+    match placed? {
+        Burst::Leader { group, .. } if !mine.is_warm() => {
+            let taken = slots - groups[group].1;
+            Some(Burst::Leader {
+                group,
+                taken: u32::try_from(taken).unwrap_or(u32::MAX),
+            })
+        }
+        place => Some(place),
+    }
 }
 
 /// `Some` when the body is a JSON object with the sweep key; the inner value is the given
@@ -816,7 +1281,7 @@ mod tests {
     use super::*;
     use crate::config::parse_config;
     use crate::fake::FakeProvider;
-    use crate::ledger::MemoryLedger;
+    use crate::ledger::{MemoryLedger, MemoryPipelineRecords};
     use crate::store::MemoryStore;
     use crate::types::{KeyPair, Run};
     use async_trait::async_trait;
@@ -1041,7 +1506,8 @@ mod tests {
     async fn ignores_other_events() {
         let (d, recording, _) = setup(false).await;
         let cases: Vec<(Vec<u8>, &str)> = vec![
-            (b"{\"object_kind\":\"pipeline\"}".to_vec(), "not_job_event"),
+            (b"{\"object_kind\":\"push\"}".to_vec(), "not_job_event"),
+            (b"{\"object_kind\":\"pipeline\"}".to_vec(), "project"),
             (b"null".to_vec(), "not_job_event"),
             (event("test", "running", 7, 1), "status"),
             (event("test", "pending", 8, 1), "project"),
@@ -1521,7 +1987,7 @@ mod tests {
                             let leader: usize = leader.parse().unwrap();
                             assert_eq!(leader, job - job % slots as usize);
                         }
-                        Burst::Duplicate => panic!("no duplicate in {n} jobs"),
+                        Burst::Duplicate | Burst::Covered => panic!("{job} of {n} jobs"),
                     }
                 }
                 assert_eq!(leaders, n.div_ceil(slots as usize), "slots {slots}, n {n}");
@@ -2704,5 +3170,872 @@ mod tests {
         assert_eq!(response.body["ms"], 300);
         assert_eq!(s.recording.start_calls(), 2);
         assert_eq!(s.started_pools(), ["node-24"]);
+    }
+
+    const W: &str = "warm:9";
+
+    #[test]
+    fn a_warm_intent_first_in_the_window_leads_a_group_of_free_slots() {
+        let leader = |group| Some(Burst::Leader { group, taken: 0 });
+        let follows = |leader: &str| {
+            Some(Burst::Follower {
+                leader: leader.into(),
+            })
+        };
+
+        let warm_then_two = [intent(NOW, W), intent(NOW + 1, "1"), intent(NOW + 1, "2")];
+        assert_eq!(rank_burst(&warm_then_two, W, NOW, 2), leader(0));
+        assert_eq!(rank_burst(&warm_then_two, "1", NOW + 1, 2), follows(W));
+        assert_eq!(
+            rank_burst(&warm_then_two, "2", NOW + 1, 2),
+            follows(W),
+            "one VM: the warm VM takes both jobs"
+        );
+
+        let warm_then_three = [
+            intent(NOW, W),
+            intent(NOW + 1, "1"),
+            intent(NOW + 1, "2"),
+            intent(NOW + 1, "3"),
+        ];
+        assert_eq!(
+            rank_burst(&warm_then_three, "3", NOW + 1, 2),
+            Some(Burst::Leader { group: 1, taken: 1 }),
+            "two VMs: the warm VM and one for the third job"
+        );
+
+        let two_then_warm = [intent(NOW, "1"), intent(NOW, "2"), intent(NOW, W)];
+        assert_eq!(
+            rank_burst(&two_then_warm, "1", NOW, 2),
+            Some(Burst::Leader { group: 0, taken: 2 })
+        );
+        assert_eq!(rank_burst(&two_then_warm, "2", NOW, 2), follows("1"));
+        assert_eq!(
+            rank_burst(&two_then_warm, W, NOW, 2),
+            Some(Burst::Covered),
+            "one VM: a job of the same second ranks first, the warm intent takes no part"
+        );
+        let later = [
+            intent(NOW, "1"),
+            intent(NOW, "2"),
+            intent(NOW, W),
+            intent(NOW + 1, "3"),
+        ];
+        assert_eq!(
+            rank_burst(&later, "3", NOW + 1, 2),
+            Some(Burst::Leader { group: 1, taken: 1 }),
+            "a covered warm intent opens no group"
+        );
+
+        let one_then_warm = [intent(NOW - 20, "1"), intent(NOW, W), intent(NOW + 1, "2")];
+        assert_eq!(rank_burst(&one_then_warm, W, NOW, 2), Some(Burst::Covered));
+        assert_eq!(
+            rank_burst(&one_then_warm, "2", NOW + 1, 2),
+            follows("1"),
+            "the job fills the open slot of the window's VM"
+        );
+
+        let two_pipelines = [intent(NOW, "warm:8"), intent(NOW, W), intent(NOW + 1, "1")];
+        assert_eq!(rank_burst(&two_pipelines, "warm:8", NOW, 1), leader(0));
+        assert_eq!(rank_burst(&two_pipelines, W, NOW, 1), Some(Burst::Covered));
+        assert_eq!(
+            rank_burst(&two_pipelines, "1", NOW + 1, 1),
+            follows("warm:8")
+        );
+
+        let left = [intent(NOW - GROUP_WINDOW_S - 1, "1"), intent(NOW, W)];
+        assert_eq!(
+            rank_burst(&left, W, NOW, 2),
+            leader(0),
+            "an intent that left the window"
+        );
+        assert_eq!(
+            rank_burst(&[intent(NOW - 5, W)], W, NOW, 2),
+            Some(Burst::Duplicate)
+        );
+    }
+
+    fn records_config(extra: &str) -> Arc<Config> {
+        Arc::new(
+            parse_config(&format!(
+                r#"{{
+                  "name": "demo",
+                  "gitlab": {{ "url": "https://gitlab.example", "projectIds": [7] }},
+                  "host": {{ "type": "fake" }}, "provider": {{ "type": "fake" }},
+                  "defaultPool": "vm",
+                  "pools": [
+                    {{ "tag": "vm", "image": "img/node", "runtime": "instances", "slots": 2, "maxRuns": 2 }},
+                    {{ "tag": "jobs", "image": "img/kaniko", "stages": ["build"], "runtime": "jobs" }}
+                  ],
+                  {extra}
+                  "cache": {{ "type": "s3" }}
+                }}"#
+            ))
+            .unwrap(),
+        )
+    }
+
+    async fn warm_setup(
+        config: Arc<Config>,
+        secrets: Secrets,
+        ledger: Option<Arc<dyn Ledger>>,
+        records: Option<Arc<dyn PipelineRecords>>,
+    ) -> VmSetup {
+        let mut s = setup_of(config, secrets, ledger).await;
+        s.dispatcher = s.dispatcher.with_records(records);
+        s
+    }
+
+    fn build(id: u64, name: &str, stage: &str) -> Value {
+        json!({
+            "id": id, "name": name, "stage": stage, "status": "created",
+            "when": "on_success", "manual": false, "allow_failure": false
+        })
+    }
+
+    fn pipeline_body(id: Value, status: &str, project: u64, builds: &[Value]) -> Vec<u8> {
+        json!({
+            "object_kind": "pipeline",
+            "object_attributes": { "id": id, "status": status },
+            "project": { "id": project },
+            "builds": builds
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn pipeline_headers() -> Vec<(String, String)> {
+        vec![
+            ("X-Gitlab-Token".to_string(), "hook-secret".to_string()),
+            ("X-Gitlab-Event".to_string(), "Pipeline Hook".to_string()),
+        ]
+    }
+
+    impl VmSetup {
+        async fn pipeline_at(
+            &self,
+            id: u64,
+            status: &str,
+            builds: &[Value],
+            now: u64,
+        ) -> DispatchResponse {
+            let body = pipeline_body(json!(id), status, 7, builds);
+            self.dispatcher
+                .handle_request("POST", "/", &pipeline_headers(), &body, now)
+                .await
+        }
+
+        /// A pending job event of job `job` named `name` in pipeline `pipeline`.
+        async fn job_at(
+            &self,
+            name: &str,
+            stage: &str,
+            job: u64,
+            pipeline: u64,
+            now: u64,
+        ) -> DispatchResponse {
+            let body = json!({
+                "object_kind": "build", "build_id": job, "build_name": name,
+                "build_stage": stage, "build_status": "pending",
+                "pipeline_id": pipeline, "project_id": 7
+            });
+            self.dispatcher
+                .handle_request(
+                    "POST",
+                    "/",
+                    &headers("hook-secret"),
+                    body.to_string().as_bytes(),
+                    now,
+                )
+                .await
+        }
+    }
+
+    fn vm_jobs(pairs: &[(&str, &[&str])]) -> Option<VmJobs> {
+        Some(
+            pairs
+                .iter()
+                .map(|(pool, jobs)| {
+                    (
+                        pool.to_string(),
+                        jobs.iter().map(|j| j.to_string()).collect(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pipeline_event_starts_one_warm_vm_that_its_vm_jobs_ride_on() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let records = Arc::new(MemoryPipelineRecords::new());
+        let s = warm_setup(
+            records_config(""),
+            vm_secrets(),
+            Some(ledger.clone()),
+            Some(records.clone()),
+        )
+        .await;
+        let now = T0 + 60;
+        s.set_clock(now);
+        let mut manual = build(4, "release", "deploy");
+        manual["status"] = "manual".into();
+        manual["when"] = "manual".into();
+        manual["manual"] = true.into();
+        let mut on_failure = build(6, "cleanup", "deploy");
+        on_failure["when"] = "on_failure".into();
+        let mut done = build(7, "lint", "test");
+        done["status"] = "success".into();
+        let mut pending = build(8, "smoke", "test");
+        pending["status"] = "pending".into();
+        let builds = [
+            build(1, "compile", "build"),
+            build(2, "unit", "test"),
+            build(3, "e2e", "deploy"),
+            manual,
+            build(5, "ciburst-check", ".pre"),
+            on_failure,
+            done,
+            pending,
+        ];
+        let warm = s.pipeline_at(9, "pending", &builds, now).await;
+        assert_eq!(warm.status, 200, "{}", warm.body);
+        let run = warm.body["pools"][0]["runId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            warm.body,
+            json!({
+                "result": "warm", "pipeline": 9, "ms": 0,
+                "pools": [{ "pool": "vm", "action": "started", "runId": run, "vmJobs": 3 }]
+            })
+        );
+        assert_eq!(s.taken(), [0], "every slot of the warm VM is free");
+        assert_eq!(s.vms().await[0].free, 2);
+        let started = s.recording.started.lock().unwrap()[0].clone();
+        assert_eq!(started.labels["job"], W);
+        assert_eq!(started.labels["pipeline"], "9");
+        assert_eq!(started.labels["project"], "7");
+        assert_eq!(started.env[keys::VM_SECRET], VM_SECRET);
+        assert_eq!(
+            ledger.all(),
+            [(
+                "vm".to_string(),
+                Intent {
+                    at: now,
+                    job: W.to_string()
+                }
+            )]
+        );
+        assert_eq!(
+            records.vm_jobs("9").await.unwrap(),
+            vm_jobs(&[("vm", &["2", "3", "8"])])
+        );
+        assert!(s.lines().contains(&format!(
+            r#"info warm pipeline="9" project="7" pool="vm" action="started" run="{run}" vm_jobs="3" ms="0""#
+        )));
+
+        let unit = s.job_at("unit", "test", 2, 9, now + 1).await;
+        assert_eq!(
+            unit.body,
+            grouped(W),
+            "a stage 1 VM job rides on the warm VM"
+        );
+        let again = s.pipeline_at(9, "running", &builds, now + 2).await;
+        assert_eq!(
+            again.body,
+            json!({ "result": "duplicate", "pipeline": 9, "ms": 0 })
+        );
+        assert!(
+            s.lines()
+                .contains(&r#"info duplicate pipeline="9" project="7" ms="0""#.to_string())
+        );
+        let e2e = s.job_at("e2e", "deploy", 3, 9, now + 60).await;
+        assert_eq!(
+            e2e.body,
+            json!({ "result": "claimed", "pool": "vm", "runId": run, "ms": 0 }),
+            "a stage 2 VM job claims the warm VM"
+        );
+        assert_eq!(s.taken(), [0], "one VM for the pipeline");
+        let mut seen = records.seen_jobs("9").await.unwrap();
+        seen.sort();
+        assert_eq!(seen, ["2", "3"]);
+
+        let closed = s.pipeline_at(9, "success", &builds, now + 300).await;
+        assert_eq!(
+            closed.body,
+            json!({ "result": "closed", "pipeline": 9, "ms": 0 })
+        );
+        assert_eq!(records.vm_jobs("9").await.unwrap(), None);
+        assert!(
+            s.lines()
+                .contains(&r#"info closed pipeline="9" project="7" ms="0""#.to_string())
+        );
+    }
+
+    fn warm_pools(response: &DispatchResponse) -> Value {
+        response.body["pools"].clone()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_burst_window_and_claim_candidates_take_the_pipeline_instead() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let records = Arc::new(MemoryPipelineRecords::new());
+        let s = warm_setup(
+            records_config(""),
+            vm_secrets(),
+            Some(ledger.clone()),
+            Some(records.clone()),
+        )
+        .await;
+        let first = s.pending_at("test", 1, T0).await;
+        assert_eq!(first.body["result"], "started");
+        let warm = s
+            .pipeline_at(9, "pending", &[build(2, "unit", "test")], T0 + 5)
+            .await;
+        assert_eq!(
+            warm.body,
+            json!({
+                "result": "warm", "pipeline": 9, "ms": 0,
+                "pools": [{ "pool": "vm", "action": "capacity", "vmJobs": 1 }]
+            }),
+            "a job event of the window ranks before the warm intent"
+        );
+        assert!(s.lines().contains(
+            &r#"info warm pipeline="9" project="7" pool="vm" action="capacity" vm_jobs="1" ms="0""#
+                .to_string()
+        ));
+        assert_eq!(
+            s.job_at("unit", "test", 2, 9, T0 + 6).await.body,
+            grouped("1"),
+            "the covered warm intent leaves the open slot to the job"
+        );
+        assert_eq!(s.taken(), [1]);
+
+        s.report(&run_of(&first), VmState::Busy, 1).await;
+        let intents = ledger.all().len();
+        let warm = s
+            .pipeline_at(10, "pending", &[build(12, "unit", "test")], T0 + 60)
+            .await;
+        assert_eq!(
+            warm_pools(&warm),
+            json!([{ "pool": "vm", "action": "capacity", "vmJobs": 1 }]),
+            "a claim candidate"
+        );
+        assert_eq!(
+            ledger.all().len(),
+            intents,
+            "candidates come before the ledger"
+        );
+        assert_eq!(s.taken(), [1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_warm_step_respects_max_runs_warm_start_and_missing_records() {
+        let records = Arc::new(MemoryPipelineRecords::new());
+        let s = warm_setup(
+            records_config(""),
+            vm_secrets(),
+            None,
+            Some(records.clone()),
+        )
+        .await;
+        for job in [1, 2] {
+            let run = run_of(&s.pending_at("test", job, T0).await);
+            s.report(&run, VmState::Busy, 0).await;
+        }
+        let full = s
+            .pipeline_at(9, "pending", &[build(3, "unit", "test")], T0 + 60)
+            .await;
+        assert_eq!(
+            warm_pools(&full),
+            json!([{ "pool": "vm", "action": "at_capacity", "vmJobs": 1 }])
+        );
+        assert_eq!(s.taken(), [1, 1]);
+
+        let ledger = Arc::new(MemoryLedger::new());
+        let mut config = (*records_config("")).clone();
+        config.pools[0].warm_start = Some(false);
+        let cold = Dispatcher::new(
+            Arc::new(config),
+            s.recording.clone(),
+            Arc::new(vm_secrets()),
+            Log::silent(),
+        )
+        .with_ledger(Some(ledger.clone()))
+        .with_records(Some(records.clone()));
+        let response = cold
+            .handle_request(
+                "POST",
+                "/",
+                &pipeline_headers(),
+                &pipeline_body(json!(11), "pending", 7, &[build(1, "unit", "test")]),
+                T0,
+            )
+            .await;
+        assert_eq!(
+            warm_pools(&response),
+            json!([{ "pool": "vm", "action": "disabled", "vmJobs": 1 }])
+        );
+        assert_eq!(
+            records.vm_jobs("11").await.unwrap(),
+            vm_jobs(&[("vm", &["1"])]),
+            "the record still serves the reservation"
+        );
+
+        let bare = vm_setup_with(vm_secrets(), Some(ledger.clone())).await;
+        let response = bare
+            .pipeline_at(12, "pending", &[build(1, "unit", "test")], T0)
+            .await;
+        assert_eq!(
+            response.body,
+            json!({
+                "result": "warm", "pipeline": 12, "ms": 0,
+                "pools": [{ "pool": "vm", "action": "disabled", "vmJobs": 1 }]
+            }),
+            "without records"
+        );
+        let again = bare
+            .pipeline_at(12, "running", &[build(1, "unit", "test")], T0)
+            .await;
+        assert_eq!(again.body["result"], "warm");
+        assert!(bare.recording.started.lock().unwrap().is_empty());
+        assert!(bare.recording.asked.lock().unwrap().is_empty());
+        assert!(ledger.all().is_empty());
+        assert_eq!(s.taken(), [1, 1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pipeline_events_answer_by_project_and_status() {
+        let records = Arc::new(MemoryPipelineRecords::new());
+        let s = warm_setup(
+            records_config(""),
+            vm_secrets(),
+            None,
+            Some(records.clone()),
+        )
+        .await;
+        let unit = [build(1, "unit", "test")];
+        let dispatcher = &s.dispatcher;
+        let post = |body: Vec<u8>| async move {
+            dispatcher
+                .handle_request("POST", "/", &pipeline_headers(), &body, T0)
+                .await
+        };
+        let other = post(pipeline_body(json!(9), "pending", 8, &unit)).await;
+        assert_eq!(
+            other.body,
+            json!({ "result": "ignored", "reason": "project", "ms": 0 })
+        );
+        let wrong_token = s
+            .dispatcher
+            .handle_request(
+                "POST",
+                "/",
+                &headers("nope"),
+                &pipeline_body(json!(9), "pending", 7, &unit),
+                T0,
+            )
+            .await;
+        assert_eq!(wrong_token.status, 401);
+        for id in [json!(null), json!("9"), json!(-1)] {
+            let bad = post(pipeline_body(id.clone(), "pending", 7, &unit)).await;
+            assert_eq!(bad.status, 400, "{id}");
+            assert_eq!(bad.body, json!({ "result": "bad_request", "ms": 0 }));
+        }
+        for status in ["created", "manual", "scheduled", "waiting_for_resource", ""] {
+            let response = post(pipeline_body(json!(9), status, 7, &unit)).await;
+            assert_eq!(
+                response.body,
+                json!({ "result": "ignored", "reason": "status", "status": status, "ms": 0 })
+            );
+        }
+        let lane_only = [build(1, "compile", "build")];
+        let mut manual = build(2, "unit", "test");
+        manual["when"] = "manual".into();
+        let mut flagged = build(3, "unit", "test");
+        flagged["manual"] = true.into();
+        let mut running = build(4, "unit", "test");
+        running["status"] = "running".into();
+        for builds in [
+            &lane_only[..],
+            &[manual][..],
+            &[flagged][..],
+            &[running][..],
+            &[][..],
+        ] {
+            let response = post(pipeline_body(json!(9), "pending", 7, builds)).await;
+            assert_eq!(
+                response.body,
+                json!({ "result": "ignored", "reason": "no_vm_jobs", "ms": 0 })
+            );
+        }
+        assert_eq!(records.vm_jobs("9").await.unwrap(), None, "nothing written");
+        for status in ["success", "failed", "canceled", "skipped"] {
+            let response = post(pipeline_body(json!(9), status, 7, &unit)).await;
+            assert_eq!(
+                response.body,
+                json!({ "result": "closed", "pipeline": 9, "ms": 0 })
+            );
+        }
+        assert!(s.recording.started.lock().unwrap().is_empty());
+        assert!(s.recording.asked.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ignore_jobs_start_nothing() {
+        let records = Arc::new(MemoryPipelineRecords::new());
+        let s = warm_setup(
+            records_config(r#""ignoreJobs": ["pages", "deploy-*"],"#),
+            vm_secrets(),
+            None,
+            Some(records.clone()),
+        )
+        .await;
+        for (name, stage) in [("pages", "test"), ("deploy-prod", "build")] {
+            let response = s.job_at(name, stage, 1, 9, T0).await;
+            assert_eq!(response.status, 200);
+            assert_eq!(
+                response.body,
+                json!({ "result": "ignored", "reason": "ignore_jobs", "ms": 0 })
+            );
+        }
+        let response = s
+            .pipeline_at(
+                9,
+                "pending",
+                &[build(1, "pages", "test"), build(2, "deploy-prod", "test")],
+                T0,
+            )
+            .await;
+        assert_eq!(response.body["reason"], "no_vm_jobs");
+        let own = s.job_at("ciburst-setup", "test", 3, 9, T0).await;
+        assert_eq!(own.body["reason"], "own_job");
+        assert!(s.recording.started.lock().unwrap().is_empty());
+        assert!(s.recording.asked.lock().unwrap().is_empty());
+        assert_eq!(records.vm_jobs("9").await.unwrap(), None);
+        assert_eq!(
+            s.job_at("unit", "test", 4, 9, T0).await.body["result"],
+            "started"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lane_job_leaves_the_slots_its_pipelines_vm_jobs_still_need() {
+        let records = Arc::new(MemoryPipelineRecords::new());
+        let s = warm_setup(
+            lane_config(true),
+            lane_secrets(),
+            None,
+            Some(records.clone()),
+        )
+        .await;
+        let vm = idle_vm(&s, 1, 2).await;
+        let builds = [
+            build(11, "lint", "test"),
+            build(12, "unit-a", "test"),
+            build(13, "e2e", "test"),
+            build(14, "image", "test"),
+            build(15, "unit-c", "test"),
+        ];
+        let now = T0 + 60;
+        let warm = s.pipeline_at(20, "pending", &builds, now).await;
+        assert_eq!(
+            warm_pools(&warm),
+            json!([{ "pool": "vm", "action": "capacity", "vmJobs": 2 }])
+        );
+
+        let lint = s.job_at("lint", "test", 11, 20, now).await;
+        assert_eq!(lint.body["result"], "started", "{}", lint.body);
+        assert_eq!(lint.body["pool"], "node-24");
+        let lint_run = run_of(&lint);
+        assert!(s.lines().contains(&format!(
+            r#"info started job="11" pipeline="20" project="7" stage="test" pool="node-24" reserve="2" run="{lint_run}" taken="1" ms="0""#
+        )));
+        let other = s.job_at("unit-b", "test", 31, 30, now).await;
+        assert_eq!(
+            other.body["result"], "claimed",
+            "the reserve of another pipeline does not count"
+        );
+        assert_eq!(s.vms().await[0].free, 1);
+
+        let e2e = s.job_at("e2e", "test", 13, 20, now).await;
+        assert_eq!(e2e.body["result"], "claimed", "{}", e2e.body);
+        s.report(&vm, VmState::Busy, 1).await;
+        let unit = s.job_at("unit-a", "test", 12, 20, now).await;
+        assert_eq!(unit.body["result"], "started", "{}", unit.body);
+        assert!(s.lines().iter().any(|l| l.starts_with("info started")
+            && l.contains(r#"job="12""#)
+            && l.contains(r#"reserve="1""#)));
+        let image = s.job_at("image", "test", 14, 20, now).await;
+        assert_eq!(image.body["result"], "claimed", "{}", image.body);
+        let mut seen = records.seen_jobs("20").await.unwrap();
+        seen.sort();
+        assert_eq!(seen, ["13", "14"]);
+
+        s.report(&vm, VmState::Busy, 1).await;
+        let late = s.job_at("unit-c", "test", 15, 20, now).await;
+        assert_eq!(
+            late.body,
+            json!({ "result": "claimed", "pool": "vm", "lane": "node-24", "runId": vm, "ms": 0 }),
+            "the seen markers free the reserved slots"
+        );
+        assert_eq!(s.started_pools(), ["vm", "node-24", "node-24"]);
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Op {
+        Open,
+        VmJobs,
+        Seen,
+        SeenJobs,
+        Close,
+    }
+
+    impl Op {
+        fn name(self) -> &'static str {
+            match self {
+                Op::Open => "open",
+                Op::VmJobs => "vm_jobs",
+                Op::Seen => "seen",
+                Op::SeenJobs => "seen_jobs",
+                Op::Close => "close",
+            }
+        }
+    }
+
+    struct FaultyRecords {
+        inner: MemoryPipelineRecords,
+        failing: Op,
+    }
+
+    impl FaultyRecords {
+        fn check(&self, op: Op) -> Result<()> {
+            if op == self.failing {
+                return Err(Error::provider("bucket refused"));
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl PipelineRecords for FaultyRecords {
+        async fn open(&self, pipeline: &str, vm_jobs: &VmJobs) -> Result<bool> {
+            self.check(Op::Open)?;
+            self.inner.open(pipeline, vm_jobs).await
+        }
+        async fn vm_jobs(&self, pipeline: &str) -> Result<Option<VmJobs>> {
+            self.check(Op::VmJobs)?;
+            self.inner.vm_jobs(pipeline).await
+        }
+        async fn seen(&self, pipeline: &str, job: &str) -> Result<()> {
+            self.check(Op::Seen)?;
+            self.inner.seen(pipeline, job).await
+        }
+        async fn seen_jobs(&self, pipeline: &str) -> Result<Vec<String>> {
+            self.check(Op::SeenJobs)?;
+            self.inner.seen_jobs(pipeline).await
+        }
+        async fn close(&self, pipeline: &str) -> Result<()> {
+            self.check(Op::Close)?;
+            self.inner.close(pipeline).await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_record_never_fails_an_answer() {
+        for op in [Op::Open, Op::VmJobs, Op::Seen, Op::SeenJobs, Op::Close] {
+            let records = Arc::new(FaultyRecords {
+                inner: MemoryPipelineRecords::new(),
+                failing: op,
+            });
+            let s = warm_setup(lane_config(true), lane_secrets(), None, Some(records)).await;
+            idle_vm(&s, 1, 2).await;
+            let now = T0 + 60;
+            let builds = [build(11, "lint", "test"), build(13, "e2e", "test")];
+            let warm = s.pipeline_at(20, "pending", &builds, now).await;
+            let action = if op == Op::Open {
+                "disabled"
+            } else {
+                "capacity"
+            };
+            assert_eq!(
+                warm_pools(&warm),
+                json!([{ "pool": "vm", "action": action, "vmJobs": 1 }]),
+                "{op:?}"
+            );
+            let lint = s.job_at("lint", "test", 11, 20, now).await;
+            assert_eq!(lint.body["result"], "claimed", "{op:?} {}", lint.body);
+            let e2e = s.job_at("e2e", "test", 13, 20, now).await;
+            assert_eq!(e2e.body["result"], "claimed", "{op:?} {}", e2e.body);
+            let closed = s.pipeline_at(20, "failed", &builds, now).await;
+            assert_eq!(closed.body["result"], "closed", "{op:?}");
+            let failed: Vec<String> = s
+                .lines()
+                .into_iter()
+                .filter(|l| l.starts_with("warn records_failed"))
+                .collect();
+            let prefix = format!(
+                r#"warn records_failed op="{}" pipeline="20" error="bucket refused""#,
+                op.name()
+            );
+            assert!(failed.iter().any(|l| l.starts_with(&prefix)), "{failed:?}");
+            let op = format!(r#"warn records_failed op="{}" "#, op.name());
+            assert!(failed.iter().all(|l| l.starts_with(&op)), "{failed:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_ledger_wait_serves_every_vm_pool_of_the_pipeline() {
+        let config: Arc<Config> = Arc::new(
+            parse_config(
+                r#"{
+                  "name": "demo",
+                  "gitlab": { "url": "https://gitlab.example", "projectIds": [7] },
+                  "host": { "type": "fake" }, "provider": { "type": "fake" },
+                  "defaultPool": "vm",
+                  "pools": [
+                    { "tag": "vm", "image": "img/node", "runtime": "instances", "slots": 2 },
+                    { "tag": "big", "image": "img/node", "runtime": "instances", "jobs": ["e2e*"], "slots": 1 },
+                    { "tag": "cold", "image": "img/node", "runtime": "instances", "jobs": ["cold*"], "warmStart": false },
+                    { "tag": "jobs", "image": "img/kaniko", "stages": ["build"], "runtime": "jobs" }
+                  ],
+                  "cache": { "type": "s3" }
+                }"#,
+            )
+            .unwrap(),
+        );
+        let mut secrets = vm_secrets();
+        secrets.runner_tokens = ["vm", "big", "cold", "jobs"]
+            .into_iter()
+            .map(|tag| (tag.to_string(), format!("glrt-{tag}")))
+            .collect();
+        let ledger = Arc::new(MemoryLedger::new());
+        let mut s = warm_setup(
+            config,
+            secrets,
+            Some(ledger.clone()),
+            Some(Arc::new(MemoryPipelineRecords::new())),
+        )
+        .await;
+        s.dispatcher = s
+            .dispatcher
+            .with_group_wait(Duration::from_secs(GROUP_WAIT_S));
+        let mut with_host = pipeline_headers();
+        with_host.push(("Host".to_string(), "dispatch.example".to_string()));
+        let body = pipeline_body(
+            json!(9),
+            "running",
+            7,
+            &[
+                build(1, "compile", "build"),
+                build(2, "unit", "test"),
+                build(3, "e2e-a", "test"),
+                build(4, "e2e-b", "test"),
+                build(5, "cold-x", "test"),
+            ],
+        );
+        let response = s
+            .dispatcher
+            .handle_request("POST", "/", &with_host, &body, T0)
+            .await;
+        let actions: Vec<(Value, Value, Value)> = response.body["pools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| (p["pool"].clone(), p["action"].clone(), p["vmJobs"].clone()))
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                (json!("vm"), json!("started"), json!(1)),
+                (json!("big"), json!("started"), json!(2)),
+                (json!("cold"), json!("disabled"), json!(1)),
+            ]
+        );
+        assert_eq!(response.body["ms"], GROUP_WAIT_S * 1000, "one wait");
+        assert_eq!(s.taken(), [0, 0]);
+        assert_eq!(s.started_pools(), ["vm", "big"]);
+        let started = s.recording.started.lock().unwrap().clone();
+        assert!(
+            started
+                .iter()
+                .all(|r| r.env.get("CIBURST_DISPATCH_URL").map(String::as_str)
+                    == Some("https://dispatch.example"))
+        );
+        let pools: Vec<String> = ledger.all().into_iter().map(|(pool, _)| pool).collect();
+        assert_eq!(pools, ["vm", "big"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_warm_start_answers_500() {
+        let records = Arc::new(MemoryPipelineRecords::new());
+        let s = warm_setup(
+            records_config(""),
+            vm_secrets(),
+            None,
+            Some(records.clone()),
+        )
+        .await;
+        s.recording.fail_starts([Error::provider("scaleway: 400")]);
+        let failed = s
+            .pipeline_at(9, "pending", &[build(1, "unit", "test")], T0)
+            .await;
+        assert_eq!(failed.status, 500);
+        assert_eq!(failed.body, json!({ "result": "error", "ms": 0 }));
+        assert!(s.lines().contains(
+            &r#"error start_failed pipeline="9" project="7" pool="vm" error="scaleway: 400" ms="0""#
+                .to_string()
+        ));
+
+        s.recording.fail_starts([Error::retryable("scaleway: 503")]);
+        let retried = s
+            .pipeline_at(10, "pending", &[build(2, "unit", "test")], T0)
+            .await;
+        assert_eq!(retried.body["pools"][0]["action"], "started");
+        assert_eq!(retried.body["ms"], 300);
+        assert_eq!(s.recording.start_calls(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pipeline_event_and_parallel_job_events_agree_on_one_vm() {
+        for (job_at, expected) in [(T0, "capacity"), (T0 + 1, "started")] {
+            let ledger = Arc::new(MemoryLedger::new());
+            let mut s = warm_setup(
+                records_config(""),
+                vm_secrets(),
+                Some(ledger.clone()),
+                Some(Arc::new(MemoryPipelineRecords::new())),
+            )
+            .await;
+            s.set_clock(T0);
+            s.dispatcher = s
+                .dispatcher
+                .with_group_wait(Duration::from_secs(GROUP_WAIT_S));
+            let builds = [build(2, "unit", "test"), build(3, "e2e", "test")];
+            let (warm, unit, e2e) = tokio::join!(
+                s.pipeline_at(9, "pending", &builds, T0),
+                s.job_at("unit", "test", 2, 9, job_at),
+                s.job_at("e2e", "test", 3, 9, job_at),
+            );
+            assert_eq!(warm.body["pools"][0]["action"], expected, "{job_at}");
+            let results = [unit.body["result"].clone(), e2e.body["result"].clone()];
+            let vms = s.vms().await;
+            assert_eq!(vms.len(), 1, "{job_at}: {results:?}");
+            if expected == "capacity" {
+                assert_eq!(
+                    results,
+                    [json!("started"), json!("grouped")],
+                    "jobs of the same second rank first"
+                );
+                assert_eq!((s.taken(), vms[0].free), (vec![2], 0));
+            } else {
+                assert_eq!(results, [json!("grouped"), json!("grouped")]);
+                assert_eq!(unit.body["leader"], W);
+                assert_eq!((s.taken(), vms[0].free), (vec![0], 2));
+            }
+            assert_eq!(ledger.all().len(), 3);
+        }
     }
 }

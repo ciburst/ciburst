@@ -154,10 +154,10 @@ pub async fn run_vm_provider_contract<F: VmProviderFactory>(factory: &F) {
     let other = config.pool_by_tag("other").expect("pool other").clone();
     assert_eq!(pool.slots, 3, "the contract pool has three slots");
 
-    // start: free = slots - taken, at least one taken, never below zero
+    // start: free = slots - taken, never below zero
     {
         let (_backend, provider) = provisioned(factory, &config).await;
-        for (taken, free) in [(2, 1), (0, 2), (1, 2), (3, 0), (5, 0)] {
+        for (taken, free) in [(2, 1), (1, 2), (3, 0), (5, 0)] {
             let run = provider.start(request(&pool, taken)).await.expect("start");
             assert!(!run.is_empty());
             let started = vm(&*provider, "vm", &run).await;

@@ -7,12 +7,13 @@ use ciburst_core::config::{Config, parse_config};
 use ciburst_core::dispatch::Dispatcher;
 use ciburst_core::fake::{FakeHost, FakeProvider};
 use ciburst_core::gitlab::Gitlab;
+use ciburst_core::ledger::{MemoryPipelineRecords, PipelineRecords};
 use ciburst_core::log::Log;
 use ciburst_core::plan::format_plan;
 use ciburst_core::plan::{GitlabOutputs, MemoryOutputs, OUTPUTS_SCOPE, OutputsStore};
 use ciburst_core::provision::{Provisioner, check, keys, secrets_from_outputs};
 use ciburst_core::store::MemoryStore;
-use ciburst_core::testing::gitlab_fake::{FAKE_TOKEN, FakeGitlab};
+use ciburst_core::testing::gitlab_fake::{FAKE_TOKEN, FakeBuild, FakeGitlab};
 use ciburst_core::types::{Action, Host, Outputs, Provider, Rotation, Step};
 use serde_json::json;
 
@@ -129,7 +130,7 @@ async fn plans_everything_applies_then_plans_nothing() {
         s.fake.hook_token(hooks[0].0).as_deref(),
         Some(values[keys::HOOK_TOKEN].as_str())
     );
-    assert_eq!(s.fake.hook_flags(hooks[0].0), Some((true, false)));
+    assert_eq!(s.fake.hook_flags(hooks[0].0), Some((true, false, true)));
 
     let second = s.provisioner.plan(&[]).await.unwrap();
     assert!(all(&second, Action::Noop), "{second:?}");
@@ -665,6 +666,152 @@ async fn a_disabled_hook_plans_the_re_enable_and_apply_enables_it() {
         ]
     );
     assert_eq!(s.fake.hook_alert(eight).unwrap().0, "executable");
+}
+
+#[tokio::test]
+async fn a_hook_without_pipeline_events_gets_them() {
+    let s = setup(config(&[7, 8]), true);
+    s.provisioner.apply(&[]).await.unwrap();
+    let hooks = s.fake.hooks();
+    let (seven, eight) = (hooks[0].0, hooks[1].0);
+    s.fake.clear_pipeline_events(seven);
+    let plan = s.provisioner.plan(&[]).await.unwrap();
+    let changed: Vec<Step> = plan.into_iter().filter(|step| !step.is_noop()).collect();
+    assert_eq!(
+        format_plan(&changed),
+        "update  gitlab hook in project 7  (pipeline events)"
+    );
+    let token = s.fake.hook_token(seven);
+    s.lines.lock().unwrap().clear();
+    s.provisioner.apply(&[]).await.unwrap();
+    assert_eq!(hook_lines(&s), [r#"info hook project="7""#]);
+    assert_eq!(s.fake.hook_flags(seven), Some((true, false, true)));
+    assert_eq!(s.fake.hook_token(seven), token, "the token stays");
+    assert!(
+        s.provisioner
+            .plan(&[])
+            .await
+            .unwrap()
+            .iter()
+            .all(Step::is_noop)
+    );
+
+    s.fake.clear_pipeline_events(seven);
+    s.fake.clear_pipeline_events(eight);
+    s.fake.disable_hook(eight, "disabled", None);
+    let details = |plan: Vec<Step>| -> Vec<(String, Option<String>)> {
+        plan.into_iter()
+            .filter(|step| step.id.starts_with("hook:"))
+            .map(|step| (step.id, step.detail))
+            .collect()
+    };
+    assert_eq!(
+        details(s.provisioner.plan(&[]).await.unwrap()),
+        [
+            ("hook:7".to_string(), Some("pipeline events".to_string())),
+            (
+                "hook:8".to_string(),
+                Some("pipeline events, re-enable: disabled until never".to_string())
+            ),
+        ]
+    );
+    assert_eq!(
+        details(s.provisioner.plan(&[Rotation::Hook]).await.unwrap())[1].1,
+        Some("new token, pipeline events, re-enable: disabled until never".to_string())
+    );
+    s.lines.lock().unwrap().clear();
+    s.provisioner.apply(&[]).await.unwrap();
+    assert_eq!(
+        hook_lines(&s),
+        [
+            r#"info hook project="7""#,
+            r#"info hook project="8""#,
+            r#"info hook_reenabled project="8""#,
+        ]
+    );
+    for hook in [seven, eight] {
+        assert_eq!(s.fake.hook_flags(hook), Some((true, false, true)));
+    }
+    assert_eq!(s.fake.hook_alert(eight).unwrap().0, "executable");
+}
+
+#[tokio::test]
+async fn the_hook_delivers_pipeline_events_that_warm_a_vm() {
+    let raw = json!({
+        "name": "demo",
+        "gitlab": { "url": "https://gitlab.example", "projectIds": [7] },
+        "host": { "type": "fake" },
+        "provider": { "type": "fake" },
+        "defaultPool": "vm",
+        "ignoreJobs": ["pages"],
+        "pools": [
+            { "tag": "vm", "image": "img/node", "runtime": "instances" },
+            { "tag": "node", "image": "img/node", "runtime": "jobs", "stages": ["lint"] }
+        ],
+        "cache": { "type": "s3" }
+    });
+    let s = setup(Arc::new(parse_config(&raw.to_string()).unwrap()), true);
+    s.provisioner.apply(&[]).await.unwrap();
+    let hook = s.fake.hooks()[0].0;
+    let secrets = secrets_from_outputs(&s.config, &s.outputs.read().await.unwrap());
+    let records = Arc::new(MemoryPipelineRecords::new());
+    let dispatcher = Dispatcher::new(
+        s.config.clone(),
+        s.provider.clone(),
+        Arc::new(secrets),
+        Log::silent(),
+    )
+    .with_records(Some(records.clone()));
+    let builds = [
+        FakeBuild::created(11, "eslint", "lint"),
+        FakeBuild::created(12, "image", "build"),
+        FakeBuild::created(13, "pages", "deploy"),
+        FakeBuild::manual(14, "release", "deploy"),
+        FakeBuild::created(15, "rollback", "deploy").with_when("on_failure"),
+        FakeBuild::created(16, "e2e", "test").with_status("pending"),
+    ];
+    let (headers, body) = s.fake.pipeline_hook(hook, 31, "pending", &builds).unwrap();
+    let event: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(event["object_kind"], "pipeline");
+    assert_eq!(event["project"]["id"], 7);
+    assert_eq!(
+        event["object_attributes"]["stages"],
+        json!(["lint", "build", "deploy", "test"])
+    );
+    assert_eq!(event["builds"][3]["when"], "manual");
+    assert!(event["builds"][0].get("tag_list").is_none(), "no tags");
+    assert!(headers.contains(&("X-Gitlab-Event".to_string(), "Pipeline Hook".to_string())));
+    let response = dispatcher
+        .handle_request("POST", "/", &headers, &body, 0)
+        .await;
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert_eq!(response.body["result"], "warm");
+    assert_eq!(response.body["pipeline"], 31);
+    assert_eq!(response.body["pools"][0]["action"], "started");
+    assert_eq!(response.body["pools"][0]["vmJobs"], 2);
+    let jobs = records.vm_jobs("31").await.unwrap().unwrap();
+    assert_eq!(jobs["vm"], ["12", "16"]);
+    let vms = s.provider.capacity("vm").await.unwrap().unwrap();
+    assert_eq!(vms.len(), 1);
+    assert_eq!(vms[0].free, 2, "the warm VM has every slot free");
+
+    let (headers, body) = s.fake.pipeline_hook(hook, 31, "running", &builds).unwrap();
+    let again = dispatcher
+        .handle_request("POST", "/", &headers, &body, 1)
+        .await;
+    assert_eq!(again.body["result"], "duplicate");
+    let (headers, body) = s.fake.pipeline_hook(hook, 31, "success", &builds).unwrap();
+    let closed = dispatcher
+        .handle_request("POST", "/", &headers, &body, 2)
+        .await;
+    assert_eq!(closed.body["result"], "closed");
+    assert_eq!(records.vm_jobs("31").await.unwrap(), None);
+
+    s.fake.clear_pipeline_events(hook);
+    assert!(
+        s.fake.pipeline_hook(hook, 32, "pending", &builds).is_none(),
+        "a hook without pipeline events gets none"
+    );
 }
 
 #[tokio::test]

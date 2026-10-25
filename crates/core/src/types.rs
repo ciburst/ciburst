@@ -186,8 +186,9 @@ pub struct StartRequest {
     pub pool: Pool,
     pub env: BTreeMap<String, String>,
     pub labels: BTreeMap<String, String>,
-    /// Slots of the new VM the dispatcher already assigned (M4 R6), at least 1; a VM provider
-    /// creates the VM with `free = slots - taken`. One-job runtimes ignore it.
+    /// Slots of the new VM the dispatcher already assigned (M4 R6), 0 for the warm VM of a
+    /// pipeline (M6.1 rule R4); a VM provider creates the VM with `free = slots - taken`.
+    /// One-job runtimes ignore it.
     pub taken: u32,
 }
 

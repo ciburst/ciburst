@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use crate::check::{Problem, Suggestion};
 #[cfg(feature = "pipeline")]
-use crate::check::{check_jobs, suggest_lanes};
+use crate::check::{check_jobs, suggest_ignore_jobs, suggest_lanes};
 use crate::config::{CacheType, Config, Pool};
 use crate::fake::Clock;
 use crate::gitlab::{DELIVERIES, Delivery, Gitlab, Hook, Job, REENABLE_TRIGGER};
@@ -176,6 +176,8 @@ pub struct ProjectReport {
     pub problems: Vec<Problem>,
     /// Lanes for the Docker-free jobs on VM pools (D46).
     pub suggestions: Vec<Suggestion>,
+    /// Jobs of other runners that `ignoreJobs` misses (M6.1 rule R8).
+    pub ignore: Vec<String>,
     /// The project's hook to the dispatcher; `None` when the dispatcher's URL is unknown or
     /// the project has no hook to it (D51).
     pub hook: Option<Hook>,
@@ -362,6 +364,9 @@ impl Provisioner {
                 if rotate {
                     changes.push("new token".to_string());
                 }
+                if !hook.pipeline_events {
+                    changes.push("pipeline events".to_string());
+                }
                 if !hook.is_executable() {
                     changes.push(format!("re-enable: {}", hook.disabled()));
                 }
@@ -475,8 +480,8 @@ impl Provisioner {
         Ok(())
     }
 
-    /// Creates missing hooks, gives existing ones a rotated token, and enables a disabled one
-    /// again with a test delivery (D51).
+    /// Creates missing hooks, gives existing ones a rotated token or the pipeline events they
+    /// lack (M6.1 rule R2), and enables a disabled one again with a test delivery (D51).
     async fn apply_hooks(&self, steps: &[Step], hook_token: &str, rotate: bool) -> Result<()> {
         let Some(gitlab) = &self.gitlab else {
             return Ok(());
@@ -499,7 +504,7 @@ impl Provisioner {
             let hooks = gitlab.list_hooks(project_id).await?;
             match hooks.iter().find(|h| h.url == url) {
                 Some(existing) => {
-                    if rotate {
+                    if rotate || !existing.pipeline_events {
                         gitlab
                             .update_hook(project_id, existing.id, &url, hook_token)
                             .await?;
@@ -866,7 +871,7 @@ pub async fn check(
             None => None,
         };
         let lint = gitlab.lint_jobs(project_id, content_ref).await?;
-        let (problems, suggestions) = if lint.valid {
+        let (problems, suggestions, ignore) = if lint.valid {
             let pipeline = match &lint.merged_yaml {
                 Some(text) => crate::pipeline::parse_merged_yaml(text)
                     .map_err(|error| Error::other(format!("project {project_id}: {error}")))?,
@@ -875,9 +880,10 @@ pub async fn check(
             (
                 check_jobs(config, &lint.jobs, &pipeline),
                 suggest_lanes(config, &lint.jobs, &pipeline),
+                suggest_ignore_jobs(config, &lint.jobs),
             )
         } else {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new())
         };
         report.push(ProjectReport {
             project_id,
@@ -885,6 +891,7 @@ pub async fn check(
             errors: lint.errors,
             problems,
             suggestions,
+            ignore,
             hook,
         });
     }
