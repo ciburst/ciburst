@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use ciburst::Env;
 use ciburst_core::Result;
 use ciburst_core::check::LintJob;
+use ciburst_core::gitlab::Gitlab;
 use ciburst_core::http::{Headers, HttpClient, Request, Response};
 use ciburst_core::log::Log;
 use ciburst_core::plan::OUTPUTS_SCOPE;
@@ -344,4 +345,49 @@ async fn a_missing_file_gives_the_pure_defaults() {
         run.out,
         "destroy removes every resource of ci-5; confirm with --yes ci-5\n"
     );
+}
+
+#[tokio::test]
+async fn the_check_job_reports_a_disabled_webhook() {
+    let dir = tempfile::tempdir().unwrap();
+    let absent = dir.path().join("absent.json").display().to_string();
+    let fake = Arc::new(FakeGitlab::new());
+    fake.set_jobs(
+        PROJECT,
+        vec![LintJob {
+            name: "unit".into(),
+            stage: Some("test".into()),
+            tag_list: vec!["vm".into()],
+        }],
+    );
+    let url = "https://dispatch.example.invalid/";
+    let gitlab = Gitlab::new("https://gitlab.example", FAKE_TOKEN, fake.clone());
+    let other = gitlab
+        .create_hook(PROJECT, "https://other.example.invalid/", "x")
+        .await
+        .unwrap();
+    fake.disable_hook(other.id, "disabled", None);
+    let hook = gitlab.create_hook(PROJECT, url, "t").await.unwrap();
+    fake.disable_hook(hook.id, "disabled", None);
+    let mut vars = job_vars("true");
+    let args = ["--config", &absent, "check"];
+    let run = ciburst(vars.clone(), fake.clone(), &args).await;
+    assert_eq!(run.code, 0, "no URL in the outputs: {}", run.out);
+
+    vars.insert(keys::DISPATCH_URL.to_string(), url.to_string());
+    let run = ciburst(vars.clone(), fake.clone(), &args).await;
+    assert_eq!(run.code, 1, "{}", run.out);
+    assert_eq!(
+        run.out,
+        concat!(
+            "project 5: webhook disabled until never: run ciburst-setup to enable it again\n",
+            "project 5: every job matches the stage map\n",
+        )
+    );
+    gitlab
+        .test_hook(PROJECT, hook.id, "push_events")
+        .await
+        .unwrap();
+    let run = ciburst(vars, fake.clone(), &args).await;
+    assert_eq!(run.code, 0, "{}", run.out);
 }

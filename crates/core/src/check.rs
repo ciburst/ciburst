@@ -42,7 +42,11 @@ pub struct Suggestion {
     pub tag: String,
     /// The jobs' image, variables expanded.
     pub image: String,
+    /// Job names and patterns for the lane's `jobs`.
     pub jobs: Vec<String>,
+    /// The jobs of the pipeline's YAML that need the lane's tag, a parallel or matrix job
+    /// once under its own name (M7 rule R7).
+    pub tagged: Vec<String>,
 }
 
 /// Compares the jobs of a linted pipeline with the routing of the config (D46): each job's
@@ -147,8 +151,15 @@ fn lane_problems(lane: &Pool, job: &JobSpec, pipeline: &Pipeline) -> Vec<String>
 
 /// D46: lanes for the Docker-free jobs routed to a VM pool, one per image in the order the
 /// jobs come. A job that carries only tags of no pool runs elsewhere on purpose; a job
-/// without an image, or with one that names an unknown variable, gets no lane.
+/// without an image, or with one that names an unknown variable, gets no lane. The copies of
+/// a parallel or matrix job share one pattern `<name>*` unless another job's name starts with
+/// `<name>` (M7 rule R7).
 pub fn suggest_lanes(config: &Config, jobs: &[LintJob], pipeline: &Pipeline) -> Vec<Suggestion> {
+    let names: Vec<&str> = jobs
+        .iter()
+        .map(|job| job.name.as_str())
+        .chain(pipeline.jobs.keys().map(String::as_str))
+        .collect();
     let mut suggestions: Vec<Suggestion> = Vec::new();
     for job in jobs.iter().filter(|job| !is_own_job(&job.name)) {
         let stage = job.stage.as_deref().unwrap_or(DEFAULT_STAGE);
@@ -169,8 +180,29 @@ pub fn suggest_lanes(config: &Config, jobs: &[LintJob], pipeline: &Pipeline) -> 
         if !spec.services.is_empty() || is_docker_image(&image) || docker_line(spec).is_some() {
             continue;
         }
+        let (pattern, tagged) = match pipeline.parallel_of(&job.name) {
+            Some(base) => {
+                let shared = names.iter().any(|other| {
+                    other.starts_with(base)
+                        && *other != base
+                        && pipeline.parallel_of(other) != Some(base)
+                });
+                let pattern = if shared {
+                    job.name.clone()
+                } else {
+                    format!("{base}*")
+                };
+                (pattern, base.to_string())
+            }
+            None => (job.name.clone(), job.name.clone()),
+        };
         if let Some(lane) = suggestions.iter_mut().find(|lane| lane.image == image) {
-            lane.jobs.push(job.name.clone());
+            if !lane.jobs.contains(&pattern) {
+                lane.jobs.push(pattern);
+            }
+            if !lane.tagged.contains(&tagged) {
+                lane.tagged.push(tagged);
+            }
             continue;
         }
         let base = lane_tag(&image);
@@ -186,7 +218,8 @@ pub fn suggest_lanes(config: &Config, jobs: &[LintJob], pipeline: &Pipeline) -> 
         suggestions.push(Suggestion {
             tag,
             image,
-            jobs: vec![job.name.clone()],
+            jobs: vec![pattern],
+            tagged: vec![tagged],
         });
     }
     suggestions
@@ -610,18 +643,74 @@ mod tests {
                     tag: "node-24-2".into(),
                     image: "node:24-bookworm-slim".into(),
                     jobs: vec!["eslint".into(), "vitest".into()],
+                    tagged: vec!["eslint".into(), "vitest".into()],
                 },
                 Suggestion {
                     tag: "rust-1".into(),
                     image: "rust:1.96.0-bookworm".into(),
                     jobs: vec!["cargo".into()],
+                    tagged: vec!["cargo".into()],
                 },
                 Suggestion {
                     tag: "rust-1-2".into(),
                     image: "rust:1.96.0-alpine".into(),
                     jobs: vec!["rust-alpine".into()],
+                    tagged: vec!["rust-alpine".into()],
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn parallel_and_matrix_jobs_get_one_pattern_and_one_tags_line() {
+        let pipeline = pipeline(json!({
+            "e2e": {
+                "image": "node:24-bookworm-slim",
+                "parallel": { "matrix": [{ "PLATFORM": ["android", "ios"] }] },
+                "script": ["npm run e2e"]
+            },
+            "unit": { "image": "node:24-bookworm-slim", "parallel": 3, "script": ["npm test"] },
+            "unit-smoke": { "image": "alpine:3.21", "script": ["true"] },
+            "lint": { "image": "node:24-bookworm-slim", "script": ["npm run lint"] }
+        }));
+        let jobs = [
+            job("e2e: [android]", Some("test"), &["vm"]),
+            job("e2e: [ios]", Some("test"), &["vm"]),
+            job("unit 1/3", Some("test"), &["vm"]),
+            job("unit 2/3", Some("test"), &["vm"]),
+            job("unit 3/3", Some("test"), &["vm"]),
+            job("unit-smoke", Some("test"), &["saas-linux-small-amd64"]),
+        ];
+        let suggestions = suggest_lanes(&lane_config(), &jobs, &pipeline);
+        assert_eq!(
+            suggestions,
+            [Suggestion {
+                tag: "node-24-2".into(),
+                image: "node:24-bookworm-slim".into(),
+                jobs: vec![
+                    "e2e*".into(),
+                    "unit 1/3".into(),
+                    "unit 2/3".into(),
+                    "unit 3/3".into()
+                ],
+                tagged: vec!["e2e".into(), "unit".into()],
+            }],
+            "unit-smoke starts with unit, so unit keeps its copies' names"
+        );
+        let mut config = lane_config();
+        config.pools[1].jobs = suggestions[0].jobs.clone();
+        for name in ["e2e: [android]", "e2e: [ios]", "unit 2/3"] {
+            assert_eq!(
+                config.pool_for(name, Some("test")).map(|p| p.tag.as_str()),
+                Some("node-24"),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            config
+                .pool_for("unit-smoke", Some("test"))
+                .map(|p| p.tag.as_str()),
+            Some("vm")
         );
     }
 }

@@ -8,8 +8,9 @@ use ciburst_core::dispatch::Dispatcher;
 use ciburst_core::fake::{FakeHost, FakeProvider};
 use ciburst_core::gitlab::Gitlab;
 use ciburst_core::log::Log;
+use ciburst_core::plan::format_plan;
 use ciburst_core::plan::{GitlabOutputs, MemoryOutputs, OUTPUTS_SCOPE, OutputsStore};
-use ciburst_core::provision::{Provisioner, keys, secrets_from_outputs};
+use ciburst_core::provision::{Provisioner, check, keys, secrets_from_outputs};
 use ciburst_core::store::MemoryStore;
 use ciburst_core::testing::gitlab_fake::{FAKE_TOKEN, FakeGitlab};
 use ciburst_core::types::{Action, Host, Outputs, Provider, Rotation, Step};
@@ -582,6 +583,202 @@ async fn checks_lane_jobs_and_suggests_lanes_from_the_merged_yaml() {
     assert_eq!(report[0].suggestions[0].tag, "alpine-3");
     assert_eq!(report[0].suggestions[0].jobs, ["unit"]);
     assert!(report[1].problems.is_empty() && report[1].suggestions.is_empty());
+}
+
+fn hook_lines(s: &Setup) -> Vec<String> {
+    s.lines
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.starts_with("info hook"))
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn a_disabled_hook_plans_the_re_enable_and_apply_enables_it() {
+    let s = setup(config(&[7, 8]), true);
+    s.provisioner.apply(&[]).await.unwrap();
+    let hooks = s.fake.hooks();
+    let (seven, eight) = (hooks[0].0, hooks[1].0);
+    assert_eq!((hooks[0].1, hooks[1].1), (7, 8));
+    s.fake.disable_hook(
+        seven,
+        "temporarily_disabled",
+        Some("2026-10-25T12:00:00.000Z"),
+    );
+
+    let plan = s.provisioner.plan(&[]).await.unwrap();
+    let changed: Vec<&Step> = plan.iter().filter(|step| !step.is_noop()).collect();
+    assert_eq!(changed.len(), 1, "{plan:?}");
+    assert_eq!(
+        format_plan(&changed.into_iter().cloned().collect::<Vec<_>>()),
+        "update  gitlab hook in project 7  (re-enable: temporarily_disabled until 2026-10-25T12:00:00Z)"
+    );
+    let token = s.fake.hook_token(seven);
+
+    s.lines.lock().unwrap().clear();
+    s.provisioner.apply(&[]).await.unwrap();
+    assert_eq!(hook_lines(&s), [r#"info hook_reenabled project="7""#]);
+    assert_eq!(
+        s.fake.hook_alert(seven),
+        Some(("executable".to_string(), None))
+    );
+    assert_eq!(s.fake.hook_token(seven), token, "the token stays");
+    let calls = s.fake.calls();
+    assert!(!calls.iter().any(|c| c.method == "PUT"));
+    assert!(
+        calls.iter().any(|c| c.method == "POST"
+            && c.path == format!("/projects/7/hooks/{seven}/test/push_events"))
+    );
+    assert!(
+        s.provisioner
+            .plan(&[])
+            .await
+            .unwrap()
+            .iter()
+            .all(Step::is_noop)
+    );
+
+    s.fake.disable_hook(eight, "disabled", None);
+    let plan = s.provisioner.plan(&[Rotation::Hook]).await.unwrap();
+    let details: Vec<(&str, Option<&str>)> = plan
+        .iter()
+        .filter(|step| step.id.starts_with("hook:"))
+        .map(|step| (step.id.as_str(), step.detail.as_deref()))
+        .collect();
+    assert_eq!(
+        details,
+        [
+            ("hook:7", Some("new token")),
+            ("hook:8", Some("new token, re-enable: disabled until never")),
+        ]
+    );
+    s.lines.lock().unwrap().clear();
+    s.provisioner.apply(&[Rotation::Hook]).await.unwrap();
+    assert_eq!(
+        hook_lines(&s),
+        [
+            r#"info hook project="7""#,
+            r#"info hook project="8""#,
+            r#"info hook_reenabled project="8""#,
+        ]
+    );
+    assert_eq!(s.fake.hook_alert(eight).unwrap().0, "executable");
+}
+
+#[tokio::test]
+async fn a_failed_test_delivery_fails_apply() {
+    let s = setup(config(&[7]), true);
+    s.provisioner.apply(&[]).await.unwrap();
+    let hook = s.fake.hooks()[0].0;
+    s.fake.disable_hook(hook, "disabled", None);
+    s.fake.fail_hook_tests();
+    let error = s.provisioner.apply(&[]).await.unwrap_err().to_string();
+    assert!(
+        error.contains("422")
+            && error.contains(&format!("/projects/7/hooks/{hook}/test/push_events")),
+        "{error}"
+    );
+    assert_eq!(s.fake.hook_alert(hook).unwrap().0, "disabled");
+    assert!(hook_lines(&s).iter().all(|l| !l.contains("hook_reenabled")));
+}
+
+#[tokio::test]
+async fn check_reports_the_hook_to_the_dispatcher() {
+    let s = setup(config(&[7, 8]), true);
+    s.provisioner.apply(&[]).await.unwrap();
+    let url = s.host.url().await.unwrap().unwrap();
+    let other = Gitlab::new(&s.config.gitlab.url, FAKE_TOKEN, s.fake.clone())
+        .create_hook(7, "https://other.example/", "x")
+        .await
+        .unwrap();
+    s.fake.disable_hook(other.id, "disabled", None);
+    let eight = s.fake.hooks()[1].0;
+    s.fake
+        .disable_hook(eight, "temporarily_disabled", Some("2026-10-25T13:00:00Z"));
+    let report = s.provisioner.check(None).await.unwrap();
+    let hooks: Vec<(u64, Option<String>)> = report
+        .iter()
+        .map(|r| {
+            (
+                r.project_id,
+                r.hook
+                    .as_ref()
+                    .filter(|h| h.url == url)
+                    .map(|h| h.disabled()),
+            )
+        })
+        .collect();
+    assert_eq!(
+        hooks,
+        [
+            (7, Some("executable until never".to_string())),
+            (
+                8,
+                Some("temporarily_disabled until 2026-10-25T13:00:00Z".to_string())
+            ),
+        ],
+        "another hook of the project is not ciburst's"
+    );
+    let report = check(
+        &s.config,
+        &Gitlab::new(&s.config.gitlab.url, FAKE_TOKEN, s.fake.clone()),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(report.iter().all(|r| r.hook.is_none()), "no URL, no hook");
+}
+
+#[tokio::test]
+async fn deliveries_come_from_the_hook_to_the_dispatcher() {
+    let s = setup(config(&[7, 8]), true);
+    assert!(
+        s.provisioner
+            .hook_deliveries(None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    s.provisioner.apply(&[]).await.unwrap();
+    let url = s.host.url().await.unwrap().unwrap();
+    let seven = s.fake.hooks()[0].0;
+    for id in 1..=25 {
+        s.fake.add_hook_event(
+            seven,
+            json!({
+                "id": id,
+                "created_at": "2026-10-25T12:00:00Z",
+                "request_data": { "object_kind": "build", "build_name": format!("unit {id}/25") },
+                "response_status": "200",
+                "response_body": json!({ "result": "started", "pool": "ci", "ms": id * 10 }).to_string(),
+            }),
+        );
+    }
+    let eight = s.fake.hooks()[1].0;
+    Gitlab::new(&s.config.gitlab.url, FAKE_TOKEN, s.fake.clone())
+        .delete_hook(8, eight)
+        .await
+        .unwrap();
+    let status = s.provisioner.hook_deliveries(Some(&url)).await.unwrap();
+    assert_eq!(status.len(), 2);
+    assert_eq!(status[0].hook.as_ref().map(|h| h.id), Some(seven));
+    let subjects: Vec<&str> = status[0]
+        .deliveries
+        .iter()
+        .map(|d| d.subject.as_str())
+        .collect();
+    assert_eq!(subjects.len(), 20);
+    assert_eq!(
+        (subjects[0], subjects[19]),
+        ("unit 6/25", "unit 25/25"),
+        "the 20 newest, oldest first"
+    );
+    assert_eq!(status[0].deliveries[19].ms, "250");
+    assert_eq!((status[1].project_id, &status[1].hook), (8, &None));
+    assert!(status[1].deliveries.is_empty());
 }
 
 #[tokio::test]

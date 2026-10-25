@@ -49,7 +49,42 @@ struct HookRecord {
     token: String,
     job_events: bool,
     push_events: bool,
+    alert_status: String,
+    disabled_until: Option<String>,
+    /// Deliveries, oldest first.
+    events: Vec<Value>,
 }
+
+impl HookRecord {
+    fn to_json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "url": self.url,
+            "project_id": self.project_id,
+            "job_events": self.job_events,
+            "push_events": self.push_events,
+            "enable_ssl_verification": true,
+            "alert_status": self.alert_status,
+            "disabled_until": self.disabled_until,
+        })
+    }
+}
+
+/// The `trigger` values of `POST /projects/:id/hooks/:hook_id/test/:trigger`.
+const HOOK_TRIGGERS: [&str; 12] = [
+    "push_events",
+    "tag_push_events",
+    "issues_events",
+    "confidential_issues_events",
+    "note_events",
+    "merge_requests_events",
+    "job_events",
+    "pipeline_events",
+    "wiki_page_events",
+    "releases_events",
+    "emoji_events",
+    "resource_access_token_events",
+];
 
 /// A project variable as the fake stores it, the value of a hidden one included.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +180,8 @@ struct Inner {
     variables: BTreeMap<u64, Vec<FakeVariable>>,
     pipeline_jobs: BTreeMap<u64, Vec<FakeJob>>,
     runner_creation_forbidden: bool,
+    /// Test deliveries fail, as when the dispatcher does not answer 2xx.
+    hook_tests_fail: bool,
 }
 
 /// In-memory GitLab with the endpoints ciburst uses, behind the [`HttpClient`] seam. It is as
@@ -290,6 +327,46 @@ impl FakeGitlab {
             .entry(project_id)
             .or_default()
             .push(job);
+    }
+
+    /// `alert_status` and `disabled_until` of a hook.
+    pub fn hook_alert(&self, hook_id: u64) -> Option<(String, Option<String>)> {
+        self.inner
+            .lock()
+            .expect("fake gitlab")
+            .hooks
+            .iter()
+            .find(|h| h.id == hook_id)
+            .map(|h| (h.alert_status.clone(), h.disabled_until.clone()))
+    }
+
+    /// Disables a hook as GitLab does after failed deliveries: `temporarily_disabled` with
+    /// the time it ends, or `disabled` without one.
+    pub fn disable_hook(&self, hook_id: u64, alert_status: &str, disabled_until: Option<&str>) {
+        let mut inner = self.inner.lock().expect("fake gitlab");
+        let hook = inner
+            .hooks
+            .iter_mut()
+            .find(|h| h.id == hook_id)
+            .expect("hook to disable");
+        hook.alert_status = alert_status.to_string();
+        hook.disabled_until = disabled_until.map(String::from);
+    }
+
+    /// Test deliveries fail from now on and leave the hook as it is.
+    pub fn fail_hook_tests(&self) {
+        self.inner.lock().expect("fake gitlab").hook_tests_fail = true;
+    }
+
+    /// Records a delivery of a hook; the events list shows it first.
+    pub fn add_hook_event(&self, hook_id: u64, event: Value) {
+        let mut inner = self.inner.lock().expect("fake gitlab");
+        let hook = inner
+            .hooks
+            .iter_mut()
+            .find(|h| h.id == hook_id)
+            .expect("hook of the event");
+        hook.events.push(event);
     }
 
     /// `POST /user/runners` answers 403, as for a token without `create_runner`.
@@ -606,24 +683,66 @@ impl FakeGitlab {
                     .hooks
                     .iter()
                     .filter(|h| h.project_id == project)
-                    .map(|h| json!({ "id": h.id, "url": h.url }))
+                    .map(HookRecord::to_json)
                     .collect();
                 json(200, Value::Array(list))
+            }
+            ("GET", ["projects", p, "hooks", h, "events"]) => {
+                let (project, hook_id) = (id(p).unwrap_or(0), id(h).unwrap_or(0));
+                match inner
+                    .hooks
+                    .iter()
+                    .find(|hook| hook.project_id == project && hook.id == hook_id)
+                {
+                    None => json(404, json!({ "message": "404 Not found" })),
+                    Some(hook) => {
+                        let newest_first = hook.events.iter().rev().cloned().collect();
+                        return paginate(&request.url, newest_first);
+                    }
+                }
+            }
+            ("POST", ["projects", p, "hooks", h, "test", trigger]) => {
+                let (project, hook_id) = (id(p).unwrap_or(0), id(h).unwrap_or(0));
+                let failing = inner.hook_tests_fail;
+                match inner
+                    .hooks
+                    .iter_mut()
+                    .find(|hook| hook.project_id == project && hook.id == hook_id)
+                {
+                    None => json(404, json!({ "message": "404 Not found" })),
+                    Some(_) if !HOOK_TRIGGERS.contains(trigger) => json(
+                        400,
+                        json!({ "error": "trigger does not have a valid value" }),
+                    ),
+                    Some(_) if failing => json(
+                        422,
+                        json!({ "message": "Hook execution failed: Failed to open TCP connection" }),
+                    ),
+                    Some(hook) => {
+                        hook.alert_status = "executable".to_string();
+                        hook.disabled_until = None;
+                        json(201, json!({ "message": "201 Created" }))
+                    }
+                }
             }
             ("POST", ["projects", p, "hooks"]) => {
                 let body = body.unwrap_or(Value::Null);
                 let hook_id = inner.next_id;
                 inner.next_id += 1;
-                inner.hooks.push(HookRecord {
+                let hook = HookRecord {
                     id: hook_id,
                     project_id: id(p).unwrap_or(0),
                     url: body["url"].as_str().unwrap_or("").to_string(),
                     token: body["token"].as_str().unwrap_or("").to_string(),
                     job_events: body["job_events"].as_bool().unwrap_or(false),
                     push_events: body["push_events"].as_bool().unwrap_or(true),
-                });
-                let url = body["url"].clone();
-                json(201, json!({ "id": hook_id, "url": url }))
+                    alert_status: "executable".to_string(),
+                    disabled_until: None,
+                    events: Vec::new(),
+                };
+                let created = hook.to_json();
+                inner.hooks.push(hook);
+                json(201, created)
             }
             ("PUT" | "DELETE", ["projects", p, "hooks", h]) => {
                 let project = id(p).unwrap_or(0);
@@ -645,8 +764,7 @@ impl FakeGitlab {
                         hook.token = body["token"].as_str().unwrap_or("").to_string();
                         hook.job_events = body["job_events"].as_bool().unwrap_or(false);
                         hook.push_events = body["push_events"].as_bool().unwrap_or(true);
-                        let url = hook.url.clone();
-                        json(200, json!({ "id": hook_id, "url": url }))
+                        json(200, hook.to_json())
                     }
                 }
             }
