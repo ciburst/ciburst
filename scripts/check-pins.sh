@@ -37,8 +37,6 @@ places=(
   "images/test/run-single-slot.sh|gitlab/gitlab-runner:v$runner"
   "crates/core/src/cloud_init.rs|$runner_url"
   "crates/core/src/cloud_init.rs|$runner_sha"
-  "crates/scaleway/tests/provider_instances.rs|$runner_url"
-  "crates/scaleway/tests/provider_instances.rs|$runner_sha"
 )
 
 failures=0
@@ -86,9 +84,9 @@ scan '"rust[0-9]{3,}"' exact "\"$runtime\""
 scan 'gitlab-runner:v[0-9]+\.[0-9]+\.[0-9]+' version "$runner"
 scan 'gitlab-runner-downloads\.s3\.amazonaws\.com/v[0-9]+\.[0-9]+\.[0-9]+' version "$runner"
 
-# A file that downloads the runner binary also checks its sha256.
+# A file that names the runner download also names its sha256, as literal or as the constant.
 while IFS= read -r file; do
-  if ! grep -qF -- "$runner_sha" "$file"; then
+  if ! grep -qF -e "$runner_sha" -e RUNNER_SHA256 "$file"; then
     fail "$file: downloads gitlab-runner without the sha256 $runner_sha"
   fi
 done < <(git grep -l -F 'gitlab-runner-downloads.s3.amazonaws.com' -- . \

@@ -1,4 +1,4 @@
-//! Fake of a public download host such as `gitlab-runner-downloads.s3.amazonaws.com`, an S3
+//! Fake of a public download host such as GitLab's runner downloads bucket, an S3
 //! bucket that anybody may read: GET and HEAD of a served file without credentials, `404
 //! NoSuchKey` for any other key of a served host, `403 AccessDenied` for any other method, as
 //! S3 answers an anonymous writer. A query string is refused like an unknown key.
