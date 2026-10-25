@@ -2,6 +2,8 @@
 # ciburst lane bootstrap (D45): a serverless run of a GitLab job's own image. Installs git, curl
 # and CA certificates when the image lacks them, fetches the pinned gitlab-runner from the
 # deployment's bucket, checks its SHA-256 and execs `run-single` with the shell executor.
+# Builds and cache live in /builds and /cache when the user may create them, else below $HOME,
+# else below /tmp; CIBURST_BUILDS_DIR and CIBURST_CACHE_DIR override each.
 # CIBURST_LANE_DRY_RUN=1 installs the tools, skips the download and prints the command with
 # secrets masked instead of running it.
 set -eu
@@ -13,6 +15,10 @@ fail() {
 
 have() {
   command -v "$1" > /dev/null 2>&1
+}
+
+writable_home() {
+  [ -n "${HOME:-}" ] && [ -d "$HOME" ] && [ -w "$HOME" ]
 }
 
 require() {
@@ -56,7 +62,12 @@ if [ -n "$missing" ]; then
 fi
 
 bin_dir=/usr/local/bin
-[ -d "$bin_dir" ] && [ -w "$bin_dir" ] || bin_dir="${HOME:-/tmp}/.ciburst/bin"
+if [ ! -d "$bin_dir" ] || [ ! -w "$bin_dir" ]; then
+  bin_dir=/tmp/.ciburst/bin
+  if writable_home; then
+    bin_dir="$HOME/.ciburst/bin"
+  fi
+fi
 mkdir -p "$bin_dir"
 runner="$bin_dir/gitlab-runner"
 if [ "${CIBURST_LANE_DRY_RUN:-0}" != "1" ]; then
@@ -79,13 +90,25 @@ case "$wait_timeout" in
   '' | *[!0-9]*) fail "RUNNER_WAIT_TIMEOUT must be a whole number of seconds" ;;
 esac
 
+# The runner creates both directories. /tmp is memory in Serverless Jobs, so it comes last.
+if [ "$(id -u)" = 0 ] || [ -w / ]; then
+  builds_dir=/builds
+  cache_dir=/cache
+elif writable_home; then
+  builds_dir="$HOME/builds"
+  cache_dir="$HOME/cache"
+else
+  builds_dir=/tmp/ciburst-builds
+  cache_dir=/tmp/ciburst-cache
+fi
+
 set -- "$runner" run-single \
   --url "$CI_SERVER_URL" \
   --token "$RUNNER_TOKEN" \
   --executor shell \
   --shell "$shell" \
-  --builds-dir "${CIBURST_BUILDS_DIR:-/builds}" \
-  --cache-dir "${CIBURST_CACHE_DIR:-/cache}" \
+  --builds-dir "${CIBURST_BUILDS_DIR:-$builds_dir}" \
+  --cache-dir "${CIBURST_CACHE_DIR:-$cache_dir}" \
   --max-builds 0 \
   --wait-timeout "$wait_timeout"
 

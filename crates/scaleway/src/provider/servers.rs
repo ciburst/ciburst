@@ -10,7 +10,9 @@ use ciburst_core::types::{Run, StartRequest, VmCapacity, VmReport};
 use ciburst_core::{Error, Result};
 use serde_json::{Value, json};
 
+use super::cloud_init::Download;
 use super::instance::{self, ApiError, DOCKER_IMAGE_LABEL, FALLBACK_IMAGE_LABEL, InstanceApi};
+use super::runner::runner_url;
 use super::vm;
 use super::{PROVIDER_NAME, Runtime, Scaleway, USER_DATA_KEY, cloud_init, iam, instance_types};
 
@@ -151,6 +153,22 @@ impl Scaleway {
             .ok_or_else(not_provisioned)?;
         let agent_url =
             cloud_init::agent_url(&self.config, self.client.region(), &project_id, &agent);
+        let runner_url = runner_url(
+            &self.config,
+            self.client.region(),
+            &project_id,
+            self.runner_sha256(),
+        );
+        let downloads = (
+            Download {
+                url: &runner_url,
+                sha256: self.runner_sha256(),
+            },
+            Download {
+                url: &agent_url,
+                sha256: &agent,
+            },
+        );
         let api = self.instances();
         let security_group = api
             .find_security_group(&project_id, &self.security_group_name())
@@ -220,14 +238,7 @@ impl Scaleway {
                 .map(String::from)
                 .ok_or_else(|| Error::provider("scaleway server: response without id"))?;
             match self
-                .boot(
-                    &api,
-                    &id,
-                    secret,
-                    &base,
-                    (&agent_url, &agent),
-                    install_docker,
-                )
+                .boot(&api, &id, secret, &base, downloads, install_docker)
                 .await
             {
                 Ok(Attempt::Started) => {
@@ -260,14 +271,14 @@ impl Scaleway {
     }
 
     /// User data, then power on. The VM gets its token, never the secret behind it, and the
-    /// agent's URL and SHA-256.
+    /// URLs and SHA-256 of runner and agent.
     async fn boot(
         &self,
         api: &InstanceApi<'_>,
         id: &str,
         secret: &str,
         base: &BTreeMap<String, String>,
-        (agent_url, agent_sha256): (&str, &str),
+        (runner, agent): (Download<'_>, Download<'_>),
         install_docker: bool,
     ) -> Result<Attempt> {
         let mut env = base.clone();
@@ -276,7 +287,7 @@ impl Scaleway {
             cloud_init::VM_TOKEN.to_string(),
             ciburst_core::vm::token(secret, id),
         );
-        let user_data = cloud_init::render(&env, agent_url, agent_sha256, install_docker)?;
+        let user_data = cloud_init::render(&env, runner, agent, install_docker)?;
         api.set_user_data(id, USER_DATA_KEY, &user_data).await?;
         match api.action(id, "poweron").await? {
             Ok(()) => Ok(Attempt::Started),
@@ -450,8 +461,9 @@ impl Scaleway {
             .await
     }
 
-    /// D38: the URL and SHA-256 of the agent in the cache bucket, which VMs of every provider
-    /// download without credentials, and with an S3 cache the bucket's location. No secret.
+    /// D38, M6 rule R6: the URL and SHA-256 of the agent and the URL of the runner in the cache
+    /// bucket, which VMs of every provider download without credentials, and with an S3 cache
+    /// the bucket's location. No secret.
     pub(super) async fn vm_shared_env(&self) -> Result<BTreeMap<String, String>> {
         let unusable = |reason: String| {
             Error::provider(format!("{PROVIDER_NAME}: shared environment: {reason}"))
@@ -471,6 +483,10 @@ impl Scaleway {
                 cloud_init::agent_url(&self.config, region, &project_id, &agent),
             ),
             (cloud_init::AGENT_SHA256_KEY.to_string(), agent),
+            (
+                cloud_init::RUNNER_URL_KEY.to_string(),
+                runner_url(&self.config, region, &project_id, self.runner_sha256()),
+            ),
         ]);
         if self.cache_on() {
             env.extend(cloud_init::cache_location(

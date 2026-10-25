@@ -16,7 +16,9 @@ use ciburst_scaleway::testing::s3_api::{FAKE_CLOCK, FAKE_PREFERRED_PROJECT};
 use ciburst_scaleway::testing::scaleway_fake::{
     FAKE_ACCESS_KEY, FAKE_REGION, FAKE_SECRET_KEY, ScalewayFake,
 };
-use ciburst_scaleway::testing::{agent_fixture, agent_fixture_sha256};
+use ciburst_scaleway::testing::{
+    RUNNER_FIXTURE_URL, agent_fixture, agent_fixture_sha256, runner_fixture_sha256,
+};
 use sha2::{Digest, Sha256};
 
 fn provider(backend: &Arc<ScalewayFake>, agent: Option<PathBuf>) -> Scaleway {
@@ -32,6 +34,17 @@ fn with_config(
     Scaleway::new(config, backend.client(), log)
         .with_s3_access_key(FAKE_ACCESS_KEY)
         .with_agent(agent)
+        .with_runner_source(RUNNER_FIXTURE_URL, runner_fixture_sha256())
+}
+
+/// The keys below `ciburst/agent/` in `bucket`, with their content.
+fn agents(backend: &ScalewayFake, bucket: &str) -> Vec<(String, Vec<u8>)> {
+    backend
+        .s3
+        .objects(bucket)
+        .into_iter()
+        .filter(|(key, _)| key.starts_with("ciburst/agent/"))
+        .collect()
 }
 
 fn step<'a>(steps: &'a [Step], id: &str) -> &'a Step {
@@ -76,7 +89,7 @@ async fn the_binary_is_uploaded_once_as_a_public_object() {
     let key = format!("ciburst/agent/{sha}");
     let fixture = std::fs::read(agent_fixture()).unwrap();
     assert_eq!(
-        backend.s3.objects(&bucket(&project_id)),
+        agents(&backend, &bucket(&project_id)),
         [(key.clone(), fixture.clone())]
     );
     assert_eq!(
@@ -249,13 +262,11 @@ async fn a_new_binary_is_a_new_object_and_without_one_the_newest_stays() {
     );
     let outputs = newer.apply(&steps).await.unwrap();
     assert_eq!(outputs["CIBURST_AGENT_SHA256"], second_sha);
-    let keys: Vec<String> = backend
-        .s3
-        .objects(&bucket)
-        .into_iter()
-        .map(|(k, _)| k)
-        .collect();
-    assert_eq!(keys.len(), 2, "the older agent stays for VMs that boot now");
+    assert_eq!(
+        agents(&backend, &bucket).len(),
+        2,
+        "the older agent stays for VMs that boot now"
+    );
 
     let (log, lines) = Log::memory();
     let without = with_config(contract_config(), &backend, None, log);

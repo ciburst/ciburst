@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use ciburst_core::Error;
+use ciburst_core::cloud_init::RUNNER_SHA256;
 use ciburst_core::composite::Composite;
 use ciburst_core::config::{CacheType, Config};
 use ciburst_core::http::HttpClient;
@@ -30,6 +31,7 @@ const CACHE_SECRET: &str = "cache-secret-key-value";
 const DISPATCH_URL: &str = "https://dispatch.example.invalid";
 const AGENT_SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const AGENT_URL: &str = "https://contract-cache-p-1.s3.example.invalid/ciburst/agent/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const RUNNER_URL: &str = "https://contract-cache-p-1.s3.example.invalid/ciburst/runner/bed4af01315780cf27d259b9d7a74d20cc0a6fc0d34c9952205b59c244639fd1";
 
 /// The contract config with both pools on Hetzner and an empty `providers.hetzner`.
 fn config(change: impl FnOnce(&mut Config)) -> Arc<Config> {
@@ -70,6 +72,7 @@ fn env() -> BTreeMap<String, String> {
         ("CIBURST_DISPATCH_URL", DISPATCH_URL),
         ("CIBURST_AGENT_URL", AGENT_URL),
         ("CIBURST_AGENT_SHA256", AGENT_SHA256),
+        ("CIBURST_RUNNER_URL", RUNNER_URL),
         ("CACHE_TYPE", "s3"),
         ("CACHE_S3_SERVER_ADDRESS", "s3.example.invalid"),
         ("CACHE_S3_BUCKET_NAME", "contract-cache-p-1"),
@@ -388,7 +391,14 @@ async fn start_creates_the_server_of_rule_r12_with_its_user_data() {
     let commands = runcmd(&user_data);
     assert_eq!(commands.len(), 4, "{commands:?}");
     assert!(commands[0].starts_with("test -f /swapfile || (fallocate -l 4G /swapfile"));
-    assert!(commands[1].starts_with("curl -fsSL -o /tmp/gitlab-runner "));
+    assert_eq!(
+        commands[1],
+        format!(
+            "curl -fsSL -o /tmp/gitlab-runner {RUNNER_URL} && echo \"{RUNNER_SHA256}  /tmp/gitlab-runner\" | sha256sum -c - && install -m 0755 /tmp/gitlab-runner /usr/local/bin/gitlab-runner && rm -f /tmp/gitlab-runner"
+        ),
+        "M6 rule R6: the runner of the cache bucket, checked against the pinned hash"
+    );
+    assert!(!user_data.contains(ciburst_core::cloud_init::RUNNER_URL));
     assert_eq!(
         commands[2],
         format!(
@@ -411,6 +421,7 @@ async fn start_creates_the_server_of_rule_r12_with_its_user_data() {
     assert!(!vm_env.contains_key("CIBURST_VM_SECRET"));
     assert!(!vm_env.contains_key("CIBURST_AGENT_URL"));
     assert!(!vm_env.contains_key("CIBURST_AGENT_SHA256"));
+    assert!(!vm_env.contains_key("CIBURST_RUNNER_URL"));
     assert!(
         logged
             .iter()
@@ -532,6 +543,7 @@ async fn start_refuses_what_a_vm_cannot_use_before_creating_anything() {
         "CIBURST_DISPATCH_URL",
         "CIBURST_AGENT_URL",
         "CIBURST_AGENT_SHA256",
+        "CIBURST_RUNNER_URL",
         "CACHE_TYPE",
         "CACHE_S3_SERVER_ADDRESS",
         "CACHE_S3_BUCKET_NAME",
@@ -573,6 +585,16 @@ async fn start_refuses_what_a_vm_cannot_use_before_creating_anything() {
     assert_eq!(
         error,
         "cloud-init: CIBURST_AGENT_SHA256 \"not-a-hash\" is not a SHA-256 in hex"
+    );
+    let mut start = request(&plain(), "ci");
+    start.env.insert(
+        "CIBURST_RUNNER_URL".into(),
+        "https://cache.example/runner;reboot".into(),
+    );
+    let error = provider.start(start).await.unwrap_err().to_string();
+    assert_eq!(
+        error,
+        "cloud-init: CIBURST_RUNNER_URL \"https://cache.example/runner;reboot\" is not an https URL"
     );
 
     let jobs = config(|c| c.pools[1].runtime = Some("jobs".into()));
@@ -1341,6 +1363,7 @@ impl Provider for Main {
         Ok([
             ("CIBURST_AGENT_URL", AGENT_URL),
             ("CIBURST_AGENT_SHA256", AGENT_SHA256),
+            ("CIBURST_RUNNER_URL", RUNNER_URL),
             ("CACHE_TYPE", "s3"),
             ("CACHE_S3_SERVER_ADDRESS", "s3.example.invalid"),
             ("CACHE_S3_BUCKET_NAME", "contract-cache-p-1"),
@@ -1383,6 +1406,7 @@ async fn the_composite_routes_steps_starts_and_run_ids_here() {
     for key in [
         "CIBURST_AGENT_URL",
         "CIBURST_AGENT_SHA256",
+        "CIBURST_RUNNER_URL",
         "CACHE_TYPE",
         "CACHE_S3_SERVER_ADDRESS",
         "CACHE_S3_BUCKET_NAME",
@@ -1395,6 +1419,7 @@ async fn the_composite_routes_steps_starts_and_run_ids_here() {
     assert!(run_id.starts_with("hetzner:contract-ci-"), "{run_id}");
     let user_data = fake.user_data(name_of(&run_id)).unwrap();
     assert!(user_data.contains(&format!("curl -fsSL -o /tmp/ciburst-vm-agent {AGENT_URL} ")));
+    assert!(user_data.contains(&format!("curl -fsSL -o /tmp/gitlab-runner {RUNNER_URL} ")));
     let vm_env = vm_env(&user_data);
     assert_eq!(vm_env["CACHE_S3_BUCKET_NAME"], "contract-cache-p-1");
     assert_eq!(

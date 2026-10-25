@@ -1,5 +1,5 @@
 //! The `instances` runtime against the VM provider contract, on the fake Instance API with the
-//! agent fixture in the fake cache bucket.
+//! agent and runner fixtures in the fake cache bucket.
 
 use std::sync::Arc;
 
@@ -9,8 +9,8 @@ use ciburst_core::log::Log;
 use ciburst_core::testing::vm_contract::{VmProviderFactory, run_vm_provider_contract};
 use ciburst_core::types::Provider;
 use ciburst_scaleway::provider::Scaleway;
-use ciburst_scaleway::testing::agent_fixture;
 use ciburst_scaleway::testing::scaleway_fake::{FAKE_ACCESS_KEY, ScalewayFake};
+use ciburst_scaleway::testing::{RUNNER_FIXTURE_URL, agent_fixture, runner_fixture_sha256};
 
 struct Instances;
 
@@ -31,7 +31,8 @@ impl VmProviderFactory for Instances {
         Arc::new(
             Scaleway::new(config, backend.client(), Log::silent())
                 .with_s3_access_key(FAKE_ACCESS_KEY)
-                .with_agent(Some(agent_fixture())),
+                .with_agent(Some(agent_fixture()))
+                .with_runner_source(RUNNER_FIXTURE_URL, runner_fixture_sha256()),
         )
     }
 

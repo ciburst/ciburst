@@ -1,13 +1,17 @@
 //! Serverless Jobs `serverless-jobs/v1alpha1`: job definitions per pool, runs, start and stop.
+//! A definition is a lane (D45, M6 rule R5): the pool's image runs `lane-bootstrap.sh`, which
+//! its environment carries, and fetches the runner from the cache bucket.
 
 use std::collections::BTreeMap;
 
 use ciburst_core::config::{CacheType, Config, Pool};
+use ciburst_core::lane;
 use ciburst_core::provision::keys;
 use ciburst_core::types::{Action, Run, RunState, StartRequest};
 use ciburst_core::{Error, Result};
 use serde_json::{Value, json};
 
+use super::runner::runner_url;
 use super::{PROVIDER_NAME, Scaleway, list_all, s3};
 use crate::client::ScalewayClient;
 
@@ -38,13 +42,33 @@ pub fn bucket_name(config: &Config, project_id: &str) -> String {
     format!("{}-cache-{project_id}", config.name)
 }
 
-pub fn definition_env(config: &Config, pool: &Pool, region: &str, project_id: &str) -> Value {
+/// The definition's environment: pool, GitLab, wait timeout, the bootstrap with the runner it
+/// downloads and checks (M6 rule R5), and the cache location with an S3 cache.
+pub fn definition_env(
+    config: &Config,
+    pool: &Pool,
+    region: &str,
+    project_id: &str,
+    runner_sha256: &str,
+) -> Value {
     let mut env = BTreeMap::from([
         ("CIBURST_POOL".to_string(), pool.tag.clone()),
         ("CI_SERVER_URL".to_string(), config.gitlab.url.clone()),
         (
             "RUNNER_WAIT_TIMEOUT".to_string(),
             pool.wait_timeout_s.to_string(),
+        ),
+        (
+            lane::SCRIPT_KEY.to_string(),
+            s3::base64(lane::BOOTSTRAP.as_bytes()),
+        ),
+        (
+            lane::RUNNER_URL_KEY.to_string(),
+            runner_url(config, region, project_id, runner_sha256),
+        ),
+        (
+            lane::RUNNER_SHA256_KEY.to_string(),
+            runner_sha256.to_string(),
         ),
     ]);
     if config.cache.kind == CacheType::S3 {
@@ -61,17 +85,24 @@ pub fn definition_env(config: &Config, pool: &Pool, region: &str, project_id: &s
     json!(env)
 }
 
-/// The full definition body for create and update.
-pub fn desired_definition(config: &Config, pool: &Pool, region: &str, project_id: &str) -> Value {
+/// The full definition body for create and update: the lane's image with
+/// [`lane::COMMAND`], which runs the bootstrap of its environment.
+pub fn desired_definition(
+    config: &Config,
+    pool: &Pool,
+    region: &str,
+    project_id: &str,
+    runner_sha256: &str,
+) -> Value {
     json!({
         "name": format!("{}-{}", config.name, pool.tag),
         "cpu_limit": pool.vcpu * 1000,
         "memory_limit": pool.memory_mib,
         "local_storage_capacity": pool.storage_mib,
         "image_uri": pool.image,
-        "command": "",
+        "command": lane::COMMAND,
         "project_id": project_id,
-        "environment_variables": definition_env(config, pool, region, project_id),
+        "environment_variables": definition_env(config, pool, region, project_id, runner_sha256),
         "description": format!("ciburst pool {}", pool.tag),
         "job_timeout": format!("{}s", pool.timeout_s),
     })
@@ -263,7 +294,13 @@ impl Scaleway {
             .config
             .pool_by_tag(tag)
             .ok_or_else(|| Error::provider(format!("{PROVIDER_NAME}: unknown pool {tag}")))?;
-        let body = desired_definition(&self.config, pool, self.client.region(), project_id);
+        let body = desired_definition(
+            &self.config,
+            pool,
+            self.client.region(),
+            project_id,
+            self.runner_sha256(),
+        );
         match (existing, existing_id) {
             (Some(current), Some(id)) => {
                 if !differences(&body, &current).is_empty() {
@@ -383,22 +420,34 @@ mod tests {
         assert!(labels_from_env(&Value::Null).is_empty());
     }
 
+    const SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
     #[test]
-    fn builds_the_definition_of_rule_four() {
+    fn builds_the_lane_definition_of_rule_r5() {
         let config = contract_config();
         let pool = &config.pools[0];
-        let body = desired_definition(&config, pool, "fr-par", "p-1");
+        let body = desired_definition(&config, pool, "fr-par", "p-1", SHA);
         assert_eq!(body["name"], "contract-ci");
         assert_eq!(body["cpu_limit"], 2000);
         assert_eq!(body["memory_limit"], 4096);
         assert_eq!(body["local_storage_capacity"], 10240);
         assert_eq!(body["job_timeout"], "3600s");
+        assert_eq!(body["image_uri"], "example.invalid/node:24");
+        assert_eq!(body["command"], lane::COMMAND);
+        let env = &body["environment_variables"];
+        let script = env["CIBURST_LANE"].as_str().unwrap();
+        let decoded = crate::testing::s3_api::base64_decode(script).unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), lane::BOOTSTRAP);
+        let mut rest = env.clone();
+        rest.as_object_mut().unwrap().remove("CIBURST_LANE");
         assert_eq!(
-            body["environment_variables"],
+            rest,
             json!({
                 "CIBURST_POOL": "ci",
                 "CI_SERVER_URL": "https://gitlab.example",
                 "RUNNER_WAIT_TIMEOUT": "60",
+                "CIBURST_RUNNER_URL": format!("https://contract-cache-p-1.s3.fr-par.scw.cloud/ciburst/runner/{SHA}"),
+                "CIBURST_RUNNER_SHA256": SHA,
                 "CACHE_TYPE": "s3",
                 "CACHE_S3_SERVER_ADDRESS": "s3.fr-par.scw.cloud",
                 "CACHE_S3_BUCKET_NAME": "contract-cache-p-1",
@@ -408,10 +457,50 @@ mod tests {
         );
         let mut actual = body.clone();
         actual["job_timeout"] = json!("3600.000000000s");
-        actual["command"] = Value::Null;
         assert!(differences(&body, &actual).is_empty());
         actual["cpu_limit"] = json!(4000);
         actual["job_timeout"] = json!("60s");
         assert_eq!(differences(&body, &actual), ["cpu_limit", "job_timeout"]);
+    }
+
+    #[test]
+    fn a_definition_without_the_lane_drifts_in_command_and_environment() {
+        let config = contract_config();
+        let pool = &config.pools[0];
+        let body = desired_definition(&config, pool, "fr-par", "p-1", SHA);
+        let mut before = body.clone();
+        before["command"] = Value::Null;
+        for key in [
+            "CIBURST_LANE",
+            "CIBURST_RUNNER_URL",
+            "CIBURST_RUNNER_SHA256",
+        ] {
+            before["environment_variables"]
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+        }
+        assert_eq!(
+            differences(&body, &before),
+            ["command", "environment_variables"]
+        );
+        for (key, value) in [
+            ("CIBURST_LANE", "IyEvYmluL3NoCg=="),
+            ("CIBURST_RUNNER_URL", "https://other.example/gitlab-runner"),
+            ("CIBURST_RUNNER_SHA256", &"f".repeat(64)),
+        ] {
+            let mut changed = body.clone();
+            changed["environment_variables"][key] = json!(value);
+            assert_eq!(
+                differences(&body, &changed),
+                ["environment_variables"],
+                "{key}"
+            );
+        }
+        let newer = desired_definition(&config, pool, "fr-par", "p-1", &"e".repeat(64));
+        assert_eq!(differences(&newer, &body), ["environment_variables"]);
+        let mut image = body.clone();
+        image["image_uri"] = json!("example.invalid/node:22");
+        assert_eq!(differences(&body, &image), ["image_uri"]);
     }
 }

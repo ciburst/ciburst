@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::cloud_init::{AGENT_SHA256_KEY, AGENT_URL_KEY, DISPATCH_URL};
+use crate::cloud_init::{AGENT_SHA256_KEY, AGENT_URL_KEY, DISPATCH_URL, RUNNER_URL_KEY};
 use crate::config::{Config, Pool, parse_config};
 use crate::provision::keys;
 use crate::types::{Provider, StartRequest, VmCapacity, VmReport, VmState};
@@ -58,7 +58,7 @@ pub trait VmProviderFactory: Send + Sync {
 }
 
 /// Everything a VM start of any provider reads from the request: runner token, VM secret,
-/// dispatcher URL, the agent of D38 and the S3 cache.
+/// dispatcher URL, the agent of D38, the runner object of M6 rule R6 and the S3 cache.
 pub fn start_env() -> BTreeMap<String, String> {
     [
         ("RUNNER_TOKEN", "glrt-vm-contract"),
@@ -69,6 +69,10 @@ pub fn start_env() -> BTreeMap<String, String> {
             "https://vmcontract-cache.s3.example.invalid/ciburst/agent/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         ),
         (AGENT_SHA256_KEY, AGENT),
+        (
+            RUNNER_URL_KEY,
+            "https://vmcontract-cache.s3.example.invalid/ciburst/runner/bed4af01315780cf27d259b9d7a74d20cc0a6fc0d34c9952205b59c244639fd1",
+        ),
         ("CACHE_TYPE", "s3"),
         ("CACHE_S3_SERVER_ADDRESS", "s3.example.invalid"),
         ("CACHE_S3_BUCKET_NAME", "vmcontract-cache"),

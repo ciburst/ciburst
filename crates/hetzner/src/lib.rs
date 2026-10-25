@@ -16,7 +16,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ciburst_core::cloud_init::{AGENT_SHA256_KEY, AGENT_URL_KEY, DISPATCH_URL, RUN_ID, VM_TOKEN};
+use ciburst_core::cloud_init::{
+    AGENT_SHA256_KEY, AGENT_URL_KEY, DISPATCH_URL, Download, RUN_ID, RUNNER_SHA256, RUNNER_URL_KEY,
+    VM_TOKEN,
+};
 use ciburst_core::config::{CacheType, Config, Pool};
 use ciburst_core::http::HttpClient;
 use ciburst_core::log::Log;
@@ -66,10 +69,14 @@ const CACHE_KEYS: [&str; 6] = [
 ];
 const CACHE_SHARED: &str = "CACHE_SHARED";
 
-/// Where a VM downloads the agent and the SHA-256 cloud-init checks it against.
-struct Agent {
-    url: String,
-    sha256: String,
+/// What a new VM is built from: `vm.env` without run id and token, the VM secret, and where
+/// it downloads runner and agent (D38, M6 rule R6).
+struct Base {
+    env: BTreeMap<String, String>,
+    secret: String,
+    runner_url: String,
+    agent_url: String,
+    agent_sha256: String,
 }
 
 /// The settings of `providers.hetzner`.
@@ -492,14 +499,11 @@ impl Hetzner {
         }
     }
 
-    /// `vm.env` of a new VM without its run id and token, the VM secret, and the agent's URL
-    /// and SHA-256 (D38, from the main provider's `shared_env`). Fails before anything is
-    /// created when the request lacks a value, naming the key.
-    fn base_env(
-        &self,
-        pool: &Pool,
-        request: &BTreeMap<String, String>,
-    ) -> Result<(BTreeMap<String, String>, String, Agent)> {
+    /// `vm.env` of a new VM without its run id and token, the VM secret, the agent's URL and
+    /// SHA-256 and the runner's URL (D38, M6 rule R6, from the main provider's `shared_env`;
+    /// the runner's SHA-256 is the pinned `cloud_init::RUNNER_SHA256`). Fails before anything
+    /// is created when the request lacks a value, naming the key.
+    fn base_env(&self, pool: &Pool, request: &BTreeMap<String, String>) -> Result<Base> {
         let required = |key: &str| {
             request
                 .get(key)
@@ -512,10 +516,9 @@ impl Hetzner {
         let runner_token = required("RUNNER_TOKEN")?;
         let secret = required(keys::VM_SECRET)?;
         let dispatch_url = required(DISPATCH_URL)?;
-        let agent = Agent {
-            url: required(AGENT_URL_KEY)?,
-            sha256: required(AGENT_SHA256_KEY)?,
-        };
+        let agent_url = required(AGENT_URL_KEY)?;
+        let agent_sha256 = required(AGENT_SHA256_KEY)?;
+        let runner_url = required(RUNNER_URL_KEY)?;
         let mut env = BTreeMap::from([
             (DISPATCH_URL.to_string(), dispatch_url),
             ("CI_SERVER_URL".to_string(), self.config.gitlab.url.clone()),
@@ -539,7 +542,13 @@ impl Hetzner {
                 env.insert(CACHE_SHARED.to_string(), shared.clone());
             }
         }
-        Ok((env, secret, agent))
+        Ok(Base {
+            env,
+            secret,
+            runner_url,
+            agent_url,
+            agent_sha256,
+        })
     }
 
     /// Rule R12: the first server type with capacity runs the VM; the name is chosen first, so
@@ -554,7 +563,13 @@ impl Hetzner {
             .position(|p| p.tag == *tag)
             .unwrap_or_default();
         let settings = self.checked(&[(index, pool)])?;
-        let (mut env, secret, agent) = self.base_env(pool, &request.env)?;
+        let Base {
+            mut env,
+            secret,
+            runner_url,
+            agent_url,
+            agent_sha256,
+        } = self.base_env(pool, &request.env)?;
         let not_provisioned =
             || Error::provider(format!("{RUNTIME}: pool {tag} is not provisioned"));
         let firewall = self.find_firewall().await?.ok_or_else(not_provisioned)?;
@@ -568,7 +583,18 @@ impl Hetzner {
             VM_TOKEN.to_string(),
             ciburst_core::vm::token(&secret, &run_id),
         );
-        let user_data = ciburst_core::cloud_init::render(&env, &agent.url, &agent.sha256, false)?;
+        let user_data = ciburst_core::cloud_init::render(
+            &env,
+            Download {
+                url: &runner_url,
+                sha256: RUNNER_SHA256,
+            },
+            Download {
+                url: &agent_url,
+                sha256: &agent_sha256,
+            },
+            false,
+        )?;
         if user_data.len() > MAX_USER_DATA {
             return Err(Error::provider(format!(
                 "{RUNTIME}: pool {tag}: user data is {} bytes, the API takes at most {MAX_USER_DATA}",

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 
@@ -9,6 +11,8 @@ pub struct Request {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Option<Vec<u8>>,
+    /// Replaces the client's timeout, for the transfer of a large file.
+    pub timeout: Option<Duration>,
 }
 
 impl Request {
@@ -18,11 +22,19 @@ impl Request {
             url: url.into(),
             headers: Vec::new(),
             body: None,
+            timeout: None,
         }
     }
 
     pub fn header(mut self, name: &str, value: impl Into<String>) -> Request {
         self.headers.push((name.to_string(), value.into()));
+        self
+    }
+
+    /// A timeout of its own instead of the client's, from connecting until the response body
+    /// has arrived.
+    pub fn timeout(mut self, timeout: Duration) -> Request {
+        self.timeout = Some(timeout);
         self
     }
 
@@ -126,6 +138,9 @@ impl HttpClient for ReqwestClient {
         }
         if let Some(body) = request.body {
             builder = builder.body(body);
+        }
+        if let Some(timeout) = request.timeout {
+            builder = builder.timeout(timeout);
         }
         let response = builder
             .send()

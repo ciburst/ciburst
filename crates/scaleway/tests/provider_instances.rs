@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use ciburst_core::cloud_init::RUNNER_SHA256;
 use ciburst_core::config::Config;
 use ciburst_core::log::Log;
 use ciburst_core::testing::contract::contract_config;
@@ -16,7 +17,9 @@ use ciburst_core::vm::{
 use ciburst_scaleway::provider::Scaleway;
 use ciburst_scaleway::testing::instance_api::FAKE_CLOCK;
 use ciburst_scaleway::testing::scaleway_fake::{FAKE_ACCESS_KEY, ScalewayFake};
-use ciburst_scaleway::testing::{agent_fixture, agent_fixture_sha256};
+use ciburst_scaleway::testing::{
+    RUNNER_FIXTURE_URL, agent_fixture, agent_fixture_sha256, runner_fixture_sha256,
+};
 use serde_json::{Value, json};
 use yaml_rust2::{Yaml, YamlLoader};
 
@@ -41,6 +44,7 @@ fn provider(config: Arc<Config>, backend: &Arc<ScalewayFake>, log: Log) -> Scale
     Scaleway::new(config, backend.client(), log)
         .with_s3_access_key(FAKE_ACCESS_KEY)
         .with_agent(Some(agent_fixture()))
+        .with_runner_source(RUNNER_FIXTURE_URL, runner_fixture_sha256())
 }
 
 async fn provisioned(config: Arc<Config>, log: Log) -> (Arc<ScalewayFake>, Scaleway, String) {
@@ -151,16 +155,25 @@ async fn first_plan_lists_the_agent_and_security_group_and_no_job_definition() {
             ("key:dispatch".to_string(), Action::Create),
             ("key:cache".to_string(), Action::Create),
             ("bucket".to_string(), Action::Create),
+            ("runner-binary".to_string(), Action::Create),
             ("vm:agent".to_string(), Action::Create),
             ("vm:security-group".to_string(), Action::Create),
         ]
     );
     assert_eq!(
         steps[4].resource,
+        format!("gitlab-runner ciburst/runner/{}", runner_fixture_sha256())
+    );
+    assert_eq!(
+        steps[4].detail.as_deref(),
+        Some(format!("copy of {RUNNER_FIXTURE_URL}, public-read").as_str())
+    );
+    assert_eq!(
+        steps[5].resource,
         format!("vm agent ciburst/agent/{}", agent_fixture_sha256())
     );
-    assert_eq!(steps[4].detail.as_deref(), Some("upload, public-read"));
-    assert_eq!(steps[5].resource, "security group contract-vm");
+    assert_eq!(steps[5].detail.as_deref(), Some("upload, public-read"));
+    assert_eq!(steps[6].resource, "security group contract-vm");
     assert!(backend.writes().is_empty(), "plan writes nothing");
 
     provider.apply(&steps).await.unwrap();
@@ -315,15 +328,15 @@ async fn start_creates_the_server_of_rule_four_then_user_data_then_poweron() {
     assert_eq!(commands.len(), 4, "{commands:?}");
     assert!(commands[0].starts_with("test -f /swapfile || (fallocate -l 4G /swapfile"));
     let commands = &commands[1..];
-    assert!(commands[0].starts_with(
-        "curl -fsSL -o /tmp/gitlab-runner https://gitlab-runner-downloads.s3.amazonaws.com/v18.11.4/binaries/gitlab-runner-linux-amd64 && "
-    ));
-    assert!(commands[0].contains(
-        "echo \"bed4af01315780cf27d259b9d7a74d20cc0a6fc0d34c9952205b59c244639fd1  /tmp/gitlab-runner\" | sha256sum -c -"
-    ));
-    assert!(
-        commands[0].contains("install -m 0755 /tmp/gitlab-runner /usr/local/bin/gitlab-runner")
+    let runner = runner_fixture_sha256();
+    assert_eq!(
+        commands[0],
+        format!(
+            "curl -fsSL -o /tmp/gitlab-runner https://{bucket}.s3.fr-par.scw.cloud/ciburst/runner/{runner} && echo \"{runner}  /tmp/gitlab-runner\" | sha256sum -c - && install -m 0755 /tmp/gitlab-runner /usr/local/bin/gitlab-runner && rm -f /tmp/gitlab-runner"
+        ),
+        "M6 rule R6: the runner object of the cache bucket"
     );
+    assert!(!user_data.contains("gitlab-runner-downloads"));
     let sha = agent_fixture_sha256();
     assert_eq!(
         commands[1],
@@ -560,6 +573,9 @@ async fn the_dispatcher_starts_vms_on_the_agent_of_its_environment_without_a_reg
         "https://contract-cache-{project_id}.s3.fr-par.scw.cloud/ciburst/agent/{sha} "
     )));
     assert!(user_data.contains(&format!("echo \"{sha}  /tmp/ciburst-vm-agent\"")));
+    assert!(user_data.contains(&format!(
+        "curl -fsSL -o /tmp/gitlab-runner https://contract-cache-{project_id}.s3.fr-par.scw.cloud/ciburst/runner/{RUNNER_SHA256} && echo \"{RUNNER_SHA256}  /tmp/gitlab-runner\""
+    )));
     let s3_calls = backend.s3.calls().len();
     dispatcher.start(request(&plain(), "ci")).await.unwrap();
     assert_eq!(
@@ -1086,7 +1102,8 @@ async fn plan_warns_when_the_zone_has_no_quota_for_the_pool_types() {
 async fn plan_warns_and_preflight_fails_without_an_agent() {
     let backend = Arc::new(ScalewayFake::new());
     let (log, lines) = Log::memory();
-    let without = Scaleway::new(plain(), backend.client(), log);
+    let without = Scaleway::new(plain(), backend.client(), log)
+        .with_runner_source(RUNNER_FIXTURE_URL, runner_fixture_sha256());
     let steps = without.plan(&[]).await.unwrap();
     let step = steps.iter().find(|s| s.id == "vm:agent").unwrap();
     assert_eq!(step.action, Action::Create);

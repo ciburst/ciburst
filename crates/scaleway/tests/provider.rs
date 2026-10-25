@@ -15,6 +15,7 @@ use ciburst_scaleway::provider::s3::{S3, lifecycle_xml};
 use ciburst_scaleway::testing::scaleway_fake::{
     FAKE_ACCESS_KEY, FAKE_REGION, FAKE_SECRET_KEY, ScalewayFake,
 };
+use ciburst_scaleway::testing::{RUNNER_FIXTURE_URL, runner_fixture_sha256};
 use serde_json::json;
 
 struct Factory;
@@ -44,7 +45,9 @@ fn jobs(config: Arc<Config>) -> Arc<Config> {
 }
 
 fn provider(config: Arc<Config>, backend: &Arc<ScalewayFake>, log: Log) -> Scaleway {
-    Scaleway::new(jobs(config), backend.client(), log).with_s3_access_key(FAKE_ACCESS_KEY)
+    Scaleway::new(jobs(config), backend.client(), log)
+        .with_s3_access_key(FAKE_ACCESS_KEY)
+        .with_runner_source(RUNNER_FIXTURE_URL, runner_fixture_sha256())
 }
 
 fn with_credentials(
@@ -55,6 +58,7 @@ fn with_credentials(
 ) -> Scaleway {
     let client = ScalewayClient::new(backend.clone(), credentials, FAKE_REGION);
     Scaleway::new(jobs(config), Arc::new(client), log)
+        .with_runner_source(RUNNER_FIXTURE_URL, runner_fixture_sha256())
 }
 
 fn cache_off() -> Arc<Config> {
@@ -115,11 +119,16 @@ async fn first_plan_lists_every_resource_in_order() {
             ("key:dispatch".to_string(), Action::Create),
             ("key:cache".to_string(), Action::Create),
             ("bucket".to_string(), Action::Create),
+            ("runner-binary".to_string(), Action::Create),
             ("definition:ci".to_string(), Action::Create),
             ("definition:build".to_string(), Action::Create),
         ]
     );
     assert!(backend.writes().is_empty(), "plan writes nothing");
+    assert!(
+        backend.downloads.calls().is_empty(),
+        "plan downloads nothing"
+    );
 }
 
 #[tokio::test]
