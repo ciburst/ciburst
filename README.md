@@ -27,6 +27,7 @@ Status: pre-release. `ciburst/ciburst` stays private until v1.0.0; the component
 - Lane speed: a Rust compile at 2 vCPU takes as long as on GitLab's small hosted runner, at 4 vCPU about half as long; a TypeScript check is within 12 %.
 - The first setup takes 6 to 15 hosted-runner minutes while Scaleway compiles the dispatcher; later setups take under a minute.
 - `linux/amd64` only. Optional: Hetzner CX33 VMs at about half the price (`docs/RUNBOOK.md`, Hetzner).
+- A job cache over 5 GiB is not saved (Scaleway's S3 copy limit); the job still passes and logs `Failed to create cache`.
 
 Compared per job-minute for a small runner (providers' price pages, 2026-10-25, 1 EUR = 1.1193 USD; sources in `docs/SPEC.md` section 15):
 
