@@ -6,12 +6,16 @@ use rand::Rng;
 use rand::distr::Alphanumeric;
 use serde_json::{Value, json};
 
-use crate::check::{Problem, check_jobs};
+use crate::check::{Problem, Suggestion};
+#[cfg(feature = "pipeline")]
+use crate::check::{check_jobs, suggest_lanes};
 use crate::config::{CacheType, Config, Pool};
 use crate::fake::Clock;
 use crate::gitlab::{Gitlab, Job};
 use crate::http::{HttpClient, Request};
 use crate::log::Log;
+#[cfg(feature = "pipeline")]
+use crate::pipeline::Pipeline;
 use crate::plan::OutputsStore;
 use crate::time::parse_rfc3339;
 use crate::types::{Action, Host, KeyPair, Outputs, Provider, Rotation, Run, Secrets, Step};
@@ -19,6 +23,9 @@ use crate::{Error, Result};
 
 /// Pending jobs younger than this still have their own webhook on the way (spec D41).
 pub const REPLAY_MIN_AGE_S: u64 = 60;
+
+/// Detail of a runner step that only replaces the runner's tags (D47).
+const RETAG: &str = "set tags ";
 
 /// Output keys: `.local/outputs.env`, or project variables in pipeline mode.
 pub mod keys {
@@ -167,6 +174,8 @@ pub struct ProjectReport {
     pub valid: bool,
     pub errors: Vec<String>,
     pub problems: Vec<Problem>,
+    /// Lanes for the Docker-free jobs on VM pools (D46).
+    pub suggestions: Vec<Suggestion>,
 }
 
 /// Orchestrates provider, GitLab and host steps. GitLab is optional for plan and apply.
@@ -235,19 +244,30 @@ impl Provisioner {
         let mut steps = Vec::new();
         for pool in &self.config.pools {
             let description = self.runner_description(pool);
-            let existing = runners.iter().any(|r| r.description == description);
+            let existing = runners.iter().find(|r| r.description == description);
             let has_token = current.contains_key(&keys::runner_token(&pool.tag));
             let mut step = Step::new(
                 format!("runner:{}", pool.tag),
                 Action::Create,
                 format!("gitlab runner {description}"),
             );
-            if existing && rotate {
+            if existing.is_some() && rotate {
                 step.action = Action::Update;
                 step.detail = Some("delete and recreate, new token".into());
-            } else if existing && has_token {
-                step.action = Action::Noop;
-            } else if existing {
+            } else if let Some(runner) = existing
+                && has_token
+            {
+                let wanted = self.config.runner_tags(pool);
+                let tagged = gitlab.runner(runner.id).await?.tag_list;
+                let same =
+                    wanted.len() == tagged.len() && wanted.iter().all(|t| tagged.contains(t));
+                if same {
+                    step.action = Action::Noop;
+                } else {
+                    step.action = Action::Update;
+                    step.detail = Some(format!("{RETAG}{}", wanted.join(", ")));
+                }
+            } else if existing.is_some() {
                 step.action = Action::Update;
                 step.detail = Some("token missing in outputs, delete and recreate".into());
             }
@@ -365,12 +385,26 @@ impl Provisioner {
                 continue;
             }
             let description = self.runner_description(pool);
-            if let Some(existing) = runners.iter().find(|r| r.description == description) {
+            let tags = self.config.runner_tags(pool);
+            let existing = runners.iter().find(|r| r.description == description);
+            if let Some(existing) = existing
+                && step.detail.as_deref().is_some_and(|d| d.starts_with(RETAG))
+            {
+                gitlab.update_runner_tags(existing.id, &tags).await?;
+                self.log.info(
+                    "runner_tags",
+                    &[
+                        ("pool", &pool.tag),
+                        ("id", &existing.id.to_string()),
+                        ("tags", &tags.join(",")),
+                    ],
+                );
+                continue;
+            }
+            if let Some(existing) = existing {
                 gitlab.delete_runner(existing.id).await?;
             }
-            let runner = gitlab
-                .create_runner(primary, &pool.tag, &description)
-                .await?;
+            let runner = gitlab.create_runner(primary, &tags, &description).await?;
             created.insert(keys::runner_id(&pool.tag), runner.id.to_string());
             created.insert(keys::runner_token(&pool.tag), runner.token.clone());
             for &project_id in self.other_projects() {
@@ -737,6 +771,7 @@ impl Provisioner {
     }
 
     /// See [`check`].
+    #[cfg(feature = "pipeline")]
     pub async fn check(&self, content_ref: Option<&str>) -> Result<Vec<ProjectReport>> {
         let gitlab = self
             .gitlab
@@ -746,8 +781,10 @@ impl Provisioner {
     }
 }
 
-/// Lints every project's pipeline at `content_ref` (the default branch when `None`) and
-/// compares its jobs with the stage map. Needs only the config and GitLab.
+/// Lints every project's pipeline at `content_ref` (the default branch when `None`), compares
+/// its jobs with the routing of the config and proposes lanes (D46). Needs only the config and
+/// GitLab.
+#[cfg(feature = "pipeline")]
 pub async fn check(
     config: &Config,
     gitlab: &Gitlab,
@@ -756,16 +793,25 @@ pub async fn check(
     let mut report = Vec::new();
     for &project_id in &config.gitlab.project_ids {
         let lint = gitlab.lint_jobs(project_id, content_ref).await?;
-        let problems = if lint.valid {
-            check_jobs(config, &lint.jobs)
+        let (problems, suggestions) = if lint.valid {
+            let pipeline = match &lint.merged_yaml {
+                Some(text) => crate::pipeline::parse_merged_yaml(text)
+                    .map_err(|error| Error::other(format!("project {project_id}: {error}")))?,
+                None => Pipeline::default(),
+            };
+            (
+                check_jobs(config, &lint.jobs, &pipeline),
+                suggest_lanes(config, &lint.jobs, &pipeline),
+            )
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         report.push(ProjectReport {
             project_id,
             valid: lint.valid,
             errors: lint.errors,
             problems,
+            suggestions,
         });
     }
     Ok(report)

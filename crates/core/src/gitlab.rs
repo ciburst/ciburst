@@ -39,6 +39,9 @@ pub struct Lint {
     pub errors: Vec<String>,
     #[serde(default)]
     pub jobs: Vec<LintJob>,
+    /// The configuration with its includes merged, as YAML.
+    #[serde(default)]
+    pub merged_yaml: Option<String>,
 }
 
 /// A project CI/CD variable as GitLab lists it.
@@ -222,13 +225,13 @@ impl Gitlab {
     pub async fn create_runner(
         &self,
         project_id: u64,
-        tag: &str,
+        tags: &[String],
         description: &str,
     ) -> Result<CreatedRunner> {
         let body = json!({
             "runner_type": "project_type",
             "project_id": project_id,
-            "tag_list": [tag],
+            "tag_list": tags,
             "run_untagged": false,
             "description": description,
         });
@@ -263,6 +266,23 @@ impl Gitlab {
         )
         .await?;
         Ok(())
+    }
+
+    /// A runner with its tags, which list responses omit.
+    pub async fn runner(&self, runner_id: u64) -> Result<Runner> {
+        self.get(&format!("/runners/{runner_id}"), &[]).await
+    }
+
+    /// Replaces the runner's tags (D47).
+    pub async fn update_runner_tags(&self, runner_id: u64, tags: &[String]) -> Result<Runner> {
+        self.call(
+            "PUT",
+            &format!("/runners/{runner_id}"),
+            &[],
+            Some(json!({ "tag_list": tags })),
+        )
+        .await?
+        .json()
     }
 
     pub async fn delete_runner(&self, runner_id: u64) -> Result<()> {
@@ -319,9 +339,12 @@ impl Gitlab {
     }
 
     /// Lints the pipeline at `content_ref` (branch, tag or commit), the default branch when
-    /// `None`.
+    /// `None`, with its jobs and merged YAML.
     pub async fn lint_jobs(&self, project_id: u64, content_ref: Option<&str>) -> Result<Lint> {
-        let mut query = vec![("include_jobs", "true".to_string())];
+        let mut query = vec![
+            ("include_jobs", "true".to_string()),
+            ("include_merged_yaml", "true".to_string()),
+        ];
         if let Some(content_ref) = content_ref {
             query.push(("content_ref", content_ref.to_string()));
         }
@@ -674,7 +697,7 @@ mod tests {
         let fake = Arc::new(FakeGitlab::new());
         fake.forbid_runner_creation();
         let error = client(&fake)
-            .create_runner(7, "vm", "demo-vm")
+            .create_runner(7, &["vm".into()], "demo-vm")
             .await
             .unwrap_err();
         assert!(matches!(error, Error::Gitlab { status: 403, .. }));
@@ -690,7 +713,10 @@ mod tests {
     async fn runners_round_trip() {
         let fake = Arc::new(FakeGitlab::new());
         let gitlab = client(&fake);
-        let created = gitlab.create_runner(7, "ci", "demo-ci").await.unwrap();
+        let created = gitlab
+            .create_runner(7, &["ci".into()], "demo-ci")
+            .await
+            .unwrap();
         assert!(created.token.starts_with("glrt-"));
         let listed = gitlab.list_runners(7).await.unwrap();
         assert_eq!(listed.len(), 1);
@@ -721,6 +747,64 @@ mod tests {
                 "run_untagged": false, "description": "demo-ci"
             })
         );
+    }
+
+    #[tokio::test]
+    async fn runner_tags_are_read_and_replaced_as_gitlab_does() {
+        let fake = Arc::new(FakeGitlab::new());
+        let gitlab = client(&fake);
+        let tags = |list: &[&str]| -> Vec<String> { list.iter().map(|t| t.to_string()).collect() };
+        let created = gitlab
+            .create_runner(7, &tags(&["vm", "node-24"]), "demo-vm")
+            .await
+            .unwrap();
+        let runner = gitlab.runner(created.id).await.unwrap();
+        assert_eq!(runner.description, "demo-vm");
+        assert_eq!(runner.tag_list, ["vm", "node-24"]);
+        assert_eq!(
+            gitlab
+                .list_runners_tagged(7, "node-24")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let updated = gitlab
+            .update_runner_tags(created.id, &tags(&["vm", "node-24", "rust-1"]))
+            .await
+            .unwrap();
+        assert_eq!(updated.tag_list, ["vm", "node-24", "rust-1"]);
+        assert_eq!(
+            gitlab.runner(created.id).await.unwrap().tag_list,
+            ["vm", "node-24", "rust-1"]
+        );
+        let put = fake
+            .calls()
+            .into_iter()
+            .find(|c| c.method == "PUT")
+            .unwrap();
+        assert_eq!(put.path, format!("/runners/{}", created.id));
+        assert_eq!(
+            put.body.unwrap(),
+            json!({ "tag_list": ["vm", "node-24", "rust-1"] })
+        );
+
+        assert_eq!(status_of(gitlab.runner(99).await), 404);
+        assert_eq!(
+            status_of(gitlab.update_runner_tags(99, &tags(&["vm"])).await),
+            404
+        );
+        assert_eq!(
+            status_of(gitlab.update_runner_tags(created.id, &[]).await),
+            400,
+            "a runner that takes no untagged jobs needs a tag"
+        );
+        assert_eq!(
+            status_of(gitlab.create_runner(7, &[], "demo-none").await),
+            400
+        );
+        assert_eq!(gitlab.runner(created.id).await.unwrap().tag_list.len(), 3);
     }
 
     #[tokio::test]
@@ -757,10 +841,16 @@ mod tests {
             }],
         );
         fake.set_lint_errors(8, vec!["invalid yaml".into()]);
+        fake.set_merged_yaml(7, "unit:\n  script: [true]\n");
         let gitlab = client(&fake);
         let ok = gitlab.lint_jobs(7, None).await.unwrap();
         assert!(ok.valid);
         assert_eq!(ok.jobs.len(), 1);
+        assert_eq!(ok.merged_yaml.as_deref(), Some("unit:\n  script: [true]\n"));
+        assert_eq!(
+            fake.calls()[0].query,
+            "include_jobs=true&include_merged_yaml=true"
+        );
         fake.set_jobs_at(7, "drill", Vec::new());
         assert!(
             gitlab

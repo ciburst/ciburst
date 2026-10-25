@@ -11,7 +11,7 @@ name = "ciburst"
 path = "src/main.rs"
 
 [dependencies]
-ciburst-core = { path = "../core", version = "0.1.0" }
+ciburst-core = { path = "../core", version = "0.1.0", features = ["pipeline"] }
 ciburst-hetzner = { path = "../hetzner", version = "0.1.0" }
 ciburst-scaleway = { path = "../scaleway", version = "0.1.0" }
 clap.workspace = true
@@ -20,5 +20,5 @@ tokio.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
-ciburst-core = { path = "../core", version = "0.1.0", features = ["testing"] }
+ciburst-core = { path = "../core", version = "0.1.0", features = ["pipeline", "testing"] }
 tempfile.workspace = true

@@ -18,10 +18,12 @@ pub const DEFAULT_SLOTS: u32 = 2;
 
 /// The runtime of VM pools on the main provider.
 pub const INSTANCES_RUNTIME: &str = "instances";
+/// The runtime of serverless lanes on the main provider (D45).
+pub const JOBS_RUNTIME: &str = "jobs";
 
 /// Names a key of `providers` must not take: runtimes of the main provider and step id
 /// prefixes, which the composite routes by (M5 rule R7).
-pub const RESERVED_RUNTIMES: [&str; 15] = [
+pub const RESERVED_RUNTIMES: [&str; 16] = [
     "instances",
     "jobs",
     "vm",
@@ -34,6 +36,7 @@ pub const RESERVED_RUNTIMES: [&str; 15] = [
     "hook",
     "runner",
     "runner-enable",
+    "runner-binary",
     "function",
     "namespace",
     "cron",
@@ -208,19 +211,61 @@ impl Config {
         pool.runtime.as_deref() == Some(INSTANCES_RUNTIME) || self.extra_provider_of(pool).is_some()
     }
 
+    /// Whether `pool` is a serverless lane: runtime `jobs` (D45).
+    pub fn is_lane(&self, pool: &Pool) -> bool {
+        pool.runtime.as_deref() == Some(JOBS_RUNTIME)
+    }
+
     pub fn pool_by_tag(&self, tag: &str) -> Option<&Pool> {
         self.pools.iter().find(|pool| pool.tag == tag)
     }
 
-    /// The pool a stage is mapped to, else the default pool, else none.
-    pub fn pool_for_stage(&self, stage: Option<&str>) -> Option<&Pool> {
-        stage
-            .and_then(|s| {
+    /// D46: the first pool in config order with a `jobs` pattern matching the job name, else
+    /// the pool its stage is mapped to, else the default pool, else none.
+    pub fn pool_for(&self, name: &str, stage: Option<&str>) -> Option<&Pool> {
+        self.pool_by_name(name)
+            .or_else(|| {
+                let stage = stage?;
                 self.pools
                     .iter()
-                    .find(|pool| pool.stages.iter().any(|x| x == s))
+                    .find(|pool| pool.stages.iter().any(|s| s == stage))
             })
             .or_else(|| self.default_pool())
+    }
+
+    /// The first pool in config order with a `jobs` pattern matching `name` (D46).
+    pub fn pool_by_name(&self, name: &str) -> Option<&Pool> {
+        self.pools
+            .iter()
+            .find(|pool| pool.jobs.iter().any(|pattern| glob_match(pattern, name)))
+    }
+
+    /// D47: the VM pool whose free slots a pending job of `lane` claims before a lane run
+    /// starts: the default pool when it is a VM pool, else the first VM pool. None for a pool
+    /// that is no lane and for a lane with `vmFirst: false`.
+    pub fn vm_first_pool(&self, lane: &Pool) -> Option<&Pool> {
+        if !self.is_lane(lane) || lane.vm_first == Some(false) {
+            return None;
+        }
+        self.default_pool()
+            .filter(|pool| self.is_vm_pool(pool))
+            .or_else(|| self.pools.iter().find(|pool| self.is_vm_pool(pool)))
+    }
+
+    /// D47: the tags of a pool's GitLab runner. Its own tag, and on the VM pool that lanes
+    /// claim slots of, the tag of every lane with `vmFirst` in config order.
+    pub fn runner_tags(&self, pool: &Pool) -> Vec<String> {
+        std::iter::once(pool.tag.clone())
+            .chain(
+                self.pools
+                    .iter()
+                    .filter(|lane| {
+                        self.vm_first_pool(lane)
+                            .is_some_and(|vm| vm.tag == pool.tag)
+                    })
+                    .map(|lane| lane.tag.clone()),
+            )
+            .collect()
     }
 
     /// The added provider a pool belongs to, `None` for the main provider.
@@ -306,6 +351,7 @@ pub fn validate(mut config: Config) -> Result<Config> {
     } else {
         let mut tags = BTreeSet::new();
         let mut stage_owner: BTreeMap<&str, &str> = BTreeMap::new();
+        let mut pattern_owner: BTreeMap<&str, &str> = BTreeMap::new();
         for (index, pool) in config.pools.iter().enumerate() {
             let where_ = format!("pools[{index}]");
             if !valid_tag(&pool.tag) {
@@ -342,6 +388,25 @@ pub fn validate(mut config: Config) -> Result<Config> {
                     stage_owner.insert(stage.as_str(), pool.tag.as_str());
                 }
             }
+            for pattern in &pool.jobs {
+                if pattern.is_empty() {
+                    errors.push(format!("{where_}.jobs: empty pattern"));
+                } else if let Some(owner) = pattern_owner.get(pattern.as_str()) {
+                    if *owner != pool.tag {
+                        errors.push(format!(
+                            "{where_}.jobs: {pattern} is in pool {owner} and pool {}",
+                            pool.tag
+                        ));
+                    }
+                } else {
+                    pattern_owner.insert(pattern.as_str(), pool.tag.as_str());
+                }
+            }
+            if pool.vm_first.is_some() && !config.is_lane(pool) {
+                errors.push(format!(
+                    "{where_}.vmFirst: lanes only (runtime {JOBS_RUNTIME})"
+                ));
+            }
         }
         if let Some(default) = &config.default_pool
             && !tags.contains(default.as_str())
@@ -363,15 +428,8 @@ pub fn validate(mut config: Config) -> Result<Config> {
     if config.cache.expire_days == 0 {
         errors.push("cache.expireDays: positive integer".to_string());
     }
-    if config.cache.kind != CacheType::S3 {
-        for (index, pool) in config.pools.iter().enumerate() {
-            if config.is_vm_pool(pool) {
-                errors.push(format!(
-                    "pools[{index}]: VM pool {} needs cache.type s3",
-                    pool.tag
-                ));
-            }
-        }
+    if config.cache.kind != CacheType::S3 && !config.pools.is_empty() {
+        errors.push("cache.type: s3 required; the runner object lives in the bucket".to_string());
     }
 
     if errors.is_empty() {
@@ -405,6 +463,37 @@ pub fn check_capabilities(
         }
     }
     errors
+}
+
+/// D46: whether `name` matches `pattern`, where `*` matches any run of characters, `?` one
+/// character and every other character itself.
+pub fn glob_match(pattern: &str, name: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    let (mut p, mut n) = (0, 0);
+    // The last `*` and the name position it matched up to; a mismatch retries one further.
+    let mut star: Option<(usize, usize)> = None;
+    while n < name.len() {
+        match pattern.get(p) {
+            Some('*') => {
+                star = Some((p, n));
+                p += 1;
+            }
+            Some(&c) if c == '?' || c == name[n] => {
+                p += 1;
+                n += 1;
+            }
+            _ => match star {
+                Some((star_p, star_n)) => {
+                    star = Some((star_p, star_n + 1));
+                    p = star_p + 1;
+                    n = star_n + 1;
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern[p..].iter().all(|&c| c == '*')
 }
 
 fn valid_name(name: &str) -> bool {
@@ -457,7 +546,8 @@ mod tests {
             "pools": [
                 { "tag": "ci", "image": "img/node", "stages": ["test"] },
                 { "tag": "build", "image": "img/kaniko", "stages": ["build"], "vcpu": 4 }
-            ]
+            ],
+            "cache": { "type": "s3" }
         })
     }
 
@@ -475,7 +565,15 @@ mod tests {
         assert_eq!(config.pools[0].vcpu, DEFAULT_VCPU);
         assert_eq!(config.pools[0].max_runs, DEFAULT_MAX_RUNS);
         assert_eq!(config.pools[1].vcpu, 4);
-        assert_eq!(config.cache, CacheConfig::default());
+        assert_eq!(
+            config.cache,
+            CacheConfig {
+                kind: CacheType::S3,
+                expire_days: DEFAULT_EXPIRE_DAYS
+            }
+        );
+        assert!(config.pools[0].jobs.is_empty());
+        assert_eq!(config.pools[0].vm_first, None);
         assert_eq!(config.provider.extra["region"], "fr-par");
     }
 
@@ -532,7 +630,7 @@ mod tests {
     #[test]
     fn routes_stages_with_default_fallback() {
         let config = parse_config(&valid().to_string()).unwrap();
-        let tag = |stage| config.pool_for_stage(stage).map(|p| p.tag.as_str());
+        let tag = |stage| config.pool_for("unit", stage).map(|p| p.tag.as_str());
         assert_eq!(tag(Some("build")), Some("build"));
         assert_eq!(tag(Some("test")), Some("ci"));
         assert_eq!(tag(Some("deploy")), Some("ci"));
@@ -544,12 +642,200 @@ mod tests {
         let mut raw = valid();
         raw.as_object_mut().unwrap().remove("defaultPool");
         let config = parse_config(&raw.to_string()).unwrap();
-        assert_eq!(config.pool_for_stage(Some("deploy")), None);
-        assert_eq!(config.pool_for_stage(None), None);
+        assert_eq!(config.pool_for("unit", Some("deploy")), None);
+        assert_eq!(config.pool_for("unit", None), None);
         assert_eq!(
-            config.pool_for_stage(Some("build")).map(|p| p.tag.as_str()),
+            config
+                .pool_for("unit", Some("build"))
+                .map(|p| p.tag.as_str()),
             Some("build")
         );
+    }
+
+    fn lanes() -> Value {
+        let mut raw = valid();
+        raw["pools"] = serde_json::json!([
+            { "tag": "vm", "image": "ubuntu:24.04", "runtime": "instances", "stages": ["test"] },
+            { "tag": "node-24", "image": "node:24-bookworm-slim", "runtime": "jobs",
+              "jobs": ["lint", "unit-*"], "stages": ["build"] },
+            { "tag": "rust-1", "image": "rust:1.96.0-bookworm", "runtime": "jobs",
+              "jobs": ["unit-rust", "clippy?"], "vmFirst": false },
+            { "tag": "ts-5", "image": "node:24-bookworm-slim", "runtime": "jobs", "jobs": ["*-ts"] }
+        ]);
+        raw["defaultPool"] = "vm".into();
+        raw
+    }
+
+    #[test]
+    fn job_names_route_before_stages_in_config_order() {
+        let config = parse_config(&lanes().to_string()).unwrap();
+        let tag = |name, stage| config.pool_for(name, stage).map(|p| p.tag.as_str());
+        assert_eq!(
+            tag("lint", Some("test")),
+            Some("node-24"),
+            "name before stage"
+        );
+        assert_eq!(
+            tag("unit-rust", None),
+            Some("node-24"),
+            "first pool in order"
+        );
+        assert_eq!(tag("unit-", None), Some("node-24"), "* matches nothing too");
+        assert_eq!(tag("clippy1", Some("test")), Some("rust-1"));
+        assert_eq!(
+            tag("clippy", Some("test")),
+            Some("vm"),
+            "? is one character"
+        );
+        assert_eq!(tag("clippy12", Some("test")), Some("vm"));
+        assert_eq!(tag("check-ts", Some("build")), Some("ts-5"));
+        assert_eq!(tag("Lint", Some("build")), Some("node-24"), "stage map");
+        assert_eq!(tag("deploy", Some("deploy")), Some("vm"), "default pool");
+        assert_eq!(config.pool_by_name("deploy"), None);
+    }
+
+    #[test]
+    fn glob_patterns_know_star_and_question_mark_only() {
+        let cases = [
+            ("*", "", true),
+            ("*", "anything at all", true),
+            ("?", "", false),
+            ("?", "x", true),
+            ("??", "x", false),
+            ("a*b*c", "abc", true),
+            ("a*b*c", "a-b-b-c", true),
+            ("a*b*c", "a-b-b-cd", false),
+            ("*b", "abab", true),
+            ("*ab", "aab", true),
+            ("test:*", "test: [node, 24]", true),
+            ("unit ?/3", "unit 2/3", true),
+            ("[ab]", "a", false),
+            ("[ab]", "[ab]", true),
+            ("a.c", "abc", false),
+            ("ä?", "äö", true),
+            ("lint", "lint ", false),
+            ("**x", "x", true),
+        ];
+        for (pattern, name, expected) in cases {
+            assert_eq!(glob_match(pattern, name), expected, "{pattern} {name}");
+        }
+    }
+
+    #[test]
+    fn lanes_claim_slots_of_the_default_vm_pool_else_the_first() {
+        let config = parse_config(&lanes().to_string()).unwrap();
+        let first = |tag: &str| {
+            config
+                .vm_first_pool(config.pool_by_tag(tag).unwrap())
+                .map(|p| p.tag.as_str())
+        };
+        assert_eq!(first("node-24"), Some("vm"));
+        assert_eq!(first("rust-1"), None, "vmFirst false");
+        assert_eq!(first("ts-5"), Some("vm"));
+        assert_eq!(first("vm"), None, "no lane");
+        let tags = |tag: &str| config.runner_tags(config.pool_by_tag(tag).unwrap());
+        assert_eq!(tags("vm"), ["vm", "node-24", "ts-5"]);
+        assert_eq!(tags("node-24"), ["node-24"]);
+        assert_eq!(tags("rust-1"), ["rust-1"]);
+
+        let mut raw = lanes();
+        raw["providers"] = serde_json::json!({ "hetzner": {} });
+        let pools = raw["pools"].as_array_mut().unwrap();
+        pools.insert(
+            0,
+            serde_json::json!({ "tag": "hz", "image": "ubuntu:24.04", "runtime": "hetzner" }),
+        );
+        let config = parse_config(&raw.to_string()).unwrap();
+        let lane = config.pool_by_tag("node-24").unwrap();
+        assert_eq!(
+            config.vm_first_pool(lane).unwrap().tag,
+            "vm",
+            "the default pool"
+        );
+        assert_eq!(
+            config.runner_tags(config.pool_by_tag("hz").unwrap()),
+            ["hz"]
+        );
+
+        raw["defaultPool"] = "node-24".into();
+        let config = parse_config(&raw.to_string()).unwrap();
+        let lane = config.pool_by_tag("node-24").unwrap();
+        assert_eq!(
+            config.vm_first_pool(lane).unwrap().tag,
+            "hz",
+            "the first VM pool"
+        );
+        assert_eq!(
+            config.runner_tags(config.pool_by_tag("hz").unwrap()),
+            ["hz", "node-24", "ts-5"]
+        );
+        assert_eq!(
+            config.runner_tags(config.pool_by_tag("vm").unwrap()),
+            ["vm"]
+        );
+
+        let mut raw = lanes();
+        raw["pools"].as_array_mut().unwrap().remove(0);
+        raw["defaultPool"] = "node-24".into();
+        let config = parse_config(&raw.to_string()).unwrap();
+        assert!(
+            config
+                .pools
+                .iter()
+                .all(|p| config.vm_first_pool(p).is_none()),
+            "no VM pool"
+        );
+        assert_eq!(config.runner_tags(&config.pools[0]), ["node-24"]);
+    }
+
+    #[test]
+    fn job_patterns_must_be_non_empty_and_in_one_pool() {
+        let mut raw = lanes();
+        raw["pools"][1]["jobs"] = serde_json::json!(["lint", "", "lint", "unit-*"]);
+        raw["pools"][2]["jobs"] = serde_json::json!(["lint", "unit-*", "clippy?"]);
+        raw["pools"][3]["jobs"] = serde_json::json!(["unit-*"]);
+        assert_eq!(
+            errors_of(raw),
+            [
+                "pools[1].jobs: empty pattern",
+                "pools[2].jobs: lint is in pool node-24 and pool rust-1",
+                "pools[2].jobs: unit-* is in pool node-24 and pool rust-1",
+                "pools[3].jobs: unit-* is in pool node-24 and pool ts-5",
+            ]
+        );
+    }
+
+    #[test]
+    fn vm_first_belongs_to_lanes() {
+        let mut raw = lanes();
+        raw["pools"][0]["vmFirst"] = true.into();
+        raw["pools"][1]["vmFirst"] = true.into();
+        raw["providers"] = serde_json::json!({ "hetzner": {} });
+        raw["pools"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({ "tag": "hz", "image": "x", "runtime": "hetzner", "vmFirst": false }));
+        raw["pools"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({ "tag": "plain", "image": "x", "vmFirst": true }));
+        assert_eq!(
+            errors_of(raw),
+            [
+                "pools[0].vmFirst: lanes only (runtime jobs)",
+                "pools[4].vmFirst: lanes only (runtime jobs)",
+                "pools[5].vmFirst: lanes only (runtime jobs)",
+            ]
+        );
+        let config = parse_config(&lanes().to_string()).unwrap();
+        let back = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            back["pools"][1]["jobs"],
+            serde_json::json!(["lint", "unit-*"])
+        );
+        assert_eq!(back["pools"][2]["vmFirst"], false);
+        assert!(back["pools"][0].get("vmFirst").is_none());
+        assert!(back["pools"][0].get("jobs").is_none());
     }
 
     #[test]
@@ -661,7 +947,10 @@ mod tests {
 
         match merge_config(&defaults, r#"{ "cache": { "type": "none" } }"#) {
             Err(Error::Config(errors)) => {
-                assert_eq!(errors, ["pools[0]: VM pool vm needs cache.type s3"])
+                assert_eq!(
+                    errors,
+                    ["cache.type: s3 required; the runner object lives in the bucket"]
+                )
             }
             other => panic!("expected a config error, got {other:?}"),
         }
@@ -692,27 +981,23 @@ mod tests {
     }
 
     #[test]
-    fn vm_pools_need_an_s3_cache() {
-        let mut raw = valid();
-        raw["providers"] = serde_json::json!({ "hetzner": {} });
-        raw["pools"] = serde_json::json!([
-            { "tag": "vm", "image": "img/node", "runtime": "instances" },
-            { "tag": "hz", "image": "img/node", "runtime": "hetzner" },
-            { "tag": "ci", "image": "img/node", "runtime": "jobs" },
-            { "tag": "other", "image": "img/node", "runtime": "elsewhere" },
-            { "tag": "plain", "image": "img/node" }
-        ]);
-        assert_eq!(
-            errors_of(raw.clone()),
-            [
-                "pools[0]: VM pool vm needs cache.type s3",
-                "pools[1]: VM pool hz needs cache.type s3",
-            ]
-        );
-        raw["cache"] = serde_json::json!({ "type": "none" });
-        assert_eq!(errors_of(raw.clone()).len(), 2);
-        raw["cache"] = serde_json::json!({ "type": "s3" });
-        assert!(parse_config(&raw.to_string()).is_ok());
+    fn every_config_with_a_pool_needs_an_s3_cache() {
+        let needs = ["cache.type: s3 required; the runner object lives in the bucket"];
+        for pool in [
+            serde_json::json!({ "tag": "ci", "image": "node:24", "runtime": "jobs" }),
+            serde_json::json!({ "tag": "vm", "image": "img/node", "runtime": "instances" }),
+            serde_json::json!({ "tag": "plain", "image": "img/node" }),
+        ] {
+            let mut raw = valid();
+            raw["pools"] = serde_json::json!([pool]);
+            raw["defaultPool"] = Value::Null;
+            raw.as_object_mut().unwrap().remove("cache");
+            assert_eq!(errors_of(raw.clone()), needs, "{pool}");
+            raw["cache"] = serde_json::json!({ "type": "none" });
+            assert_eq!(errors_of(raw.clone()), needs, "{pool}");
+            raw["cache"] = serde_json::json!({ "type": "s3" });
+            assert!(parse_config(&raw.to_string()).is_ok(), "{pool}");
+        }
     }
 
     #[tokio::test]

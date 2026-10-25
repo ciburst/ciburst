@@ -376,6 +376,214 @@ async fn checks_pipelines_against_the_stage_map() {
     assert_eq!(report[1].problems[0].job, "image");
 }
 
+fn lanes_config(rust_vm_first: bool) -> Arc<Config> {
+    let raw = json!({
+        "name": "demo",
+        "gitlab": { "url": "https://gitlab.example", "projectIds": [7, 8] },
+        "host": { "type": "fake" },
+        "provider": { "type": "fake" },
+        "defaultPool": "vm",
+        "pools": [
+            { "tag": "vm", "image": "ubuntu:24.04", "runtime": "instances" },
+            { "tag": "node-24", "image": "node:24-bookworm-slim", "runtime": "jobs", "jobs": ["lint"] },
+            { "tag": "rust-1", "image": "rust:1.96.0-bookworm", "runtime": "jobs",
+              "jobs": ["clippy"], "vmFirst": rust_vm_first }
+        ],
+        "cache": { "type": "s3" }
+    });
+    Arc::new(parse_config(&raw.to_string()).unwrap())
+}
+
+#[tokio::test]
+async fn the_vm_runner_carries_the_tags_of_vm_first_lanes() {
+    let fake = Arc::new(FakeGitlab::new());
+    let store = Arc::new(MemoryStore::new());
+    let host_store = Arc::new(MemoryStore::new());
+    let outputs = Arc::new(MemoryOutputs::new());
+    let (log, lines) = Log::memory();
+    let provisioner = |config: Arc<Config>| {
+        Provisioner::new(
+            config.clone(),
+            Arc::new(FakeProvider::new(config.clone(), store.clone())),
+            Arc::new(FakeHost::new(config.clone(), host_store.clone())),
+            Some(Arc::new(Gitlab::new(
+                &config.gitlab.url,
+                FAKE_TOKEN,
+                fake.clone(),
+            ))),
+            outputs.clone(),
+            log.clone(),
+        )
+    };
+    let runner_steps = |steps: &[Step]| -> Vec<(String, Action, Option<String>)> {
+        steps
+            .iter()
+            .filter(|s| s.id.starts_with("runner:"))
+            .map(|s| (s.id.clone(), s.action, s.detail.clone()))
+            .collect()
+    };
+    let id_of =
+        |values: &Outputs, tag: &str| -> u64 { values[&keys::runner_id(tag)].parse().unwrap() };
+
+    let first = provisioner(lanes_config(false));
+    first.apply(&[]).await.unwrap();
+    let values = outputs.read().await.unwrap();
+    let tags = |tag: &str| fake.runner_tags(id_of(&values, tag)).unwrap();
+    assert_eq!(tags("vm"), ["vm", "node-24"]);
+    assert_eq!(tags("node-24"), ["node-24"]);
+    assert_eq!(tags("rust-1"), ["rust-1"]);
+    assert!(all(&first.plan(&[]).await.unwrap(), Action::Noop));
+
+    let second = provisioner(lanes_config(true));
+    let plan = second.plan(&[]).await.unwrap();
+    assert_eq!(
+        runner_steps(&plan),
+        [
+            (
+                "runner:vm".to_string(),
+                Action::Update,
+                Some("set tags vm, node-24, rust-1".to_string())
+            ),
+            ("runner:node-24".to_string(), Action::Noop, None),
+            ("runner:rust-1".to_string(), Action::Noop, None),
+        ]
+    );
+    for step in plan.iter().filter(|s| !s.id.starts_with("runner:")) {
+        let expected = if step.id == "dispatcher" {
+            Action::Update
+        } else {
+            Action::Noop
+        };
+        assert_eq!(
+            step.action, expected,
+            "{step:?}, the dispatcher gets the config"
+        );
+    }
+    let creates = fake
+        .calls()
+        .iter()
+        .filter(|c| c.path == "/user/runners")
+        .count();
+    second.apply(&[]).await.unwrap();
+    assert_eq!(
+        outputs.read().await.unwrap(),
+        values,
+        "same runners, same tokens"
+    );
+    assert_eq!(tags("vm"), ["vm", "node-24", "rust-1"]);
+    assert_eq!(fake.runner_count(), 3);
+    assert_eq!(
+        fake.calls()
+            .iter()
+            .filter(|c| c.path == "/user/runners")
+            .count(),
+        creates
+    );
+    let put = fake
+        .calls()
+        .into_iter()
+        .find(|c| c.method == "PUT")
+        .unwrap();
+    assert_eq!(put.path, format!("/runners/{}", id_of(&values, "vm")));
+    assert_eq!(
+        put.body.unwrap(),
+        json!({ "tag_list": ["vm", "node-24", "rust-1"] })
+    );
+    assert!(lines.lock().unwrap().contains(&format!(
+        r#"info runner_tags pool="vm" id="{}" tags="vm,node-24,rust-1""#,
+        id_of(&values, "vm")
+    )));
+    assert!(all(&second.plan(&[]).await.unwrap(), Action::Noop));
+
+    let gitlab = Gitlab::new("https://gitlab.example", FAKE_TOKEN, fake.clone());
+    gitlab
+        .update_runner_tags(id_of(&values, "vm"), &["vm".to_string()])
+        .await
+        .unwrap();
+    let drifted = second.plan(&[]).await.unwrap();
+    assert_eq!(runner_steps(&drifted)[0].1, Action::Update, "{drifted:?}");
+
+    let mut without = (*lanes_config(true)).clone();
+    without.pools.retain(|p| p.tag != "node-24");
+    let third = provisioner(Arc::new(without));
+    let plan = third.plan(&[]).await.unwrap();
+    assert_eq!(
+        runner_steps(&plan),
+        [
+            (
+                "runner:vm".to_string(),
+                Action::Update,
+                Some("set tags vm, rust-1".to_string())
+            ),
+            ("runner:rust-1".to_string(), Action::Noop, None),
+            ("runner:node-24".to_string(), Action::Delete, None),
+        ]
+    );
+    third.apply(&[]).await.unwrap();
+    assert_eq!(tags("vm"), ["vm", "rust-1"]);
+    assert_eq!(fake.runner_count(), 2);
+    assert_eq!(fake.runner_tags(id_of(&values, "node-24")), None);
+    assert_eq!(
+        fake.runner_projects()
+            .iter()
+            .filter(|(_, projects)| projects == &[7, 8])
+            .count(),
+        2,
+        "both runners stay enabled in project 8"
+    );
+
+    let rotated = third.apply(&[Rotation::Runner]).await.unwrap();
+    assert_eq!(runner_steps(&rotated)[0].1, Action::Update);
+    let renewed = outputs.read().await.unwrap();
+    assert_ne!(id_of(&renewed, "vm"), id_of(&values, "vm"));
+    assert_eq!(
+        fake.runner_tags(id_of(&renewed, "vm")).unwrap(),
+        ["vm", "rust-1"],
+        "a recreated runner gets every tag"
+    );
+}
+
+#[tokio::test]
+async fn checks_lane_jobs_and_suggests_lanes_from_the_merged_yaml() {
+    let s = setup(lanes_config(true), true);
+    let job = |name: &str, tags: &[&str]| LintJob {
+        name: name.into(),
+        stage: Some("test".into()),
+        tag_list: tags.iter().map(|t| t.to_string()).collect(),
+    };
+    s.fake.set_jobs(
+        7,
+        vec![
+            job("lint", &["node-24"]),
+            job("clippy", &["rust-1"]),
+            job("unit", &["vm"]),
+        ],
+    );
+    s.fake.set_merged_yaml(
+        7,
+        "---\nlint:\n  image: node:24-bookworm-slim\n  services:\n  - postgres:17\n  script:\n  - npm run lint\nclippy:\n  image: rust:1.96.0-bookworm\n  script:\n  - cargo clippy\nunit:\n  image: alpine:3.21\n  script:\n  - make test\n",
+    );
+    s.fake.set_merged_yaml(8, "unit: [");
+    let error = s.provisioner.check(None).await.unwrap_err().to_string();
+    assert!(error.starts_with("project 8: merged YAML: "), "{error}");
+
+    s.fake.set_merged_yaml(8, "{}");
+    let report = s.provisioner.check(None).await.unwrap();
+    let problems: Vec<&str> = report[0]
+        .problems
+        .iter()
+        .map(|p| p.problem.as_str())
+        .collect();
+    assert_eq!(
+        problems,
+        ["lane node-24 has no Docker daemon but the job has services: postgres:17"]
+    );
+    assert_eq!(report[0].suggestions.len(), 1);
+    assert_eq!(report[0].suggestions[0].tag, "alpine-3");
+    assert_eq!(report[0].suggestions[0].jobs, ["unit"]);
+    assert!(report[1].problems.is_empty() && report[1].suggestions.is_empty());
+}
+
 #[tokio::test]
 async fn host_url_is_known_after_apply() {
     let s = setup(config(&[7]), false);

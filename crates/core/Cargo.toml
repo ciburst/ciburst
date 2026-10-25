@@ -11,6 +11,8 @@ default = ["reqwest"]
 reqwest = ["dep:reqwest"]
 # The contract harness and the GitLab fake, for tests of this and other crates.
 testing = []
+# `check` of pipelines: reads GitLab's merged YAML. The dispatcher does without it.
+pipeline = ["dep:yaml-rust2"]
 
 [dependencies]
 async-trait.workspace = true
@@ -24,8 +26,9 @@ sha2.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["time"] }
+yaml-rust2 = { version = "0.13.0", default-features = false, optional = true }
 
 [dev-dependencies]
-ciburst-core = { path = ".", features = ["testing"] }
+ciburst-core = { path = ".", features = ["pipeline", "testing"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

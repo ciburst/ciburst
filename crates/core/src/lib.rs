@@ -14,6 +14,7 @@ pub mod http;
 pub mod lane;
 pub mod ledger;
 pub mod log;
+pub mod pipeline;
 pub mod plan;
 pub mod provision;
 pub mod store;
