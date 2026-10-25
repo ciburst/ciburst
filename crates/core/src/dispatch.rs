@@ -6,6 +6,7 @@ use std::time::Duration;
 use serde::Serialize;
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
+use tokio::time::Instant;
 
 use crate::check::is_own_job;
 use crate::config::{CacheType, Config, Pool};
@@ -15,6 +16,30 @@ use crate::provision::keys;
 use crate::types::{Provider, Secrets, StartRequest, VmCapacity, VmReport, VmState};
 use crate::vm;
 use crate::{Error, Result};
+
+/// M7 rule R4: the pause before the one retry of a start that failed with a retryable error.
+pub const START_RETRY_PAUSE: Duration = Duration::from_millis(300);
+/// M7 rule R4: a retry begins only this long after the request arrived, at the latest.
+pub const START_RETRY_WITHIN: Duration = Duration::from_secs(5);
+
+/// When a request arrived, on tokio's clock, which tests pause and advance (M7 rule R1).
+#[derive(Debug, Clone, Copy)]
+struct Arrival(Instant);
+
+impl Arrival {
+    fn now() -> Arrival {
+        Arrival(Instant::now())
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.0.elapsed()
+    }
+
+    /// Whole milliseconds since the request arrived.
+    fn ms(&self) -> u64 {
+        u64::try_from(self.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
 
 /// Status and JSON body of an answer; a `Value::Null` body means no body at all.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -102,7 +127,8 @@ impl Dispatcher {
 
     /// Entry of every request. `POST /vm` and `POST /terminate` come from VMs with their
     /// capability token, a body with `ciburst_sweep` from the cron trigger, everything else is a
-    /// GitLab webhook. `now` is unix seconds.
+    /// GitLab webhook. `now` is unix seconds. Every answer with a body carries `ms`, the whole
+    /// milliseconds since the request arrived (M7 rule R1).
     pub async fn handle_request(
         &self,
         method: &str,
@@ -111,19 +137,33 @@ impl Dispatcher {
         body: &[u8],
         now: u64,
     ) -> DispatchResponse {
+        let at = Arrival::now();
+        let response = self.route(method, path, headers, body, now, at).await;
+        stamp(response, at)
+    }
+
+    async fn route(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+        now: u64,
+        at: Arrival,
+    ) -> DispatchResponse {
         if method.eq_ignore_ascii_case("POST") {
             let path = path.trim_end_matches('/');
             if path == vm::PATH_REPORT {
-                return self.vm_report(headers, body, now).await;
+                return self.vm_report(headers, body, now, at).await;
             }
             if path == vm::PATH_TERMINATE {
-                return self.vm_terminate(headers).await;
+                return self.vm_terminate(headers, at).await;
             }
         }
         if let Some(given) = sweep_arg(body) {
-            return self.sweep(given.as_deref(), now).await;
+            return self.sweep(given.as_deref(), now, at).await;
         }
-        self.webhook(headers, body, now).await
+        self.webhook(headers, body, now, at).await
     }
 
     /// The GitLab webhook at the current time.
@@ -135,11 +175,28 @@ impl Dispatcher {
     }
 
     pub async fn handle(&self, headers: &[(String, String)], body: &[u8]) -> DispatchResponse {
+        let at = Arrival::now();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        self.webhook(headers, body, now).await
+        stamp(self.webhook(headers, body, now, at).await, at)
+    }
+
+    /// Log lines of a request end with `ms` (M7 rule R1).
+    fn info(&self, at: Arrival, message: &str, fields: &[(&str, &str)]) {
+        let ms = at.ms().to_string();
+        self.log.info(message, &with_ms(fields, &ms));
+    }
+
+    fn warn(&self, at: Arrival, message: &str, fields: &[(&str, &str)]) {
+        let ms = at.ms().to_string();
+        self.log.warn(message, &with_ms(fields, &ms));
+    }
+
+    fn error(&self, at: Arrival, message: &str, fields: &[(&str, &str)]) {
+        let ms = at.ms().to_string();
+        self.log.error(message, &with_ms(fields, &ms));
     }
 
     async fn webhook(
@@ -147,6 +204,7 @@ impl Dispatcher {
         headers: &[(String, String)],
         body: &[u8],
         now: u64,
+        at: Arrival,
     ) -> DispatchResponse {
         if !token_matches(
             header(headers, "x-gitlab-token"),
@@ -195,7 +253,7 @@ impl Dispatcher {
             .collect();
         if let Some(vm_pool) = self.config.vm_first_pool(&pool)
             && let Some((run_id, free)) = self
-                .claim_for_lane(vm_pool, &pool, &labels["job"], now)
+                .claim_for_lane(vm_pool, &pool, &labels["job"], now, at)
                 .await
         {
             let free = free.to_string();
@@ -205,7 +263,7 @@ impl Dispatcher {
                 ("free", free.as_str()),
                 ("lane", pool.tag.as_str()),
             ]);
-            self.log.info("claimed", &fields);
+            self.info(at, "claimed", &fields);
             return reply(
                 200,
                 "claimed",
@@ -220,32 +278,32 @@ impl Dispatcher {
                 .map(|h| format!("https://{h}"))
         });
         match self
-            .schedule(&pool, labels.clone(), now, callback.as_deref())
+            .schedule(&pool, labels.clone(), now, callback.as_deref(), at)
             .await
         {
             Ok(Decision::Claimed { run_id, free }) => {
                 let free = free.to_string();
                 fields.push(("run", &run_id));
                 fields.push(("free", &free));
-                self.log.info("claimed", &fields);
+                self.info(at, "claimed", &fields);
                 reply(200, "claimed", json!({ "pool": pool.tag, "runId": run_id }))
             }
             Ok(Decision::AtCapacity(live)) => {
                 let live = live.to_string();
                 fields.push(("live", &live));
-                self.log.info("at_capacity", &fields);
+                self.info(at, "at_capacity", &fields);
                 reply(200, "at_capacity", json!({ "pool": pool.tag }))
             }
             Ok(Decision::Started { run_id, taken }) => {
                 let taken = taken.to_string();
                 fields.push(("run", &run_id));
                 fields.push(("taken", &taken));
-                self.log.info("started", &fields);
+                self.info(at, "started", &fields);
                 reply(200, "started", json!({ "pool": pool.tag, "runId": run_id }))
             }
             Ok(Decision::Grouped { leader }) => {
                 fields.push(("leader", &leader));
-                self.log.info("grouped", &fields);
+                self.info(at, "grouped", &fields);
                 reply(
                     200,
                     "grouped",
@@ -253,13 +311,13 @@ impl Dispatcher {
                 )
             }
             Ok(Decision::Duplicate) => {
-                self.log.info("duplicate", &fields);
+                self.info(at, "duplicate", &fields);
                 reply(200, "duplicate", json!({ "pool": pool.tag }))
             }
             Err(error) => {
                 let message = error.to_string();
                 fields.push(("error", &message));
-                self.log.error("start_failed", &fields);
+                self.error(at, "start_failed", &fields);
                 reply(500, "error", json!({}))
             }
         }
@@ -275,6 +333,7 @@ impl Dispatcher {
         labels: BTreeMap<String, String>,
         now: u64,
         callback: Option<&str>,
+        at: Arrival,
     ) -> Result<Decision> {
         let Some(vms) = self.provider.capacity(&pool.tag).await? else {
             let live = self
@@ -287,7 +346,7 @@ impl Dispatcher {
             if live >= pool.max_runs as usize {
                 return Ok(Decision::AtCapacity(live));
             }
-            return self.start(pool, labels, false, None, 1).await;
+            return self.start(pool, labels, false, None, 1, at).await;
         };
         let job = labels.get("job").cloned().unwrap_or_default();
         if let Some((target, free)) = claim_target(&vms, &job, now) {
@@ -301,11 +360,12 @@ impl Dispatcher {
                 Err(error) => {
                     // A failed claim must not leave the job unserved; a new VM costs one hour.
                     let message = error.to_string();
-                    self.log.warn(
+                    self.warn(
+                        at,
                         "claim_failed",
                         &[("run", &target.run_id), ("error", &message)],
                     );
-                    return self.start(pool, labels, true, callback, 1).await;
+                    return self.start(pool, labels, true, callback, 1, at).await;
                 }
             }
         }
@@ -323,11 +383,12 @@ impl Dispatcher {
                     if live >= pool.max_runs as usize {
                         return Ok(Decision::AtCapacity(live));
                     }
-                    return self.start(pool, labels, true, callback, taken).await;
+                    return self.start(pool, labels, true, callback, taken, at).await;
                 }
                 Err(error) => {
                     let message = error.to_string();
-                    self.log.warn(
+                    self.warn(
+                        at,
                         "ledger_failed",
                         &[("pool", &pool.tag), ("job", &job), ("error", &message)],
                     );
@@ -338,7 +399,7 @@ impl Dispatcher {
         if live >= pool.max_runs as usize {
             return Ok(Decision::AtCapacity(live));
         }
-        self.start(pool, labels, true, callback, 1).await
+        self.start(pool, labels, true, callback, 1, at).await
     }
 
     /// D47: a pending job of `lane` claims a free slot of `vm_pool` when one of its VMs is a
@@ -350,12 +411,14 @@ impl Dispatcher {
         lane: &Pool,
         job: &str,
         now: u64,
+        at: Arrival,
     ) -> Option<(String, u64)> {
         let vms = match self.provider.capacity(&vm_pool.tag).await {
             Ok(vms) => vms?,
             Err(error) => {
                 let message = error.to_string();
-                self.log.warn(
+                self.warn(
+                    at,
                     "claim_failed",
                     &[
                         ("pool", &vm_pool.tag),
@@ -371,7 +434,8 @@ impl Dispatcher {
             Ok(()) => Some((target.run_id.clone(), free)),
             Err(error) => {
                 let message = error.to_string();
-                self.log.warn(
+                self.warn(
+                    at,
                     "claim_failed",
                     &[
                         ("run", &target.run_id),
@@ -398,7 +462,9 @@ impl Dispatcher {
             .ok_or_else(|| Error::other("the ledger lacks the intent just recorded"))
     }
 
-    /// Starts a run; `taken` slots of a new VM are already assigned (M4 rule R6).
+    /// Starts a run; `taken` slots of a new VM are already assigned (M4 rule R6). A retryable
+    /// failure is retried once after [`START_RETRY_PAUSE`] when the retry begins within
+    /// [`START_RETRY_WITHIN`] of the request's arrival (M7 rule R4).
     async fn start(
         &self,
         pool: &Pool,
@@ -406,20 +472,36 @@ impl Dispatcher {
         vm: bool,
         callback: Option<&str>,
         taken: u32,
+        at: Arrival,
     ) -> Result<Decision> {
         let mut env = run_env(&self.config, &self.secrets, pool, vm)?;
         if vm && let Some(url) = callback {
             env.insert("CIBURST_DISPATCH_URL".to_string(), url.to_string());
         }
-        let run_id = self
-            .provider
-            .start(StartRequest {
-                pool: pool.clone(),
-                env,
-                labels,
-                taken,
-            })
-            .await?;
+        let job = labels.get("job").cloned().unwrap_or_default();
+        let request = StartRequest {
+            pool: pool.clone(),
+            env,
+            labels,
+            taken,
+        };
+        let run_id = match self.provider.start(request.clone()).await {
+            Ok(run_id) => run_id,
+            Err(error)
+                if error.is_retryable()
+                    && at.elapsed() + START_RETRY_PAUSE < START_RETRY_WITHIN =>
+            {
+                let message = error.to_string();
+                self.warn(
+                    at,
+                    "start_retry",
+                    &[("pool", &pool.tag), ("job", &job), ("error", &message)],
+                );
+                tokio::time::sleep(START_RETRY_PAUSE).await;
+                self.provider.start(request).await?
+            }
+            Err(error) => return Err(error),
+        };
         Ok(Decision::Started { run_id, taken })
     }
 
@@ -433,14 +515,13 @@ impl Dispatcher {
 
     /// A refused VM or cron request. The run id is the caller's claim, shortened because the
     /// header is unauthenticated input.
-    fn refuse(&self, route: &str, headers: &[(String, String)]) -> DispatchResponse {
+    fn refuse(&self, route: &str, headers: &[(String, String)], at: Arrival) -> DispatchResponse {
         let run: String = header(headers, vm::HEADER_RUN)
             .unwrap_or("")
             .chars()
             .take(64)
             .collect();
-        self.log
-            .warn("unauthorized", &[("route", route), ("run", &run)]);
+        self.warn(at, "unauthorized", &[("route", route), ("run", &run)]);
         unauthorized()
     }
 
@@ -449,9 +530,10 @@ impl Dispatcher {
         headers: &[(String, String)],
         body: &[u8],
         now: u64,
+        at: Arrival,
     ) -> DispatchResponse {
         let Some(run) = self.vm_caller(headers) else {
-            return self.refuse(vm::PATH_REPORT, headers);
+            return self.refuse(vm::PATH_REPORT, headers, at);
         };
         let Ok(report) = serde_json::from_slice::<VmReport>(body) else {
             return reply(400, "bad_request", json!({}));
@@ -459,7 +541,8 @@ impl Dispatcher {
         match self.provider.report(run, &report, now).await {
             Ok(()) => {
                 let free = report.free.to_string();
-                self.log.info(
+                self.info(
+                    at,
                     "reported",
                     &[
                         ("run", run),
@@ -471,47 +554,44 @@ impl Dispatcher {
             }
             Err(error) => {
                 let message = error.to_string();
-                self.log
-                    .error("report_failed", &[("run", run), ("error", &message)]);
+                self.error(at, "report_failed", &[("run", run), ("error", &message)]);
                 reply(500, "error", json!({}))
             }
         }
     }
 
-    async fn vm_terminate(&self, headers: &[(String, String)]) -> DispatchResponse {
+    async fn vm_terminate(&self, headers: &[(String, String)], at: Arrival) -> DispatchResponse {
         let Some(run) = self.vm_caller(headers) else {
-            return self.refuse(vm::PATH_TERMINATE, headers);
+            return self.refuse(vm::PATH_TERMINATE, headers, at);
         };
         match self.provider.stop(run).await {
             Ok(()) => {
-                self.log.info("terminated", &[("run", run)]);
+                self.info(at, "terminated", &[("run", run)]);
                 reply(200, "terminated", json!({}))
             }
             Err(error) => {
                 let message = error.to_string();
-                self.log
-                    .error("terminate_failed", &[("run", run), ("error", &message)]);
+                self.error(at, "terminate_failed", &[("run", run), ("error", &message)]);
                 reply(500, "error", json!({}))
             }
         }
     }
 
-    async fn sweep(&self, given: Option<&str>, now: u64) -> DispatchResponse {
+    async fn sweep(&self, given: Option<&str>, now: u64, at: Arrival) -> DispatchResponse {
         if !token_matches(given, self.secrets.sweep_token.as_deref()) {
-            self.log.warn("unauthorized", &[("route", "sweep")]);
+            self.warn(at, "unauthorized", &[("route", "sweep")]);
             return unauthorized();
         }
         match self.provider.sweep(now).await {
             Ok(runs) => {
                 let count = runs.len().to_string();
                 let joined = runs.join(",");
-                self.log
-                    .info("swept", &[("count", &count), ("runs", &joined)]);
+                self.info(at, "swept", &[("count", &count), ("runs", &joined)]);
                 reply(200, "swept", json!({ "runs": runs }))
             }
             Err(error) => {
                 let message = error.to_string();
-                self.log.error("sweep_failed", &[("error", &message)]);
+                self.error(at, "sweep_failed", &[("error", &message)]);
                 reply(500, "error", json!({}))
             }
         }
@@ -674,6 +754,20 @@ fn unauthorized() -> DispatchResponse {
     }
 }
 
+/// M7 rule R1: a body gets `ms`, the whole milliseconds since the request arrived.
+fn stamp(mut response: DispatchResponse, at: Arrival) -> DispatchResponse {
+    if let Value::Object(map) = &mut response.body {
+        map.insert("ms".to_string(), Value::from(at.ms()));
+    }
+    response
+}
+
+fn with_ms<'a>(fields: &[(&'a str, &'a str)], ms: &'a str) -> Vec<(&'a str, &'a str)> {
+    let mut all = fields.to_vec();
+    all.push(("ms", ms));
+    all
+}
+
 fn reply(status: u16, result: &str, mut extra: Value) -> DispatchResponse {
     if let Value::Object(map) = &mut extra {
         map.insert("result".to_string(), Value::String(result.to_string()));
@@ -786,10 +880,18 @@ mod tests {
         inner: Arc<FakeProvider>,
         started: Mutex<Vec<StartRequest>>,
         fail: bool,
+        /// Claims fail with a retryable error, as a 503 of the tag update would.
         fail_claim: std::sync::atomic::AtomicBool,
         /// Pools asked for capacity and runs claimed, in order.
         asked: Mutex<Vec<String>>,
         claimed: Mutex<Vec<String>>,
+        /// Errors of the next start calls, one per call.
+        start_errors: Mutex<VecDeque<Error>>,
+        start_calls: AtomicU64,
+        claim_calls: AtomicU64,
+        /// How long every provider call of a request takes, and a start on top of it.
+        delay: Mutex<Duration>,
+        start_delay: Mutex<Duration>,
     }
 
     impl Recording {
@@ -801,10 +903,31 @@ mod tests {
                 fail_claim: Default::default(),
                 asked: Mutex::new(Vec::new()),
                 claimed: Mutex::new(Vec::new()),
+                start_errors: Mutex::new(VecDeque::new()),
+                start_calls: AtomicU64::new(0),
+                claim_calls: AtomicU64::new(0),
+                delay: Mutex::new(Duration::ZERO),
+                start_delay: Mutex::new(Duration::ZERO),
+            }
+        }
+
+        fn fail_starts(&self, errors: impl IntoIterator<Item = Error>) {
+            self.start_errors.lock().unwrap().extend(errors);
+        }
+
+        fn start_calls(&self) -> u64 {
+            self.start_calls.load(Ordering::SeqCst)
+        }
+
+        async fn pause(&self) {
+            let delay = *self.delay.lock().unwrap();
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
             }
         }
     }
 
+    use std::collections::VecDeque;
     use std::sync::Mutex;
 
     #[async_trait]
@@ -822,33 +945,49 @@ mod tests {
             self.inner.destroy().await
         }
         async fn start(&self, request: StartRequest) -> Result<String> {
+            self.start_calls.fetch_add(1, Ordering::SeqCst);
+            self.pause().await;
+            let start_delay = *self.start_delay.lock().unwrap();
+            if !start_delay.is_zero() {
+                tokio::time::sleep(start_delay).await;
+            }
             if self.fail {
                 return Err(Error::provider("quota"));
+            }
+            if let Some(error) = self.start_errors.lock().unwrap().pop_front() {
+                return Err(error);
             }
             self.started.lock().unwrap().push(request.clone());
             self.inner.start(request).await
         }
         async fn list(&self, pool: Option<&str>) -> Result<Vec<Run>> {
+            self.pause().await;
             self.inner.list(pool).await
         }
         async fn stop(&self, run_id: &str) -> Result<()> {
+            self.pause().await;
             self.inner.stop(run_id).await
         }
         async fn capacity(&self, pool: &str) -> Result<Option<Vec<VmCapacity>>> {
+            self.pause().await;
             self.asked.lock().unwrap().push(pool.to_string());
             self.inner.capacity(pool).await
         }
         async fn claim(&self, run_id: &str) -> Result<()> {
-            if self.fail_claim.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(Error::provider("tag update refused"));
+            self.claim_calls.fetch_add(1, Ordering::SeqCst);
+            self.pause().await;
+            if self.fail_claim.load(Ordering::SeqCst) {
+                return Err(Error::retryable("tag update: 503"));
             }
             self.claimed.lock().unwrap().push(run_id.to_string());
             self.inner.claim(run_id).await
         }
         async fn report(&self, run_id: &str, report: &VmReport, now: u64) -> Result<()> {
+            self.pause().await;
             self.inner.report(run_id, report, now).await
         }
         async fn sweep(&self, now: u64) -> Result<Vec<String>> {
+            self.pause().await;
             self.inner.sweep(now).await
         }
     }
@@ -867,7 +1006,7 @@ mod tests {
         (dispatcher, recording, lines)
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn rejects_bad_tokens() {
         let (d, _, _) = setup(false).await;
         assert_eq!(d.handle(&[], b"{}").await.status, 401);
@@ -890,15 +1029,15 @@ mod tests {
         assert_eq!(empty.handle(&headers(""), b"{}").await.status, 401);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn answers_400_for_bad_json() {
         let (d, _, _) = setup(false).await;
         let response = d.handle(&headers("hook-secret"), b"{not json").await;
         assert_eq!(response.status, 400);
-        assert_eq!(response.body["result"], "bad_request");
+        assert_eq!(response.body, json!({ "result": "bad_request", "ms": 0 }));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn ignores_other_events() {
         let (d, recording, _) = setup(false).await;
         let cases: Vec<(Vec<u8>, &str)> = vec![
@@ -916,7 +1055,7 @@ mod tests {
         assert!(recording.started.lock().unwrap().is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn ignores_the_components_own_jobs() {
         let (d, recording, _) = setup(false).await;
         let named = |name: &str, project: u64| {
@@ -947,7 +1086,7 @@ mod tests {
         assert_eq!(response.body["result"], "started");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn starts_in_the_pool_of_the_stage() {
         let (d, recording, lines) = setup(false).await;
         let response = d
@@ -980,7 +1119,7 @@ mod tests {
         assert!(!lines.iter().any(|l| l.contains("glrt-")));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn default_pool_and_case_insensitive_headers() {
         let (d, _, _) = setup(false).await;
         let headers = vec![("x-gitlab-token".to_string(), "hook-secret".to_string())];
@@ -989,7 +1128,7 @@ mod tests {
         assert_eq!(response.body["pool"], "ci");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn without_a_default_pool_unmapped_stages_start_nothing() {
         let (d, recording, _) = setup(false).await;
         let mut config = (*d.config).clone();
@@ -1014,7 +1153,7 @@ mod tests {
         assert_eq!(mapped.body["result"], "started");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn at_capacity_until_a_run_ends() {
         let (d, recording, _) = setup(false).await;
         let first = d
@@ -1037,7 +1176,7 @@ mod tests {
         assert_eq!(third.body["result"], "started");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn answers_500_when_the_provider_fails() {
         let (d, _, lines) = setup(true).await;
         let response = d
@@ -1545,7 +1684,7 @@ mod tests {
         response.body["runId"].as_str().unwrap().to_string()
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn starts_vms_until_max_runs_not_counting_draining_ones() {
         let s = vm_setup(vm_secrets()).await;
         let first = s.pending_at("test", 1, T0).await;
@@ -1558,7 +1697,10 @@ mod tests {
         );
         let third = s.pending_at("test", 3, T0).await;
         assert_eq!(third.status, 200);
-        assert_eq!(third.body, json!({ "result": "at_capacity", "pool": "vm" }));
+        assert_eq!(
+            third.body,
+            json!({ "result": "at_capacity", "pool": "vm", "ms": 0 })
+        );
 
         s.report(&run_of(&first), VmState::Draining, 2).await;
         let fourth = s.pending_at("test", 4, T0 + GROUP_WINDOW_S).await;
@@ -1586,7 +1728,7 @@ mod tests {
         assert!(!lines.iter().any(|l| l.contains(VM_SECRET)), "{lines:?}");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn claims_a_free_slot_instead_of_starting() {
         let s = vm_setup(vm_secrets()).await;
         let a = run_of(&s.pending_at("test", 1, T0).await);
@@ -1598,7 +1740,7 @@ mod tests {
         assert_eq!(claimed.status, 200);
         assert_eq!(
             claimed.body,
-            json!({ "result": "claimed", "pool": "vm", "runId": b })
+            json!({ "result": "claimed", "pool": "vm", "runId": b, "ms": 0 })
         );
         let free: BTreeMap<String, u32> = s
             .vms()
@@ -1622,7 +1764,7 @@ mod tests {
         assert_eq!(full.body["result"], "at_capacity");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn one_job_pools_keep_counting_runs_and_never_get_the_vm_secret() {
         let ledger = Arc::new(MemoryLedger::new());
         let s = vm_setup_with(vm_secrets(), Some(ledger.clone())).await;
@@ -1635,7 +1777,7 @@ mod tests {
         assert!(!started[0].env.contains_key(keys::VM_SECRET));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_vm_pool_without_a_vm_secret_fails_to_start() {
         let mut secrets = vm_secrets();
         secrets.vm_secret = None;
@@ -1649,7 +1791,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn vm_requests_need_the_token_of_their_run() {
         let s = vm_setup(vm_secrets()).await;
         let run = run_of(&s.pending_at("test", 1, T0).await);
@@ -1694,13 +1836,14 @@ mod tests {
             assert!(
                 lines
                     .iter()
-                    .any(|l| l == &format!(r#"warn unauthorized route="{route}" run="{run}""#)),
+                    .any(|l| l
+                        == &format!(r#"warn unauthorized route="{route}" run="{run}" ms="0""#)),
                 "{lines:?}"
             );
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_vm_reports_its_state() {
         let s = vm_setup(vm_secrets()).await;
         let run = run_of(&s.pending("test", 1).await);
@@ -1709,7 +1852,7 @@ mod tests {
             .post("/vm/", &headers, br#"{"state":"busy","free":1,"slots":2}"#)
             .await;
         assert_eq!(response.status, 200);
-        assert_eq!(response.body, json!({ "result": "reported" }));
+        assert_eq!(response.body, json!({ "result": "reported", "ms": 0 }));
         let vm = &s.vms().await[0];
         assert_eq!(
             (vm.state, vm.free, vm.seen),
@@ -1729,7 +1872,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_report_for_a_gone_vm_answers_500() {
         let s = vm_setup(vm_secrets()).await;
         let run = run_of(&s.pending("test", 1).await);
@@ -1749,7 +1892,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_vm_terminates_itself_only() {
         let s = vm_setup(vm_secrets()).await;
         let run = run_of(&s.pending_at("test", 1, T0).await);
@@ -1762,7 +1905,7 @@ mod tests {
             )
             .await;
         assert_eq!(response.status, 200);
-        assert_eq!(response.body, json!({ "result": "terminated" }));
+        assert_eq!(response.body, json!({ "result": "terminated", "ms": 0 }));
         let vms = s.vms().await;
         assert_eq!(vms.len(), 1);
         assert_eq!(vms[0].run_id, other);
@@ -1784,7 +1927,7 @@ mod tests {
         assert_eq!(s.vms().await.len(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_cron_body_sweeps_with_the_sweep_token() {
         let s = vm_setup(vm_secrets()).await;
         let run = run_of(&s.pending("test", 1).await);
@@ -1806,13 +1949,19 @@ mod tests {
             .handle_request("POST", "/", &[], &sweep(json!("sweep-secret")), T0 + 60)
             .await;
         assert_eq!(early.status, 200);
-        assert_eq!(early.body, json!({ "result": "swept", "runs": [] }));
+        assert_eq!(
+            early.body,
+            json!({ "result": "swept", "runs": [], "ms": 0 })
+        );
         let response = s
             .dispatcher
             .handle_request("POST", "/", &[], &sweep(json!("sweep-secret")), late)
             .await;
         assert_eq!(response.status, 200);
-        assert_eq!(response.body, json!({ "result": "swept", "runs": [run] }));
+        assert_eq!(
+            response.body,
+            json!({ "result": "swept", "runs": [run], "ms": 0 })
+        );
         assert!(s.vms().await.is_empty());
         let lines = s.lines();
         assert!(
@@ -1824,7 +1973,7 @@ mod tests {
         assert_eq!(
             lines
                 .iter()
-                .filter(|l| *l == r#"warn unauthorized route="sweep""#)
+                .filter(|l| *l == r#"warn unauthorized route="sweep" ms="0""#)
                 .count(),
             5
         );
@@ -1836,7 +1985,7 @@ mod tests {
         assert_eq!(response.status, 401);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn other_requests_reach_the_webhook() {
         let (d, recording, _) = setup(false).await;
         let response = d
@@ -1863,7 +2012,7 @@ mod tests {
         assert_eq!(recording.started.lock().unwrap().len(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_silent_vm_is_not_capacity() {
         let s = vm_setup(vm_secrets()).await;
         let run = run_of(&s.pending("test", 1).await);
@@ -1892,7 +2041,7 @@ mod tests {
         assert_eq!(stale.body["result"], "started", "{}", stale.body);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_failed_claim_starts_a_vm() {
         let s = vm_setup(vm_secrets()).await;
         let run = run_of(&s.pending("test", 1).await);
@@ -1905,9 +2054,11 @@ mod tests {
         assert_ne!(run_of(&response), run);
         assert!(s.lines().iter().any(|l| l.starts_with("warn claim_failed")));
         assert_eq!(s.taken(), [1, 1]);
+        assert_eq!(s.recording.claim_calls.load(Ordering::SeqCst), 1);
+        assert!(!s.lines().iter().any(|l| l.contains("start_retry")));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn vms_get_the_callback_url_from_the_host_header() {
         let s = vm_setup(vm_secrets()).await;
         let mut with_host = headers("hook-secret");
@@ -1939,10 +2090,10 @@ mod tests {
     }
 
     fn grouped(leader: &str) -> Value {
-        json!({ "result": "grouped", "pool": "vm", "leader": leader })
+        json!({ "result": "grouped", "pool": "vm", "leader": leader, "ms": 0 })
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_burst_leader_starts_a_vm_for_its_group_and_followers_ride_on_it() {
         let ledger = Arc::new(MemoryLedger::new());
         let s = vm_setup_with(vm_secrets(), Some(ledger.clone())).await;
@@ -1960,7 +2111,7 @@ mod tests {
         );
         assert_eq!(
             s.pending_at("test", 14, T0).await.body,
-            json!({ "result": "at_capacity", "pool": "vm" }),
+            json!({ "result": "at_capacity", "pool": "vm", "ms": 0 }),
             "rank 4 is group 2 and maxRuns is 2"
         );
         assert_eq!(s.pending_at("test", 15, T0).await.body, grouped("14"));
@@ -1984,7 +2135,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_duplicate_event_starts_nothing() {
         let ledger = Arc::new(MemoryLedger::new());
         let s = vm_setup_with(vm_secrets(), Some(ledger.clone())).await;
@@ -1992,7 +2143,10 @@ mod tests {
         assert_eq!(first.body["result"], "started");
         let again = s.pending_at("test", 20, T0 + 5).await;
         assert_eq!(again.status, 200);
-        assert_eq!(again.body, json!({ "result": "duplicate", "pool": "vm" }));
+        assert_eq!(
+            again.body,
+            json!({ "result": "duplicate", "pool": "vm", "ms": 0 })
+        );
         assert_eq!(s.taken(), [1]);
         assert!(
             s.lines()
@@ -2007,7 +2161,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn leaders_count_toward_max_runs_by_rank_beside_the_old_vms() {
         for (old_state, rank_two) in [
             (VmState::Busy, "at_capacity"),
@@ -2036,7 +2190,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_claim_candidate_keeps_the_job_out_of_the_ledger() {
         let ledger = Arc::new(MemoryLedger::new());
         let s = vm_setup_with(vm_secrets(), Some(ledger.clone())).await;
@@ -2048,7 +2202,7 @@ mod tests {
         assert_eq!(ledger.all().len(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_event_without_a_job_id_keeps_the_m3_rule() {
         let ledger = Arc::new(MemoryLedger::new());
         let s = vm_setup_with(vm_secrets(), Some(ledger.clone())).await;
@@ -2094,7 +2248,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_failing_ledger_falls_back_to_the_m3_rule() {
         for fault in [Fault::Record, Fault::Since, Fault::Forget] {
             let s = vm_setup_with(vm_secrets(), Some(Arc::new(FaultyLedger(fault)))).await;
@@ -2149,8 +2303,14 @@ mod tests {
             dispatcher.handle_request("POST", "/", &hook, &bodies[2], T0),
         );
         assert_eq!(begin.elapsed(), Duration::from_secs(GROUP_WAIT_S));
-        assert_eq!(a.body, grouped("30"));
+        let waited = GROUP_WAIT_S * 1000;
+        assert_eq!(
+            a.body,
+            json!({ "result": "grouped", "pool": "vm", "leader": "30", "ms": waited }),
+            "ms counts the group wait"
+        );
         assert_eq!(b.body["result"], "started", "{}", b.body);
+        assert_eq!(b.body["ms"], waited);
         assert_eq!(c.body["result"], "started", "{}", c.body);
         let mut taken = s.taken();
         taken.sort();
@@ -2229,7 +2389,7 @@ mod tests {
         run
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_lane_job_claims_a_free_vm_slot_first() {
         let ledger = Arc::new(MemoryLedger::new());
         let s = setup_of(lane_config(true), lane_secrets(), Some(ledger.clone())).await;
@@ -2238,11 +2398,11 @@ mod tests {
         assert_eq!(claimed.status, 200);
         assert_eq!(
             claimed.body,
-            json!({ "result": "claimed", "pool": "vm", "lane": "node-24", "runId": vm })
+            json!({ "result": "claimed", "pool": "vm", "lane": "node-24", "runId": vm, "ms": 0 })
         );
         assert_eq!(s.vms().await[0].free, 1);
         assert!(s.lines().contains(&format!(
-            r#"info claimed job="2" pipeline="9" project="7" stage="test" pool="vm" run="{vm}" free="2" lane="node-24""#
+            r#"info claimed job="2" pipeline="9" project="7" stage="test" pool="vm" run="{vm}" free="2" lane="node-24" ms="0""#
         )));
         let second = s.named_at("unit-api", 3, T0 + 60).await;
         assert_eq!(second.body["result"], "claimed", "{}", second.body);
@@ -2256,7 +2416,7 @@ mod tests {
         assert_eq!(ledger.all().len(), 1, "only the VM job's intent");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_lane_job_without_a_claim_candidate_starts_its_lane() {
         let ledger = Arc::new(MemoryLedger::new());
         let s = setup_of(lane_config(true), lane_secrets(), Some(ledger.clone())).await;
@@ -2284,7 +2444,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_lane_with_vm_first_false_never_claims() {
         let s = setup_of(lane_config(true), lane_secrets(), None).await;
         idle_vm(&s, 1, 2).await;
@@ -2296,7 +2456,7 @@ mod tests {
         assert_eq!(*s.recording.asked.lock().unwrap(), ["vm", "rust-1"]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn without_a_vm_pool_a_lane_never_claims() {
         let s = setup_of(lane_config(false), lane_secrets(), None).await;
         let response = s.named_at("lint", 1, T0 + 60).await;
@@ -2308,7 +2468,7 @@ mod tests {
         assert!(s.recording.claimed.lock().unwrap().is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_lane_at_max_runs_answers_at_capacity() {
         let ledger = Arc::new(MemoryLedger::new());
         let s = setup_of(lane_config(true), lane_secrets(), Some(ledger.clone())).await;
@@ -2319,7 +2479,7 @@ mod tests {
         assert_eq!(third.status, 200);
         assert_eq!(
             third.body,
-            json!({ "result": "at_capacity", "pool": "node-24" })
+            json!({ "result": "at_capacity", "pool": "node-24", "ms": 0 })
         );
         assert!(s.lines().iter().any(|l| l.starts_with("info at_capacity")
             && l.contains(r#"pool="node-24""#)
@@ -2327,7 +2487,7 @@ mod tests {
         assert!(ledger.all().is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_failed_claim_leaves_the_job_to_its_lane() {
         let s = setup_of(lane_config(true), lane_secrets(), None).await;
         let vm = idle_vm(&s, 1, 2).await;
@@ -2339,5 +2499,210 @@ mod tests {
             r#"warn claim_failed run="{vm}" lane="node-24" error="#
         ))));
         assert_eq!(s.vms().await[0].free, 2);
+        assert_eq!(
+            s.recording.claim_calls.load(Ordering::SeqCst),
+            1,
+            "a retryable claim failure is not retried"
+        );
+    }
+
+    /// The value of the `ms` field that ends a log line.
+    fn ms_of(line: &str) -> Option<u64> {
+        line.rsplit_once(" ms=\"")?
+            .1
+            .strip_suffix('"')?
+            .parse()
+            .ok()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_answer_and_log_line_carries_the_milliseconds_since_arrival() {
+        let s = vm_setup(vm_secrets()).await;
+        let run = run_of(&s.pending("test", 1).await);
+        let token = vm::token(VM_SECRET, &run);
+        let before = s.lines().len();
+        *s.recording.delay.lock().unwrap() = Duration::from_millis(250);
+        let hook = headers("hook-secret");
+        let report = serde_json::to_vec(&VmReport {
+            state: VmState::Idle,
+            free: 1,
+            slots: 2,
+        })
+        .unwrap();
+        let pipeline = json!({
+            "object_kind": "pipeline",
+            "object_attributes": { "id": 9, "status": "pending" },
+            "project": { "id": 7 }
+        });
+        let sweep = json!({ vm::SWEEP_ARG: "sweep-secret" });
+        let cases = [
+            (
+                "/",
+                hook.clone(),
+                event("test", "pending", 7, 2),
+                "claimed",
+                500,
+            ),
+            (
+                "/",
+                hook.clone(),
+                event("build", "pending", 7, 3),
+                "started",
+                1000,
+            ),
+            (
+                "/",
+                hook.clone(),
+                pipeline.to_string().into_bytes(),
+                "ignored",
+                0,
+            ),
+            (
+                "/",
+                hook.clone(),
+                event("test", "running", 7, 2),
+                "ignored",
+                0,
+            ),
+            ("/", hook.clone(), b"{not json".to_vec(), "bad_request", 0),
+            ("/vm", vm_headers(&run, &token), report, "reported", 250),
+            (
+                "/",
+                Vec::new(),
+                sweep.to_string().into_bytes(),
+                "swept",
+                250,
+            ),
+            (
+                "/terminate",
+                vm_headers(&run, &token),
+                Vec::new(),
+                "terminated",
+                250,
+            ),
+        ];
+        for (path, headers, body, result, ms) in cases {
+            let response = s.post(path, &headers, &body).await;
+            assert_eq!(response.body["result"], result, "{path} {}", response.body);
+            assert_eq!(response.body["ms"], ms, "{path} {}", response.body);
+        }
+        s.recording.fail_starts([Error::provider("scaleway: 400")]);
+        let failed = s.pending("build", 4).await;
+        assert_eq!(failed.status, 500);
+        assert_eq!(failed.body, json!({ "result": "error", "ms": 1000 }));
+        let refused = s.post("/vm", &vm_headers(&run, "0"), b"{}").await;
+        assert_eq!(
+            (refused.status, refused.body),
+            (401, Value::Null),
+            "401 keeps no body"
+        );
+
+        let lines = s.lines()[before..].to_vec();
+        let decisions: Vec<(&str, Option<u64>)> = lines
+            .iter()
+            .map(|line| (line.split(' ').nth(1).unwrap_or(""), ms_of(line)))
+            .collect();
+        assert_eq!(
+            decisions,
+            [
+                ("claimed", Some(500)),
+                ("started", Some(1000)),
+                ("reported", Some(250)),
+                ("swept", Some(250)),
+                ("terminated", Some(250)),
+                ("start_failed", Some(1000)),
+                ("unauthorized", Some(0)),
+            ],
+            "{lines:?}"
+        );
+    }
+
+    /// A VM job's answer when the provider's start calls fail with `errors` and each takes
+    /// `start_delay`.
+    async fn start_failing(errors: Vec<Error>, start_delay: Duration) -> (VmSetup, Value) {
+        let s = vm_setup(vm_secrets()).await;
+        s.recording.fail_starts(errors);
+        *s.recording.start_delay.lock().unwrap() = start_delay;
+        let response = s.pending("test", 1).await;
+        let answer = json!({ "status": response.status, "body": response.body });
+        (s, answer)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retryable_start_failure_is_retried_once_after_300_ms() {
+        let (s, answer) =
+            start_failing(vec![Error::retryable("scaleway: 503")], Duration::ZERO).await;
+        assert_eq!(answer["status"], 200);
+        assert_eq!(answer["body"]["result"], "started", "{answer}");
+        assert_eq!(answer["body"]["ms"], 300);
+        assert_eq!(s.recording.start_calls(), 2);
+        let lines = s.lines();
+        assert_eq!(
+            lines[0],
+            r#"warn start_retry pool="vm" job="1" error="scaleway: 503" ms="0""#
+        );
+        assert!(lines[1].starts_with("info started"), "{lines:?}");
+        assert_eq!(ms_of(&lines[1]), Some(300));
+
+        let (s, answer) = start_failing(
+            vec![
+                Error::retryable("scaleway: 503"),
+                Error::retryable("scaleway: 429"),
+            ],
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(answer["status"], 500, "one retry only");
+        assert_eq!(answer["body"], json!({ "result": "error", "ms": 300 }));
+        assert_eq!(s.recording.start_calls(), 2);
+        assert!(
+            s.lines()[1].starts_with(r#"error start_failed job="1" pipeline="9" project="7" stage="test" pool="vm" error="scaleway: 429""#),
+            "{:?}",
+            s.lines()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn other_start_failures_are_not_retried() {
+        let (s, answer) =
+            start_failing(vec![Error::provider("scaleway: 400")], Duration::ZERO).await;
+        assert_eq!(answer["status"], 500);
+        assert_eq!(answer["body"], json!({ "result": "error", "ms": 0 }));
+        assert_eq!(s.recording.start_calls(), 1);
+        assert!(!s.lines().iter().any(|l| l.contains("start_retry")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_begins_within_5_s_of_the_arrival_only() {
+        let (s, answer) = start_failing(
+            vec![Error::retryable("scaleway: 503")],
+            Duration::from_millis(4_699),
+        )
+        .await;
+        assert_eq!(answer["body"]["result"], "started", "{answer}");
+        assert_eq!(answer["body"]["ms"], 4_699 + 300 + 4_699);
+        assert_eq!(s.recording.start_calls(), 2);
+
+        let (s, answer) = start_failing(
+            vec![Error::retryable("scaleway: 503")],
+            Duration::from_millis(4_700),
+        )
+        .await;
+        assert_eq!(answer["status"], 500, "the retry would begin at 5 s");
+        assert_eq!(answer["body"]["ms"], 4_700);
+        assert_eq!(s.recording.start_calls(), 1);
+        assert!(!s.lines().iter().any(|l| l.contains("start_retry")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lane_start_is_retried_too() {
+        let s = setup_of(lane_config(false), lane_secrets(), None).await;
+        s.recording.fail_starts([Error::retryable("scaleway: 503")]);
+        let response = s.named_at("lint", 1, T0).await;
+        assert_eq!(response.body["result"], "started", "{}", response.body);
+        assert_eq!(response.body["pool"], "node-24");
+        assert_eq!(response.body["ms"], 300);
+        assert_eq!(s.recording.start_calls(), 2);
+        assert_eq!(s.started_pools(), ["node-24"]);
     }
 }
