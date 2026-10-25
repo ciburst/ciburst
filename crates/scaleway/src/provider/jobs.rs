@@ -4,11 +4,11 @@ use std::collections::BTreeMap;
 
 use ciburst_core::config::{CacheType, Config, Pool};
 use ciburst_core::provision::keys;
-use ciburst_core::types::RunState;
+use ciburst_core::types::{Action, Run, RunState, StartRequest};
 use ciburst_core::{Error, Result};
 use serde_json::{Value, json};
 
-use super::{list_all, s3};
+use super::{PROVIDER_NAME, Scaleway, list_all, s3};
 use crate::client::ScalewayClient;
 
 /// Label key and the run environment variable that carries it.
@@ -220,6 +220,119 @@ pub fn run_state(state: &str) -> RunState {
         "scheduled" | "running" => RunState::Running,
         "succeeded" => RunState::Done,
         _ => RunState::Failed,
+    }
+}
+
+impl Scaleway {
+    pub(super) fn definition_name(&self, tag: &str) -> String {
+        format!("{}-{tag}", self.name())
+    }
+
+    pub(super) fn definition_tag<'a>(&self, definition: &'a Value) -> Option<&'a str> {
+        definition["name"]
+            .as_str()?
+            .strip_prefix(self.name())?
+            .strip_prefix('-')
+            .filter(|tag| !tag.is_empty())
+    }
+
+    pub(super) async fn apply_definition(
+        &self,
+        tag: &str,
+        action: Action,
+        project_id: &str,
+    ) -> Result<()> {
+        let name = self.definition_name(tag);
+        let existing = list_definitions(&self.client, project_id)
+            .await?
+            .into_iter()
+            .find(|d| d["name"].as_str() == Some(name.as_str()));
+        let existing_id = existing
+            .as_ref()
+            .and_then(|d| d["id"].as_str())
+            .map(String::from);
+        if action == Action::Delete {
+            if let Some(id) = existing_id {
+                delete_definition(&self.client, &id).await?;
+                self.log
+                    .info("deleted job definition", &[("name", &name), ("id", &id)]);
+            }
+            return Ok(());
+        }
+        let pool = self
+            .config
+            .pool_by_tag(tag)
+            .ok_or_else(|| Error::provider(format!("{PROVIDER_NAME}: unknown pool {tag}")))?;
+        let body = desired_definition(&self.config, pool, self.client.region(), project_id);
+        match (existing, existing_id) {
+            (Some(current), Some(id)) => {
+                if !differences(&body, &current).is_empty() {
+                    update_definition(&self.client, &id, &body).await?;
+                    self.log
+                        .info("updated job definition", &[("name", &name), ("id", &id)]);
+                }
+            }
+            _ => {
+                let id = create_definition(&self.client, &body).await?;
+                self.log
+                    .info("created job definition", &[("name", &name), ("id", &id)]);
+            }
+        }
+        Ok(())
+    }
+
+    async fn find_definition(&self, project_id: &str, tag: &str) -> Result<Option<String>> {
+        let name = self.definition_name(tag);
+        Ok(list_definitions(&self.client, project_id)
+            .await?
+            .iter()
+            .find(|d| d["name"].as_str() == Some(name.as_str()))
+            .and_then(|d| d["id"].as_str().map(String::from)))
+    }
+
+    pub(super) async fn start_job(&self, request: StartRequest) -> Result<String> {
+        let tag = &request.pool.tag;
+        let not_provisioned =
+            || Error::provider(format!("{PROVIDER_NAME}: pool {tag} is not provisioned"));
+        let project_id = self
+            .client
+            .find_project(self.name())
+            .await?
+            .ok_or_else(not_provisioned)?;
+        let definition_id = self
+            .find_definition(&project_id, tag)
+            .await?
+            .ok_or_else(not_provisioned)?;
+        let env = run_env(&request.env, &request.labels);
+        start(&self.client, &definition_id, &env).await
+    }
+
+    pub(super) async fn job_runs(&self, project_id: &str, tags: &[&str]) -> Result<Vec<Run>> {
+        if tags.is_empty() {
+            return Ok(Vec::new());
+        }
+        let definitions = list_definitions(&self.client, project_id).await?;
+        let mut runs = Vec::new();
+        for tag in tags {
+            let name = self.definition_name(tag);
+            let Some(definition_id) = definitions
+                .iter()
+                .find(|d| d["name"].as_str() == Some(name.as_str()))
+                .and_then(|d| d["id"].as_str())
+            else {
+                continue;
+            };
+            for run in list_runs(&self.client, project_id, definition_id).await? {
+                runs.push(Run {
+                    run_id: run["id"].as_str().unwrap_or_default().to_string(),
+                    pool: tag.to_string(),
+                    state: run_state(run["state"].as_str().unwrap_or_default()),
+                    created_at: run["created_at"].as_str().unwrap_or_default().to_string(),
+                    labels: labels_from_env(&run["environment_variables"]),
+                });
+            }
+        }
+        Ok(runs)
     }
 }
 

@@ -16,6 +16,7 @@ pub mod log;
 pub mod plan;
 pub mod provision;
 pub mod store;
+pub mod time;
 pub mod types;
 pub mod vm;
 
