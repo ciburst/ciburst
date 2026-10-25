@@ -37,9 +37,12 @@ Compared per job-minute for a small runner (providers' price pages, 2026-10-25, 
 | Self-built on AWS spot, m6i.large | 0.0009, plus about 10 EUR a month for the manager | per second |
 | RocketRunner small, one always-on VM | 9.46 EUR a month flat | per minute, capped |
 | ciburst VM slot, half a DEV1-M, half the paid hour used | 0.00045 | per started hour |
+| ciburst VMs, measured: the drill consumer's 3 pipelines on one DEV1-L per job | 0.0046 | per started hour, VMs busy about 20 % of it |
 | ciburst lane, 2 vCPU | 0.0017, free up to about 1,700 minutes a month | per second |
 
 A month of 3,000 job-minutes: GitLab 23.23 EUR, self-built AWS spot 12.95, RocketRunner 9.46, ciburst lanes 2.24, ciburst VM slots 1.36. A VM slot has 1.5 shared vCPU and 2 GB, GitLab's small runner 2 vCPU and 8 GB.
+
+VMs reach their per-minute price only when pipelines keep them busy through their paid hours. A project with a few pipelines a day pays mostly for idle minutes until minute 55; its Docker-free jobs cost less in lanes, which bill per second and start inside the free tier.
 
 ## Adopt
 

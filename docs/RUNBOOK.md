@@ -356,6 +356,9 @@ Measured:
 | Same workloads: GitLab's small hosted runner, DEV1-M `nl-ams-1`, Serverless Job 2 vCPU, 4 vCPU | `cargo install ripgrep`: 56, 54, 52, 30 s; three TypeScript checks: 8.5, 14.3, 9.5 to 10.9 s; `npm install`: 1.4, 2.5, 2.7 to 3.0 s |
 | Lane bootstrap in a Serverless Job | `apk add git` 2 to 4 s; `apt-get` with its own lists and archives directories (the sandbox drops root's capabilities) 21 s; images with `git` and `curl` need none |
 | `CIBURST_LANE` size, the lane `COMMAND` in `nl-ams` (2026-10-25) | job definitions with 6,728 to 87,528 characters accepted; dry runs on `alpine:3.21` and `node:24-bookworm-slim` succeeded |
+| Scaleway bill, October to 2026-10-25 21:18 UTC (consumption API, amounts in cents per line) | 2.00 EUR in total, 1.97 of it VM-hours (compute, IPv4, local SSD); Serverless Jobs (29,556 vCPU-s, 63,472 GB-s) and Functions fully inside the free tier; Object Storage and registry 0.02 |
+| Price per VM-hour from the bill | DEV1-M 0.021 + IPv4 0.005 + local SSD 0.002 = 0.028 EUR; DEV1-L 0.044 + 0.005 + 0.004 = 0.053 EUR; local SSD is billed per clock hour (960 GB-hours for 8 DEV1-L hours of 80 GB) |
+| Cost per job-minute, drill consumer on VMs (3 pipelines, one DEV1-L per job, 2026-10-25) | 0.68 EUR for 146 job-minutes on 12 DEV1-L hours: 0.0046 EUR per job-minute, about half of GitLab's small runner (0.0089); the VMs were busy about 20 % of their paid hours |
 
 ### M5 drill
 
