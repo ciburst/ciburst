@@ -131,7 +131,7 @@ Without a cloud: `cargo run -p ciburst -- apply --config test/config.fake.json -
 |---|---|
 | `plan` | every step `apply` would run |
 | `apply` | checks that each pool can start, creates or updates everything, then starts the jobs that wait |
-| `status` | dispatcher URL, live runs per pool, the last 20 runs |
+| `status` | dispatcher URL, live runs per pool, the last 20 runs; with a GitLab token the webhook's state and its last 20 deliveries |
 | `check [--ref <ref>] [--suggest]` | lints each project's pipeline against the pools and exits 1 on a problem; `--suggest` prints lanes for the Docker-free jobs and exits 0, or 1 when a pipeline cannot be read |
 | `rotate runner\|hook\|key\|cache\|vm` | replaces that secret and redeploys |
 | `destroy --yes <name>` | removes every resource of the deployment |

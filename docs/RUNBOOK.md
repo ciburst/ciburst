@@ -103,7 +103,16 @@ Where to look when a job waits:
 | 401 | no body | wrong or missing hook, VM or sweep token |
 | 500 | `error` | the provider failed (start, report, terminate, sweep) or the function's environment is incomplete; the body carries nothing more |
 
-Every 200 answer of a job event except `ignored` also names the `pool`. A `grouped` job depends on its leader's delivery: `started` (the VM boots), `at_capacity` (the group waits for a slot) or 500 (the group waits for the next VM). Lane jobs never answer `grouped` or `duplicate`: lanes do not use the burst ledger.
+Every answer with a body carries `ms`, the dispatcher's elapsed milliseconds; GitLab.com counts an answer after 10 s as a failed delivery and disables the webhook after four failures in a row (section Webhook health). Every 200 answer of a job event except `ignored` also names the `pool`. A `grouped` job depends on its leader's delivery: `started` (the VM boots), `at_capacity` (the group waits for a slot) or 500 (the group waits for the next VM). Lane jobs never answer `grouped` or `duplicate`: lanes do not use the burst ledger.
+
+## Webhook health
+
+GitLab disables a webhook after four failed deliveries in a row, and GitLab.com counts an answer after 10 s as failed. A disabled webhook delivers nothing, so pending jobs wait without a trace.
+
+1. Detect: `ciburst check` (the `ciburst-check` job) prints `project <id>: webhook <alert_status> until <time or never>: run ciburst-setup to enable it again` and exits 1; `ciburst status` prints `hook <id>: <alert_status>`.
+2. Repair: `ciburst-setup` (or `ciburst apply`). The plan shows `update  gitlab hook in project <id>  (re-enable: <alert_status> until <time or never>)`; `apply` sends GitLab's test delivery, which the dispatcher answers 200, logs `hook_reenabled` and replays the waiting jobs.
+   Check: `ciburst status` prints `hook <id>: executable`; the waiting jobs start.
+3. Cause: the deliveries in `ciburst status` show the failed answers and their `ms`.
 
 ## Logs
 
@@ -111,8 +120,9 @@ Every line reads `<level> <message> key="value" ...` and never holds a secret.
 
 | Source | Where | Lines |
 |---|---|---|
-| Dispatcher | the function's stderr, which Cockpit does not show (2026-10-24): read the answers on the webhook's recent events instead | `info` `claimed` (with `lane` for a lane job on a VM slot), `started`, `grouped`, `duplicate`, `at_capacity` with `project`, `pipeline`, `job`, `stage`, `pool`, `run`; `warn` `claim_failed`, `ledger_failed`, `unauthorized`; `error` `start_failed`, `report_failed`, `terminate_failed`, `sweep_failed`, and `env` naming a missing variable |
-| CLI | stderr; in pipeline mode the `ciburst-setup` job log | one line per action; `plan` warns `vm pools cannot start pool="<tag>" reason="..."`; `apply` logs `replayed` per replayed job, `replay_failed` and `output_unmasked` |
+| Dispatcher | the function's stderr, which Cockpit does not show (2026-10-24): read the answers on the webhook's recent events instead | `info` `claimed` (with `lane` for a lane job on a VM slot), `started`, `grouped`, `duplicate`, `at_capacity` with `project`, `pipeline`, `job`, `stage`, `pool`, `run`; `warn` `claim_failed`, `ledger_failed`, `start_retry` (a 429 or 503 of the provider, retried once after 300 ms within 5 s), `start_lookup` (a VM start looked up its image or security group: a type not in `CIBURST_VM_IMAGES`, or a create refused for a removed image; the next `ciburst apply` resolves them again), `unauthorized`; every line ends with `ms`; `error` `start_failed`, `report_failed`, `terminate_failed`, `sweep_failed`, and `env` naming a missing variable |
+| CLI | stderr; in pipeline mode the `ciburst-setup` job log | one line per action; `plan` warns `vm pools cannot start pool="<tag>" reason="..."`; `apply` logs `hook_reenabled`, `replayed` per replayed job, `replay_failed` and `output_unmasked` |
+| Deliveries | `ciburst status` with a GitLab token: the webhook's 20 newest deliveries, oldest first | `delivery <time> <job name, pipeline <id> or event kind> <http status> <result> <pool> <ms>`; `-` where the answer lacks the key, `?` for an unreadable body |
 | Lane run | the job run's stdout and stderr on Serverless Jobs; `ciburst status` lists the run and its state | `ciburst-lane: <reason>` before the bootstrap exits 64 (section Failure modes), then `gitlab-runner`'s own lines |
 | VM agent | the VM's journal, `journalctl -u ciburst-vm-agent`, through the provider's console view only | `agent started`, `state from=... to=...` (`starting`, `idle`, `busy`, `draining`, `quitting`), `slot started`, `slot exited`, `report failed`, `terminate accepted`, `terminate failed`, `terminate gave up` |
 

@@ -35,6 +35,7 @@ Goal: the project's jobs run on ciburst: jobs that need a Docker daemon on VMs, 
 Verify:
 - The CI file is valid: Pipeline editor, Validate; or `POST /projects/:id/ci/lint` with a token that may.
 - After the setup: jobs run on the runner `ci-<project id>-vm`, lane jobs on `ci-<project id>-<lane tag>` or on a free VM slot; `ciburst-check` prints `every job matches the stage map`.
+- Webhook: Settings, Webhooks, recent events show each delivery's answer with `ms` (under 10 s, or GitLab counts it failed); `ciburst status` with a token lists the same.
 - The first pipeline starts with empty caches: the jobs' caches live in the deployment's own bucket, and GitLab's hosted-runner cache does not carry over.
 
 Limits: `linux/amd64` images only; a VM ends after 24 hours at the latest. Job variables, file variables such as deploy keys included, reach the VM that runs the job, as on any runner; the runner deletes them after the job.
