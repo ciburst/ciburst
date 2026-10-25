@@ -382,13 +382,13 @@ Measured:
 
 1. Dev deployment with two lanes, from `node:24-bookworm-slim` and from `rust:1.99.0-bookworm`, each with `jobs` patterns for the lane jobs of a demo pipeline; `vmFirst` default. `ciburst apply`, then `ciburst plan`.
    Check: the apply creates the runner object, both job definitions and their runners, and updates the runner `<name>-vm` with both lane tags; the plan prints only `noop`.
-   Result: ____
+   Result (2026-10-25, `ciburst/ciburst-adopt-demo`, lanes `node24` from `node:24-bookworm-slim` with `vmFirst` and `rust` from `rust:1.99.0-bookworm` at 4 vCPU with `"vmFirst": false`): the setup took 9.9 hosted minutes, 5 of them the dispatcher deploy. It copied the runner (119 MB) into the bucket in 2 s, created both job definitions and runners and set the tags of `<name>-vm` to `vm, node24`. After the PATH fix a setup updated both definitions; the next one planned 17 `noop` in 17 s.
 2. Demo pipeline while no VM runs.
    Check: every lane job's delivery answers `started`; the jobs pass on the lanes' runners; the Debian slim run spends about 21 s in the bootstrap, the Rust run none.
-   Result: ____
+   Result (2026-10-25): both lane jobs answered `started` and passed on their runners, no VM started. `lane-node` queued 38 s (start and `apt-get` of `git` and `curl`), restored the cache its VM run had created and ran three TypeScript checks in 9.9 s (14.4 s on the DEV1-M); `lane-rust` queued 30 s and compiled ripgrep in 29.6 s at 4 vCPU. Finding, fixed: the shell executor's login shell replaced the image's `PATH`, so `cargo` was missing in the first Rust run.
 3. Demo pipeline while a VM of the pool is `idle` with free slots and older than 30 s.
    Check: the lane jobs answer `claimed` with `lane` and pass on the runner `<name>-vm`; no lane run starts.
-   Result: ____
+   Result (2026-10-25): with one idle VM, `lane-node` answered `{"lane":"node24","pool":"vm","result":"claimed"}` and ran on `<name>-vm` after 1.4 s in the queue; `lane-rust` (`vmFirst` false) answered `started` and ran in its lane after 6.8 s. Before the setup, the old dispatcher had routed both lane jobs by stage and started a VM, which took the node job as soon as the setup added `node24` to its runner. Finding: the delivery that started the VM answered after 10.4 s, beyond GitLab.com's 10 s webhook timeout, and counted as failed although the VM started (spec section 13, risks).
 4. The drill consumer: `ciburst check --suggest`, the proposed lanes in `ciburst.json` and the `tags:` in its pipeline, `ciburst-setup`, a pipeline.
    Check: `ciburst-check` passes; every job passes; wall clock and cost against its 18-minute warm VM pipeline.
    Result: ____
