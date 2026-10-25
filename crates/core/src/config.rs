@@ -16,6 +16,29 @@ pub const DEFAULT_MAX_RUNS: u32 = 10;
 pub const DEFAULT_EXPIRE_DAYS: u32 = 30;
 pub const DEFAULT_SLOTS: u32 = 2;
 
+/// The runtime of VM pools on the main provider.
+pub const INSTANCES_RUNTIME: &str = "instances";
+
+/// Names a key of `providers` must not take: runtimes of the main provider and step id
+/// prefixes, which the composite routes by (M5 rule R7).
+pub const RESERVED_RUNTIMES: [&str; 15] = [
+    "instances",
+    "jobs",
+    "vm",
+    "key",
+    "definition",
+    "bucket",
+    "registry",
+    "project",
+    "iam",
+    "hook",
+    "runner",
+    "runner-enable",
+    "function",
+    "namespace",
+    "cron",
+];
+
 const fn d_vcpu() -> u32 {
     DEFAULT_VCPU
 }
@@ -133,6 +156,49 @@ pub struct Config {
 }
 
 impl Config {
+    /// The config `ciburst --ci` starts from (M5 rule R1): one VM pool on Scaleway Instances
+    /// that takes every stage.
+    pub fn ci_defaults(project_id: u64, server_url: &str) -> Config {
+        let region = |kind: &str| Section {
+            kind: kind.to_string(),
+            extra: Map::from_iter([("region".to_string(), Value::from("fr-par"))]),
+        };
+        Config {
+            name: format!("ci-{project_id}"),
+            gitlab: GitlabConfig {
+                url: server_url.to_string(),
+                project_ids: vec![project_id],
+            },
+            host: region("scaleway-function"),
+            provider: region("scaleway"),
+            default_pool: Some("vm".to_string()),
+            pools: vec![Pool {
+                tag: "vm".to_string(),
+                image: "ubuntu:24.04".to_string(),
+                stages: Vec::new(),
+                vcpu: DEFAULT_VCPU,
+                memory_mib: DEFAULT_MEMORY_MIB,
+                storage_mib: DEFAULT_STORAGE_MIB,
+                timeout_s: DEFAULT_TIMEOUT_S,
+                wait_timeout_s: DEFAULT_WAIT_TIMEOUT_S,
+                max_runs: 4,
+                runtime: Some(INSTANCES_RUNTIME.to_string()),
+                slots: DEFAULT_SLOTS,
+                instance_types: vec!["DEV1-M".to_string(), "DEV1-L".to_string()],
+            }],
+            cache: CacheConfig {
+                kind: CacheType::S3,
+                expire_days: DEFAULT_EXPIRE_DAYS,
+            },
+            providers: BTreeMap::new(),
+        }
+    }
+
+    /// Whether `pool` runs on VMs: runtime `instances` or an added provider.
+    pub fn is_vm_pool(&self, pool: &Pool) -> bool {
+        pool.runtime.as_deref() == Some(INSTANCES_RUNTIME) || self.extra_provider_of(pool).is_some()
+    }
+
     pub fn pool_by_tag(&self, tag: &str) -> Option<&Pool> {
         self.pools.iter().find(|pool| pool.tag == tag)
     }
@@ -170,9 +236,35 @@ pub fn parse_config(json: &str) -> Result<Config> {
     validate(config)
 }
 
+/// The config document `overlay` over `base` by top-level key: a key of `overlay` replaces
+/// the whole value of `base` (M5 rule R1). The result is validated.
+pub fn merge_config(base: &Config, overlay: &str) -> Result<Config> {
+    let structural = |error: serde_json::Error| Error::Config(vec![error.to_string()]);
+    let Value::Object(overlay) = serde_json::from_str::<Value>(overlay).map_err(structural)? else {
+        return Err(Error::Config(vec!["config: a JSON object".to_string()]));
+    };
+    let mut merged = match serde_json::to_value(base)? {
+        Value::Object(map) => map,
+        _ => Map::new(),
+    };
+    merged.extend(overlay);
+    validate(serde_json::from_value(Value::Object(merged)).map_err(structural)?)
+}
+
 pub async fn load_config(path: &Path) -> Result<Config> {
-    let text = tokio::fs::read_to_string(path).await?;
-    parse_config(&text)
+    parse_config(&read_config_file(path).await?)
+}
+
+/// The text of a config file; a missing file is an error that names it.
+pub async fn read_config_file(path: &Path) -> Result<String> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(text) => Ok(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(Error::other(format!(
+            "config file {} not found",
+            path.display()
+        ))),
+        Err(error) => Err(Error::other(format!("{}: {error}", path.display()))),
+    }
 }
 
 pub fn validate(mut config: Config) -> Result<Config> {
@@ -254,11 +346,23 @@ pub fn validate(mut config: Config) -> Result<Config> {
             errors.push(format!(
                 "providers.{runtime}: lowercase letters, digits and hyphens"
             ));
+        } else if RESERVED_RUNTIMES.contains(&runtime.as_str()) {
+            errors.push(format!("providers.{runtime}: reserved name"));
         }
     }
 
     if config.cache.expire_days == 0 {
         errors.push("cache.expireDays: positive integer".to_string());
+    }
+    if config.cache.kind != CacheType::S3 {
+        for (index, pool) in config.pools.iter().enumerate() {
+            if config.is_vm_pool(pool) {
+                errors.push(format!(
+                    "pools[{index}]: VM pool {} needs cache.type s3",
+                    pool.tag
+                ));
+            }
+        }
     }
 
     if errors.is_empty() {
@@ -268,10 +372,15 @@ pub fn validate(mut config: Config) -> Result<Config> {
     }
 }
 
-/// Pools that exceed what the provider offers.
-pub fn check_capabilities(config: &Config, caps: &Capabilities) -> Vec<String> {
+/// Pools that exceed what their provider offers; `caps_for` answers per pool (a composite with
+/// the member serving it).
+pub fn check_capabilities(
+    config: &Config,
+    caps_for: impl Fn(&Pool) -> Capabilities,
+) -> Vec<String> {
     let mut errors = Vec::new();
     for (index, pool) in config.pools.iter().enumerate() {
+        let caps = caps_for(pool);
         for (field, value, limit) in [
             ("vcpu", pool.vcpu, caps.max_vcpu),
             ("memoryMiB", pool.memory_mib, caps.max_memory_mib),
@@ -448,7 +557,7 @@ mod tests {
             billing: Billing::PerSecond,
         };
         assert_eq!(
-            check_capabilities(&config, &caps),
+            check_capabilities(&config, |_| caps.clone()),
             vec![
                 "pools[0].timeoutS: 3600 above tiny maximum 600",
                 "pools[1].vcpu: 4 above tiny maximum 2",
@@ -458,8 +567,150 @@ mod tests {
         let roomy = Capabilities {
             max_vcpu: 6,
             max_duration_s: 86400,
-            ..caps
+            ..caps.clone()
         };
-        assert!(check_capabilities(&config, &roomy).is_empty());
+        assert!(check_capabilities(&config, |_| roomy.clone()).is_empty());
+        let per_pool = check_capabilities(&config, |pool| {
+            if pool.tag == "build" {
+                roomy.clone()
+            } else {
+                caps.clone()
+            }
+        });
+        assert_eq!(
+            per_pool,
+            vec!["pools[0].timeoutS: 3600 above tiny maximum 600"]
+        );
+    }
+
+    #[test]
+    fn ci_defaults_are_one_vm_pool_on_scaleway() {
+        let defaults = Config::ci_defaults(4711, "https://gitlab.example");
+        let config = validate(defaults.clone()).unwrap();
+        assert_eq!(config, defaults);
+        assert_eq!(config.name, "ci-4711");
+        assert_eq!(config.gitlab.url, "https://gitlab.example");
+        assert_eq!(config.gitlab.project_ids, [4711]);
+        assert_eq!(config.host.kind, "scaleway-function");
+        assert_eq!(config.host.extra["region"], "fr-par");
+        assert_eq!(config.provider.kind, "scaleway");
+        assert_eq!(config.provider.extra["region"], "fr-par");
+        assert_eq!(config.provider.extra.len(), 1, "no registry key");
+        assert_eq!(config.default_pool.as_deref(), Some("vm"));
+        assert_eq!(config.pools.len(), 1);
+        let pool = &config.pools[0];
+        assert_eq!(pool.tag, "vm");
+        assert_eq!(pool.runtime.as_deref(), Some("instances"));
+        assert_eq!(pool.image, "ubuntu:24.04");
+        assert!(pool.stages.is_empty());
+        assert_eq!((pool.slots, pool.max_runs), (2, 4));
+        assert_eq!(pool.instance_types, ["DEV1-M", "DEV1-L"]);
+        assert_eq!(
+            config.cache,
+            CacheConfig {
+                kind: CacheType::S3,
+                expire_days: 30
+            }
+        );
+        assert!(config.providers.is_empty());
+        assert!(config.is_vm_pool(pool));
+    }
+
+    #[test]
+    fn a_file_replaces_whole_top_level_keys_of_the_defaults() {
+        let defaults = Config::ci_defaults(5, "https://gitlab.example");
+        assert_eq!(merge_config(&defaults, "{}").unwrap(), defaults);
+
+        let merged = merge_config(
+            &defaults,
+            r#"{
+              "provider": { "type": "scaleway", "zone": "nl-ams-1" },
+              "pools": [
+                { "tag": "vm", "image": "ubuntu:24.04", "runtime": "instances" },
+                { "tag": "rust", "image": "img/rust", "runtime": "jobs", "stages": ["rust"] }
+              ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(merged.provider.extra.get("region"), None, "replaced whole");
+        assert_eq!(merged.provider.extra["zone"], "nl-ams-1");
+        assert_eq!(merged.pools.len(), 2);
+        assert_eq!(
+            merged.pools[0].max_runs, DEFAULT_MAX_RUNS,
+            "no default kept"
+        );
+        assert!(merged.pools[0].instance_types.is_empty());
+        assert_eq!(merged.name, defaults.name);
+        assert_eq!(merged.gitlab, defaults.gitlab);
+        assert_eq!(merged.host, defaults.host);
+        assert_eq!(merged.default_pool, defaults.default_pool);
+        assert_eq!(merged.cache, defaults.cache);
+
+        let named = merge_config(&defaults, r#"{ "name": "shop", "defaultPool": null }"#).unwrap();
+        assert_eq!(named.name, "shop");
+        assert_eq!(named.default_pool, None);
+
+        match merge_config(&defaults, r#"{ "cache": { "type": "none" } }"#) {
+            Err(Error::Config(errors)) => {
+                assert_eq!(errors, ["pools[0]: VM pool vm needs cache.type s3"])
+            }
+            other => panic!("expected a config error, got {other:?}"),
+        }
+        for bad in ["[]", "{", r#"{ "pools": 3 }"#] {
+            assert!(
+                matches!(merge_config(&defaults, bad), Err(Error::Config(_))),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_reserved_provider_names() {
+        for name in RESERVED_RUNTIMES {
+            let mut raw = valid();
+            raw["providers"] = serde_json::json!({});
+            raw["providers"][name] = serde_json::json!({});
+            raw["cache"] = serde_json::json!({ "type": "s3" });
+            assert_eq!(
+                errors_of(raw),
+                [format!("providers.{name}: reserved name")],
+                "{name}"
+            );
+        }
+        let mut raw = valid();
+        raw["providers"] = serde_json::json!({ "hetzner": {} });
+        assert!(parse_config(&raw.to_string()).is_ok());
+    }
+
+    #[test]
+    fn vm_pools_need_an_s3_cache() {
+        let mut raw = valid();
+        raw["providers"] = serde_json::json!({ "hetzner": {} });
+        raw["pools"] = serde_json::json!([
+            { "tag": "vm", "image": "img/node", "runtime": "instances" },
+            { "tag": "hz", "image": "img/node", "runtime": "hetzner" },
+            { "tag": "ci", "image": "img/node", "runtime": "jobs" },
+            { "tag": "other", "image": "img/node", "runtime": "elsewhere" },
+            { "tag": "plain", "image": "img/node" }
+        ]);
+        assert_eq!(
+            errors_of(raw.clone()),
+            [
+                "pools[0]: VM pool vm needs cache.type s3",
+                "pools[1]: VM pool hz needs cache.type s3",
+            ]
+        );
+        raw["cache"] = serde_json::json!({ "type": "none" });
+        assert_eq!(errors_of(raw.clone()).len(), 2);
+        raw["cache"] = serde_json::json!({ "type": "s3" });
+        assert!(parse_config(&raw.to_string()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_missing_config_file_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.json");
+        let error = load_config(&path).await.unwrap_err().to_string();
+        assert_eq!(error, format!("config file {} not found", path.display()));
     }
 }

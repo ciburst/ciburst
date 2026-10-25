@@ -7,12 +7,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::Result;
-use crate::config::Config;
+use crate::config::{Config, Pool};
 use crate::log::Log;
 use crate::types::{
     Capabilities, Outputs, Provider, Rotation, Run, StartRequest, Step, VmCapacity, VmReport,
 };
+use crate::{Error, Result};
 
 pub struct Composite {
     config: Arc<Config>,
@@ -75,6 +75,23 @@ fn owns(runtime: &str, id: &str) -> bool {
 impl Provider for Composite {
     fn capabilities(&self) -> Capabilities {
         self.main.capabilities()
+    }
+
+    fn capabilities_for(&self, pool: &Pool) -> Capabilities {
+        self.for_pool(&pool.tag).0.capabilities_for(pool)
+    }
+
+    /// Every member's preflight; the first failure names its runtime.
+    async fn preflight(&self) -> Result<()> {
+        let members = std::iter::once((self.config.provider.kind.as_str(), &self.main))
+            .chain(self.extras.iter().map(|(name, p)| (name.as_str(), p)));
+        for (name, provider) in members {
+            provider
+                .preflight()
+                .await
+                .map_err(|error| Error::provider(format!("preflight of {name}: {error}")))?;
+        }
+        Ok(())
     }
 
     async fn plan(&self, rotate: &[Rotation]) -> Result<Vec<Step>> {
@@ -179,6 +196,7 @@ mod tests {
     use crate::config::parse_config;
     use crate::types::{Action, Billing, RunState, VmState};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     type Calls = Arc<Mutex<Vec<String>>>;
 
@@ -189,6 +207,7 @@ mod tests {
         calls: Calls,
         shared: BTreeMap<String, String>,
         fail_sweep: bool,
+        fail_preflight: AtomicBool,
         started: Mutex<Vec<StartRequest>>,
     }
 
@@ -200,6 +219,7 @@ mod tests {
                 calls: calls.clone(),
                 shared: BTreeMap::new(),
                 fail_sweep: false,
+                fail_preflight: AtomicBool::new(false),
                 started: Mutex::new(Vec::new()),
             }
         }
@@ -229,6 +249,13 @@ mod tests {
                 archs: vec!["amd64".into()],
                 billing: Billing::PerHour,
             }
+        }
+        async fn preflight(&self) -> Result<()> {
+            self.call("preflight", "");
+            if self.fail_preflight.load(Ordering::SeqCst) {
+                return Err(Error::provider("no quota"));
+            }
+            Ok(())
         }
         async fn plan(&self, _rotate: &[Rotation]) -> Result<Vec<Step>> {
             self.call("plan", "");
@@ -314,7 +341,8 @@ mod tests {
                     { "tag": "hz", "image": "img/node", "runtime": "hetzner", "stages": ["test"] },
                     { "tag": "other", "image": "img/node", "runtime": "other", "stages": ["deploy"] }
                   ],
-                  "providers": { "hetzner": { "location": "nbg1" } }
+                  "providers": { "hetzner": { "location": "nbg1" } },
+                  "cache": { "type": "s3" }
                 }"#,
             )
             .unwrap(),
@@ -545,5 +573,37 @@ mod tests {
         assert_eq!(s.composite.capabilities().name, "main");
         assert_eq!(s.composite.shared_env().await.unwrap(), s.main.shared);
         assert_eq!(s.calls(), ["main shared_env "]);
+    }
+
+    #[tokio::test]
+    async fn capabilities_for_a_pool_come_from_its_member() {
+        let s = setup(false, false);
+        let config = config();
+        let name = |tag: &str| {
+            s.composite
+                .capabilities_for(config.pool_by_tag(tag).unwrap())
+                .name
+        };
+        assert_eq!(name("vm"), "main");
+        assert_eq!(name("plain"), "main");
+        assert_eq!(name("hz"), "hetzner");
+        assert_eq!(name("other"), "main", "a runtime without a member");
+    }
+
+    #[tokio::test]
+    async fn preflight_runs_every_member_and_names_the_failing_runtime() {
+        let s = setup(false, false);
+        s.composite.preflight().await.unwrap();
+        assert_eq!(s.calls(), ["main preflight ", "hetzner preflight "]);
+
+        s.extra.fail_preflight.store(true, Ordering::SeqCst);
+        let error = s.composite.preflight().await.unwrap_err().to_string();
+        assert_eq!(error, "preflight of hetzner: no quota");
+        assert_eq!(s.calls(), ["main preflight ", "hetzner preflight "]);
+
+        s.main.fail_preflight.store(true, Ordering::SeqCst);
+        let error = s.composite.preflight().await.unwrap_err().to_string();
+        assert_eq!(error, "preflight of fake: no quota");
+        assert_eq!(s.calls(), ["main preflight "], "stops at the first failure");
     }
 }

@@ -3,10 +3,17 @@
   "gitlab": { "url": "https://gitlab.com", "projectIds": [1] },
   "host": { "type": "fake" },
   "provider": { "type": "fake" },
-  "defaultPool": "ci",
+  "defaultPool": "vm",
   "pools": [
-    { "tag": "ci", "image": "example.invalid/node:24", "stages": ["lint", "test"] },
-    { "tag": "build", "image": "example.invalid/kaniko:1", "stages": ["build"], "maxRuns": 2 }
+    {
+      "tag": "vm",
+      "runtime": "instances",
+      "image": "ubuntu:24.04",
+      "stages": [],
+      "slots": 2,
+      "instanceTypes": ["DEV1-M", "DEV1-L"],
+      "maxRuns": 4
+    }
   ],
-  "cache": { "type": "s3" }
+  "cache": { "type": "s3", "expireDays": 30 }
 }

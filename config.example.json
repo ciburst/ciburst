@@ -1,8 +1,8 @@
 {
-  "name": "ci",
+  "name": "ci-example",
   "gitlab": { "url": "https://gitlab.com", "projectIds": [0] },
   "host": { "type": "scaleway-function", "region": "fr-par" },
-  "provider": { "type": "scaleway", "region": "fr-par", "registry": true, "registryPublic": true },
+  "provider": { "type": "scaleway", "region": "fr-par" },
   "defaultPool": "vm",
   "pools": [
     {
@@ -12,31 +12,6 @@
       "stages": [],
       "slots": 2,
       "instanceTypes": ["DEV1-M", "DEV1-L"],
-      "timeoutS": 3600,
-      "maxRuns": 4
-    },
-    {
-      "tag": "rust",
-      "runtime": "jobs",
-      "image": "registry.gitlab.com/<namespace>/ciburst/rust:1",
-      "stages": ["rust"],
-      "vcpu": 4,
-      "memoryMiB": 8192,
-      "storageMiB": 10240,
-      "timeoutS": 3600,
-      "waitTimeoutS": 60,
-      "maxRuns": 4
-    },
-    {
-      "tag": "playwright",
-      "runtime": "jobs",
-      "image": "registry.gitlab.com/<namespace>/ciburst/playwright:1",
-      "stages": ["e2e"],
-      "vcpu": 4,
-      "memoryMiB": 8192,
-      "storageMiB": 10240,
-      "timeoutS": 3600,
-      "waitTimeoutS": 60,
       "maxRuns": 4
     }
   ],

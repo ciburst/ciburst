@@ -7,6 +7,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 
+use crate::check::is_own_job;
 use crate::config::{CacheType, Config, Pool};
 use crate::ledger::{GROUP_WAIT_S, GROUP_WINDOW_S, Intent, Ledger};
 use crate::log::Log;
@@ -169,6 +170,13 @@ impl Dispatcher {
         let project_id = event.get("project_id").and_then(Value::as_u64).unwrap_or(0);
         if !self.config.gitlab.project_ids.contains(&project_id) {
             return ignored("project", json!({}));
+        }
+        if let Some(name) = event
+            .get("build_name")
+            .and_then(Value::as_str)
+            .filter(|name| is_own_job(name))
+        {
+            return ignored("own_job", json!({ "name": name }));
         }
 
         let stage = event.get("build_stage").and_then(Value::as_str);
@@ -829,6 +837,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ignores_the_components_own_jobs() {
+        let (d, recording, _) = setup(false).await;
+        let named = |name: &str, project: u64| {
+            let mut event: Value =
+                serde_json::from_slice(&event("build", "pending", project, 5)).unwrap();
+            event["build_name"] = name.into();
+            event.to_string().into_bytes()
+        };
+        let response = d
+            .handle(&headers("hook-secret"), &named("ciburst-setup", 7))
+            .await;
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body["result"], "ignored");
+        assert_eq!(response.body["reason"], "own_job");
+        assert_eq!(response.body["name"], "ciburst-setup");
+        let other = d
+            .handle(&headers("hook-secret"), &named("ciburst-check", 8))
+            .await;
+        assert_eq!(
+            other.body["reason"], "project",
+            "the project check comes first"
+        );
+        assert!(recording.started.lock().unwrap().is_empty());
+
+        let response = d
+            .handle(&headers("hook-secret"), &named("ciburst", 7))
+            .await;
+        assert_eq!(response.body["result"], "started");
+    }
+
+    #[tokio::test]
     async fn starts_in_the_pool_of_the_stage() {
         let (d, recording, lines) = setup(false).await;
         let response = d
@@ -1286,7 +1325,8 @@ mod tests {
                   "pools": [
                     { "tag": "vm", "image": "img/node", "runtime": "instances", "slots": 2, "maxRuns": 2 },
                     { "tag": "jobs", "image": "img/kaniko", "stages": ["build"], "runtime": "jobs" }
-                  ]
+                  ],
+                  "cache": { "type": "s3" }
                 }"#,
             )
             .unwrap(),
@@ -1301,7 +1341,10 @@ mod tests {
                 ("jobs".to_string(), "glrt-jobs".to_string()),
             ]),
             dispatch: None,
-            cache: None,
+            cache: Some(KeyPair {
+                access_key: "AK".into(),
+                secret_key: "SK".into(),
+            }),
             vm_secret: Some(VM_SECRET.into()),
             sweep_token: Some("sweep-secret".into()),
             provider_env: BTreeMap::new(),

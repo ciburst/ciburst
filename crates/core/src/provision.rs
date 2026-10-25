@@ -1,18 +1,28 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::Rng;
 use rand::distr::Alphanumeric;
+use serde_json::{Value, json};
 
 use crate::check::{Problem, check_jobs};
-use crate::config::{Config, Pool};
-use crate::gitlab::Gitlab;
+use crate::config::{CacheType, Config, Pool};
+use crate::fake::Clock;
+use crate::gitlab::{Gitlab, Job};
+use crate::http::{HttpClient, Request};
 use crate::log::Log;
 use crate::plan::OutputsStore;
 use crate::types::{Action, Host, KeyPair, Outputs, Provider, Rotation, Run, Secrets, Step};
 use crate::{Error, Result};
 
-/// Keys of `.local/outputs.env`.
+/// Pending jobs younger than this still have their own webhook on the way (spec D41).
+pub const REPLAY_MIN_AGE_S: u64 = 60;
+
+/// Output keys: `.local/outputs.env`, or project variables in pipeline mode.
 pub mod keys {
+    use crate::config::Config;
+
     pub const HOOK_TOKEN: &str = "CIBURST_HOOK_TOKEN";
     pub const VM_SECRET: &str = "CIBURST_VM_SECRET";
     pub const SWEEP_TOKEN: &str = "CIBURST_SWEEP_TOKEN";
@@ -27,6 +37,44 @@ pub mod keys {
     pub const AGENT_SHA256: &str = "CIBURST_AGENT_SHA256";
     /// Outputs the dispatcher gets as plain environment variables.
     pub const DISPATCHER_ENV: [&str; 1] = [AGENT_SHA256];
+    pub const PROJECT_ID: &str = "CIBURST_PROJECT_ID";
+    pub const REGISTRY_ENDPOINT: &str = "CIBURST_REGISTRY_ENDPOINT";
+
+    /// Output keys that do not depend on the pools. `PROVIDER_ENV` is not among them: in
+    /// pipeline mode its values never leave memory.
+    pub const FIXED: [&str; 11] = [
+        HOOK_TOKEN,
+        VM_SECRET,
+        SWEEP_TOKEN,
+        DISPATCH_URL,
+        DISPATCH_ACCESS_KEY,
+        DISPATCH_SECRET_KEY,
+        CACHE_ACCESS_KEY,
+        CACHE_SECRET_KEY,
+        PROJECT_ID,
+        REGISTRY_ENDPOINT,
+        AGENT_SHA256,
+    ];
+
+    /// Keys a provider answers from every `apply` call; they replace stored values.
+    pub fn is_refreshed(key: &str) -> bool {
+        PROVIDER_ENV.contains(&key) || DISPATCHER_ENV.contains(&key)
+    }
+
+    /// Every output key of a deployment of `config`: the fixed ones and the runner keys of its
+    /// pools.
+    pub fn output_keys(config: &Config) -> Vec<String> {
+        FIXED
+            .iter()
+            .map(|key| key.to_string())
+            .chain(
+                config
+                    .pools
+                    .iter()
+                    .flat_map(|pool| [runner_id(&pool.tag), runner_token(&pool.tag)]),
+            )
+            .collect()
+    }
 
     pub fn runner_id(tag: &str) -> String {
         format!("CIBURST_RUNNER_ID_{}", env_name(tag))
@@ -113,6 +161,8 @@ pub struct Provisioner {
     gitlab: Option<Arc<Gitlab>>,
     outputs: Arc<dyn OutputsStore>,
     log: Log,
+    replay: Option<Arc<dyn HttpClient>>,
+    clock: Clock,
 }
 
 impl Provisioner {
@@ -131,7 +181,22 @@ impl Provisioner {
             gitlab,
             outputs,
             log,
+            replay: None,
+            clock: Arc::new(now_seconds),
         }
+    }
+
+    /// The client `apply` posts waiting jobs to the dispatcher with (M5 rule R4); without it
+    /// nothing is replayed.
+    pub fn with_replay(mut self, http: Arc<dyn HttpClient>) -> Provisioner {
+        self.replay = Some(http);
+        self
+    }
+
+    /// Replaces the system clock, which dates pending jobs for the replay.
+    pub fn with_clock(mut self, clock: Clock) -> Provisioner {
+        self.clock = clock;
+        self
     }
 
     fn runner_description(&self, pool: &Pool) -> String {
@@ -408,8 +473,35 @@ impl Provisioner {
         Ok(token)
     }
 
+    /// `rotate` plus the rotation of every output secret the config needs that `current`
+    /// lacks (M5 rule R7): a key that exists only at the provider would otherwise stay lost
+    /// behind a `noop`. A pool's missing runner token recreates that runner (`runner_steps`).
+    fn with_missing_secrets(&self, rotate: &[Rotation], current: &Outputs) -> Vec<Rotation> {
+        let mut all = rotate.to_vec();
+        let pair = |access: &str, secret: &str| {
+            current.contains_key(access) && current.contains_key(secret)
+        };
+        let mut needed = Vec::new();
+        if !pair(keys::DISPATCH_ACCESS_KEY, keys::DISPATCH_SECRET_KEY) {
+            needed.push(Rotation::Key);
+        }
+        if self.config.cache.kind == CacheType::S3
+            && !pair(keys::CACHE_ACCESS_KEY, keys::CACHE_SECRET_KEY)
+        {
+            needed.push(Rotation::Cache);
+        }
+        for rotation in needed {
+            if !all.contains(&rotation) {
+                all.push(rotation);
+            }
+        }
+        all
+    }
+
     pub async fn plan(&self, rotate: &[Rotation]) -> Result<Vec<Step>> {
         let current = self.outputs.read().await?;
+        let rotate = self.with_missing_secrets(rotate, &current);
+        let rotate = rotate.as_slice();
         let secrets = secrets_from_outputs(&self.config, &current);
         let mut steps = self.provider.plan(&provider_rotations(rotate)).await?;
         steps.extend(
@@ -421,8 +513,12 @@ impl Provisioner {
         Ok(steps)
     }
 
-    /// Applies in phases so that later phases see the outputs of earlier ones.
+    /// Applies in phases so that later phases see the outputs of earlier ones. Nothing changes
+    /// when the provider's preflight fails (M5 rule R6); waiting jobs are replayed last.
     pub async fn apply(&self, rotate: &[Rotation]) -> Result<Vec<Step>> {
+        self.provider.preflight().await?;
+        let rotate = self.with_missing_secrets(rotate, &self.outputs.read().await?);
+        let rotate = rotate.as_slice();
         let mut applied = Vec::new();
         let rotate_hook = rotate.contains(&Rotation::Hook);
         let hook_token = self.ensure_secret(keys::HOOK_TOKEN, rotate_hook).await?;
@@ -444,8 +540,14 @@ impl Provisioner {
             let outputs = self.provider.apply(std::slice::from_ref(step)).await?;
             self.outputs.write(&outputs, true).await?;
         }
+        // The tail call keeps secrets shown once; values the provider derives on every call
+        // (agent digest, provider credentials) replace the stored ones.
         let tail = self.provider.apply(&[]).await?;
-        self.outputs.write(&tail, false).await?;
+        let (fresh, kept): (Outputs, Outputs) = tail
+            .into_iter()
+            .partition(|(key, _)| keys::is_refreshed(key));
+        self.outputs.write(&fresh, true).await?;
+        self.outputs.write(&kept, false).await?;
         applied.extend(provider_steps);
 
         let current = self.outputs.read().await?;
@@ -467,13 +569,104 @@ impl Provisioner {
         let hook_steps = self.hook_steps(rotate.contains(&Rotation::Hook)).await?;
         self.apply_hooks(&hook_steps, &hook_token).await?;
         applied.extend(hook_steps);
+        self.replay(&hook_token).await;
         Ok(applied)
+    }
+
+    /// Posts every pending job that waits for a pool tag longer than [`REPLAY_MIN_AGE_S`] to the
+    /// dispatcher as GitLab would (M5 rule R4, spec D41), so jobs that queued before the setup
+    /// start. Failures are logged; they never fail `apply`.
+    async fn replay(&self, hook_token: &str) {
+        let (Some(gitlab), Some(http)) = (&self.gitlab, &self.replay) else {
+            return;
+        };
+        let url = match self.host.url().await {
+            Ok(Some(url)) if !hook_token.is_empty() => url,
+            Ok(_) => return,
+            Err(error) => {
+                self.log
+                    .warn("replay_failed", &[("error", &error.to_string())]);
+                return;
+            }
+        };
+        let now = (self.clock)();
+        let tags: BTreeSet<&str> = self.config.pools.iter().map(|p| p.tag.as_str()).collect();
+        for &project_id in &self.config.gitlab.project_ids {
+            let project = project_id.to_string();
+            let jobs = match gitlab.list_pending_jobs(project_id).await {
+                Ok(jobs) => jobs,
+                Err(error) => {
+                    self.log.warn(
+                        "replay_failed",
+                        &[("project", &project), ("error", &error.to_string())],
+                    );
+                    continue;
+                }
+            };
+            let mut waiting: Vec<Job> = jobs
+                .into_iter()
+                .filter(|job| job.tag_list.iter().any(|t| tags.contains(t.as_str())))
+                .filter(|job| {
+                    parse_rfc3339(&job.created_at)
+                        .is_some_and(|created| now.saturating_sub(created) > REPLAY_MIN_AGE_S)
+                })
+                .collect();
+            waiting.sort_by_key(|job| job.id);
+            for job in waiting {
+                let body = json!({
+                    "object_kind": "build",
+                    "build_status": "pending",
+                    "project_id": project_id,
+                    "build_id": job.id,
+                    "build_name": job.name,
+                    "build_stage": job.stage,
+                    "pipeline_id": job.pipeline.as_ref().map(|p| p.id),
+                });
+                let request = Request::new("POST", url.clone())
+                    .header("X-Gitlab-Event", "Job Hook")
+                    .header("X-Gitlab-Token", hook_token)
+                    .json(&body);
+                let job_id = job.id.to_string();
+                match http.send(request).await {
+                    Ok(response) if response.ok() => {
+                        let result = response
+                            .json::<Value>()
+                            .ok()
+                            .and_then(|v| v.get("result").and_then(Value::as_str).map(String::from))
+                            .unwrap_or_else(|| response.status.to_string());
+                        self.log.info(
+                            "replayed",
+                            &[("project", &project), ("job", &job_id), ("result", &result)],
+                        );
+                    }
+                    Ok(response) => self.log.warn(
+                        "replay_failed",
+                        &[
+                            ("project", &project),
+                            ("job", &job_id),
+                            ("status", &response.status.to_string()),
+                        ],
+                    ),
+                    Err(error) => self.log.warn(
+                        "replay_failed",
+                        &[
+                            ("project", &project),
+                            ("job", &job_id),
+                            ("error", &error.to_string()),
+                        ],
+                    ),
+                }
+            }
+        }
     }
 
     pub async fn destroy(&self) -> Result<()> {
         let current = self.outputs.read().await?;
         if let Some(gitlab) = &self.gitlab {
-            let url = self.host.url().await?;
+            let url = match self.host.url().await? {
+                Some(url) => Some(url),
+                None => current.get(keys::DISPATCH_URL).cloned(),
+            };
             for &project_id in &self.config.gitlab.project_ids {
                 for hook in gitlab.list_hooks(project_id).await? {
                     if url.as_deref() == Some(hook.url.as_str()) {
@@ -527,30 +720,39 @@ impl Provisioner {
         })
     }
 
-    /// Lints every project's pipeline at `content_ref` (the default branch when `None`) and
-    /// compares its jobs with the stage map.
+    /// See [`check`].
     pub async fn check(&self, content_ref: Option<&str>) -> Result<Vec<ProjectReport>> {
         let gitlab = self
             .gitlab
             .as_ref()
             .ok_or_else(|| Error::other("check needs a GitLab token"))?;
-        let mut report = Vec::new();
-        for &project_id in &self.config.gitlab.project_ids {
-            let lint = gitlab.lint_jobs(project_id, content_ref).await?;
-            let problems = if lint.valid {
-                check_jobs(&self.config, &lint.jobs)
-            } else {
-                Vec::new()
-            };
-            report.push(ProjectReport {
-                project_id,
-                valid: lint.valid,
-                errors: lint.errors,
-                problems,
-            });
-        }
-        Ok(report)
+        check(&self.config, gitlab, content_ref).await
     }
+}
+
+/// Lints every project's pipeline at `content_ref` (the default branch when `None`) and
+/// compares its jobs with the stage map. Needs only the config and GitLab.
+pub async fn check(
+    config: &Config,
+    gitlab: &Gitlab,
+    content_ref: Option<&str>,
+) -> Result<Vec<ProjectReport>> {
+    let mut report = Vec::new();
+    for &project_id in &config.gitlab.project_ids {
+        let lint = gitlab.lint_jobs(project_id, content_ref).await?;
+        let problems = if lint.valid {
+            check_jobs(config, &lint.jobs)
+        } else {
+            Vec::new()
+        };
+        report.push(ProjectReport {
+            project_id,
+            valid: lint.valid,
+            errors: lint.errors,
+            problems,
+        });
+    }
+    Ok(report)
 }
 
 fn provider_rotations(rotate: &[Rotation]) -> Vec<Rotation> {
@@ -559,4 +761,112 @@ fn provider_rotations(rotate: &[Rotation]) -> Vec<Rotation> {
         .copied()
         .filter(|r| matches!(r, Rotation::Key | Rotation::Cache))
         .collect()
+}
+
+fn now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Unix seconds of an RFC 3339 timestamp such as `2026-10-25T12:00:00.123Z`.
+fn parse_rfc3339(text: &str) -> Option<u64> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 20 {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| -> Option<i64> {
+        let part = text.get(range)?;
+        part.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| part.parse().ok())?
+    };
+    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
+    let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !matches!(bytes[10], b'T' | b't' | b' ')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let mut rest = &text[19..];
+    if let Some(fraction) = rest.strip_prefix('.') {
+        let digits = fraction.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        rest = &fraction[digits..];
+    }
+    let offset = match rest {
+        "Z" | "z" => 0,
+        _ => {
+            let sign = match rest.as_bytes().first()? {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            if rest.len() != 6 || rest.as_bytes()[3] != b':' {
+                return None;
+            }
+            let hours: i64 = rest.get(1..3)?.parse().ok()?;
+            let minutes: i64 = rest.get(4..6)?.parse().ok()?;
+            sign * (hours * 3600 + minutes * 60)
+        }
+    };
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    u64::try_from(days * 86_400 + hour * 3600 + minute * 60 + second - offset).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_gitlab_timestamps() {
+        assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_rfc3339("2026-10-25T12:00:00.123Z"),
+            Some(1_792_929_600)
+        );
+        assert_eq!(
+            parse_rfc3339("2026-10-25T14:00:00+02:00"),
+            Some(1_792_929_600)
+        );
+        assert_eq!(parse_rfc3339("2000-03-01T00:00:00Z"), Some(951_868_800));
+        for bad in [
+            "",
+            "2026-10-25",
+            "2026-13-25T12:00:00Z",
+            "2026-10-25T12:00:00",
+            "x",
+        ] {
+            assert_eq!(parse_rfc3339(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn output_keys_cover_the_pools_and_leave_provider_env_out() {
+        let config = Config::ci_defaults(5, "https://gitlab.example");
+        let all = keys::output_keys(&config);
+        assert_eq!(all.len(), keys::FIXED.len() + 2);
+        assert!(all.contains(&keys::runner_token("vm")));
+        assert!(all.contains(&keys::runner_id("vm")));
+        assert!(all.contains(&keys::AGENT_SHA256.to_string()));
+        assert!(!all.iter().any(|k| keys::PROVIDER_ENV.contains(&k.as_str())));
+        assert!(keys::is_refreshed("HCLOUD_TOKEN"));
+        assert!(keys::is_refreshed(keys::AGENT_SHA256));
+        assert!(!keys::is_refreshed(keys::DISPATCH_SECRET_KEY));
+    }
 }

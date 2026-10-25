@@ -7,7 +7,7 @@ use rand::Rng;
 use rand::distr::Alphanumeric;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{CacheType, Config, Pool};
+use crate::config::{CacheType, Config, INSTANCES_RUNTIME, Pool};
 use crate::provision::keys;
 use crate::store::Store;
 use crate::types::{
@@ -18,7 +18,7 @@ use crate::vm;
 use crate::{Error, Result};
 
 /// A pool with this `runtime` runs on fake VMs: several slots, reports, claims and the sweep.
-pub const VM_RUNTIME: &str = "instances";
+pub const VM_RUNTIME: &str = INSTANCES_RUNTIME;
 
 /// Unix seconds; injectable so that simulations control time.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -510,7 +510,8 @@ mod tests {
                   "pools": [
                     { "tag": "vm", "image": "img/node", "runtime": "instances", "slots": 2 },
                     { "tag": "jobs", "image": "img/node", "runtime": "jobs", "stages": ["build"] }
-                  ]
+                  ],
+                  "cache": { "type": "s3" }
                 }"#,
             )
             .unwrap(),

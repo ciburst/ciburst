@@ -23,8 +23,8 @@ use ciburst_core::ledger::{GROUP_WINDOW_S, MemoryLedger};
 use ciburst_core::log::Log;
 use ciburst_core::store::MemoryStore;
 use ciburst_core::types::{
-    Capabilities, Outputs, Provider, Rotation, Run, Secrets, StartRequest, Step, VmCapacity,
-    VmReport, VmState,
+    Capabilities, KeyPair, Outputs, Provider, Rotation, Run, Secrets, StartRequest, Step,
+    VmCapacity, VmReport, VmState,
 };
 use ciburst_core::vm;
 use serde_json::{Value, json};
@@ -212,7 +212,8 @@ impl Sim {
                     "pools": [{
                         "tag": "vm", "image": "img/node", "runtime": "instances",
                         "slots": slots, "maxRuns": max_runs
-                    }]
+                    }],
+                    "cache": { "type": "s3" }
                 })
                 .to_string(),
             )
@@ -233,7 +234,10 @@ impl Sim {
             hook_token: Some(HOOK.into()),
             runner_tokens: BTreeMap::from([("vm".to_string(), "glrt-vm".to_string())]),
             dispatch: None,
-            cache: None,
+            cache: Some(KeyPair {
+                access_key: "AK".into(),
+                secret_key: "SK".into(),
+            }),
             vm_secret: Some(VM_SECRET.into()),
             sweep_token: Some(SWEEP.into()),
             provider_env: BTreeMap::new(),

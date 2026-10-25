@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ciburst_core::check::LintJob;
@@ -7,11 +8,11 @@ use ciburst_core::dispatch::Dispatcher;
 use ciburst_core::fake::{FakeHost, FakeProvider};
 use ciburst_core::gitlab::Gitlab;
 use ciburst_core::log::Log;
-use ciburst_core::plan::{MemoryOutputs, OutputsStore};
+use ciburst_core::plan::{GitlabOutputs, MemoryOutputs, OUTPUTS_SCOPE, OutputsStore};
 use ciburst_core::provision::{Provisioner, keys, secrets_from_outputs};
 use ciburst_core::store::MemoryStore;
 use ciburst_core::testing::gitlab_fake::{FAKE_TOKEN, FakeGitlab};
-use ciburst_core::types::{Action, Host, Provider, Rotation, Step};
+use ciburst_core::types::{Action, Host, Outputs, Provider, Rotation, Step};
 use serde_json::json;
 
 fn config(project_ids: &[u64]) -> Arc<Config> {
@@ -547,4 +548,321 @@ async fn the_vm_secret_is_not_rotated_while_a_vm_runs() {
     let error = s.provisioner.apply(&[Rotation::Vm]).await.unwrap_err();
     assert!(error.to_string().contains("1 VMs are running"), "{error}");
     assert_eq!(s.outputs.read().await.unwrap()[keys::VM_SECRET], before);
+}
+
+/// The fake provider behind a preflight that fails, and answering `extra` from every apply
+/// call, as providers answer values they derive each time.
+struct Wrapped {
+    inner: Arc<FakeProvider>,
+    preflight: Option<&'static str>,
+    calls: AtomicU64,
+    extra: fn(u64) -> Outputs,
+}
+
+impl Wrapped {
+    fn new(inner: Arc<FakeProvider>) -> Wrapped {
+        Wrapped {
+            inner,
+            preflight: None,
+            calls: AtomicU64::new(0),
+            extra: |_| Outputs::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for Wrapped {
+    fn capabilities(&self) -> ciburst_core::types::Capabilities {
+        self.inner.capabilities()
+    }
+    async fn preflight(&self) -> ciburst_core::Result<()> {
+        match self.preflight {
+            Some(reason) => Err(ciburst_core::Error::provider(reason)),
+            None => Ok(()),
+        }
+    }
+    async fn plan(&self, rotate: &[Rotation]) -> ciburst_core::Result<Vec<Step>> {
+        self.inner.plan(rotate).await
+    }
+    async fn apply(&self, steps: &[Step]) -> ciburst_core::Result<Outputs> {
+        let mut outputs = self.inner.apply(steps).await?;
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        outputs.extend((self.extra)(call));
+        Ok(outputs)
+    }
+    async fn destroy(&self) -> ciburst_core::Result<()> {
+        self.inner.destroy().await
+    }
+    async fn start(
+        &self,
+        request: ciburst_core::types::StartRequest,
+    ) -> ciburst_core::Result<String> {
+        self.inner.start(request).await
+    }
+    async fn list(
+        &self,
+        pool: Option<&str>,
+    ) -> ciburst_core::Result<Vec<ciburst_core::types::Run>> {
+        self.inner.list(pool).await
+    }
+    async fn stop(&self, run_id: &str) -> ciburst_core::Result<()> {
+        self.inner.stop(run_id).await
+    }
+}
+
+fn provisioner_with(s: &Setup, provider: Arc<dyn Provider>, with_gitlab: bool) -> Provisioner {
+    let gitlab = with_gitlab.then(|| {
+        Arc::new(Gitlab::new(
+            &s.config.gitlab.url,
+            FAKE_TOKEN,
+            s.fake.clone(),
+        ))
+    });
+    Provisioner::new(
+        s.config.clone(),
+        provider,
+        s.host.clone(),
+        gitlab,
+        s.outputs.clone(),
+        Log::silent(),
+    )
+}
+
+#[tokio::test]
+async fn a_failing_preflight_changes_nothing() {
+    let s = setup(config(&[7]), true);
+    let mut wrapped = Wrapped::new(s.provider.clone());
+    wrapped.preflight = Some("fr-par-1 has no quota for DEV1-M; zones with quota: nl-ams-1");
+    let provisioner = provisioner_with(&s, Arc::new(wrapped), true);
+    let error = provisioner.apply(&[]).await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "fr-par-1 has no quota for DEV1-M; zones with quota: nl-ams-1"
+    );
+    assert!(all(&s.provider.plan(&[]).await.unwrap(), Action::Create));
+    assert_eq!(s.host.url().await.unwrap(), None);
+    assert_eq!(s.fake.runner_count(), 0);
+    assert!(s.fake.hooks().is_empty());
+    assert!(s.outputs.read().await.unwrap().is_empty());
+    assert!(s.fake.calls().is_empty(), "GitLab untouched");
+
+    let plan = provisioner.plan(&[]).await.unwrap();
+    assert!(
+        all(&plan, Action::Create),
+        "plan does not run the preflight"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_key_pair_in_the_outputs_rotates_it() {
+    for (access, secret, step) in [
+        (
+            keys::DISPATCH_ACCESS_KEY,
+            keys::DISPATCH_SECRET_KEY,
+            "key:dispatch",
+        ),
+        (keys::CACHE_ACCESS_KEY, keys::CACHE_SECRET_KEY, "key:cache"),
+    ] {
+        let s = setup(config(&[7]), true);
+        s.provisioner.apply(&[]).await.unwrap();
+        let before = s.outputs.read().await.unwrap();
+        let mut lost = before.clone();
+        lost.remove(secret);
+        s.outputs.clear().await.unwrap();
+        s.outputs.write(&lost, true).await.unwrap();
+
+        let plan = s.provisioner.plan(&[]).await.unwrap();
+        let changed: Vec<(&str, Action)> = plan
+            .iter()
+            .filter(|s| !s.is_noop())
+            .map(|s| (s.id.as_str(), s.action))
+            .collect();
+        assert_eq!(
+            changed,
+            [(step, Action::Update), ("dispatcher", Action::Update)],
+            "{secret}"
+        );
+        s.provisioner.apply(&[]).await.unwrap();
+        let after = s.outputs.read().await.unwrap();
+        assert_ne!(after[secret], before[secret]);
+        assert_ne!(after[access], before[access]);
+        let again = s.provisioner.plan(&[]).await.unwrap();
+        assert!(all(&again, Action::Noop), "{again:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_missing_runner_token_recreates_only_its_runner() {
+    let s = setup(config(&[7]), true);
+    s.provisioner.apply(&[]).await.unwrap();
+    let before = s.outputs.read().await.unwrap();
+    let mut lost = before.clone();
+    lost.remove(&keys::runner_token("build"));
+    s.outputs.clear().await.unwrap();
+    s.outputs.write(&lost, true).await.unwrap();
+    let plan = s.provisioner.plan(&[]).await.unwrap();
+    let changed: Vec<&str> = plan
+        .iter()
+        .filter(|s| !s.is_noop())
+        .map(|s| s.id.as_str())
+        .collect();
+    assert_eq!(changed, ["runner:build", "dispatcher"]);
+    s.provisioner.apply(&[]).await.unwrap();
+    let after = s.outputs.read().await.unwrap();
+    assert!(after.contains_key(&keys::runner_token("build")));
+    assert_eq!(
+        after[&keys::runner_token("ci")],
+        before[&keys::runner_token("ci")]
+    );
+}
+
+#[tokio::test]
+async fn without_an_s3_cache_no_cache_key_is_needed() {
+    let mut raw = (*config(&[7])).clone();
+    raw.cache = Default::default();
+    let s = setup(Arc::new(raw), false);
+    s.provisioner.apply(&[]).await.unwrap();
+    assert!(
+        !s.outputs
+            .read()
+            .await
+            .unwrap()
+            .contains_key(keys::CACHE_SECRET_KEY)
+    );
+    let plan = s.provisioner.plan(&[]).await.unwrap();
+    assert!(all(&plan, Action::Noop), "{plan:?}");
+    assert!(!plan.iter().any(|s| s.id == "key:cache"));
+}
+
+#[tokio::test]
+async fn every_apply_call_refreshes_provider_and_dispatcher_env() {
+    let s = setup(config(&[7]), false);
+    let mut wrapped = Wrapped::new(s.provider.clone());
+    wrapped.extra = |call| {
+        Outputs::from([
+            (keys::AGENT_SHA256.to_string(), format!("sha-{call}")),
+            ("HCLOUD_TOKEN".to_string(), format!("hcloud-{call}")),
+            (keys::PROJECT_ID.to_string(), format!("project-{call}")),
+        ])
+    };
+    let wrapped = Arc::new(wrapped);
+    let provisioner = provisioner_with(&s, wrapped.clone(), false);
+    provisioner.apply(&[]).await.unwrap();
+    let first = s.outputs.read().await.unwrap();
+    let calls = wrapped.calls.load(Ordering::SeqCst);
+    assert_eq!(
+        first[keys::AGENT_SHA256],
+        format!("sha-{calls}"),
+        "tail call"
+    );
+    assert_eq!(first["HCLOUD_TOKEN"], format!("hcloud-{calls}"));
+    let kept = format!("project-{}", calls - 1);
+    assert_eq!(
+        first[keys::PROJECT_ID],
+        kept,
+        "the last step's, not the tail's"
+    );
+
+    provisioner.apply(&[]).await.unwrap();
+    let second = s.outputs.read().await.unwrap();
+    let calls = wrapped.calls.load(Ordering::SeqCst);
+    assert_eq!(second[keys::AGENT_SHA256], format!("sha-{calls}"));
+    assert_eq!(second["HCLOUD_TOKEN"], format!("hcloud-{calls}"));
+    assert_eq!(
+        second[keys::PROJECT_ID],
+        kept,
+        "a tail value does not replace it"
+    );
+    let secrets = secrets_from_outputs(&s.config, &second);
+    assert_eq!(
+        secrets.dispatcher_env[keys::AGENT_SHA256],
+        format!("sha-{calls}")
+    );
+    assert_eq!(
+        secrets.provider_env["HCLOUD_TOKEN"],
+        format!("hcloud-{calls}")
+    );
+    assert!(
+        s.host
+            .plan(&secrets)
+            .await
+            .unwrap()
+            .iter()
+            .all(Step::is_noop),
+        "the host got the refreshed values"
+    );
+}
+
+/// The variables of `project` in scope `ciburst`, as a pipeline job of that environment sees
+/// them.
+fn job_env(fake: &FakeGitlab, project: u64) -> BTreeMap<String, String> {
+    fake.variables(project)
+        .into_iter()
+        .filter(|v| v.environment_scope == OUTPUTS_SCOPE)
+        .map(|v| (v.key, v.value))
+        .collect()
+}
+
+#[tokio::test]
+async fn pipeline_mode_keeps_the_outputs_in_project_variables() {
+    let s = setup(config(&[7]), true);
+    let gitlab = Arc::new(Gitlab::new(
+        &s.config.gitlab.url,
+        FAKE_TOKEN,
+        s.fake.clone(),
+    ));
+    let store = |env: &BTreeMap<String, String>| {
+        Arc::new(GitlabOutputs::new(
+            gitlab.clone(),
+            7,
+            keys::output_keys(&s.config),
+            env,
+            Log::silent(),
+        ))
+    };
+    let first = Provisioner::new(
+        s.config.clone(),
+        s.provider.clone(),
+        s.host.clone(),
+        Some(gitlab.clone()),
+        store(&BTreeMap::new()),
+        Log::silent(),
+    );
+    first.apply(&[]).await.unwrap();
+    let env = job_env(&s.fake, 7);
+    for key in [
+        keys::HOOK_TOKEN,
+        keys::VM_SECRET,
+        keys::SWEEP_TOKEN,
+        keys::DISPATCH_URL,
+        keys::DISPATCH_SECRET_KEY,
+        keys::CACHE_SECRET_KEY,
+    ] {
+        assert!(env.contains_key(key), "{key} in {env:?}");
+    }
+    assert!(env[&keys::runner_token("ci")].starts_with("glrt-"));
+    assert!(s.fake.variables(7).iter().all(|v| v.protected && v.raw));
+
+    let second = Provisioner::new(
+        s.config.clone(),
+        s.provider.clone(),
+        s.host.clone(),
+        Some(gitlab.clone()),
+        store(&env),
+        Log::silent(),
+    );
+    let plan = second.plan(&[]).await.unwrap();
+    assert!(all(&plan, Action::Noop), "{plan:?}");
+    let writes = s.fake.calls().len();
+    second.apply(&[]).await.unwrap();
+    assert!(
+        !s.fake.calls()[writes..]
+            .iter()
+            .any(|c| c.path.contains("/variables") && c.method != "GET"),
+        "a second setup writes no variable"
+    );
+
+    second.destroy().await.unwrap();
+    assert!(job_env(&s.fake, 7).is_empty());
+    assert_eq!(s.fake.runner_count(), 0);
 }

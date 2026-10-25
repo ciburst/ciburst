@@ -16,7 +16,7 @@ pub const CONTRACT_CONFIG: &str = r#"{
   "defaultPool": "ci",
   "pools": [
     { "tag": "ci", "image": "example.invalid/node:24", "stages": ["test"] },
-    { "tag": "build", "image": "example.invalid/kaniko:1", "stages": ["build"], "maxRuns": 1 }
+    { "tag": "build", "image": "example.invalid/node:24", "stages": ["build"], "maxRuns": 1 }
   ],
   "cache": { "type": "s3", "expireDays": 14 }
 }"#;

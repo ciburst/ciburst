@@ -32,10 +32,7 @@ impl Request {
     }
 
     pub fn header_value(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
+        header_value(&self.headers, name)
     }
 }
 
@@ -73,10 +70,27 @@ impl Response {
     }
 }
 
+/// Response headers with lower-case names.
+pub type Headers = Vec<(String, String)>;
+
+/// The value of header `name` (any case) in `headers`.
+pub fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
 /// The one HTTP seam of the core. Production uses [`ReqwestClient`]; tests use in-memory fakes.
 #[async_trait]
 pub trait HttpClient: Send + Sync {
     async fn send(&self, request: Request) -> Result<Response>;
+
+    /// `send` with the response headers, for paginated lists; a client without them
+    /// answers none.
+    async fn send_with_headers(&self, request: Request) -> Result<(Response, Headers)> {
+        Ok((self.send(request).await?, Headers::new()))
+    }
 }
 
 #[cfg(feature = "reqwest")]
@@ -100,6 +114,10 @@ impl ReqwestClient {
 #[async_trait]
 impl HttpClient for ReqwestClient {
     async fn send(&self, request: Request) -> Result<Response> {
+        Ok(self.send_with_headers(request).await?.0)
+    }
+
+    async fn send_with_headers(&self, request: Request) -> Result<(Response, Headers)> {
         let method = reqwest::Method::from_bytes(request.method.as_bytes())
             .map_err(|error| Error::Http(error.to_string()))?;
         let mut builder = self.client.request(method, &request.url);
@@ -114,11 +132,18 @@ impl HttpClient for ReqwestClient {
             .await
             .map_err(|error| Error::Http(error.to_string()))?;
         let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                Some((name.as_str().to_string(), value.to_str().ok()?.to_string()))
+            })
+            .collect();
         let body = response
             .bytes()
             .await
             .map_err(|error| Error::Http(error.to_string()))?
             .to_vec();
-        Ok(Response { status, body })
+        Ok((Response { status, body }, headers))
     }
 }
