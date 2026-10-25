@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
 use std::sync::Arc;
 
@@ -593,6 +593,27 @@ fn the_embedded_zip_is_the_function_package() {
             || n.contains('\\')
             || n.starts_with("crates/")),
         "{names:?}"
+    );
+    assert!(
+        !names
+            .iter()
+            .any(|n| n.starts_with("src/testing") || n.contains("/src/testing")),
+        "no test fakes: {names:?}"
+    );
+    assert!(
+        names
+            .iter()
+            .any(|n| n == "vendor/scaleway/src/provider/steps.rs")
+    );
+    let vendored: BTreeSet<&str> = names
+        .iter()
+        .filter_map(|n| n.strip_prefix("vendor/")?.split('/').next())
+        .filter(|name| !name.is_empty())
+        .collect();
+    assert_eq!(
+        vendored,
+        BTreeSet::from(["core", "hetzner", "scaleway"]),
+        "every path dependency of the function, and nothing else"
     );
 
     let mut read = |name: &str| {

@@ -5,10 +5,13 @@
 //! Cargo.toml              ciburst-dispatch-scaleway, bare [workspace], no inheritance, deps on vendor/
 //! Cargo.lock              the workspace lock
 //! src/                    crates/dispatch-scaleway/src
-//! vendor/core/            crates/core (Cargo.toml, src)
-//! vendor/scaleway/        crates/scaleway (Cargo.toml, src), without this build script
-//! vendor/hetzner/         crates/hetzner (Cargo.toml, src)
+//! vendor/<dir>/           every crate the function depends on by path, directly or through
+//!                         another vendored crate (Cargo.toml, src), without build scripts
 //! ```
+//!
+//! Path dependencies are `../<dir>` siblings below `crates/`, so they stay siblings below
+//! `vendor/`. The test fakes in `src/testing` are left out: only the `testing` feature compiles
+//! them, and the function never enables it.
 //!
 //! The vendored copy of this crate has no build script, so it embeds an empty zip and the
 //! packing does not recurse. Entries are sorted and carry fixed timestamps and permissions, so
@@ -23,31 +26,31 @@ use std::path::{Path, PathBuf};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, DateTime, ZipWriter};
 
+/// The directory below `src` that holds the test fakes.
+const TESTING_DIR: &str = "testing";
+
 fn main() {
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    let root = manifest_dir
+    let crates = manifest_dir
         .parent()
-        .and_then(Path::parent)
-        .expect("crates/scaleway lives two levels below the workspace root")
+        .expect("crates/scaleway lives below crates/")
         .to_path_buf();
-    let core = root.join("crates").join("core");
-    let hetzner = root.join("crates").join("hetzner");
-    let dispatch = root.join("crates").join("dispatch-scaleway");
-    let scaleway = manifest_dir;
+    let root = crates
+        .parent()
+        .expect("crates/ lives in the workspace root")
+        .to_path_buf();
+    let dispatch = crates.join("dispatch-scaleway");
+    let vendored = path_dependencies(&dispatch);
 
-    for path in [
-        root.join("Cargo.toml"),
-        root.join("Cargo.lock"),
-        core.join("Cargo.toml"),
-        core.join("src"),
-        scaleway.join("Cargo.toml"),
-        scaleway.join("src"),
-        hetzner.join("Cargo.toml"),
-        hetzner.join("src"),
-        dispatch.join("Cargo.toml"),
-        dispatch.join("src"),
-    ] {
+    for path in [root.join("Cargo.toml"), root.join("Cargo.lock")]
+        .into_iter()
+        .chain(
+            std::iter::once(&dispatch)
+                .chain(vendored.values())
+                .flat_map(|dir| [dir.join("Cargo.toml"), dir.join("src")]),
+        )
+    {
         println!("cargo::rerun-if-changed={}", path.display());
     }
 
@@ -63,26 +66,15 @@ fn main() {
             .into_bytes(),
         ),
         ("Cargo.lock".to_string(), read(&root.join("Cargo.lock"))),
-        (
-            "vendor/core/Cargo.toml".to_string(),
-            vendored_manifest(&inherited.resolve(&read_text(&core.join("Cargo.toml"))))
-                .into_bytes(),
-        ),
-        (
-            "vendor/scaleway/Cargo.toml".to_string(),
-            vendored_manifest(&inherited.resolve(&read_text(&scaleway.join("Cargo.toml"))))
-                .into_bytes(),
-        ),
-        (
-            "vendor/hetzner/Cargo.toml".to_string(),
-            vendored_manifest(&inherited.resolve(&read_text(&hetzner.join("Cargo.toml"))))
-                .into_bytes(),
-        ),
     ];
     collect(&dispatch.join("src"), "src", &mut files);
-    collect(&core.join("src"), "vendor/core/src", &mut files);
-    collect(&scaleway.join("src"), "vendor/scaleway/src", &mut files);
-    collect(&hetzner.join("src"), "vendor/hetzner/src", &mut files);
+    for (name, dir) in &vendored {
+        files.push((
+            format!("vendor/{name}/Cargo.toml"),
+            vendored_manifest(&inherited.resolve(&read_text(&dir.join("Cargo.toml")))).into_bytes(),
+        ));
+        collect(&dir.join("src"), &format!("vendor/{name}/src"), &mut files);
+    }
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR")).join("function.zip");
@@ -98,7 +90,69 @@ fn read_text(path: &Path) -> String {
     String::from_utf8(read(path)).unwrap_or_else(|_| panic!("{} is not UTF-8", path.display()))
 }
 
-/// Adds every file below `dir` under the zip prefix `prefix`, with `/` separators.
+/// Every crate `crate_dir` depends on by path, directly or through another of them, by
+/// directory name.
+fn path_dependencies(crate_dir: &Path) -> BTreeMap<String, PathBuf> {
+    let mut found = BTreeMap::new();
+    let mut queue = vec![crate_dir.to_path_buf()];
+    while let Some(dir) = queue.pop() {
+        let manifest = dir.join("Cargo.toml");
+        for relative in dependency_paths(&read_text(&manifest)) {
+            let name = sibling(&relative).unwrap_or_else(|| {
+                panic!(
+                    "{}: path dependency {relative} is not a ../<dir> sibling",
+                    manifest.display()
+                )
+            });
+            let path = dir.parent().expect("a crate has a parent").join(name);
+            if found.insert(name.to_string(), path.clone()).is_none() {
+                queue.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// The `path` values of a manifest's normal dependencies, target-specific ones included; dev
+/// and build dependencies do not reach the function.
+fn dependency_paths(manifest: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut table = String::new();
+    for line in manifest.lines() {
+        if let Some(name) = table_name(line) {
+            table = name.to_string();
+            continue;
+        }
+        let dotted = table.starts_with("dependencies.") || table.contains(".dependencies.");
+        let inline = table == "dependencies" || table.ends_with(".dependencies");
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let (key, value) = (key.trim(), value.trim());
+        if dotted && key == "path" {
+            paths.push(value.trim_matches('"').to_string());
+        } else if inline && value.starts_with('{') {
+            for item in split_items(inner(value)) {
+                if let Some((k, v)) = item.split_once('=')
+                    && k.trim() == "path"
+                {
+                    paths.push(v.trim().trim_matches('"').to_string());
+                }
+            }
+        }
+    }
+    paths
+}
+
+/// `<dir>` of a `../<dir>` path.
+fn sibling(relative: &str) -> Option<&str> {
+    relative
+        .strip_prefix("../")
+        .filter(|name| !name.is_empty() && !name.contains(['/', '\\']) && *name != "..")
+}
+
+/// Adds every file below `dir` under the zip prefix `prefix`, with `/` separators; a
+/// `testing` directory right below a `src` directory stays out.
 fn collect(dir: &Path, prefix: &str, files: &mut Vec<(String, Vec<u8>)>) {
     let mut entries: Vec<_> = fs::read_dir(dir)
         .unwrap_or_else(|error| panic!("read {}: {error}", dir.display()))
@@ -113,7 +167,10 @@ fn collect(dir: &Path, prefix: &str, files: &mut Vec<(String, Vec<u8>)>) {
             .to_string();
         let zip_name = format!("{prefix}/{name}");
         if path.is_dir() {
-            collect(&path, &zip_name, files);
+            let testing = name == TESTING_DIR && (prefix == "src" || prefix.ends_with("/src"));
+            if !testing {
+                collect(&path, &zip_name, files);
+            }
         } else {
             files.push((zip_name, read(&path)));
         }
@@ -299,17 +356,14 @@ fn split_items(body: &str) -> Vec<&str> {
 /// package from any parent.
 fn root_manifest(package: &str, workspace: &str) -> String {
     let mut text = strip_tables(package, &["dev-dependencies", "build-dependencies"]);
-    for (from, to) in [
-        ("path = \"../core\"", "path = \"vendor/core\""),
-        ("path = \"../scaleway\"", "path = \"vendor/scaleway\""),
-        ("path = \"../hetzner\"", "path = \"vendor/hetzner\""),
-    ] {
-        assert!(
-            text.contains(from),
-            "dispatch-scaleway/Cargo.toml no longer has {from}"
-        );
-        text = text.replace(from, to);
+    for relative in dependency_paths(&text) {
+        let name = sibling(&relative).expect("checked by path_dependencies");
+        text = text.replace(&format!("\"{relative}\""), &format!("\"vendor/{name}\""));
     }
+    assert!(
+        !text.contains("\"../"),
+        "a path outside vendor/ is left in the function manifest"
+    );
     text.push('\n');
     text.push_str(&detached_workspace(workspace));
     text
