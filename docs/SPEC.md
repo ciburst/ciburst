@@ -1,6 +1,6 @@
 # Spec: ciburst, GitLab runners that exist only while jobs run
 
-Status: M4 cost done 2026-10-24 (Hetzner drill waits for the owner's token); M5 roundup (D37 to D42, `docs/milestones/M5-roundup.md`) in progress.
+Status: M5 roundup done 2026-10-25 (adoption drill in `docs/RUNBOOK.md`); the Hetzner drill waits for the owner's token; M6 go public next.
 
 ## 0. Decision log
 
@@ -349,7 +349,7 @@ No UI, no offline mode, English only, no legal pages; authentication is section 
 | M2, done | first deployment, registry step, drill | drill results in the runbook |
 | M3, done | VM pools on Scaleway Instances with the Docker executor, agent, drain, sweep (`docs/milestones/M3-vm-provider.md`) | drill pipeline passes on VMs |
 | M4, done | burst grouping, two slots, swap, composite provider, Hetzner provider (`docs/milestones/M4-cost.md`); the Hetzner drill waits for the owner's token | five VM jobs start three VMs |
-| M5, roundup | `docs/milestones/M5-roundup.md`, D37 to D42: CI/CD component, `--ci`, outputs in project variables, `cli` image, agent from the cache bucket, replay, own jobs, preflight, contributor fixes, docs truth pass | the roundup's definition of done |
+| M5, done | `docs/milestones/M5-roundup.md`, D37 to D42: CI/CD component, `--ci`, outputs in project variables, `cli` image, agent from the cache bucket, replay, own jobs, preflight, contributor fixes, docs truth pass | the roundup's definition of done |
 | M6, go public | hardening from M2 to M5, policy files (D27), project visibility public, GitHub mirror, Pages site at `ciburst.zwa.la`, crates.io publication of `ciburst-core`, `ciburst-scaleway` and `ciburst`, `v1.0.0` tag with binaries and images | release pipeline green, the images pull anonymously from the GitLab registry, the docs site answers |
 
 Definition of done per milestone: tests green locally and on CI, `cargo fmt`, `clippy -D warnings` and `cargo deny` clean, docs updated, no secret and no identifying value in the repo, no em or en dash, summary to the owner with the go question for the next milestone.
