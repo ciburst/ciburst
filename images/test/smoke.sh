@@ -1,32 +1,17 @@
 #!/usr/bin/env bash
-# Builds one image and checks it: a pool image's runner, toolchain and entrypoint, or the cli
-# image's two static binaries.
-# Usage: images/test/smoke.sh <base|node|rust|playwright|cli> [image reference]
+# Builds the cli image and checks its two static binaries.
+# Usage: images/test/smoke.sh [image reference]
 # SMOKE_NO_BUILD=1 skips the build and tests an existing reference. On a tag vX.Y.Z (CI_COMMIT_TAG)
-# the cli binaries must report X.Y.Z, else the workspace version of Cargo.toml.
+# the binaries must report X.Y.Z, else the workspace version of Cargo.toml.
 set -euo pipefail
 
 export MSYS_NO_PATHCONV=1
 
-name="${1:?usage: smoke.sh <image> [reference]}"
-ref="${2:-ciburst-smoke/$name:local}"
+ref="${1:-ciburst-smoke/cli:local}"
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 if command -v cygpath > /dev/null; then
   root="$(cygpath -m "$root")"
 fi
-runner_version="18.11.4"
-
-user="runner"
-builds_dir="/builds"
-context="$root/images"
-case "$name" in
-  base) toolchain=(git --version) expect_tool="git version" ;;
-  node) toolchain=(node --version) expect_tool="v24." ;;
-  rust) toolchain=(cargo --version) expect_tool="cargo 1.96.0" ;;
-  playwright) toolchain=(npx --yes playwright@1.64.1 --version) expect_tool="Version 1.64.1" ;;
-  cli) context="$root" ;;
-  *) echo "unknown image: $name" >&2; exit 2 ;;
-esac
 
 failures=0
 pass() { echo "ok    $1"; }
@@ -37,142 +22,55 @@ contains() {
   if [[ "$haystack" == *"$needle"* ]]; then pass "$label"; else fail "$label: expected '$needle' in: $haystack"; fi
 }
 
-lacks() {
-  local label="$1" haystack="$2" needle="$3"
-  if [[ "$haystack" != *"$needle"* ]]; then pass "$label"; else fail "$label: unexpected '$needle'"; fi
-}
-
 equals() {
   local label="$1" actual="$2" expected="$3"
   if [ "$actual" = "$expected" ]; then pass "$label"; else fail "$label: expected '$expected', got: $actual"; fi
 }
 
-finish() {
-  if [ "$failures" -ne 0 ]; then
-    echo "$failures check(s) failed for $name" >&2
-    exit 1
-  fi
-  echo "smoke passed for $name"
-}
-
 if [ "${SMOKE_NO_BUILD:-0}" != "1" ]; then
   start=$(date +%s)
-  docker build ${SMOKE_QUIET:+--quiet} --platform linux/amd64 --file "$root/images/$name/Dockerfile" --tag "$ref" "$context"
+  docker build --platform linux/amd64 --file "$root/images/cli/Dockerfile" --tag "$ref" "$root"
   echo "build seconds: $(( $(date +%s) - start ))"
 fi
 echo "image bytes: $(docker image inspect --format '{{.Size}}' "$ref")"
 
-if [ "$name" = "cli" ]; then
-  version="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' "$root/Cargo.toml")"
-  if [[ "${CI_COMMIT_TAG:-}" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-    version="${BASH_REMATCH[1]}"
-  fi
-
-  out="$(docker run --rm "$ref" ciburst --version 2>&1)"
-  equals "ciburst --version" "$out" "ciburst $version"
-  out="$(docker run --rm "$ref" ciburst-vm-agent --version 2>&1)"
-  equals "ciburst-vm-agent --version" "$out" "ciburst-vm-agent $version"
-
-  # GitLab's Docker executor runs job scripts with the image's sh; the CLI finds the agent
-  # next to its own executable.
-  out="$(docker run --rm "$ref" sh -c 'command -v ciburst && command -v ciburst-vm-agent' 2>&1)"
-  equals "sh finds both binaries" "$out" "$(printf '/usr/local/bin/ciburst\n/usr/local/bin/ciburst-vm-agent')"
-
-  status=0
-  out="$(docker run --rm -e CIBURST_VM_ENV=/missing.env "$ref" ciburst-vm-agent 2>&1)" || status=$?
-  equals "agent without env file exits 64" "$status" "64"
-  contains "agent names the missing env file" "$out" 'error config path="/missing.env"'
-
-  # The agent runs on VMs of any distribution and the CLI on any Linux: both must be static.
-  bin_dir="$root/target/smoke-cli"
-  mkdir -p "$bin_dir"
-  id="$(docker create --platform linux/amd64 "$ref")"
-  for bin in ciburst ciburst-vm-agent; do
-    docker cp "$id:/usr/local/bin/$bin" "$bin_dir/$bin"
-  done
-  docker rm "$id" > /dev/null
-  if out="$("$root/scripts/check-static-elf.sh" "$bin_dir/ciburst" "$bin_dir/ciburst-vm-agent" 2>&1)"; then
-    pass "static x86-64 binaries"
-    echo "$out"
-  else
-    fail "static x86-64 binaries: $out"
-  fi
-  finish
-  exit 0
+version="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' "$root/Cargo.toml")"
+if [[ "${CI_COMMIT_TAG:-}" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+  version="${BASH_REMATCH[1]}"
 fi
 
-out="$(docker run --rm "$ref" gitlab-runner --version 2>&1)"
-contains "gitlab-runner --version" "$out" "Version:      $runner_version"
+out="$(docker run --rm "$ref" ciburst --version 2>&1)"
+equals "ciburst --version" "$out" "ciburst $version"
+out="$(docker run --rm "$ref" ciburst-vm-agent --version 2>&1)"
+equals "ciburst-vm-agent --version" "$out" "ciburst-vm-agent $version"
 
-out="$(docker run --rm "$ref" "${toolchain[@]}" 2>&1)"
-contains "${toolchain[*]}" "$out" "$expect_tool"
-
-# The shell executor runs every job step in a login shell that ends with the exit builtin.
-if out="$(docker run --rm "$ref" bash --login -c "${toolchain[*]}; exit" 2>&1)"; then
-  contains "login shell: ${toolchain[*]}" "$out" "$expect_tool"
-else
-  fail "login shell: ${toolchain[*]} exits non-zero: $out"
-fi
-
-out="$(docker run --rm "$ref" id -un 2>&1)"
-contains "user" "$out" "$user"
-
-if [ "$name" = "rust" ]; then
-  out="$(docker run --rm "$ref" cargo clippy --version 2>&1)"
-  contains "cargo clippy --version" "$out" "clippy"
-  out="$(docker run --rm "$ref" cargo fmt --version 2>&1)"
-  contains "cargo fmt --version" "$out" "rustfmt"
-fi
-
-sample=(
-  -e CIBURST_DRY_RUN=1
-  -e CIBURST_POOL="$name"
-  -e CI_SERVER_URL=https://gitlab.example.com
-  -e RUNNER_TOKEN=glrt-smoke-token
-  -e RUNNER_WAIT_TIMEOUT=45
-  -e CACHE_TYPE=s3
-  -e CACHE_S3_SERVER_ADDRESS=s3.fr-par.scw.cloud
-  -e CACHE_S3_BUCKET_NAME=ci-cache-smoke
-  -e CACHE_S3_BUCKET_LOCATION=fr-par
-  -e CACHE_S3_ACCESS_KEY=SCWSMOKEACCESSKEY
-  -e CACHE_S3_SECRET_KEY=smoke-secret-key
-  -e CACHE_SHARED=true
-)
-out="$(docker run --rm "${sample[@]}" "$ref" 2>&1)"
-expected=(
-  "gitlab-runner run-single"
-  "--url https://gitlab.example.com"
-  "--token [masked]"
-  "--executor shell"
-  "--shell bash"
-  "--builds-dir $builds_dir"
-  "--cache-dir /cache"
-  "--max-builds 0"
-  "--wait-timeout 45"
-  "--cache-type s3"
-  "--cache-s3-server-address s3.fr-par.scw.cloud"
-  "--cache-s3-bucket-name ci-cache-smoke"
-  "--cache-s3-bucket-location fr-par"
-  "--cache-s3-access-key [masked]"
-  "--cache-s3-secret-key [masked]"
-  "--cache-shared"
-)
-for flag in "${expected[@]}"; do
-  contains "dry run $flag" "$out" "$flag"
-done
-lacks "dry run masks the token" "$out" "glrt-smoke-token"
-lacks "dry run masks the secret key" "$out" "smoke-secret-key"
+# GitLab's Docker executor runs job scripts with the image's sh; the CLI finds the agent
+# next to its own executable.
+out="$(docker run --rm "$ref" sh -c 'command -v ciburst && command -v ciburst-vm-agent' 2>&1)"
+equals "sh finds both binaries" "$out" "$(printf '/usr/local/bin/ciburst\n/usr/local/bin/ciburst-vm-agent')"
 
 status=0
-docker run --rm -e CI_SERVER_URL=https://gitlab.example.com -e CIBURST_DRY_RUN=1 "$ref" > /dev/null 2>&1 || status=$?
-if [ "$status" -ne 0 ]; then pass "missing RUNNER_TOKEN exits $status"; else fail "missing RUNNER_TOKEN exits 0"; fi
-out="$(docker run --rm -e CI_SERVER_URL=https://gitlab.example.com -e CIBURST_DRY_RUN=1 "$ref" 2>&1 || true)"
-contains "missing RUNNER_TOKEN is named" "$out" "missing environment variable RUNNER_TOKEN"
+out="$(docker run --rm -e CIBURST_VM_ENV=/missing.env "$ref" ciburst-vm-agent 2>&1)" || status=$?
+equals "agent without env file exits 64" "$status" "64"
+contains "agent names the missing env file" "$out" 'error config path="/missing.env"'
 
-out="$(docker run --rm "${sample[@]}" -e CACHE_S3_SECRET_KEY= "$ref" 2>&1 || true)"
-contains "missing CACHE_S3_SECRET_KEY is named" "$out" "missing environment variable CACHE_S3_SECRET_KEY"
+# The agent runs on VMs of any distribution and the CLI on any Linux: both must be static.
+bin_dir="$root/target/smoke-cli"
+mkdir -p "$bin_dir"
+id="$(docker create --platform linux/amd64 "$ref")"
+for bin in ciburst ciburst-vm-agent; do
+  docker cp "$id:/usr/local/bin/$bin" "$bin_dir/$bin"
+done
+docker rm "$id" > /dev/null
+if out="$("$root/scripts/check-static-elf.sh" "$bin_dir/ciburst" "$bin_dir/ciburst-vm-agent" 2>&1)"; then
+  pass "static x86-64 binaries"
+  echo "$out"
+else
+  fail "static x86-64 binaries: $out"
+fi
 
-out="$(docker run --rm -e CI_SERVER_URL=http://127.0.0.1:9 -e RUNNER_TOKEN=glrt-smoke-token -e RUNNER_WAIT_TIMEOUT=2 "$ref" 2>&1 || true)"
-contains "run-single starts and exits after the idle window" "$out" "has not received a job"
-
-finish
+if [ "$failures" -ne 0 ]; then
+  echo "$failures check(s) failed for the cli image" >&2
+  exit 1
+fi
+echo "smoke passed for the cli image"

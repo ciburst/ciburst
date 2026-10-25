@@ -21,7 +21,8 @@ workflow:
 
 # Inputs of each job for `rules:changes`. Merge requests compare with main, pushes to main with
 # the previous push. Pipelines started without a push (web, API) run every job; tags run lint,
-# deny and test, release tags vX.Y.Z also the images and the release.
+# deny and test, tags v* also lane-bootstrap, release tags vX.Y.Z also the cli image and the
+# release.
 .paths:
   test: &test-paths
     - Cargo.toml
@@ -49,11 +50,11 @@ workflow:
     - deny.toml
     - scripts/ci-install-cargo-deny.sh
     - .gitlab-ci.yml
-  pool-image: &pool-image-paths
-    - images/$IMAGE/**/*
-    - images/base/entrypoint.sh
-    - images/test/smoke.sh
-    - scripts/ci-push-image.sh
+  lane-bootstrap: &lane-bootstrap-paths
+    - crates/core/src/lane-bootstrap.sh
+    - crates/core/src/lane.rs
+    - crates/core/src/cloud_init.rs
+    - images/test/lane-bootstrap.sh
     - .gitlab-ci.yml
   cli-image: &cli-image-paths
     - Cargo.toml
@@ -133,54 +134,38 @@ test:
   script:
     - cargo test --workspace --all-features
 
-# Builds and smoke-tests one image; pushes it on main and on release tags only
-# (scripts/ci-push-image.sh), so merge requests build and test without pushing.
-.image:
-  stage: images
+# Jobs that run containers, on a Docker-in-Docker daemon.
+.docker:
   image: docker:27.5.1
   services:
     - docker:27.5.1-dind
   variables:
     DOCKER_TLS_CERTDIR: "/certs"
-  needs: []
-  rules:
-    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-      changes:
-        paths: *pool-image-paths
-        compare_to: refs/heads/main
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-      changes: *pool-image-paths
   before_script:
     - apk add --no-cache bash
+
+# Runs the lane bootstrap in the images of images/test/lane-bootstrap.sh.
+lane-bootstrap:
+  extends: .docker
+  stage: test
+  needs: []
+  timeout: 15 minutes
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        paths: *lane-bootstrap-paths
+        compare_to: refs/heads/main
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: *lane-bootstrap-paths
   script:
-    - images/test/smoke.sh "$IMAGE" "ciburst-ci/$IMAGE:$CI_COMMIT_SHORT_SHA"
-    - scripts/ci-push-image.sh "ciburst-ci/$IMAGE:$CI_COMMIT_SHORT_SHA" "$IMAGE"
+    - images/test/lane-bootstrap.sh
 
-image:base:
-  extends: .image
-  variables:
-    IMAGE: base
-
-image:node:
-  extends: .image
-  variables:
-    IMAGE: node
-
-image:rust:
-  extends: .image
-  variables:
-    IMAGE: rust
-
-image:playwright:
-  extends: .image
-  variables:
-    IMAGE: playwright
-
+# Builds and smoke-tests the cli image; pushes it on main and on release tags only
+# (scripts/ci-push-image.sh), so merge requests build and test without pushing.
 image:cli:
-  extends: .image
-  variables:
-    IMAGE: cli
+  extends: .docker
+  stage: images
   needs:
     - job: test
       optional: true
@@ -192,6 +177,9 @@ image:cli:
         compare_to: refs/heads/main
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       changes: *cli-image-paths
+  script:
+    - images/test/smoke.sh "ciburst-ci/cli:$CI_COMMIT_SHORT_SHA"
+    - scripts/ci-push-image.sh "ciburst-ci/cli:$CI_COMMIT_SHORT_SHA"
 
 .release:
   stage: release
@@ -209,7 +197,7 @@ release:binary:
 release:
   extends: .release
   image: registry.gitlab.com/gitlab-org/cli:v1.124.0
-  needs: [release:binary, image:cli, image:base, image:node, image:rust, image:playwright]
+  needs: [release:binary, image:cli]
   variables:
     GLAB_ENABLE_CI_AUTOLOGIN: "true"
   script:
