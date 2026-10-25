@@ -1,8 +1,8 @@
-# M3 drill pipeline for the drill consumer branch `ciburst-drill` (docs/RUNBOOK.md, M3 drill).
+# Drill pipeline for the drill consumer's branch `ciburst-drill` (docs/RUNBOOK.md, Acceptance drill).
 # Drill config: `vm` is the default pool (Scaleway Instances, Docker executor); `ci` is a
 # Serverless Jobs fast lane for stage `test`. The dispatcher maps a job's stage to a pool, so
 # every VM job uses stage `vm`, which no other pool lists. The hosted-runner job sits in stage
-# `test` so its pending event starts a cheap fast-lane run, not a VM.
+# `test` so its pending event starts a fast-lane run, not a VM.
 
 stages: [vm, test]
 
@@ -24,7 +24,7 @@ rust:
   tags: [vm]
   image: rust:1.96.1
   variables:
-    # The drill consumer checkout pins another toolchain in rust-toolchain.toml.
+    # The drill consumer's checkout pins another toolchain in rust-toolchain.toml.
     RUSTUP_TOOLCHAIN: "1.96.1"
   script:
     - cargo --version

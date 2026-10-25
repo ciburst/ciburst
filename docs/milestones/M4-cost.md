@@ -1,25 +1,6 @@
 # M4: cost
 
-Go: owner, 2026-10-24 ("Optimize for costs"), on the three options after the M3 drill. Spec D32 to D35. Contract commit: see the base commit named in each agent prompt.
-
-## Why
-
-Scaleway bills a CPU Instance from creation, per started hour, 60 minutes minimum; Hetzner bills every started hour. A VM that is created and not needed costs a full hour. The M3 drill started one VM per job of a burst (5 VMs for 5 jobs at 2 slots), passed `maxRuns` under parallel events, and paid 0.0272 EUR per DEV1-M hour (instance, IPv4, 40 GB local SSD).
-
-| Per job slot-hour | EUR |
-|---|---|
-| Scaleway DEV1-M, 2 slots | 0.0136 |
-| Hetzner CX33 (4 vCPU, 8 GB, 80 GB, IPv4 included), 2 slots | 0.0072 |
-| RocketRunner small (2 vCPU, 4 GB), 0.018 USD | 0.0155 |
-
-## Scope
-
-1. Dispatcher: burst grouping through an intent ledger (D33), starting VMs as capacity, claims spread over VMs, `maxRuns` as a hard cap.
-2. Defaults: `slots` 2; cloud-init adds a 4 GiB swap file.
-3. Composite provider in core (D35); provider `hetzner` (D34).
-4. Scaleway: the S3 ledger, `shared_env`, pools of other runtimes skipped, `taken` honoured, `HCLOUD_TOKEN` in the function.
-5. Drill: a cold burst on Scaleway; the same drill on Hetzner once the owner has a token.
-6. Added after the agents (D36): `defaultPool` is optional; without it unmapped stages start nothing.
+Go: owner, 2026-10-24 ("Optimize for costs"), on the three options after the M3 drill. Spec D32 to D35.
 
 ## Rules
 
@@ -62,22 +43,3 @@ R12. Provider `hetzner` (crate `ciburst-hetzner`, runtime `hetzner`, API `https:
 - `destroy`: every server with `ciburst-name==<name>`, then the firewall.
 
 R13. Scaleway: `ScalewayLedger` over the cache bucket with the cache key, objects `ciburst/intents/<pool>/<unix s, 10 digits>-<job id, 20 digits>`, empty body; read with ListObjectsV2 `prefix` and `start-after`. The function builds it when the cache is S3 and its keys are set. The host writes `Secrets.provider_env` (for example `HCLOUD_TOKEN`) as secret environment variables of the function. `ScalewayJobs` ignores pools of other providers.
-
-## Ownership
-
-| Owner | Paths |
-|---|---|
-| A, core | `crates/core/**` except `config.rs`, `types.rs`, `cloud_init.rs`, `cloud-init.yaml` (contract; change only after asking) |
-| B, Scaleway | `crates/scaleway/**`, `crates/dispatch-scaleway/**` |
-| C, Hetzner | `crates/hetzner/**` |
-| Orchestrator | `docs/**`, `crates/cli/**`, `Cargo.toml`, `config.example.json`, `ci/**`, `images/**`, the contract files |
-
-## Tests
-
-- A: R1 to R7 as unit tests; composite routing (R8) with two fake members; the race simulation extended by cold bursts of 1 to 10 simultaneous events with slots 1 to 3 and `maxRuns` caps: VMs started equal `min(ceil(N / slots), maxRuns - live)`, every job starts within one job duration plus one boot; a duplicate event starts nothing.
-- B: the ledger against the S3 fake (PUT, ListObjectsV2 with `prefix`, `start-after`, pagination); `respond` with a ledger; `free = slots - taken` on created servers; `shared_env`; pools of other runtimes produce no steps and no runs; `HCLOUD_TOKEN` as a secret variable.
-- C: an in-process fake of the Hetzner API (servers, firewalls, labels, label selectors, pagination, error codes) as stingy as the real one; plan and apply idempotent; start, list, stop; capacity, claim, report, sweep; type fallback; user data without the VM secret; run id and name format.
-
-## Definition of done
-
-`cargo fmt --check`, `clippy -D warnings`, `cargo test`, `cargo deny` green; the function zip builds with the vendored `hetzner` crate; Scaleway drill: a cold pipeline with five VM jobs starts three VMs at two slots and passes; Hetzner drill done or listed as waiting for the owner's token; runbook and spec updated; no identifying data, no em or en dash.
