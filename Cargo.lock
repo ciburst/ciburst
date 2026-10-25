@@ -226,6 +226,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "yaml-rust2",
 ]
 
 [[package]]
