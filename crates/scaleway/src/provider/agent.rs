@@ -18,6 +18,9 @@ pub const AGENT_PREFIX: &str = "ciburst/agent/";
 /// Why no VM could start: neither a binary nor an uploaded agent.
 pub const NO_AGENT: &str =
     "no VM agent: pass --agent <path> or build one with scripts/agent-binary.sh";
+/// Why a VM pool could not start without an S3 cache.
+pub const NO_CACHE: &str =
+    "VM pools need cache.type s3: VMs fetch their agent from the cache bucket";
 
 /// Listing pages read at most while looking for the newest agent.
 const MAX_LIST_PAGES: usize = 100;
@@ -55,15 +58,23 @@ impl Scaleway {
         self
     }
 
-    /// Whether a pool runs on VMs: an own pool on Instances or a pool of another provider,
-    /// whose VMs fetch the agent from this bucket too.
+    /// The pools that run on VMs: own pools on Instances and pools of other providers, whose
+    /// VMs fetch the agent from this bucket too.
+    pub(super) fn vm_pools(&self) -> Result<Vec<&str>> {
+        let mut tags = Vec::new();
+        for pool in &self.config.pools {
+            let vm = self.config.extra_provider_of(pool).is_some()
+                || self.runtime(pool)? == Runtime::Instances;
+            if vm {
+                tags.push(pool.tag.as_str());
+            }
+        }
+        Ok(tags)
+    }
+
+    /// Whether a pool runs on VMs, so the cache bucket holds the agent.
     pub(super) fn needs_agent(&self) -> Result<bool> {
-        let other_pools = self.own_pools().count() < self.config.pools.len();
-        let own_vms = self
-            .own_runtimes()?
-            .iter()
-            .any(|(_, runtime)| *runtime == Runtime::Instances);
-        Ok(own_vms || other_pools)
+        Ok(!self.vm_pools()?.is_empty())
     }
 
     fn binary(&self) -> Result<Option<Binary>> {

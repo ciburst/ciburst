@@ -205,17 +205,24 @@ async fn vms_of_other_providers_need_the_agent_and_the_s3_cache() {
     assert!(without_agent.preflight().await.is_err());
 
     let no_cache = config(|c| {
-        c.pools[0].runtime = Some("jobs".into());
+        c.pools[0].runtime = None;
         c.cache.kind = CacheType::None;
     });
-    let error = provider(no_cache, &backend, Log::silent())
-        .plan(&[])
-        .await
-        .unwrap_err()
-        .to_string();
+    let reason = "VM pools need cache.type s3: VMs fetch their agent from the cache bucket";
+    let (log, lines) = Log::memory();
+    let without_cache = provider(no_cache, &backend, log);
+    let steps = without_cache.plan(&[]).await.unwrap();
+    assert!(steps.iter().all(|s| s.id != "vm:agent"), "{steps:?}");
+    assert_eq!(
+        *lines.lock().unwrap(),
+        ["ci", "build"]
+            .map(|pool| format!(r#"warn vm pools cannot start pool="{pool}" reason="{reason}""#))
+    );
+    let error = without_cache.preflight().await.unwrap_err().to_string();
     assert_eq!(
         error,
-        "scaleway: VM pools need cache.type s3: VMs fetch their agent from the cache bucket"
+        format!("scaleway: pool ci: {reason}; pool build: {reason}"),
+        "the pool without runtime runs on Instances"
     );
     let only_jobs = config(|c| {
         c.providers.clear();

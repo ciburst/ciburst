@@ -7,7 +7,7 @@ use ciburst_core::types::{Action, Outputs, Rotation, Step};
 use ciburst_core::{Error, Result};
 use serde_json::Value;
 
-use super::agent::{AGENT_STEP, NO_AGENT};
+use super::agent::{AGENT_STEP, NO_AGENT, NO_CACHE};
 use super::iam::{self, AppState};
 use super::keys::KeyKind;
 use super::registry::{self, NamespaceState};
@@ -72,11 +72,13 @@ impl Scaleway {
         self.default_runtime()?;
         let runtimes = self.own_runtimes()?;
         let needs_agent = self.needs_agent()?;
-        if needs_agent && !self.cache_on() {
-            return Err(Error::provider(format!(
-                "{PROVIDER_NAME}: VM pools need cache.type s3: VMs fetch their agent from the \
-                 cache bucket"
-            )));
+        if !self.cache_on() {
+            for tag in self.vm_pools()? {
+                self.log.warn(
+                    "vm pools cannot start",
+                    &[("pool", tag), ("reason", NO_CACHE)],
+                );
+            }
         }
         let observed = self.observe().await?;
         let name = self.name();
@@ -138,7 +140,7 @@ impl Scaleway {
         } else if observed.registry.is_some() {
             steps.push(Step::new("registry", Action::Delete, registry_resource));
         }
-        if needs_agent {
+        if needs_agent && self.cache_on() {
             steps.push(
                 self.agent_step(&observed.project, observed.bucket.is_some())
                     .await?,
@@ -213,7 +215,11 @@ impl Scaleway {
             .into_iter()
             .map(|(tag, reason)| format!("pool {tag}: {reason}"))
             .collect();
-        if self.needs_agent()? && !self.agent_available().await? {
+        if !self.cache_on() {
+            for tag in self.vm_pools()? {
+                problems.push(format!("pool {tag}: {NO_CACHE}"));
+            }
+        } else if self.needs_agent()? && !self.agent_available().await? {
             problems.push(NO_AGENT.to_string());
         }
         if problems.is_empty() {
@@ -295,7 +301,7 @@ impl Scaleway {
                 }
             }
         }
-        if self.needs_agent()? {
+        if self.cache_on() && self.needs_agent()? {
             if agent.is_none() {
                 agent = self.current_agent(&project).await?;
             }
