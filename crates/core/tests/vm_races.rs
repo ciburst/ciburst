@@ -237,6 +237,7 @@ impl Sim {
             vm_secret: Some(VM_SECRET.into()),
             sweep_token: Some(SWEEP.into()),
             provider_env: BTreeMap::new(),
+            dispatcher_env: BTreeMap::new(),
         };
         let (log, lines) = Log::memory();
         let dispatcher = Dispatcher::new(config, provider.clone(), Arc::new(secrets), log)

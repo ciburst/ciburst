@@ -1,7 +1,7 @@
 //! Scaleway Serverless Function entry: `handle` receives the GitLab webhook, the VM agents'
 //! `POST /vm` and `POST /terminate`, and the sweep cron, and hands method, path, headers, body
 //! and the current time to `ciburst_core::dispatch::Dispatcher::handle_request` with a
-//! `ScalewayJobs` provider and, with an S3 cache, the burst ledger in the cache bucket, both
+//! `Scaleway` provider and, with an S3 cache, the burst ledger in the cache bucket, both
 //! built from the function's environment. The variable names are
 //! `ciburst_scaleway::host::vars`, the ones the host sets.
 //!
@@ -25,7 +25,7 @@ use ciburst_hetzner::Hetzner;
 use ciburst_scaleway::client::{Credentials, ScalewayClient};
 use ciburst_scaleway::host::vars;
 use ciburst_scaleway::ledger::ScalewayLedger;
-use ciburst_scaleway::provider::ScalewayJobs;
+use ciburst_scaleway::provider::Scaleway;
 use http::{Request, Response, StatusCode};
 
 /// GitLab job events are a few kilobytes, VM reports and cron arguments less.
@@ -123,6 +123,7 @@ impl Env {
             vm_secret: optional(vars::VM_SECRET),
             sweep_token: optional(vars::SWEEP_TOKEN),
             provider_env: BTreeMap::new(),
+            dispatcher_env: BTreeMap::new(),
         };
         let credentials = Credentials {
             secret_key: required(vars::SECRET_KEY)?,
@@ -157,11 +158,11 @@ impl Env {
         Ok(self.backends_on(http, log))
     }
 
-    /// The `ScalewayJobs` provider, in a [`Composite`] with Hetzner when the config adds it
+    /// The `Scaleway` provider, in a [`Composite`] with Hetzner when the config adds it
     /// (spec D35), and the ledger, both on `http`.
     pub fn backends_on(&self, http: Arc<dyn HttpClient>, log: Log) -> Backends {
         let client = ScalewayClient::new(http.clone(), self.credentials.clone(), &self.region);
-        let main: Arc<dyn Provider> = Arc::new(ScalewayJobs::new(
+        let main: Arc<dyn Provider> = Arc::new(Scaleway::new(
             self.config.clone(),
             Arc::new(client),
             log.clone(),

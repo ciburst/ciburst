@@ -687,6 +687,7 @@ mod tests {
             vm_secret: None,
             sweep_token: None,
             provider_env: BTreeMap::new(),
+            dispatcher_env: BTreeMap::new(),
         })
     }
 
@@ -1304,6 +1305,7 @@ mod tests {
             vm_secret: Some(VM_SECRET.into()),
             sweep_token: Some("sweep-secret".into()),
             provider_env: BTreeMap::new(),
+            dispatcher_env: BTreeMap::new(),
         }
     }
 

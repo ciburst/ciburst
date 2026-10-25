@@ -9,6 +9,8 @@ license.workspace = true
 [features]
 default = ["reqwest"]
 reqwest = ["dep:reqwest"]
+# The contract harness and the GitLab fake, for tests of this and other crates.
+testing = []
 
 [dependencies]
 async-trait.workspace = true
@@ -24,5 +26,6 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
+ciburst-core = { path = ".", features = ["testing"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

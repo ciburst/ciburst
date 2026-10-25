@@ -12,7 +12,7 @@ use ciburst_core::log::Log;
 use ciburst_core::types::Provider;
 use ciburst_dispatch_scaleway::{Env, Incoming, respond};
 use ciburst_scaleway::host::vars;
-use ciburst_scaleway::provider::ScalewayJobs;
+use ciburst_scaleway::provider::Scaleway;
 use ciburst_scaleway::testing::scaleway_fake::{
     FAKE_ACCESS_KEY, FAKE_ORGANIZATION_ID, FAKE_SECRET_KEY, ScalewayFake,
 };
@@ -41,7 +41,7 @@ fn config(cache: &str) -> String {
 async fn deployed(cache: &str) -> (Arc<ScalewayFake>, BTreeMap<String, String>) {
     let backend = Arc::new(ScalewayFake::new());
     let text = config(cache);
-    let provider = ScalewayJobs::new(
+    let provider = Scaleway::new(
         Arc::new(parse_config(&text).unwrap()),
         backend.client(),
         Log::silent(),

@@ -19,6 +19,7 @@ pub mod store;
 pub mod types;
 pub mod vm;
 
+#[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
 pub use error::{Error, Result};

@@ -18,7 +18,7 @@ use ciburst_core::{Error, Result};
 use ciburst_hetzner::Hetzner;
 use ciburst_scaleway::client::{Credentials, DEFAULT_REGION, ScalewayClient};
 use ciburst_scaleway::host::{HOST_NAME as SCALEWAY_HOST, ScalewayFunction};
-use ciburst_scaleway::provider::ScalewayJobs;
+use ciburst_scaleway::provider::Scaleway;
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 
@@ -159,7 +159,7 @@ impl Modules {
             ))),
             "scaleway" | "scaleway-jobs" => {
                 let client = self.scaleway().await?;
-                Ok(Arc::new(ScalewayJobs::new(
+                Ok(Arc::new(Scaleway::new(
                     self.config.clone(),
                     client,
                     self.log.clone(),

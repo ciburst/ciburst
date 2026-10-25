@@ -130,6 +130,10 @@ pub struct Secrets {
     /// the host stores them as secret environment variables.
     #[serde(default)]
     pub provider_env: BTreeMap<String, String>,
+    /// Plain (not secret) environment of the dispatcher, by variable name
+    /// (`CIBURST_AGENT_SHA256`); the host stores them as ordinary environment variables.
+    #[serde(default)]
+    pub dispatcher_env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,6 +195,18 @@ pub struct StartRequest {
 #[async_trait]
 pub trait Provider: Send + Sync {
     fn capabilities(&self) -> Capabilities;
+
+    /// The capabilities that apply to `pool`; a composite answers with the member serving it.
+    fn capabilities_for(&self, _pool: &Pool) -> Capabilities {
+        self.capabilities()
+    }
+
+    /// Fails when a pool could not start a run after `apply` (no quota, no agent): `apply`
+    /// calls it before changing anything (M5 rule R6). `plan` only warns.
+    async fn preflight(&self) -> Result<()> {
+        Ok(())
+    }
+
     async fn plan(&self, rotate: &[Rotation]) -> Result<Vec<Step>>;
     async fn apply(&self, steps: &[Step]) -> Result<Outputs>;
     async fn destroy(&self) -> Result<()>;

@@ -19,6 +19,7 @@ pub mod sigv4;
 pub mod vm;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -154,19 +155,18 @@ enum Attempt {
     Unavailable(ApiError),
 }
 
-pub struct ScalewayJobs {
+pub struct Scaleway {
     config: Arc<Config>,
     client: Arc<ScalewayClient>,
     log: Log,
     s3_access_key: Option<String>,
     zone: String,
+    /// The Linux musl build of `ciburst-vm-agent` that `apply` uploads (M5 rule R3).
+    agent: Option<PathBuf>,
 }
 
-/// The provider serves both runtimes; the old name stays for existing callers.
-pub type Scaleway = ScalewayJobs;
-
-impl ScalewayJobs {
-    pub fn new(config: Arc<Config>, client: Arc<ScalewayClient>, log: Log) -> ScalewayJobs {
+impl Scaleway {
+    pub fn new(config: Arc<Config>, client: Arc<ScalewayClient>, log: Log) -> Scaleway {
         let s3_access_key = client.access_key().map(String::from);
         let zone = config
             .provider
@@ -175,18 +175,25 @@ impl ScalewayJobs {
             .and_then(Value::as_str)
             .map(String::from)
             .unwrap_or_else(|| format!("{}-1", client.region()));
-        ScalewayJobs {
+        Scaleway {
             config,
             client,
             log,
             s3_access_key,
             zone,
+            agent: None,
         }
+    }
+
+    /// The agent binary for the `vm:agent` step; `None` keeps an uploaded agent.
+    pub fn with_agent(mut self, path: Option<PathBuf>) -> Scaleway {
+        self.agent = path;
+        self
     }
 
     /// The access key that belongs to the client's secret key. S3 signs with the pair, so the
     /// cache bucket steps need it; start, list and stop do not.
-    pub fn with_s3_access_key(mut self, access_key: impl Into<String>) -> ScalewayJobs {
+    pub fn with_s3_access_key(mut self, access_key: impl Into<String>) -> Scaleway {
         self.s3_access_key = Some(access_key.into()).filter(|k| !k.is_empty());
         self
     }
@@ -1033,7 +1040,7 @@ async fn list_all(
 }
 
 #[async_trait]
-impl Provider for ScalewayJobs {
+impl Provider for Scaleway {
     fn capabilities(&self) -> Capabilities {
         let vm = self.default_runtime().unwrap_or(Runtime::Instances) == Runtime::Instances;
         Capabilities {

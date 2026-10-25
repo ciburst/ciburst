@@ -23,6 +23,10 @@ pub mod keys {
     pub const CACHE_SECRET_KEY: &str = "CIBURST_CACHE_SECRET_KEY";
     /// Outputs of added providers that the dispatcher needs as secret environment variables.
     pub const PROVIDER_ENV: [&str; 1] = ["HCLOUD_TOKEN"];
+    /// SHA-256 of the uploaded VM agent (M5 rule R3); plain dispatcher environment.
+    pub const AGENT_SHA256: &str = "CIBURST_AGENT_SHA256";
+    /// Outputs the dispatcher gets as plain environment variables.
+    pub const DISPATCHER_ENV: [&str; 1] = [AGENT_SHA256];
 
     pub fn runner_id(tag: &str) -> String {
         format!("CIBURST_RUNNER_ID_{}", env_name(tag))
@@ -69,6 +73,10 @@ pub fn secrets_from_outputs(config: &Config, outputs: &Outputs) -> Secrets {
         dispatch: pair(keys::DISPATCH_ACCESS_KEY, keys::DISPATCH_SECRET_KEY),
         cache: pair(keys::CACHE_ACCESS_KEY, keys::CACHE_SECRET_KEY),
         provider_env: keys::PROVIDER_ENV
+            .iter()
+            .filter_map(|key| outputs.get(*key).map(|v| (key.to_string(), v.clone())))
+            .collect(),
+        dispatcher_env: keys::DISPATCHER_ENV
             .iter()
             .filter_map(|key| outputs.get(*key).map(|v| (key.to_string(), v.clone())))
             .collect(),

@@ -56,6 +56,7 @@ fn secrets() -> Secrets {
         vm_secret: Some("vm-secret".into()),
         sweep_token: Some("sweep-secret".into()),
         provider_env: BTreeMap::new(),
+        dispatcher_env: BTreeMap::new(),
     }
 }
 

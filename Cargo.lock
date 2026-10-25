@@ -213,6 +213,7 @@ name = "ciburst-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "ciburst-core",
  "hex",
  "hmac",
  "rand 0.9.5",
@@ -246,6 +247,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "ciburst-core",
+ "ciburst-hetzner",
  "serde",
  "serde_json",
  "tokio",
@@ -257,6 +259,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "ciburst-core",
+ "ciburst-scaleway",
  "hex",
  "hmac",
  "md-5",

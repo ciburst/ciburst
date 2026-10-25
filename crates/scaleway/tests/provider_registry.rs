@@ -4,7 +4,7 @@ use ciburst_core::config::Config;
 use ciburst_core::log::Log;
 use ciburst_core::testing::contract::contract_config;
 use ciburst_core::types::{Action, Provider, Step};
-use ciburst_scaleway::provider::ScalewayJobs;
+use ciburst_scaleway::provider::Scaleway;
 use ciburst_scaleway::testing::scaleway_fake::ScalewayFake;
 use serde_json::json;
 
@@ -21,8 +21,8 @@ fn config(registry: bool, public: bool) -> Arc<Config> {
     Arc::new(config)
 }
 
-fn provider(config: Arc<Config>, backend: &Arc<ScalewayFake>) -> ScalewayJobs {
-    ScalewayJobs::new(config, backend.client(), Log::silent())
+fn provider(config: Arc<Config>, backend: &Arc<ScalewayFake>) -> Scaleway {
+    Scaleway::new(config, backend.client(), Log::silent())
 }
 
 fn action(steps: &[Step], id: &str) -> Option<Action> {

@@ -7,6 +7,7 @@
 //! `hetzner:<server name>`, so the name chosen before create carries the VM's token.
 
 pub mod api;
+#[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod vm;
 

@@ -10,7 +10,7 @@ use ciburst_core::testing::contract::{
 };
 use ciburst_core::types::{Action, Provider, Rotation, RunState, StartRequest, Step};
 use ciburst_scaleway::client::{Credentials, ScalewayClient};
-use ciburst_scaleway::provider::ScalewayJobs;
+use ciburst_scaleway::provider::Scaleway;
 use ciburst_scaleway::provider::s3::{S3, lifecycle_xml};
 use ciburst_scaleway::testing::scaleway_fake::{
     FAKE_ACCESS_KEY, FAKE_REGION, FAKE_SECRET_KEY, ScalewayFake,
@@ -43,8 +43,8 @@ fn jobs(config: Arc<Config>) -> Arc<Config> {
     Arc::new(config)
 }
 
-fn provider(config: Arc<Config>, backend: &Arc<ScalewayFake>, log: Log) -> ScalewayJobs {
-    ScalewayJobs::new(jobs(config), backend.client(), log).with_s3_access_key(FAKE_ACCESS_KEY)
+fn provider(config: Arc<Config>, backend: &Arc<ScalewayFake>, log: Log) -> Scaleway {
+    Scaleway::new(jobs(config), backend.client(), log).with_s3_access_key(FAKE_ACCESS_KEY)
 }
 
 fn with_credentials(
@@ -52,9 +52,9 @@ fn with_credentials(
     backend: &Arc<ScalewayFake>,
     credentials: Credentials,
     log: Log,
-) -> ScalewayJobs {
+) -> Scaleway {
     let client = ScalewayClient::new(backend.clone(), credentials, FAKE_REGION);
-    ScalewayJobs::new(jobs(config), Arc::new(client), log)
+    Scaleway::new(jobs(config), Arc::new(client), log)
 }
 
 fn cache_off() -> Arc<Config> {
@@ -67,7 +67,7 @@ fn actions(steps: &[Step]) -> Vec<(String, Action)> {
     steps.iter().map(|s| (s.id.clone(), s.action)).collect()
 }
 
-async fn provisioned(log: Log) -> (Arc<ScalewayFake>, ScalewayJobs, BTreeMap<String, String>) {
+async fn provisioned(log: Log) -> (Arc<ScalewayFake>, Scaleway, BTreeMap<String, String>) {
     let backend = Arc::new(ScalewayFake::new());
     let provider = provider(contract_config(), &backend, log);
     let steps = provider.plan(&[]).await.expect("plan");
@@ -492,7 +492,7 @@ async fn api_errors_carry_method_path_status_and_message() {
 async fn s3_errors_carry_the_s3_code() {
     let (backend, _, outputs) = provisioned(Log::silent()).await;
     let project_id = &outputs["CIBURST_PROJECT_ID"];
-    let wrong = ScalewayJobs::new(jobs(contract_config()), backend.client(), Log::silent())
+    let wrong = Scaleway::new(jobs(contract_config()), backend.client(), Log::silent())
         .with_s3_access_key("SCWWRONGACCESSKEY000");
     let error = wrong.plan(&[]).await.unwrap_err().to_string();
     assert_eq!(
@@ -515,7 +515,7 @@ async fn s3_errors_carry_the_s3_code() {
         error,
         "scaleway: the cache bucket needs the access key of SCW_SECRET_KEY"
     );
-    let no_cache = ScalewayJobs::new(jobs(cache_off()), backend.client(), Log::silent());
+    let no_cache = Scaleway::new(jobs(cache_off()), backend.client(), Log::silent());
     assert!(no_cache.plan(&[]).await.is_ok(), "no S3 without the cache");
 }
 
