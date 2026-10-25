@@ -359,6 +359,7 @@ Measured:
 | Scaleway bill, October to 2026-10-25 21:18 UTC (consumption API, amounts in cents per line) | 2.00 EUR in total, 1.97 of it VM-hours (compute, IPv4, local SSD); Serverless Jobs (29,556 vCPU-s, 63,472 GB-s) and Functions fully inside the free tier; Object Storage and registry 0.02 |
 | Price per VM-hour from the bill | DEV1-M 0.021 + IPv4 0.005 + local SSD 0.002 = 0.028 EUR; DEV1-L 0.044 + 0.005 + 0.004 = 0.053 EUR; local SSD is billed per clock hour (960 GB-hours for 8 DEV1-L hours of 80 GB) |
 | Cost per job-minute, drill consumer on VMs (3 pipelines, one DEV1-L per job, 2026-10-25) | 0.68 EUR for 146 job-minutes on 12 DEV1-L hours: 0.0046 EUR per job-minute, about half of GitLab's small runner (0.0089); the VMs were busy about 20 % of their paid hours |
+| One paid hour per VM, the bill against the job logs (`via <vm>`, 2026-10-25) | drill consumer: 8 VMs ran jobs, 8 DEV1-L hours billed, the longest ran jobs for 50 minutes across two pipelines; demo: 8 VMs ran jobs, 9 DEV1-M hours billed, the ninth most likely a VM woken by the pending events of its two hosted-runner jobs (D49). The drill consumer's first deployment paid 4 DEV1-L hours for VMs that got no job. A VM busy at minute 55 pays its next hour, by design |
 
 ### M5 drill
 
