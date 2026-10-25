@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Checks that the Rust toolchain and the gitlab-runner release carry the same pin everywhere.
-# Sources: rust-toolchain.toml (Rust), images/base/Dockerfile (gitlab-runner) and
-# crates/core/src/cloud_init.rs (the runner binary's sha256). Every place listed below must
-# carry the pin, and no file outside docs/ and test/drill/ may name another version (the drill
-# pipeline plays a consumer with its own toolchain). A version bump edits every listed place.
+# Sources: rust-toolchain.toml (Rust) and crates/core/src/cloud_init.rs (RUNNER_URL with the
+# gitlab-runner version, RUNNER_SHA256; images/test/lane-bootstrap.sh reads both from there).
+# Every place listed below must carry the pin, and no file outside docs/ and test/drill/ may
+# name another version (the drill pipeline plays a consumer with its own toolchain). A version
+# bump edits every listed place.
 # Usage: scripts/check-pins.sh
 set -euo pipefail
 
@@ -11,7 +12,7 @@ cd "$(dirname "$0")/.."
 git rev-parse --is-inside-work-tree > /dev/null
 
 rust="$(sed -n 's/^channel = "\([0-9]*\.[0-9]*\.[0-9]*\)"$/\1/p' rust-toolchain.toml)"
-runner="$(sed -n 's/^FROM gitlab\/gitlab-runner:v\([0-9]*\.[0-9]*\.[0-9]*\) AS runner$/\1/p' images/base/Dockerfile)"
+runner="$(sed -n '/^pub const RUNNER_URL: &str/,/;$/s|.*"https://gitlab-runner-downloads\.s3\.amazonaws\.com/v\([0-9]*\.[0-9]*\.[0-9]*\)/binaries/gitlab-runner-linux-amd64";$|\1|p' crates/core/src/cloud_init.rs)"
 runner_sha="$(sed -n 's/^pub const RUNNER_SHA256: &str = "\([0-9a-f]\{64\}\)";$/\1/p' crates/core/src/cloud_init.rs)"
 if [ -z "$rust" ] || [ -z "$runner" ] || [ -z "$runner_sha" ]; then
   echo "a pin source is unreadable: rust '$rust', runner '$runner', runner sha256 '$runner_sha'" >&2
@@ -26,19 +27,12 @@ places=(
   "Cargo.toml|rust-version = \"$rust_minor\""
   ".gitlab-ci.yml|image: rust:$rust-bookworm"
   ".gitlab-ci.yml|RUSTUP_TOOLCHAIN: $rust"
-  "images/rust/Dockerfile|FROM rust:$rust-bookworm"
   "images/cli/Dockerfile|FROM rust:$rust-bookworm AS build"
-  "images/test/smoke.sh|expect_tool=\"cargo $rust\""
   "scripts/test-linux.sh|rust:$rust-bookworm"
   "scripts/test-linux.sh|RUSTUP_TOOLCHAIN=$rust"
   "crates/scaleway/src/host.rs|pub const RUNTIME: &str = \"$runtime\";"
   "crates/scaleway/tests/host.rs|assert_eq!(function[\"runtime\"], \"$runtime\");"
   "crates/scaleway/tests/host.rs|rust-version = \\\"$rust_minor\\\""
-  "images/base/Dockerfile|FROM gitlab/gitlab-runner:v$runner AS runner"
-  "images/node/Dockerfile|FROM gitlab/gitlab-runner:v$runner AS runner"
-  "images/rust/Dockerfile|FROM gitlab/gitlab-runner:v$runner AS runner"
-  "images/playwright/Dockerfile|FROM gitlab/gitlab-runner:v$runner AS runner"
-  "images/test/smoke.sh|runner_version=\"$runner\""
   "images/test/runner-help.sh|gitlab/gitlab-runner:v$runner"
   "images/test/run-single-slot.sh|gitlab/gitlab-runner:v$runner"
   "crates/core/src/cloud_init.rs|$runner_url"
@@ -91,7 +85,6 @@ scan 'rust-version = \\?"[0-9]+\.[0-9]+(\.[0-9]+)?' version "$rust_minor"
 scan '"rust[0-9]{3,}"' exact "\"$runtime\""
 scan 'gitlab-runner:v[0-9]+\.[0-9]+\.[0-9]+' version "$runner"
 scan 'gitlab-runner-downloads\.s3\.amazonaws\.com/v[0-9]+\.[0-9]+\.[0-9]+' version "$runner"
-scan 'runner_version="[0-9]+\.[0-9]+\.[0-9]+' version "$runner"
 
 # A file that downloads the runner binary also checks its sha256.
 while IFS= read -r file; do

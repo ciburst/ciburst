@@ -54,12 +54,6 @@ done
     echo "- \`$bin-$target\`"
   done
   echo
-  echo "Images:"
-  echo
-  for image in cli base node rust playwright; do
-    echo "- \`${CI_REGISTRY_IMAGE:?CI_REGISTRY_IMAGE is not set}/$image:$version\`"
-  done
-  echo
-  echo "The \`cli\` image carries \`/usr/local/bin/ciburst\` and \`/usr/local/bin/ciburst-vm-agent\`."
+  echo "Image: \`${CI_REGISTRY_IMAGE:?CI_REGISTRY_IMAGE is not set}/cli:$version\` with \`/usr/local/bin/ciburst\` and \`/usr/local/bin/ciburst-vm-agent\`."
 } > release-notes.md
 cat release-notes.md release-assets.json
