@@ -66,7 +66,7 @@ The adopter follows README, Adopt. The operator's view:
 4. Run `ciburst-check`.
    Check: `every job matches the stage map`.
 5. Undo: the project variable `CIBURST_DESTROY=<name>` (protected, environment scope `ciburst`), then run `ciburst-destroy`.
-   Check: `destroyed <name>`; no output variable, webhook or runner remains; delete `CIBURST_DESTROY` afterwards. A `warn` line names what is left; a second run removes it.
+   Check: `destroyed <name>`; no output variable, webhook or runner remains; delete `CIBURST_DESTROY` afterwards. A `warn` line names what is left; a second run removes it. Remove the include only after this: a revert alone leaves the webhook, and every later job still starts a VM.
 
 Project variables after a setup, environment `ciburst`, protected, raw: the keys of `outputs.env` above except `HCLOUD_TOKEN`, which stays in memory. Tokens, secrets and secret keys are masked and hidden where GitLab allows; ids, URLs and the agent hash stay readable in job logs.
 

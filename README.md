@@ -55,7 +55,7 @@ Customize with `ciburst.json` at the repository root, then run `ciburst-setup` a
 ```
 
 Undo: add the project variable `CIBURST_DESTROY` with the deployment's name (`ci-<project id>` unless `ciburst.json` sets `name`), protected, environment scope `ciburst`, then run `ciburst-destroy`.
-Check: the log ends with `destroyed <name>`; the webhook, the runner, the output variables and the Scaleway project are gone. Delete the five variables afterwards.
+Check: the log ends with `destroyed <name>`; the webhook, the runner, the output variables and the Scaleway project are gone. Then remove the include and `ciburst.json`, and delete the five variables. Removing the include first leaves the webhook behind, and every later job still starts a VM.
 
 ## With an AI assistant
 

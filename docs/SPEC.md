@@ -269,6 +269,7 @@ Cost: CX33 0.0144 EUR per hour with IPv4 and disk, every started hour billed; th
 - The agent object is public and holds no secret; cloud-init checks it against the sha256 in the user data.
 - Burst intents live in the cache bucket, which every job can write with the cache key. A forged intent can at most cost one VM-hour or delay one job until a slot frees.
 - Pipeline mode (D39): inputs and outputs are protected project variables scoped to the environment `ciburst`, masked and hidden where GitLab allows, so only the component's jobs on the protected default branch receive them; `--ci` never reads `SCW_*`, so a project's own Scaleway variables cannot redirect the setup.
+- Job secrets: a job's variables, file variables such as deploy keys included, reach the VM that runs it, as on any runner; the runner deletes them after the job, the VM belongs to one deployment and ends within its hour.
 
 Secrets inventory ("outputs" is `.local/outputs.env` on the developer path, project variables in pipeline mode):
 
