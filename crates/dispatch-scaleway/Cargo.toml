@@ -19,6 +19,6 @@ serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-ciburst-core = { path = "../core", features = ["testing"] }
-ciburst-scaleway = { path = "../scaleway", features = ["testing"] }
+ciburst-core = { path = "../core", version = "0.1.0", features = ["testing"] }
+ciburst-scaleway = { path = "../scaleway", version = "0.1.0", features = ["testing"] }
 async-trait.workspace = true

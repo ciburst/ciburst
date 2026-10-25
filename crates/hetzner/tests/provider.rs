@@ -1294,8 +1294,8 @@ async fn api_errors_name_code_and_message_without_the_token() {
     assert_eq!(error, "hetzner: unknown step vm:security-group");
 }
 
-/// A main provider that serves no pool and shares the agent image and cache location, as
-/// Scaleway does (M4 rule R11).
+/// A main provider that serves no pool and shares the agent and cache location, as Scaleway
+/// does (D38, M4 rule R11).
 struct Main {
     started: Mutex<Vec<String>>,
 }
