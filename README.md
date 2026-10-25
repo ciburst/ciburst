@@ -28,6 +28,19 @@ Status: pre-release. `ciburst/ciburst` stays private until v1.0.0; the component
 - The first setup takes 6 to 15 hosted-runner minutes while Scaleway compiles the dispatcher; later setups take under a minute.
 - `linux/amd64` only. Optional: Hetzner CX33 VMs at about half the price (`docs/RUNBOOK.md`, Hetzner).
 
+Compared per job-minute for a small runner (providers' price pages, 2026-10-25, 1 EUR = 1.1193 USD; sources in `docs/SPEC.md` section 15):
+
+| Option | EUR per job-minute | Billing |
+|---|---|---|
+| GitLab.com hosted, small (2 vCPU, 8 GB) | 0.0089 after 400 free minutes a month | per minute |
+| AWS CodeBuild GitLab runner, small | 0.0045 | per job, rounded up to minutes |
+| Self-built on AWS spot, m6i.large | 0.0009, plus about 10 EUR a month for the manager | per second |
+| RocketRunner small, one always-on VM | 9.46 EUR a month flat | per minute, capped |
+| ciburst VM slot, half a DEV1-M, half the paid hour used | 0.00045 | per started hour |
+| ciburst lane, 2 vCPU | 0.0017, free up to about 1,700 minutes a month | per second |
+
+A month of 3,000 job-minutes: GitLab 23.23 EUR, self-built AWS spot 12.95, RocketRunner 9.46, ciburst lanes 2.24, ciburst VM slots 1.36. A VM slot has 1.5 shared vCPU and 2 GB, GitLab's small runner 2 vCPU and 8 GB.
+
 ## Adopt
 
 You need a Scaleway account with a payment method and the Owner role in the GitLab project. While `ciburst/ciburst` is private, the adopting user also needs access to it and the adopting project an entry in its CI/CD job token allowlist.
