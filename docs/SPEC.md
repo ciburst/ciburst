@@ -154,7 +154,7 @@ Credentials: on the developer path `.local/scaleway.env` (`SCW_ACCESS_KEY`, `SCW
 ### 5.5 Repository layout
 
 ```
-Cargo.toml  rust-toolchain.toml  deny.toml  LICENSE  README.md  config.example.json
+Cargo.toml  rust-toolchain.toml  deny.toml  LICENSE  README.md  AGENTS.md  config.example.json
 crates/core/               ciburst-core: config, dispatch, gitlab, provision, composite, ledger, cloud_init, vm, fake, testing
 crates/cli/                binary ciburst; registry of providers and hosts
 crates/scaleway/           provider scaleway (instances, jobs, IAM, S3, registry), host scaleway-function, ledger, build.rs packing the function zip, API fakes
