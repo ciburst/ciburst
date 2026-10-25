@@ -146,6 +146,11 @@ for image in alpine:3.21 debian:bookworm-slim node:24-bookworm-slim ubuntu:24.04
   report "dry run on $image"
 done
 
+# The job keeps the image's PATH, which the shell executor's login shell would replace.
+dry_run alpine:3.21 -e PATH=/opt/lane-test/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+expect_text "--env PATH=/opt/lane-test/bin:/usr/local/sbin"
+report "dry run on alpine:3.21 keeps the image's PATH"
+
 # An image with git and curl runs as its own user, with the builds in its home.
 dry_run node:24-bookworm --user node
 expect_text "--builds-dir /home/node/builds"

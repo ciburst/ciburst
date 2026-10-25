@@ -102,6 +102,8 @@ else
   cache_dir=/tmp/ciburst-cache
 fi
 
+# The shell executor runs jobs in a login shell, whose /etc/profile replaces the image's PATH
+# (rust images keep cargo in /usr/local/cargo/bin); the job gets it back as a variable.
 set -- "$runner" run-single \
   --url "$CI_SERVER_URL" \
   --token "$RUNNER_TOKEN" \
@@ -110,7 +112,8 @@ set -- "$runner" run-single \
   --builds-dir "${CIBURST_BUILDS_DIR:-$builds_dir}" \
   --cache-dir "${CIBURST_CACHE_DIR:-$cache_dir}" \
   --max-builds 0 \
-  --wait-timeout "$wait_timeout"
+  --wait-timeout "$wait_timeout" \
+  --env "PATH=$PATH"
 
 case "${CACHE_TYPE:-}" in
   '') ;;
