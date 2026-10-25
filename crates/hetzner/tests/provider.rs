@@ -28,7 +28,8 @@ const SECRET: &str = "vm-secret-must-stay-in-the-dispatcher";
 const RUNNER_TOKEN: &str = "glrt-vm-runner-token";
 const CACHE_SECRET: &str = "cache-secret-key-value";
 const DISPATCH_URL: &str = "https://dispatch.example.invalid";
-const AGENT_IMAGE: &str = "registry.example.invalid/contract/vm-agent:edge";
+const AGENT_SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const AGENT_URL: &str = "https://contract-cache-p-1.s3.example.invalid/ciburst/agent/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 /// The contract config with both pools on Hetzner and an empty `providers.hetzner`.
 fn config(change: impl FnOnce(&mut Config)) -> Arc<Config> {
@@ -67,7 +68,8 @@ fn env() -> BTreeMap<String, String> {
         ("CACHE_S3_SECRET_KEY", CACHE_SECRET),
         ("CIBURST_VM_SECRET", SECRET),
         ("CIBURST_DISPATCH_URL", DISPATCH_URL),
-        ("CIBURST_AGENT_IMAGE", AGENT_IMAGE),
+        ("CIBURST_AGENT_URL", AGENT_URL),
+        ("CIBURST_AGENT_SHA256", AGENT_SHA256),
         ("CACHE_TYPE", "s3"),
         ("CACHE_S3_SERVER_ADDRESS", "s3.example.invalid"),
         ("CACHE_S3_BUCKET_NAME", "contract-cache-p-1"),
@@ -390,13 +392,14 @@ async fn start_creates_the_server_of_rule_r12_with_its_user_data() {
     assert_eq!(
         commands[2],
         format!(
-            "systemctl start docker && id=$(docker create {AGENT_IMAGE} /ciburst-vm-agent) && docker cp \"$id:/ciburst-vm-agent\" /usr/local/bin/ciburst-vm-agent && docker rm \"$id\""
+            "curl -fsSL -o /tmp/ciburst-vm-agent {AGENT_URL} && echo \"{AGENT_SHA256}  /tmp/ciburst-vm-agent\" | sha256sum -c - && install -m 0755 /tmp/ciburst-vm-agent /usr/local/bin/ciburst-vm-agent && rm -f /tmp/ciburst-vm-agent"
         )
     );
     assert!(
         !user_data.contains("apt-get install"),
         "docker-ce has Docker"
     );
+    assert!(!user_data.contains("docker create"));
 
     let logged = lines.lock().unwrap().clone();
     let everything = format!(
@@ -406,7 +409,8 @@ async fn start_creates_the_server_of_rule_r12_with_its_user_data() {
     );
     assert!(!everything.contains(SECRET), "the VM secret leaked");
     assert!(!vm_env.contains_key("CIBURST_VM_SECRET"));
-    assert!(!vm_env.contains_key("CIBURST_AGENT_IMAGE"));
+    assert!(!vm_env.contains_key("CIBURST_AGENT_URL"));
+    assert!(!vm_env.contains_key("CIBURST_AGENT_SHA256"));
     assert!(
         logged
             .iter()
@@ -526,7 +530,8 @@ async fn start_refuses_what_a_vm_cannot_use_before_creating_anything() {
         "RUNNER_TOKEN",
         "CIBURST_VM_SECRET",
         "CIBURST_DISPATCH_URL",
-        "CIBURST_AGENT_IMAGE",
+        "CIBURST_AGENT_URL",
+        "CIBURST_AGENT_SHA256",
         "CACHE_TYPE",
         "CACHE_S3_SERVER_ADDRESS",
         "CACHE_S3_BUCKET_NAME",
@@ -551,11 +556,24 @@ async fn start_refuses_what_a_vm_cannot_use_before_creating_anything() {
         "hetzner: pool ci: CACHE_TYPE is gcs, the VM agent takes s3"
     );
     let mut start = request(&plain(), "ci");
+    start.env.insert(
+        "CIBURST_AGENT_URL".into(),
+        "http://plain.example/agent".into(),
+    );
+    let error = provider.start(start).await.unwrap_err().to_string();
+    assert_eq!(
+        error,
+        "cloud-init: CIBURST_AGENT_URL \"http://plain.example/agent\" is not an https URL"
+    );
+    let mut start = request(&plain(), "ci");
     start
         .env
-        .insert("CIBURST_AGENT_IMAGE".into(), "no image ref".into());
+        .insert("CIBURST_AGENT_SHA256".into(), "not-a-hash".into());
     let error = provider.start(start).await.unwrap_err().to_string();
-    assert_eq!(error, "cloud-init: no image ref is not an image reference");
+    assert_eq!(
+        error,
+        "cloud-init: CIBURST_AGENT_SHA256 \"not-a-hash\" is not a SHA-256 in hex"
+    );
 
     let jobs = config(|c| c.pools[1].runtime = Some("jobs".into()));
     let error = provider
@@ -566,6 +584,84 @@ async fn start_refuses_what_a_vm_cannot_use_before_creating_anything() {
     assert_eq!(error, "hetzner: pool build does not run on hetzner");
     assert!(fake.servers().is_empty(), "nothing started");
     assert!(!fake.calls().iter().any(|c| c.path == "/servers"));
+}
+
+#[tokio::test]
+async fn preflight_checks_token_location_and_types_in_two_reads() {
+    let fake = Arc::new(FakeHetzner::new());
+    provider(plain(), &fake, Log::silent())
+        .preflight()
+        .await
+        .unwrap();
+    let calls: Vec<String> = fake.calls().iter().map(|c| c.path.clone()).collect();
+    assert_eq!(calls, ["/locations", "/server_types"]);
+    assert!(fake.writes().is_empty());
+
+    let http: Arc<dyn HttpClient> = fake.clone();
+    let error = Hetzner::new(plain(), "wrong-token".into(), http, Log::silent())
+        .preflight()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error,
+        "hetzner: the API refuses HCLOUD_TOKEN: unauthorized (401): unable to authenticate"
+    );
+
+    let at = |location: &str| {
+        config(|c| {
+            c.providers.insert(
+                "hetzner".to_string(),
+                json!({ "location": location })
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            );
+        })
+    };
+    let error = provider(at("xyz1"), &fake, Log::silent())
+        .preflight()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error,
+        "hetzner: location xyz1 does not exist; set providers.hetzner.location"
+    );
+    let error = provider(at("ash"), &fake, Log::silent())
+        .preflight()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error,
+        "hetzner: pool ci: none of cx33, cx43 is offered in ash; pool build: none of cx33, cx43 \
+         is offered in ash"
+    );
+    let unknown_type = config(|c| c.pools[0].instance_types = vec!["cx99".into()]);
+    let error = provider(unknown_type, &fake, Log::silent())
+        .preflight()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(error, "hetzner: pool ci: none of cx99 is offered in nbg1");
+    let fallback = config(|c| c.pools[0].instance_types = vec!["cx99".into(), "cx23".into()]);
+    provider(fallback, &fake, Log::silent())
+        .preflight()
+        .await
+        .unwrap();
+
+    let none = config(|c| {
+        for pool in &mut c.pools {
+            pool.runtime = None;
+        }
+    });
+    let fresh = Arc::new(FakeHetzner::new());
+    provider(none, &fresh, Log::silent())
+        .preflight()
+        .await
+        .unwrap();
+    assert!(fresh.calls().is_empty(), "no Hetzner pool, no request");
 }
 
 #[tokio::test]
@@ -1198,8 +1294,8 @@ async fn api_errors_name_code_and_message_without_the_token() {
     assert_eq!(error, "hetzner: unknown step vm:security-group");
 }
 
-/// A main provider that serves no pool and shares the agent image and cache location, as
-/// Scaleway does (M4 rule R11).
+/// A main provider that serves no pool and shares the agent and cache location, as Scaleway
+/// does (D38, M4 rule R11).
 struct Main {
     started: Mutex<Vec<String>>,
 }
@@ -1243,7 +1339,8 @@ impl Provider for Main {
     }
     async fn shared_env(&self) -> ciburst_core::Result<BTreeMap<String, String>> {
         Ok([
-            ("CIBURST_AGENT_IMAGE", AGENT_IMAGE),
+            ("CIBURST_AGENT_URL", AGENT_URL),
+            ("CIBURST_AGENT_SHA256", AGENT_SHA256),
             ("CACHE_TYPE", "s3"),
             ("CACHE_S3_SERVER_ADDRESS", "s3.example.invalid"),
             ("CACHE_S3_BUCKET_NAME", "contract-cache-p-1"),
@@ -1284,7 +1381,8 @@ async fn the_composite_routes_steps_starts_and_run_ids_here() {
 
     let mut start = request(&mixed, "ci");
     for key in [
-        "CIBURST_AGENT_IMAGE",
+        "CIBURST_AGENT_URL",
+        "CIBURST_AGENT_SHA256",
         "CACHE_TYPE",
         "CACHE_S3_SERVER_ADDRESS",
         "CACHE_S3_BUCKET_NAME",
@@ -1295,7 +1393,9 @@ async fn the_composite_routes_steps_starts_and_run_ids_here() {
     }
     let run_id = composite.start(start).await.unwrap();
     assert!(run_id.starts_with("hetzner:contract-ci-"), "{run_id}");
-    let vm_env = vm_env(&fake.user_data(name_of(&run_id)).unwrap());
+    let user_data = fake.user_data(name_of(&run_id)).unwrap();
+    assert!(user_data.contains(&format!("curl -fsSL -o /tmp/ciburst-vm-agent {AGENT_URL} ")));
+    let vm_env = vm_env(&user_data);
     assert_eq!(vm_env["CACHE_S3_BUCKET_NAME"], "contract-cache-p-1");
     assert_eq!(
         composite.start(request(&mixed, "build")).await.unwrap(),

@@ -14,6 +14,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
+use ciburst_core::cloud_init::is_sha256;
 use ciburst_core::composite::Composite;
 use ciburst_core::config::{CacheType, Config, parse_config};
 use ciburst_core::dispatch::Dispatcher;
@@ -41,6 +42,9 @@ pub struct Env {
     pub dispatch_url: Option<String>,
     /// `HCLOUD_TOKEN`, required when the config adds the `hetzner` provider.
     pub hetzner_token: Option<String>,
+    /// `CIBURST_AGENT_SHA256`, the agent new VMs download from the cache bucket (D38); a VM
+    /// start without it fails naming the variable.
+    pub agent_sha256: Option<String>,
     /// Pause between recording a burst intent and reading the burst (M4 rule R3); not read from
     /// the environment.
     pub group_wait: Duration,
@@ -131,6 +135,12 @@ impl Env {
             organization_id: required(vars::ORGANIZATION_ID)?,
             default_project_id: Some(required(vars::PROJECT_ID)?),
         };
+        let agent_sha256 = match optional(vars::AGENT_SHA256) {
+            Some(sha256) if !is_sha256(&sha256) => {
+                return Err(EnvError::Invalid(vars::AGENT_SHA256.to_string()));
+            }
+            found => found,
+        };
         Ok(Env {
             config: Arc::new(config),
             secrets: Arc::new(secrets),
@@ -142,6 +152,7 @@ impl Env {
             } else {
                 None
             },
+            agent_sha256,
             group_wait: Duration::from_secs(GROUP_WAIT_S),
         })
     }
@@ -162,11 +173,10 @@ impl Env {
     /// (spec D35), and the ledger, both on `http`.
     pub fn backends_on(&self, http: Arc<dyn HttpClient>, log: Log) -> Backends {
         let client = ScalewayClient::new(http.clone(), self.credentials.clone(), &self.region);
-        let main: Arc<dyn Provider> = Arc::new(Scaleway::new(
-            self.config.clone(),
-            Arc::new(client),
-            log.clone(),
-        ));
+        let main: Arc<dyn Provider> = Arc::new(
+            Scaleway::new(self.config.clone(), Arc::new(client), log.clone())
+                .with_agent_sha256(self.agent_sha256.clone()),
+        );
         let ledger = self.ledger_on(http.clone());
         let Some(token) = &self.hetzner_token else {
             return Backends::new(main).with_ledger(ledger);
@@ -502,6 +512,16 @@ mod tests {
         assert_eq!(env.region, "fr-par");
 
         assert_eq!(env.secrets.vm_secret.as_deref(), Some(VM_SECRET));
+        assert_eq!(env.agent_sha256, None);
+        let sha = "ab".repeat(32);
+        let mut with_agent = vars_map();
+        with_agent.insert(vars::AGENT_SHA256.to_string(), sha.clone());
+        assert_eq!(env_from(&with_agent).unwrap().agent_sha256, Some(sha));
+        with_agent.insert(vars::AGENT_SHA256.to_string(), "AB".repeat(32));
+        assert_eq!(
+            env_from(&with_agent).err(),
+            Some(EnvError::Invalid(vars::AGENT_SHA256.to_string()))
+        );
 
         let mut no_cache = vars_map();
         no_cache.remove(vars::CACHE_SECRET_KEY);

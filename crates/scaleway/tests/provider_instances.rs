@@ -16,6 +16,7 @@ use ciburst_core::vm::{
 use ciburst_scaleway::provider::Scaleway;
 use ciburst_scaleway::testing::instance_api::FAKE_CLOCK;
 use ciburst_scaleway::testing::scaleway_fake::{FAKE_ACCESS_KEY, ScalewayFake};
+use ciburst_scaleway::testing::{agent_fixture, agent_fixture_sha256};
 use serde_json::{Value, json};
 use yaml_rust2::{Yaml, YamlLoader};
 
@@ -23,16 +24,10 @@ const SECRET: &str = "vm-secret-must-stay-in-the-dispatcher";
 const RUNNER_TOKEN: &str = "glrt-vm-runner-token";
 const CACHE_SECRET: &str = "cache-secret-key-value";
 const DISPATCH_URL: &str = "https://dispatch.example";
-const AGENT_IMAGE: &str = "rg.fr-par.scw.cloud/contract/vm-agent:edge";
 
-/// The contract config on the default runtime, with the public registry the agent comes from.
+/// The contract config (S3 cache) on the default runtime.
 fn config(change: impl FnOnce(&mut Config)) -> Arc<Config> {
     let mut config = (*contract_config()).clone();
-    config.provider.extra.insert("registry".into(), json!(true));
-    config
-        .provider
-        .extra
-        .insert("registryPublic".into(), json!(true));
     change(&mut config);
     Arc::new(config)
 }
@@ -41,8 +36,11 @@ fn plain() -> Arc<Config> {
     config(|_| {})
 }
 
+/// The provider with the agent fixture as `--agent`.
 fn provider(config: Arc<Config>, backend: &Arc<ScalewayFake>, log: Log) -> Scaleway {
-    Scaleway::new(config, backend.client(), log).with_s3_access_key(FAKE_ACCESS_KEY)
+    Scaleway::new(config, backend.client(), log)
+        .with_s3_access_key(FAKE_ACCESS_KEY)
+        .with_agent(Some(agent_fixture()))
 }
 
 async fn provisioned(config: Arc<Config>, log: Log) -> (Arc<ScalewayFake>, Scaleway, String) {
@@ -142,7 +140,7 @@ fn parse(user_data: &str) -> Yaml {
 }
 
 #[tokio::test]
-async fn first_plan_lists_the_security_group_and_no_job_definition() {
+async fn first_plan_lists_the_agent_and_security_group_and_no_job_definition() {
     let backend = Arc::new(ScalewayFake::new());
     let provider = provider(plain(), &backend, Log::silent());
     let steps = provider.plan(&[]).await.unwrap();
@@ -153,10 +151,15 @@ async fn first_plan_lists_the_security_group_and_no_job_definition() {
             ("key:dispatch".to_string(), Action::Create),
             ("key:cache".to_string(), Action::Create),
             ("bucket".to_string(), Action::Create),
-            ("registry".to_string(), Action::Create),
+            ("vm:agent".to_string(), Action::Create),
             ("vm:security-group".to_string(), Action::Create),
         ]
     );
+    assert_eq!(
+        steps[4].resource,
+        format!("vm agent ciburst/agent/{}", agent_fixture_sha256())
+    );
+    assert_eq!(steps[4].detail.as_deref(), Some("upload, public-read"));
     assert_eq!(steps[5].resource, "security group contract-vm");
     assert!(backend.writes().is_empty(), "plan writes nothing");
 
@@ -306,12 +309,14 @@ async fn start_creates_the_server_of_rule_four_then_user_data_then_poweron() {
     assert!(
         commands[0].contains("install -m 0755 /tmp/gitlab-runner /usr/local/bin/gitlab-runner")
     );
+    let sha = agent_fixture_sha256();
     assert_eq!(
         commands[1],
         format!(
-            "systemctl start docker && id=$(docker create {AGENT_IMAGE} /ciburst-vm-agent) && docker cp \"$id:/ciburst-vm-agent\" /usr/local/bin/ciburst-vm-agent && docker rm \"$id\""
+            "curl -fsSL -o /tmp/ciburst-vm-agent https://{bucket}.s3.fr-par.scw.cloud/ciburst/agent/{sha} && echo \"{sha}  /tmp/ciburst-vm-agent\" | sha256sum -c - && install -m 0755 /tmp/ciburst-vm-agent /usr/local/bin/ciburst-vm-agent && rm -f /tmp/ciburst-vm-agent"
         )
     );
+    assert!(!user_data.contains("docker create"));
     assert_eq!(
         commands[2],
         "systemctl daemon-reload && systemctl enable --now ciburst-vm-agent.service"
@@ -517,41 +522,36 @@ async fn start_refuses_what_a_vm_cannot_use() {
         assert_eq!(error, message);
     }
 
-    let no_registry = config(|c| {
-        c.provider.extra.insert("registry".into(), json!(false));
-    });
-    let error = Scaleway::new(no_registry.clone(), backend.client(), Log::silent())
-        .start(request(&no_registry, "ci"))
-        .await
-        .unwrap_err()
-        .to_string();
-    assert_eq!(
-        error,
-        "scaleway: pool ci: the instances runtime pulls its agent from the registry namespace; set provider.registry"
-    );
-
-    let private = config(|c| {
-        c.provider
-            .extra
-            .insert("registryPublic".into(), json!(false));
-    });
-    let private = provider_with(private, &backend);
-    let steps = private.plan(&[]).await.unwrap();
-    private.apply(&steps).await.unwrap();
-    let error = private
+    let without_agent = Scaleway::new(plain(), backend.client(), Log::silent());
+    let error = without_agent
         .start(request(&plain(), "ci"))
         .await
         .unwrap_err()
         .to_string();
-    assert_eq!(
-        error,
-        "scaleway: pool ci: VMs pull the agent image without credentials; set provider.registryPublic"
-    );
+    assert_eq!(error, "scaleway: pool ci: CIBURST_AGENT_SHA256 missing");
     assert!(backend.instance.servers().is_empty(), "nothing started");
 }
 
-fn provider_with(config: Arc<Config>, backend: &Arc<ScalewayFake>) -> Scaleway {
-    provider(config, backend, Log::silent())
+#[tokio::test]
+async fn the_dispatcher_starts_vms_on_the_agent_of_its_environment_without_a_registry() {
+    let (backend, _, project_id) = provisioned(plain(), Log::silent()).await;
+    assert!(backend.registry.namespaces().is_empty(), "no registry");
+    let sha = "f".repeat(64);
+    let dispatcher = Scaleway::new(plain(), backend.client(), Log::silent())
+        .with_agent_sha256(Some(sha.clone()));
+    let id = dispatcher.start(request(&plain(), "ci")).await.unwrap();
+    let user_data = backend.instance.user_data(&id, "cloud-init").unwrap();
+    assert!(user_data.contains(&format!(
+        "https://contract-cache-{project_id}.s3.fr-par.scw.cloud/ciburst/agent/{sha} "
+    )));
+    assert!(user_data.contains(&format!("echo \"{sha}  /tmp/ciburst-vm-agent\"")));
+    let s3_calls = backend.s3.calls().len();
+    dispatcher.start(request(&plain(), "ci")).await.unwrap();
+    assert_eq!(
+        backend.s3.calls().len(),
+        s3_calls,
+        "a start reads no bucket"
+    );
 }
 
 #[tokio::test]
@@ -1036,6 +1036,24 @@ async fn plan_warns_when_the_zone_has_no_quota_for_the_pool_types() {
         .expect("warning");
     assert!(warning.contains("zone fr-par-1 has no quota for DEV1-M, DEV1-L"));
     assert!(warning.contains("quota in nl-ams-1, pl-waw-1"));
+    let jobs_too = config(|c| c.pools[1].runtime = Some("jobs".into()));
+    let error = provider(jobs_too, &backend, Log::silent())
+        .preflight()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error,
+        "scaleway: pool ci: zone fr-par-1 has no quota for DEV1-M, DEV1-L: set provider.zone \
+         (quota in nl-ams-1, pl-waw-1) or ask Scaleway support to raise it"
+    );
+    let error = provider(plain(), &backend, Log::silent())
+        .preflight()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("pool ci: zone") && error.contains("; pool build: zone"));
+    assert!(backend.writes().is_empty(), "preflight writes nothing");
 
     backend
         .iam
@@ -1043,27 +1061,38 @@ async fn plan_warns_when_the_zone_has_no_quota_for_the_pool_types() {
     let (log, lines) = Log::memory();
     provider(plain(), &backend, log).plan(&[]).await.unwrap();
     assert!(lines.lock().unwrap().is_empty());
+    provider(plain(), &backend, Log::silent())
+        .preflight()
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
-async fn plan_warns_when_vms_cannot_pull_their_agent() {
+async fn plan_warns_and_preflight_fails_without_an_agent() {
     let backend = Arc::new(ScalewayFake::new());
     let (log, lines) = Log::memory();
-    let private = config(|c| {
-        c.provider
-            .extra
-            .insert("registryPublic".into(), json!(false));
-    });
-    provider(private, &backend, log).plan(&[]).await.unwrap();
-    assert!(
-        lines
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|l| l.starts_with("warn vm pools cannot start"))
+    let without = Scaleway::new(plain(), backend.client(), log);
+    let steps = without.plan(&[]).await.unwrap();
+    let step = steps.iter().find(|s| s.id == "vm:agent").unwrap();
+    assert_eq!(step.action, Action::Create);
+    assert_eq!(step.resource, "vm agent ciburst/agent/");
+    let no_agent = "no VM agent: pass --agent <path> or build one with scripts/agent-binary.sh";
+    assert_eq!(step.detail.as_deref(), Some(no_agent));
+    assert_eq!(
+        *lines.lock().unwrap(),
+        [format!(r#"warn vm pools cannot start reason="{no_agent}""#)]
     );
+    assert_eq!(
+        without.preflight().await.unwrap_err().to_string(),
+        format!("scaleway: {no_agent}")
+    );
+    let error = without.apply(&steps).await.unwrap_err().to_string();
+    assert_eq!(error, format!("scaleway: {no_agent}"));
+
     let (log, lines) = Log::memory();
-    provider(plain(), &backend, log).plan(&[]).await.unwrap();
+    let with = provider(plain(), &backend, log);
+    with.preflight().await.unwrap();
+    with.plan(&[]).await.unwrap();
     assert!(lines.lock().unwrap().is_empty());
 }
 

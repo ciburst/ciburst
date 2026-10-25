@@ -1,15 +1,19 @@
-//! The user data `cloud-init` of a VM, the contract between provider and agent (rule 6 of M3):
-//! `/etc/ciburst/vm.env`, the pinned `gitlab-runner`, the agent copied out of its image, and
-//! the agent's systemd unit. The template and rendering live in `ciburst_core::cloud_init`.
+//! The user data `cloud-init` of a VM, the contract between provider and agent (rule 6 of M3,
+//! D38): `/etc/ciburst/vm.env`, the pinned `gitlab-runner`, the agent downloaded from the cache
+//! bucket, and the agent's systemd unit. The template and rendering live in
+//! `ciburst_core::cloud_init`.
 
 use std::collections::BTreeMap;
 
 use ciburst_core::config::{CacheType, Config, Pool};
 use ciburst_core::{Error, Result};
 
+use super::agent::agent_key;
 use super::{PROVIDER_NAME, jobs, s3};
 
-pub use ciburst_core::cloud_init::{AGENT_IMAGE, AGENT_IMAGE_KEY, DISPATCH_URL, RUN_ID, VM_TOKEN};
+pub use ciburst_core::cloud_init::{
+    AGENT_SHA256_KEY, AGENT_URL_KEY, DISPATCH_URL, RUN_ID, VM_TOKEN, render,
+};
 
 /// `vm.env` without the run id and token, which exist only once the server does. Fails before
 /// anything is created when the request lacks a value the VM needs.
@@ -65,30 +69,21 @@ pub fn cache_location(config: &Config, region: &str, project_id: &str) -> BTreeM
     .collect()
 }
 
-/// The full reference of the agent image below `registry_endpoint`.
-pub fn agent_image(registry_endpoint: &str) -> Result<String> {
-    if registry_endpoint.is_empty() {
-        return Err(Error::provider(format!(
-            "{PROVIDER_NAME}: no registry endpoint for the agent image"
-        )));
-    }
-    Ok(format!("{registry_endpoint}/{AGENT_IMAGE}"))
-}
-
-/// The cloud-config document with the agent image below `registry_endpoint`.
-/// `install_docker` is for the plain Ubuntu fallback image.
-pub fn render(
-    env: &BTreeMap<String, String>,
-    registry_endpoint: &str,
-    install_docker: bool,
-) -> Result<String> {
-    ciburst_core::cloud_init::render(env, &agent_image(registry_endpoint)?, install_docker)
+/// The anonymous URL of the agent `sha256` in the cache bucket (D38).
+pub fn agent_url(config: &Config, region: &str, project_id: &str, sha256: &str) -> String {
+    s3::public_url(
+        &jobs::bucket_name(config, project_id),
+        region,
+        &agent_key(sha256),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ciburst_core::testing::contract::contract_config;
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn request() -> BTreeMap<String, String> {
         [
@@ -126,16 +121,14 @@ mod tests {
     }
 
     #[test]
-    fn render_refuses_unsafe_values() {
-        let env = BTreeMap::from([("A".to_string(), "x\ny".to_string())]);
-        assert!(render(&env, "rg.fr-par.scw.cloud/demo", false).is_err());
-        let env = BTreeMap::from([("a b".to_string(), "x".to_string())]);
-        assert!(render(&env, "rg.fr-par.scw.cloud/demo", false).is_err());
-        let env = BTreeMap::from([("A".to_string(), "x".to_string())]);
-        assert!(render(&env, "rg.example/x' y", false).is_err());
-        assert!(render(&env, "", false).is_err());
-        let text = render(&env, "rg.fr-par.scw.cloud/demo", true).unwrap();
-        assert!(!text.contains("{{"), "{text}");
-        assert!(text.starts_with("#cloud-config\n"));
+    fn the_agent_url_is_the_public_object_in_the_cache_bucket() {
+        let config = contract_config();
+        let url = agent_url(&config, "nl-ams", "p-1", SHA);
+        assert_eq!(
+            url,
+            format!("https://contract-cache-p-1.s3.nl-ams.scw.cloud/ciburst/agent/{SHA}")
+        );
+        let text = render(&BTreeMap::new(), &url, SHA, false).unwrap();
+        assert!(text.contains(&format!("curl -fsSL -o /tmp/ciburst-vm-agent {url} ")));
     }
 }

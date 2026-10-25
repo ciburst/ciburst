@@ -2,6 +2,7 @@
 //! The fake S3 endpoint verifies requests with the same functions, so the known vector test
 //! below is what ties both to the published algorithm.
 
+use ciburst_core::time::DateTime;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
@@ -172,29 +173,11 @@ pub fn parse_authorization(value: &str) -> Option<(String, String, String, Strin
 
 /// `YYYYMMDDTHHMMSSZ` for a Unix time in seconds.
 pub fn amz_date(unix_seconds: u64) -> String {
-    let days = (unix_seconds / 86_400) as i64;
-    let secs = unix_seconds % 86_400;
-    let (year, month, day) = civil_from_days(days);
+    let at = DateTime::from_unix(unix_seconds);
     format!(
-        "{year:04}{month:02}{day:02}T{:02}{:02}{:02}Z",
-        secs / 3600,
-        (secs % 3600) / 60,
-        secs % 60
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        at.year, at.month, at.day, at.hour, at.minute, at.second
     )
-}
-
-// Howard Hinnant's days_from_civil inverse, valid for the whole proleptic Gregorian calendar.
-pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    (year, month, day)
 }
 
 #[cfg(test)]

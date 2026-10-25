@@ -132,9 +132,9 @@ impl Ledger for ScalewayLedger {
                 .list_page(&self.bucket, &prefix, Some(&start_after), token.as_deref())
                 .await?;
             intents.extend(
-                page.keys
+                page.objects
                     .iter()
-                    .filter_map(|key| parse_intent(&prefix, key))
+                    .filter_map(|object| parse_intent(&prefix, &object.key))
                     .filter(|intent| intent.at >= since),
             );
             match page.next {

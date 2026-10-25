@@ -4,7 +4,7 @@
 use ciburst_core::{Error, Result};
 use serde_json::{Value, json};
 
-use super::list_all;
+use super::{Scaleway, list_all};
 use crate::client::ScalewayClient;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,4 +80,49 @@ pub async fn update_namespace(client: &ScalewayClient, id: &str, is_public: bool
 pub async fn delete_namespace(client: &ScalewayClient, id: &str) -> Result<()> {
     client.delete(&format!("{}/{id}", base(client))).await?;
     Ok(())
+}
+
+impl Scaleway {
+    pub(super) async fn ensure_registry(&self, project_id: &str) -> Result<NamespaceState> {
+        let name = self.name();
+        let public = self.registry_public();
+        let mut namespace = match find_namespace(&self.client, project_id, name).await? {
+            Some(namespace) => namespace,
+            None => {
+                let namespace = create_namespace(&self.client, project_id, name, public).await?;
+                self.log.info(
+                    "created registry namespace",
+                    &[
+                        ("name", name),
+                        ("id", &namespace.id),
+                        ("endpoint", &namespace.endpoint),
+                    ],
+                );
+                namespace
+            }
+        };
+        if namespace.is_public != public {
+            update_namespace(&self.client, &namespace.id, public).await?;
+            namespace.is_public = public;
+            self.log.info(
+                "updated registry namespace",
+                &[("name", name), ("public", &public.to_string())],
+            );
+        }
+        Ok(namespace)
+    }
+
+    pub(super) async fn delete_registry(&self, project: &Option<String>) -> Result<()> {
+        let Some(project_id) = project else {
+            return Ok(());
+        };
+        if let Some(namespace) = find_namespace(&self.client, project_id, self.name()).await? {
+            delete_namespace(&self.client, &namespace.id).await?;
+            self.log.info(
+                "deleted registry namespace",
+                &[("name", self.name()), ("id", &namespace.id)],
+            );
+        }
+        Ok(())
+    }
 }

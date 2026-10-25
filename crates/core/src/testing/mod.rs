@@ -2,3 +2,4 @@
 
 pub mod contract;
 pub mod gitlab_fake;
+pub mod vm_contract;
