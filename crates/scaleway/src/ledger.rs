@@ -65,13 +65,19 @@ fn invalid(what: String) -> Error {
     Error::provider(format!("scaleway ledger: {what}"))
 }
 
-/// `ciburst/intents/<pool>/`; a pool is a config tag (lowercase letters, digits, hyphens).
-pub fn pool_prefix(pool: &str) -> Result<String> {
-    let valid = !pool.is_empty()
+/// Whether `pool` is shaped like a config tag: lowercase letters, digits, hyphens. No tag starts
+/// with an underscore, so the prefixes `_pipelines/`, `_queue/`, `_running/` and `_stats/`
+/// beside the intents hold no pool.
+pub fn is_pool(pool: &str) -> bool {
+    !pool.is_empty()
         && pool
             .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    if !valid {
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// `ciburst/intents/<pool>/`; a pool is a config tag ([`is_pool`]).
+pub fn pool_prefix(pool: &str) -> Result<String> {
+    if !is_pool(pool) {
         return Err(invalid(format!("pool {pool:?} is not a pool tag")));
     }
     Ok(format!("{INTENT_PREFIX}{pool}/"))

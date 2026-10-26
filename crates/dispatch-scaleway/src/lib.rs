@@ -2,9 +2,9 @@
 //! events), the VM agents' `POST /vm` and `POST /terminate`, and the sweep cron, and hands
 //! method, path, headers, body and the current time to
 //! `ciburst_core::dispatch::Dispatcher::handle_request` with a `Scaleway` provider and, with an
-//! S3 cache, the burst ledger and the warm start records in the cache bucket, all built from the
-//! function's environment. The variable names are `ciburst_scaleway::host::vars`, the ones the
-//! host sets.
+//! S3 cache, the burst ledger, the warm start records and the queue-first schedule in the cache
+//! bucket, all built from the function's environment. The variable names are
+//! `ciburst_scaleway::host::vars`, the ones the host sets.
 //!
 //! A cron trigger arrives as `POST /` with its arguments as the JSON body (Scaleway docs, "Add a
 //! trigger to a function"), so the sweep is recognized by its body, not by its path.
@@ -20,7 +20,7 @@ use ciburst_core::composite::Composite;
 use ciburst_core::config::{CacheType, Config, parse_config};
 use ciburst_core::dispatch::Dispatcher;
 use ciburst_core::http::{HttpClient, ReqwestClient};
-use ciburst_core::ledger::{GROUP_WAIT_S, Ledger, PipelineRecords};
+use ciburst_core::ledger::{GROUP_WAIT_S, Ledger, PipelineRecords, Schedule};
 use ciburst_core::log::Log;
 use ciburst_core::types::{KeyPair, Provider, Secrets};
 use ciburst_hetzner::Hetzner;
@@ -29,6 +29,7 @@ use ciburst_scaleway::host::vars;
 use ciburst_scaleway::ledger::ScalewayLedger;
 use ciburst_scaleway::provider::{Scaleway, VmStart};
 use ciburst_scaleway::records::ScalewayPipelineRecords;
+use ciburst_scaleway::schedule::ScalewaySchedule;
 use http::{Request, Response, StatusCode};
 
 /// GitLab job events are a few kilobytes, VM reports and cron arguments less. A pipeline event
@@ -63,6 +64,9 @@ pub struct Backends {
     pub ledger: Option<Arc<dyn Ledger>>,
     /// The warm start records beside it (M6.1 rule R5); `None` without an S3 cache key.
     pub records: Option<Arc<dyn PipelineRecords>>,
+    /// The queue-first schedule beside it (M6.2 rules R2 to R4); `None` without an S3 cache
+    /// key.
+    pub schedule: Option<Arc<dyn Schedule>>,
 }
 
 impl Backends {
@@ -71,6 +75,7 @@ impl Backends {
             provider,
             ledger: None,
             records: None,
+            schedule: None,
         }
     }
 
@@ -81,6 +86,11 @@ impl Backends {
 
     pub fn with_records(mut self, records: Option<Arc<dyn PipelineRecords>>) -> Backends {
         self.records = records;
+        self
+    }
+
+    pub fn with_schedule(mut self, schedule: Option<Arc<dyn Schedule>>) -> Backends {
+        self.schedule = schedule;
         self
     }
 }
@@ -120,8 +130,15 @@ impl Env {
             .map_err(|_| EnvError::Invalid(vars::CONFIG.to_string()))?;
         let config_has_hetzner = config.providers.contains_key(ciburst_hetzner::RUNTIME);
         let mut runner_tokens = BTreeMap::new();
+        let mut spill_tokens = BTreeMap::new();
         for pool in &config.pools {
             runner_tokens.insert(pool.tag.clone(), required(&vars::runner_token(&pool.tag))?);
+            // The host sets it for a VM pool with a spill runner only (M6.2 rule R6).
+            if config.is_vm_pool(pool)
+                && let Some(token) = optional(&vars::spill_token(&pool.tag))
+            {
+                spill_tokens.insert(pool.tag.clone(), token);
+            }
         }
         let cache = match (
             optional(vars::CACHE_ACCESS_KEY),
@@ -134,8 +151,7 @@ impl Env {
             _ => None,
         };
         let secrets = Secrets {
-            // Read from RUNNER_SPILL_TOKEN_<TAG> by M6.2 rule R6.
-            spill_tokens: Default::default(),
+            spill_tokens,
             hook_token: Some(required(vars::HOOK_TOKEN)?),
             runner_tokens,
             dispatch: None,
@@ -183,7 +199,7 @@ impl Env {
         Env::from_lookup(|name| std::env::var(name).ok())
     }
 
-    /// Provider, ledger and records on the real HTTP client.
+    /// Provider, ledger, records and schedule on the real HTTP client.
     pub fn backends(&self, log: Log) -> Result<Backends, EnvError> {
         let http: Arc<dyn HttpClient> = Arc::new(
             ReqwestClient::new().map_err(|_| EnvError::Invalid("http client".to_string()))?,
@@ -192,7 +208,7 @@ impl Env {
     }
 
     /// The `Scaleway` provider, in a [`Composite`] with Hetzner when the config adds it
-    /// (spec D35), the ledger and the records, all on `http`.
+    /// (spec D35), the ledger, the records and the schedule, all on `http`.
     pub fn backends_on(&self, http: Arc<dyn HttpClient>, log: Log) -> Backends {
         let client = ScalewayClient::new(http.clone(), self.credentials.clone(), &self.region);
         let main: Arc<dyn Provider> = Arc::new(
@@ -202,10 +218,12 @@ impl Env {
         );
         let ledger = self.ledger_on(http.clone());
         let records = self.records_on(http.clone());
+        let schedule = self.schedule_on(http.clone());
         let Some(token) = &self.hetzner_token else {
             return Backends::new(main)
                 .with_ledger(ledger)
-                .with_records(records);
+                .with_records(records)
+                .with_schedule(schedule);
         };
         let hetzner: Arc<dyn Provider> = Arc::new(Hetzner::new(
             self.config.clone(),
@@ -222,6 +240,7 @@ impl Env {
         Backends::new(Arc::new(composite))
             .with_ledger(ledger)
             .with_records(records)
+            .with_schedule(schedule)
     }
 
     /// The burst ledger in the cache bucket `<name>-cache-<CIBURST_PROJECT_ID>` of
@@ -242,6 +261,18 @@ impl Env {
     pub fn records_on(&self, http: Arc<dyn HttpClient>) -> Option<Arc<dyn PipelineRecords>> {
         let (key, project_id) = self.cache_bucket()?;
         Some(Arc::new(ScalewayPipelineRecords::in_cache_bucket(
+            http,
+            &self.config,
+            project_id,
+            &self.region,
+            key,
+        )))
+    }
+
+    /// The queue-first schedule in the ledger's bucket, under the same key and condition.
+    pub fn schedule_on(&self, http: Arc<dyn HttpClient>) -> Option<Arc<dyn Schedule>> {
+        let (key, project_id) = self.cache_bucket()?;
+        Some(Arc::new(ScalewaySchedule::in_cache_bucket(
             http,
             &self.config,
             project_id,
@@ -583,6 +614,29 @@ mod tests {
         let mut no_vm = vars_map();
         no_vm.remove(vars::VM_SECRET);
         assert!(env_from(&no_vm).unwrap().secrets.vm_secret.is_none());
+    }
+
+    /// M6.2 rule R6: `RUNNER_SPILL_TOKEN_<TAG>` of a VM pool, optional, as the host sets it.
+    #[test]
+    fn reads_the_spill_tokens_of_vm_pools() {
+        assert!(
+            env_from(&vars_map())
+                .unwrap()
+                .secrets
+                .spill_tokens
+                .is_empty()
+        );
+        let mut spill = vars_map();
+        spill.insert(vars::spill_token("vm"), "glrt-spill".to_string());
+        spill.insert(vars::spill_token("build-x"), "glrt-lane".to_string());
+        let env = env_from(&spill).unwrap();
+        assert_eq!(
+            env.secrets.spill_tokens,
+            BTreeMap::from([("vm".to_string(), "glrt-spill".to_string())]),
+            "a lane has no spill runner"
+        );
+        spill.insert(vars::spill_token("vm"), String::new());
+        assert!(env_from(&spill).unwrap().secrets.spill_tokens.is_empty());
     }
 
     #[test]

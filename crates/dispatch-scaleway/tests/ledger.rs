@@ -12,7 +12,7 @@ use std::time::Duration;
 use ciburst_core::cloud_init::RUNNER_SHA256;
 use ciburst_core::config::{CacheType, parse_config};
 use ciburst_core::http::{HttpClient, Request};
-use ciburst_core::ledger::{Intent, VmJobs};
+use ciburst_core::ledger::{Intent, Queued, Running, VmJobs};
 use ciburst_core::log::Log;
 use ciburst_core::types::Provider;
 use ciburst_dispatch_scaleway::{Env, EnvError, Incoming, respond};
@@ -190,8 +190,10 @@ async fn no_ledger_without_both_cache_keys_or_an_s3_cache() {
         let env = env(&partial);
         assert!(env.ledger_on(backend.clone()).is_none(), "{key}");
         assert!(env.records_on(backend.clone()).is_none(), "{key}");
+        assert!(env.schedule_on(backend.clone()).is_none(), "{key}");
         let backends = env.backends_on(backend.clone(), Log::silent());
         assert!(backends.ledger.is_none() && backends.records.is_none());
+        assert!(backends.schedule.is_none());
     }
     // A config with pools always has an S3 cache (M6 rule R1); the function still builds no
     // ledger from cache keys when the cache is not S3.
@@ -202,6 +204,63 @@ async fn no_ledger_without_both_cache_keys_or_an_s3_cache() {
     no_cache.config = Arc::new(config);
     assert!(no_cache.ledger_on(backend.clone()).is_none());
     assert!(no_cache.records_on(backend.clone()).is_none());
+    assert!(no_cache.schedule_on(backend.clone()).is_none());
+}
+
+/// The queue-first schedule (M6.2 rules R2 to R4) beside the intents, under the cache key IAM
+/// scoped to the deployment's project, in the Hetzner composite too.
+#[tokio::test]
+async fn the_schedule_lives_beside_the_ledger_under_the_cache_key() {
+    let (backend, vars) = deployed("instances").await;
+    let env = env(&vars);
+    let schedule = env.schedule_on(backend.clone()).expect("schedule");
+    let queued = Queued {
+        job: "42".into(),
+        name: "build-image".into(),
+        pipeline: "9".into(),
+        at: NOW,
+    };
+    schedule.enqueue("vm", &queued).await.unwrap();
+    assert!(schedule.take_start("vm", NOW).await.unwrap());
+    assert_eq!(schedule.queued("vm").await.unwrap(), [queued]);
+    let running = Running {
+        job: "42".into(),
+        name: "build-image".into(),
+        started: NOW + 5,
+    };
+    schedule.started("vm", &running).await.unwrap();
+    assert_eq!(schedule.running("vm").await.unwrap(), [running]);
+    schedule
+        .finished("vm", "42", "build-image", Some(65))
+        .await
+        .unwrap();
+    assert_eq!(
+        schedule.typical("vm", "build-image").await.unwrap(),
+        Some(65)
+    );
+    let keys: Vec<String> = intents(&backend, &vars)
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    assert_eq!(keys.len(), 2, "{keys:?}");
+    assert_eq!(keys[0], "ciburst/intents/_queue/vm/.started");
+    assert!(
+        keys[1].starts_with("ciburst/intents/_stats/vm/"),
+        "{keys:?}"
+    );
+    assert!(
+        env.backends_on(backend.clone(), Log::silent())
+            .schedule
+            .is_some()
+    );
+
+    let mut with_hetzner = vars.clone();
+    let mut config: Value = serde_json::from_str(&vars[vars::CONFIG]).unwrap();
+    config["providers"] = json!({ "hetzner": {} });
+    with_hetzner.insert(vars::CONFIG.to_string(), config.to_string());
+    with_hetzner.insert("HCLOUD_TOKEN".to_string(), "hcloud".to_string());
+    let backends = crate::env(&with_hetzner).backends_on(backend.clone(), Log::silent());
+    assert!(backends.schedule.is_some() && backends.records.is_some());
 }
 
 /// The warm start records (M6.1 rule R5) beside the intents, under the cache key IAM scoped to
