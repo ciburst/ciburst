@@ -196,7 +196,14 @@ pub trait Schedule: Send + Sync {
     ) -> Result<()>;
     /// The typical duration of `name` in `pool`, `None` before its first finished run.
     async fn typical(&self, pool: &str, name: &str) -> Result<Option<u64>>;
+    /// Takes the pool's start marker at `now` unless one taken less than [`START_MARKER_S`]
+    /// earlier exists; `true` when taken. Keeps two evaluations at once from starting VMs twice
+    /// (M6.2 rule R4).
+    async fn take_start(&self, pool: &str, now: u64) -> Result<bool>;
 }
+
+/// Seconds a start marker of [`Schedule::take_start`] holds.
+pub const START_MARKER_S: u64 = 15;
 
 /// In-memory schedule for tests and the fake modules.
 #[derive(Default)]
@@ -204,6 +211,7 @@ pub struct MemorySchedule {
     queued: Mutex<BTreeMap<(String, String), Queued>>,
     running: Mutex<BTreeMap<(String, String), Running>>,
     typical: Mutex<BTreeMap<(String, String), u64>>,
+    started: Mutex<BTreeMap<String, u64>>,
 }
 
 impl MemorySchedule {
@@ -272,6 +280,17 @@ impl Schedule for MemorySchedule {
     async fn typical(&self, pool: &str, name: &str) -> Result<Option<u64>> {
         let typical = self.typical.lock().expect("schedule");
         Ok(typical.get(&(pool.to_string(), name.to_string())).copied())
+    }
+
+    async fn take_start(&self, pool: &str, now: u64) -> Result<bool> {
+        let mut started = self.started.lock().expect("schedule");
+        match started.get(pool) {
+            Some(at) if now.saturating_sub(*at) < START_MARKER_S => Ok(false),
+            _ => {
+                started.insert(pool.to_string(), now);
+                Ok(true)
+            }
+        }
     }
 }
 
@@ -342,5 +361,9 @@ mod tests {
         );
         assert_eq!(schedule.typical("big", "build-image").await.unwrap(), None);
         assert_eq!(schedule.queued("big").await.unwrap().len(), 1);
+        assert!(schedule.take_start("vm", 1000).await.unwrap());
+        assert!(!schedule.take_start("vm", 1014).await.unwrap());
+        assert!(schedule.take_start("big", 1014).await.unwrap());
+        assert!(schedule.take_start("vm", 1015).await.unwrap());
     }
 }
