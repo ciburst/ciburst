@@ -243,6 +243,7 @@ impl Sim {
             sweep_token: Some(SWEEP.into()),
             provider_env: BTreeMap::new(),
             dispatcher_env: BTreeMap::new(),
+            fleet_key: None,
         };
         let (log, lines) = Log::memory();
         let dispatcher = Dispatcher::new(config, provider.clone(), Arc::new(secrets), log)

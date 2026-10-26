@@ -2025,6 +2025,7 @@ mod tests {
             sweep_token: None,
             provider_env: BTreeMap::new(),
             dispatcher_env: BTreeMap::new(),
+            fleet_key: None,
         })
     }
 
@@ -2739,6 +2740,7 @@ mod tests {
             sweep_token: Some("sweep-secret".into()),
             provider_env: BTreeMap::new(),
             dispatcher_env: BTreeMap::new(),
+            fleet_key: None,
         }
     }
 

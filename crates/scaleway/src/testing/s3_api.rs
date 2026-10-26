@@ -315,6 +315,31 @@ impl FakeS3 {
         }
     }
 
+    /// The days after which the bucket's lifecycle expires `key`: the shortest expiration of the
+    /// enabled rules whose prefix (`Filter/Prefix` or the older bare `Prefix`, empty for every
+    /// key) the key starts with; `None` when no rule covers it.
+    pub fn expiry_days(&self, bucket: &str, key: &str) -> Option<u32> {
+        let document = self.lifecycle(bucket)?;
+        xml_values(&document, "Rule")
+            .iter()
+            .filter(|rule| {
+                xml_values(rule, "Status").first().map(String::as_str) == Some("Enabled")
+            })
+            .filter(|rule| {
+                let filter = xml_values(rule, "Filter").into_iter().next();
+                let prefix = filter
+                    .and_then(|f| xml_values(&f, "Prefix").into_iter().next())
+                    .or_else(|| xml_values(rule, "Prefix").into_iter().next())
+                    .unwrap_or_default();
+                key.starts_with(&prefix)
+            })
+            .filter_map(|rule| {
+                let expiration = xml_values(rule, "Expiration").into_iter().next()?;
+                xml_values(&expiration, "Days").first()?.parse().ok()
+            })
+            .min()
+    }
+
     /// Writes a private object, as a job's cache upload would.
     pub fn put_object(&self, bucket: &str, key: &str, data: &[u8]) {
         let mut inner = self.inner.lock().expect("fake s3");
