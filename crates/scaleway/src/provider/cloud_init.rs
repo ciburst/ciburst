@@ -13,11 +13,12 @@ use super::{PROVIDER_NAME, jobs, s3};
 
 pub use ciburst_core::cloud_init::{
     AGENT_SHA256_KEY, AGENT_URL_KEY, DISPATCH_URL, Download, RUN_ID, RUNNER_URL_KEY, VM_TOKEN,
-    render,
+    render, with_spill_token,
 };
 
-/// `vm.env` without the run id and token, which exist only once the server does. Fails before
-/// anything is created when the request lacks a value the VM needs.
+/// `vm.env` without the run id and token, which exist only once the server does, with the spill
+/// token when the request carries one (M6.2 rule R6). Fails before anything is created when the
+/// request lacks a value the VM needs.
 pub fn base_env(
     config: &Config,
     pool: &Pool,
@@ -43,6 +44,7 @@ pub fn base_env(
         ("CIBURST_DEFAULT_IMAGE".to_string(), pool.image.clone()),
         ("CIBURST_TIMEOUT_S".to_string(), pool.timeout_s.to_string()),
     ]);
+    with_spill_token(&mut env, request);
     if config.cache.kind == CacheType::S3 {
         env.extend(cache_location(config, region, project_id));
         for key in ["CACHE_S3_ACCESS_KEY", "CACHE_S3_SECRET_KEY"] {
@@ -83,7 +85,7 @@ pub fn agent_url(config: &Config, region: &str, project_id: &str, sha256: &str) 
 mod tests {
     use super::*;
     use crate::provider::runner::runner_url;
-    use ciburst_core::cloud_init::RUNNER_SHA256;
+    use ciburst_core::cloud_init::{RUNNER_SHA256, SPILL_TOKEN};
     use ciburst_core::testing::contract::contract_config;
 
     const SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -108,6 +110,12 @@ mod tests {
         let env = base_env(&config, pool, "fr-par", "p-1", &request()).unwrap();
         assert_eq!(env["CACHE_S3_BUCKET_NAME"], "contract-cache-p-1");
         assert!(!env.contains_key("CIBURST_VM_SECRET"));
+        assert!(!env.contains_key(SPILL_TOKEN), "no spill runner, no spill");
+        let mut spill = request();
+        spill.insert(SPILL_TOKEN.to_string(), "glrt-spill".to_string());
+        let with = base_env(&config, pool, "fr-par", "p-1", &spill).unwrap();
+        assert_eq!(with[SPILL_TOKEN], "glrt-spill");
+        assert_eq!(with.len(), env.len() + 1);
         for key in [
             "RUNNER_TOKEN",
             "CIBURST_DISPATCH_URL",

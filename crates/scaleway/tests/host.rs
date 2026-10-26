@@ -310,6 +310,71 @@ async fn a_removed_pool_removes_its_secret() {
     );
 }
 
+/// M6.2 rule R6: the spill runner's token of a pool is the secret `RUNNER_SPILL_TOKEN_<TAG>`; a
+/// changed or removed token updates the function, one of a tag outside the config is left out.
+#[tokio::test]
+async fn spill_tokens_are_secret_variables_by_pool_tag() {
+    let fake = Arc::new(FakeFunctions::new());
+    let host = host(two_pools(), &fake);
+    let mut spill = secrets();
+    spill
+        .spill_tokens
+        .insert("build-x".into(), "glrt-spill".into());
+    spill.spill_tokens.insert("gone".into(), "glrt-gone".into());
+    host.apply(&host.plan(&spill).await.unwrap(), &spill)
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.secret(FUNCTION, "RUNNER_SPILL_TOKEN_BUILD_X")
+            .as_deref(),
+        Some("glrt-spill")
+    );
+    let keys = fake.secret_keys(FUNCTION);
+    assert!(!keys.contains(&"RUNNER_SPILL_TOKEN_CI".to_string()));
+    assert!(!keys.iter().any(|k| k.contains("GONE")), "{keys:?}");
+    let function = fake.function(FUNCTION).unwrap();
+    assert!(!function.to_string().contains("glrt-spill"));
+    assert!(host.plan(&spill).await.unwrap().iter().all(Step::is_noop));
+
+    let mut rotated = spill.clone();
+    rotated
+        .spill_tokens
+        .insert("build-x".into(), "glrt-spill-2".into());
+    let plan = host.plan(&rotated).await.unwrap();
+    assert_eq!(
+        actions(&plan),
+        [
+            ("namespace", Action::Noop),
+            ("function", Action::Update),
+            ("code", Action::Noop),
+            ("cron", Action::Noop)
+        ]
+    );
+    assert!(!format!("{plan:?}").contains("glrt-spill"));
+    host.apply(&plan, &rotated).await.unwrap();
+    assert_eq!(
+        fake.secret(FUNCTION, "RUNNER_SPILL_TOKEN_BUILD_X")
+            .as_deref(),
+        Some("glrt-spill-2")
+    );
+
+    let plan = host.plan(&secrets()).await.unwrap();
+    assert_eq!(plan[1].action, Action::Update);
+    host.apply(&plan, &secrets()).await.unwrap();
+    assert!(
+        !fake
+            .secret_keys(FUNCTION)
+            .contains(&"RUNNER_SPILL_TOKEN_BUILD_X".to_string())
+    );
+    assert!(
+        host.plan(&secrets())
+            .await
+            .unwrap()
+            .iter()
+            .all(Step::is_noop)
+    );
+}
+
 #[tokio::test]
 async fn provider_credentials_are_secret_variables_that_drift_like_the_others() {
     let fake = Arc::new(FakeFunctions::new());
@@ -387,6 +452,7 @@ async fn provider_credentials_cannot_take_the_functions_own_names() {
         "HOOK_TOKEN",
         "CACHE_S3_SECRET_KEY",
         "RUNNER_TOKEN_CI",
+        "RUNNER_SPILL_TOKEN_CI",
         "CIBURST_DISPATCH_KEY",
         "SCW_SECRET_KEY",
         "hcloud_token",
@@ -483,6 +549,7 @@ async fn dispatcher_variables_cannot_take_the_functions_own_names() {
         vars::VM_IMAGES,
         "HOOK_TOKEN",
         "RUNNER_TOKEN_CI",
+        "RUNNER_SPILL_TOKEN_VM",
         "SCW_DEFAULT_PROJECT_ID",
         "HCLOUD_TOKEN",
         "lower",

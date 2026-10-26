@@ -421,6 +421,102 @@ async fn a_server_starts_with_the_slots_the_dispatcher_already_took() {
     }
 }
 
+/// M6.2 rule R6: the spill runner's token of the start env reaches `vm.env`, and nothing else:
+/// no tag, no log line.
+#[tokio::test]
+async fn the_spill_token_reaches_vm_env_only() {
+    const SPILL: &str = "glrt-spill-runner-token";
+    let (log, lines) = Log::memory();
+    let (backend, provider, _) = provisioned(plain(), log).await;
+    let config = plain();
+    let plain_id = provider.start(request(&config, "ci")).await.unwrap();
+    let user_data = backend.instance.user_data(&plain_id, "cloud-init").unwrap();
+    assert!(!vm_env(&parse(&user_data)).contains_key("RUNNER_SPILL_TOKEN"));
+
+    let mut start = request(&config, "ci");
+    start
+        .env
+        .insert("RUNNER_SPILL_TOKEN".to_string(), SPILL.to_string());
+    let id = provider.start(start).await.unwrap();
+    let user_data = backend.instance.user_data(&id, "cloud-init").unwrap();
+    let vm_env = vm_env(&parse(&user_data));
+    assert_eq!(vm_env["RUNNER_SPILL_TOKEN"], SPILL);
+    assert_eq!(vm_env["RUNNER_TOKEN"], RUNNER_TOKEN);
+    let report = VmReport {
+        state: VmState::Idle,
+        free: 2,
+        slots: 2,
+        spill: 2,
+    };
+    provider
+        .report(&id, &report, FAKE_CLOCK + 30)
+        .await
+        .unwrap();
+    let everything = format!(
+        "{}\n{:?}\n{:?}",
+        tags(&backend.instance.server(&id).unwrap()).join(","),
+        backend.instance.calls(),
+        lines.lock().unwrap()
+    );
+    assert!(!everything.contains(SPILL), "the spill token leaked");
+}
+
+/// M6.2 rule R6: a report writes its spill count into the server's tags, the capacity reads it
+/// back, a claim keeps it, and a report without spill removes it.
+#[tokio::test]
+async fn capacity_reads_the_spill_of_the_last_report() {
+    let config = config(|c| c.pools[0].slots = 2);
+    let (backend, provider, _) = provisioned(config.clone(), Log::silent()).await;
+    let id = provider.start(request(&config, "ci")).await.unwrap();
+    let started = tags(&backend.instance.server(&id).unwrap());
+    assert!(!started.iter().any(|t| t.starts_with("ciburst-spill")));
+    let spill = || provider.capacity("ci");
+    assert_eq!(spill().await.unwrap().unwrap()[0].spill, 0);
+
+    let mut report = VmReport {
+        state: VmState::Idle,
+        free: 2,
+        slots: 2,
+        spill: 2,
+    };
+    provider
+        .report(&id, &report, FAKE_CLOCK + 15)
+        .await
+        .unwrap();
+    let vm = &spill().await.unwrap().unwrap()[0];
+    assert_eq!((vm.free, vm.spill), (2, 2));
+    provider.claim(&id).await.unwrap();
+    let vm = &spill().await.unwrap().unwrap()[0];
+    assert_eq!((vm.free, vm.spill), (1, 2));
+    report.spill = 1;
+    provider
+        .report(&id, &report, FAKE_CLOCK + 30)
+        .await
+        .unwrap();
+    provider
+        .report(&id, &report, FAKE_CLOCK + 45)
+        .await
+        .unwrap();
+    let spilling = tags(&backend.instance.server(&id).unwrap());
+    assert_eq!(
+        spilling
+            .iter()
+            .filter(|t| t.starts_with("ciburst-spill:"))
+            .collect::<Vec<_>>(),
+        ["ciburst-spill:1"]
+    );
+    assert_eq!(spilling.len(), started.len() + 2, "seen and spill");
+    report.spill = 0;
+    provider
+        .report(&id, &report, FAKE_CLOCK + 60)
+        .await
+        .unwrap();
+    assert_eq!(spill().await.unwrap().unwrap()[0].spill, 0);
+    let after = tags(&backend.instance.server(&id).unwrap());
+    assert!(!after.iter().any(|t| t.starts_with("ciburst-spill")));
+    assert_eq!(after.len(), started.len() + 1, "seen");
+}
+
 #[tokio::test]
 async fn start_falls_back_to_the_next_type_when_out_of_stock() {
     let config = config(|c| {

@@ -21,8 +21,8 @@ pub const LIFECYCLE_RULE_ID: &str = "ciburst-expire";
 
 /// Rule id and prefix of every expiring part of the bucket (D38): the runner cache with
 /// `--cache-shared` (`project/<id>/<key>`) and without (`runner/<token>/project/...`), and the
-/// burst intents with the warm start records below them. The agent below `ciburst/agent/` never
-/// expires.
+/// burst intents with the warm start records and the schedule below them. The agent below
+/// `ciburst/agent/` never expires.
 pub const LIFECYCLE_RULES: [(&str, &str); 3] = [
     ("ciburst-expire-project", "project/"),
     ("ciburst-expire-runner", "runner/"),

@@ -18,7 +18,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use ciburst_core::cloud_init::{
     AGENT_SHA256_KEY, AGENT_URL_KEY, DISPATCH_URL, Download, RUN_ID, RUNNER_SHA256, RUNNER_URL_KEY,
-    VM_TOKEN,
+    VM_TOKEN, with_spill_token,
 };
 use ciburst_core::config::{CacheType, Config, Pool};
 use ciburst_core::http::HttpClient;
@@ -501,8 +501,9 @@ impl Hetzner {
 
     /// `vm.env` of a new VM without its run id and token, the VM secret, the agent's URL and
     /// SHA-256 and the runner's URL (D38, M6 rule R6, from the main provider's `shared_env`;
-    /// the runner's SHA-256 is the pinned `cloud_init::RUNNER_SHA256`). Fails before anything
-    /// is created when the request lacks a value, naming the key.
+    /// the runner's SHA-256 is the pinned `cloud_init::RUNNER_SHA256`), with the spill token
+    /// when the request carries one (M6.2 rule R6). Fails before anything is created when the
+    /// request lacks a value, naming the key.
     fn base_env(&self, pool: &Pool, request: &BTreeMap<String, String>) -> Result<Base> {
         let required = |key: &str| {
             request
@@ -528,6 +529,7 @@ impl Hetzner {
             ("CIBURST_DEFAULT_IMAGE".to_string(), pool.image.clone()),
             ("CIBURST_TIMEOUT_S".to_string(), pool.timeout_s.to_string()),
         ]);
+        with_spill_token(&mut env, request);
         if self.config.cache.kind == CacheType::S3 {
             for key in CACHE_KEYS {
                 env.insert(key.to_string(), required(key)?);

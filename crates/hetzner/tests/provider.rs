@@ -888,6 +888,70 @@ async fn report_rewrites_the_state_labels_and_keeps_every_other_label() {
     assert!(!after.contains_key("ciburst-drain"));
 }
 
+/// M6.2 rule R6: the spill runner's token of the start env reaches `vm.env` and no label, and a
+/// report's spill count goes into the label the capacity reads back.
+#[tokio::test]
+async fn the_spill_token_reaches_vm_env_and_the_spill_label_the_capacity() {
+    const SPILL: &str = "glrt-spill-runner-token";
+    let (log, lines) = Log::memory();
+    let (fake, provider) = provisioned(plain(), log).await;
+    let plain_id = provider.start(request(&plain(), "ci")).await.unwrap();
+    let user_data = fake.user_data(name_of(&plain_id)).unwrap();
+    assert!(!vm_env(&user_data).contains_key("RUNNER_SPILL_TOKEN"));
+
+    let mut start = request(&plain(), "ci");
+    start
+        .env
+        .insert("RUNNER_SPILL_TOKEN".to_string(), SPILL.to_string());
+    let run_id = provider.start(start).await.unwrap();
+    let name = name_of(&run_id).to_string();
+    let vm_env = vm_env(&fake.user_data(&name).unwrap());
+    assert_eq!(vm_env["RUNNER_SPILL_TOKEN"], SPILL);
+    assert_eq!(vm_env["RUNNER_TOKEN"], RUNNER_TOKEN);
+
+    let spill_of = |run_id: String| {
+        let provider = &provider;
+        async move {
+            provider
+                .capacity("ci")
+                .await
+                .unwrap()
+                .unwrap()
+                .into_iter()
+                .find(|vm| vm.run_id == run_id)
+                .unwrap()
+                .spill
+        }
+    };
+    assert_eq!(spill_of(run_id.clone()).await, 0);
+    let mut report = VmReport {
+        state: VmState::Idle,
+        free: 2,
+        slots: 2,
+        spill: 2,
+    };
+    provider.report(&run_id, &report, 1_000).await.unwrap();
+    assert_eq!(labels(&fake.server(&name).unwrap())["ciburst-spill"], "2");
+    assert_eq!(spill_of(run_id.clone()).await, 2);
+    provider.claim(&run_id).await.unwrap();
+    assert_eq!(spill_of(run_id.clone()).await, 2, "a claim keeps it");
+    report.spill = 0;
+    provider.report(&run_id, &report, 1_015).await.unwrap();
+    assert!(!labels(&fake.server(&name).unwrap()).contains_key("ciburst-spill"));
+    assert_eq!(spill_of(run_id.clone()).await, 0);
+
+    let everything = format!(
+        "{:?}\n{:?}\n{:?}",
+        fake.server(&name).unwrap()["labels"],
+        fake.writes()
+            .into_iter()
+            .filter(|w| w.method == "PUT")
+            .collect::<Vec<_>>(),
+        lines.lock().unwrap()
+    );
+    assert!(!everything.contains(SPILL), "the spill token leaked");
+}
+
 #[tokio::test]
 async fn claim_report_and_stop_refuse_servers_of_others() {
     let (fake, provider) = provisioned(plain(), Log::silent()).await;
