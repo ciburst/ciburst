@@ -450,7 +450,7 @@ Measured:
 
 1. Demo deployment: `ciburst-setup` with the M6.2 code.
    Check: the plan shows `update  gitlab runner <name>-vm  (set tags vm)` and `create  gitlab runner <name>-vm-spill  (tags vm, node24)`; the function has `RUNNER_SPILL_TOKEN_VM`.
-   Result (2026-10-26): the plan showed `update  gitlab runner <name>-vm  (set tags vm)` and `create  gitlab runner <name>-vm-spill  (tags vm, node24)` (10.2 hosted minutes). Superseded the same day by D55: the next setup puts the lane tags back on `<name>-vm` and deletes the spill runner.
+   Result (2026-10-26): the plan showed `update  gitlab runner <name>-vm  (set tags vm)` and `create  gitlab runner <name>-vm-spill  (tags vm, node24)` (10.2 hosted minutes). Superseded the same day by D55: the next setup (10.6 hosted minutes) planned `update  gitlab runner <name>-vm  (set tags vm, node24)` and `delete  gitlab runner <name>-vm-spill` and applied both.
 2. A Docker chain (two Docker jobs in successive stages, slots 1) while one VM runs.
    Check: the second job answers `queued` or `claimed`, never `started`; one VM in total.
    Result (2026-10-26): with one idle VM, three 60 s VM jobs started at once: two ran at once on its two slots, the third took the first freed slot after 73 s in the queue; one VM in total. The job events of that hour arrived about 35 minutes late (D55), so the dispatcher answered nothing for them in time; the VM's polling slots carried the run.
