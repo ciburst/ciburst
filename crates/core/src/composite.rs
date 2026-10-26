@@ -172,6 +172,13 @@ impl Provider for Composite {
         self.main.shared_env().await
     }
 
+    async fn fleet(
+        &self,
+        secrets: &crate::types::Secrets,
+    ) -> Result<Option<Arc<dyn crate::fleet::FleetStore>>> {
+        self.main.fleet(secrets).await
+    }
+
     async fn sweep(&self, now: u64) -> Result<Vec<String>> {
         let mut swept = Vec::new();
         let members = std::iter::once(("main", &self.main))

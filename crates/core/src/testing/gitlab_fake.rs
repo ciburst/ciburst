@@ -258,6 +258,10 @@ struct Inner {
     runner_creation_forbidden: bool,
     /// Test deliveries fail, as when the dispatcher does not answer 2xx.
     hook_tests_fail: bool,
+    /// Paths of known projects by id; `GET /projects/:id` answers 404 for others.
+    projects: BTreeMap<u64, String>,
+    /// Projects the token may not see: every call under them answers 404, as GitLab does.
+    hidden: Vec<u64>,
 }
 
 /// In-memory GitLab with the endpoints ciburst uses, behind the [`HttpClient`] seam. It is as
@@ -512,6 +516,24 @@ impl FakeGitlab {
         hook.events.push(event);
     }
 
+    /// A project `GET /projects/:id` and `GET /projects/:path` find.
+    pub fn add_project(&self, project_id: u64, path: &str) {
+        self.inner
+            .lock()
+            .expect("fake gitlab")
+            .projects
+            .insert(project_id, path.to_string());
+    }
+
+    /// The token may not see the project, as a member's project in another namespace.
+    pub fn hide_project(&self, project_id: u64) {
+        self.inner
+            .lock()
+            .expect("fake gitlab")
+            .hidden
+            .push(project_id);
+    }
+
     /// `POST /user/runners` answers 403, as for a token without `create_runner`.
     pub fn forbid_runner_creation(&self) {
         self.inner
@@ -667,7 +689,28 @@ impl FakeGitlab {
         let seg = segments(&path);
         let id = |s: &str| s.parse::<u64>().ok();
 
+        if let ["projects", p, ..] = seg.as_slice()
+            && id(p).is_some_and(|project| inner.hidden.contains(&project))
+        {
+            return (
+                json(404, json!({ "message": "404 Project Not Found" })),
+                Headers::new(),
+            );
+        }
         let response = match (method, seg.as_slice()) {
+            ("GET", ["projects", p]) => {
+                let path = p.replace("%2F", "/").replace("%2f", "/");
+                let found = inner
+                    .projects
+                    .iter()
+                    .find(|(project, known)| Some(**project) == id(p) || **known == path);
+                match found {
+                    Some((project, known)) => {
+                        json(200, json!({ "id": project, "path_with_namespace": known }))
+                    }
+                    None => json(404, json!({ "message": "404 Project Not Found" })),
+                }
+            }
             ("GET", ["projects", p, "variables"]) => {
                 let list = inner
                     .variables

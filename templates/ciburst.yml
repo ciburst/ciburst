@@ -1,8 +1,9 @@
 # ciburst CI/CD component. Every job of the including pipeline runs on the pool `pool`: a VM
 # with its own Docker daemon and GitLab's Docker executor, so `image:`, `services:` and
 # Docker-in-Docker work as on GitLab's hosted runners. The manual jobs `ciburst-setup`,
-# `ciburst-check` and `ciburst-destroy` run `ciburst --ci` on a hosted runner, on the default
-# branch when it is protected.
+# `ciburst-check`, `ciburst-destroy` and `ciburst-invite` run `ciburst --ci` on a hosted runner,
+# on the default branch when it is protected. With `role: member` a project joins the fleet of
+# another project instead, through the manual jobs `ciburst-join` and `ciburst-leave`.
 #
 # Usage. `@main` goes with the cli image `edge`; a release `@vX.Y.Z` goes with `version: X.Y.Z`.
 #
@@ -45,6 +46,10 @@ spec:
     hosted_tag:
       description: Runner tag of the GitLab hosted runner for the ciburst jobs.
       default: saas-linux-small-amd64
+    role:
+      description: "`host` sets ciburst up in this project; `member` joins the fleet of a host."
+      default: host
+      options: [host, member]
 ---
 default:
   tags:
@@ -70,7 +75,7 @@ ciburst-setup: &ciburst-job
   resource_group: ciburst
   interruptible: false
   rules:
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"
+    - if: '"$[[ inputs.role ]]" == "host" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
       when: manual
       allow_failure: true
   script:
@@ -85,3 +90,22 @@ ciburst-destroy:
   <<: *ciburst-job
   script:
     - ciburst --ci destroy --yes "$CIBURST_DESTROY"
+
+ciburst-invite:
+  <<: *ciburst-job
+  script:
+    - ciburst --ci invite
+
+ciburst-join: &ciburst-member-job
+  <<: *ciburst-job
+  rules:
+    - if: '"$[[ inputs.role ]]" == "member" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+      when: manual
+      allow_failure: true
+  script:
+    - ciburst --ci join
+
+ciburst-leave:
+  <<: *ciburst-member-job
+  script:
+    - ciburst --ci leave

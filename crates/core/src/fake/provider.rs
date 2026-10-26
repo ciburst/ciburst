@@ -8,6 +8,7 @@ use rand::distr::Alphanumeric;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{CacheType, Config, INSTANCES_RUNTIME, Pool};
+use crate::fleet::FleetStore;
 use crate::provision::keys;
 use crate::store::Store;
 use crate::types::{
@@ -115,6 +116,7 @@ pub struct FakeProvider {
     config: Arc<Config>,
     store: Arc<dyn Store>,
     clock: Clock,
+    fleet: Option<Arc<dyn FleetStore>>,
 }
 
 impl FakeProvider {
@@ -123,7 +125,14 @@ impl FakeProvider {
             config,
             store,
             clock: Arc::new(now_seconds),
+            fleet: None,
         }
+    }
+
+    /// The fleet state the provider answers from [`Provider::fleet`] (M6.3 rule R1).
+    pub fn with_fleet(mut self, fleet: Arc<dyn FleetStore>) -> FakeProvider {
+        self.fleet = Some(fleet);
+        self
     }
 
     /// Replaces the system clock, which stamps `created_at` of new runs.
@@ -451,6 +460,10 @@ impl Provider for FakeProvider {
         }
         self.save(&state).await?;
         Ok(swept)
+    }
+
+    async fn fleet(&self, _secrets: &crate::types::Secrets) -> Result<Option<Arc<dyn FleetStore>>> {
+        Ok(self.fleet.clone())
     }
 }
 

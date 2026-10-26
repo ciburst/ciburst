@@ -11,6 +11,7 @@ use crate::check::{Problem, Suggestion};
 use crate::check::{check_jobs, suggest_ignore_jobs, suggest_lanes};
 use crate::config::{CacheType, Config, SPILL_SUFFIX};
 use crate::fake::Clock;
+use crate::fleet::{FleetStore, Member};
 use crate::gitlab::{DELIVERIES, Delivery, Gitlab, Hook, Job, REENABLE_TRIGGER};
 use crate::http::{HttpClient, Request};
 use crate::log::Log;
@@ -204,6 +205,8 @@ pub struct Status {
     pub url: Option<String>,
     pub pools: Vec<PoolStatus>,
     pub runs: Vec<Run>,
+    /// The fleet's members, the host first (M6.3 rule R7); empty without fleet state.
+    pub members: Vec<Member>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,6 +222,9 @@ pub struct ProjectReport {
     /// The project's hook to the dispatcher; `None` when the dispatcher's URL is unknown or
     /// the project has no hook to it (D51).
     pub hook: Option<Hook>,
+    /// Why a member's project could not be read with this token (M6.3 rule R7); the other
+    /// fields are empty then.
+    pub unreadable: Option<String>,
 }
 
 /// The dispatcher's hook of a project and its newest deliveries, oldest first (D52).
@@ -228,6 +234,8 @@ pub struct HookStatus {
     /// `None` when the project has no hook to the dispatcher.
     pub hook: Option<Hook>,
     pub deliveries: Vec<Delivery>,
+    /// Why a member's hook could not be read with this token (M6.3 rule R7).
+    pub unreadable: Option<String>,
 }
 
 /// Orchestrates provider, GitLab and host steps. GitLab is optional for plan and apply.
@@ -240,6 +248,8 @@ pub struct Provisioner {
     log: Log,
     replay: Option<Arc<dyn HttpClient>>,
     clock: Clock,
+    /// Fleet state (M6.3 rule R1); `None` asks the provider with the secrets of the outputs.
+    fleet: Option<Arc<dyn FleetStore>>,
 }
 
 impl Provisioner {
@@ -260,7 +270,101 @@ impl Provisioner {
             log,
             replay: None,
             clock: Arc::new(now_seconds),
+            fleet: None,
         }
+    }
+
+    /// The fleet state `plan`, `apply`, `status`, `check` and `destroy` use, instead of the one
+    /// the provider opens.
+    pub fn with_fleet(mut self, fleet: Option<Arc<dyn FleetStore>>) -> Provisioner {
+        self.fleet = fleet;
+        self
+    }
+
+    /// The fleet state: the one handed in, else the provider's, opened with `secrets`.
+    async fn fleet(&self, secrets: &Secrets) -> Result<Option<Arc<dyn FleetStore>>> {
+        match &self.fleet {
+            Some(fleet) => Ok(Some(fleet.clone())),
+            None => self.provider.fleet(secrets).await,
+        }
+    }
+
+    /// The fleet state opened with the stored outputs.
+    async fn stored_fleet(&self) -> Result<Option<Arc<dyn FleetStore>>> {
+        let current = self.outputs.read().await?;
+        self.fleet(&secrets_from_outputs(&self.config, &current))
+            .await
+    }
+
+    /// The members besides the projects of the config: projects that joined (M6.3 rule R7).
+    async fn joined_members(&self) -> Result<Vec<Member>> {
+        let Some(fleet) = self.stored_fleet().await? else {
+            return Ok(Vec::new());
+        };
+        let mut members: Vec<Member> = fleet
+            .members()
+            .await?
+            .into_iter()
+            .filter(|m| !self.config.gitlab.project_ids.contains(&m.project_id))
+            .collect();
+        members.sort_by_key(|m| m.project_id);
+        Ok(members)
+    }
+
+    /// M6.3 rules R1 and R9: the routing config in the fleet state, the host as a member, and
+    /// each further project of `gitlab.projectIds` as a member with the host's runners until it
+    /// joins. `secrets` hold the hook token and the runner tokens.
+    async fn fleet_steps(
+        &self,
+        fleet: &dyn FleetStore,
+        secrets: &Secrets,
+    ) -> Result<(Vec<Step>, Vec<Member>)> {
+        let mut steps = Vec::new();
+        let wanted = serde_json::to_string(&*self.config)?;
+        let stored = fleet.config().await?;
+        steps.push(Step::new(
+            "fleet:config",
+            if stored.as_deref() == Some(wanted.as_str()) {
+                Action::Noop
+            } else {
+                Action::Update
+            },
+            "fleet config",
+        ));
+        let members = fleet.members().await?;
+        let hook = secrets.hook_token.clone().unwrap_or_default();
+        let now = (self.clock)();
+        let mut writes = Vec::new();
+        for (index, &project_id) in self.config.gitlab.project_ids.iter().enumerate() {
+            let existing = members.iter().find(|m| m.project_id == project_id);
+            // A further project that joined keeps its own record.
+            let joined = index > 0 && existing.is_some_and(|m| m.runners != secrets.runner_tokens);
+            let member = Member {
+                project_id,
+                hook_secret: hook.clone(),
+                runners: secrets.runner_tokens.clone(),
+                joined_at: existing.map_or(now, |m| m.joined_at),
+            };
+            let action = match existing {
+                _ if joined => Action::Noop,
+                None => Action::Create,
+                Some(m) if *m == member => Action::Noop,
+                Some(_) => Action::Update,
+            };
+            let mut step = Step::new(
+                format!("member:{project_id}"),
+                action,
+                format!("member {project_id}"),
+            );
+            if index > 0 && action == Action::Create {
+                step.detail = Some("host runners until it joins".into());
+            }
+            if action != Action::Noop {
+                writes.push(member);
+            }
+            steps.push(step);
+        }
+        Ok((steps, writes))
     }
 
     /// The client `apply` posts waiting jobs to the dispatcher with (M5 rule R4); without it
@@ -678,6 +782,9 @@ impl Provisioner {
         );
         steps.extend(self.host.plan(&secrets).await?);
         steps.extend(self.hook_steps(rotate.contains(&Rotation::Hook)).await?);
+        if let Some(fleet) = self.fleet(&secrets).await? {
+            steps.extend(self.fleet_steps(fleet.as_ref(), &secrets).await?.0);
+        }
         Ok(steps)
     }
 
@@ -729,6 +836,27 @@ impl Provisioner {
         secrets.hook_token = Some(hook_token.clone());
         secrets.vm_secret = Some(vm_secret);
         secrets.sweep_token = Some(sweep_token);
+        // M6.3 rule R1: the dispatcher reads the config from the fleet state, so a config change
+        // needs no deploy; the host still redeploys when code or secrets change.
+        if let Some(fleet) = self.fleet(&secrets).await? {
+            let (fleet_steps, members) = self.fleet_steps(fleet.as_ref(), &secrets).await?;
+            if fleet_steps
+                .iter()
+                .any(|s| s.id == "fleet:config" && !s.is_noop())
+            {
+                fleet
+                    .put_config(&serde_json::to_string(&*self.config)?)
+                    .await?;
+                self.log
+                    .info("fleet_config", &[("name", &self.config.name)]);
+            }
+            for member in &members {
+                fleet.put_member(member).await?;
+                self.log
+                    .info("member", &[("project", &member.project_id.to_string())]);
+            }
+            applied.extend(fleet_steps);
+        }
         let host_steps = self.host.plan(&secrets).await?;
         let host_outputs = self.host.apply(&host_steps, &secrets).await?;
         self.outputs.write(&host_outputs, true).await?;
@@ -830,6 +958,16 @@ impl Provisioner {
     }
 
     pub async fn destroy(&self) -> Result<()> {
+        // M6.3 rule R7: members that joined lose their runners' VMs and lanes with the fleet.
+        let joined = self.joined_members().await?;
+        if !joined.is_empty() {
+            let ids: Vec<String> = joined.iter().map(|m| m.project_id.to_string()).collect();
+            return Err(Error::other(format!(
+                "fleet {} has members {}: run ciburst-leave there first",
+                self.config.name,
+                ids.join(", ")
+            )));
+        }
         let current = self.outputs.read().await?;
         if let Some(gitlab) = &self.gitlab {
             let url = match self.host.url().await? {
@@ -889,11 +1027,26 @@ impl Provisioner {
                 max_runs: pool.max_runs,
             })
             .collect();
+        let mut members = match self.stored_fleet().await? {
+            Some(fleet) => fleet.members().await?,
+            None => Vec::new(),
+        };
+        let host = self.primary_project();
+        members.sort_by_key(|m| (m.project_id != host, m.project_id));
         Ok(Status {
             url: self.host.url().await?,
             pools,
             runs,
+            members,
         })
+    }
+
+    /// The projects `status` and `check` look at: those of the config, then the members that
+    /// joined.
+    async fn projects(&self) -> Result<Vec<u64>> {
+        let mut projects = self.config.gitlab.project_ids.clone();
+        projects.extend(self.joined_members().await?.iter().map(|m| m.project_id));
+        Ok(projects)
     }
 
     /// Per project the hook to the dispatcher at `url` and its newest [`DELIVERIES`]; nothing
@@ -903,8 +1056,21 @@ impl Provisioner {
             return Ok(Vec::new());
         };
         let mut status = Vec::new();
-        for &project_id in &self.config.gitlab.project_ids {
-            let hook = dispatcher_hook(gitlab, project_id, url).await?;
+        let host_projects = &self.config.gitlab.project_ids;
+        for project_id in self.projects().await? {
+            let hook = match dispatcher_hook(gitlab, project_id, url).await {
+                Ok(hook) => hook,
+                Err(error) if !host_projects.contains(&project_id) && no_access(&error) => {
+                    status.push(HookStatus {
+                        project_id,
+                        hook: None,
+                        deliveries: Vec::new(),
+                        unreadable: Some(error.to_string()),
+                    });
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let mut deliveries = Vec::new();
             if let Some(hook) = &hook {
                 let mut events = gitlab.hook_events(project_id, hook.id, DELIVERIES).await?;
@@ -916,6 +1082,7 @@ impl Provisioner {
                 project_id,
                 hook,
                 deliveries,
+                unreadable: None,
             });
         }
         Ok(status)
@@ -929,8 +1096,21 @@ impl Provisioner {
             .as_ref()
             .ok_or_else(|| Error::other("check needs a GitLab token"))?;
         let url = self.host.url().await?;
-        check(&self.config, gitlab, content_ref, url.as_deref()).await
+        let projects = self.projects().await?;
+        check_projects(&self.config, gitlab, &projects, content_ref, url.as_deref()).await
     }
+}
+
+/// Whether a GitLab call failed because the token may not read the project: a member's
+/// project in another namespace (M6.3 rule R7).
+fn no_access(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Gitlab {
+            status: 401 | 403 | 404,
+            ..
+        }
+    )
 }
 
 /// The hook of project `project_id` that delivers to `url`.
@@ -952,13 +1132,45 @@ pub async fn check(
     content_ref: Option<&str>,
     url: Option<&str>,
 ) -> Result<Vec<ProjectReport>> {
+    check_projects(config, gitlab, &config.gitlab.project_ids, content_ref, url).await
+}
+
+/// [`check`] of `projects`, the config's and the fleet's members (M6.3 rule R7). A project
+/// outside the config that the token may not read is reported `unreadable`.
+#[cfg(feature = "pipeline")]
+pub async fn check_projects(
+    config: &Config,
+    gitlab: &Gitlab,
+    projects: &[u64],
+    content_ref: Option<&str>,
+    url: Option<&str>,
+) -> Result<Vec<ProjectReport>> {
     let mut report = Vec::new();
-    for &project_id in &config.gitlab.project_ids {
-        let hook = match url {
-            Some(url) => dispatcher_hook(gitlab, project_id, url).await?,
-            None => None,
+    for &project_id in projects {
+        let read = async {
+            let hook = match url {
+                Some(url) => dispatcher_hook(gitlab, project_id, url).await?,
+                None => None,
+            };
+            Ok::<_, Error>((hook, gitlab.lint_jobs(project_id, content_ref).await?))
         };
-        let lint = gitlab.lint_jobs(project_id, content_ref).await?;
+        let (hook, lint) = match read.await {
+            Ok(read) => read,
+            Err(error) if !config.gitlab.project_ids.contains(&project_id) && no_access(&error) => {
+                report.push(ProjectReport {
+                    project_id,
+                    valid: true,
+                    errors: Vec::new(),
+                    problems: Vec::new(),
+                    suggestions: Vec::new(),
+                    ignore: Vec::new(),
+                    hook: None,
+                    unreadable: Some(error.to_string()),
+                });
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let (problems, suggestions, ignore) = if lint.valid {
             let pipeline = match &lint.merged_yaml {
                 Some(text) => crate::pipeline::parse_merged_yaml(text)
@@ -981,6 +1193,7 @@ pub async fn check(
             suggestions,
             ignore,
             hook,
+            unreadable: None,
         });
     }
     Ok(report)

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Result;
 use crate::config::Pool;
+use crate::fleet::FleetStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -243,6 +244,12 @@ pub trait Provider: Send + Sync {
     /// Ends runs that stopped behaving (spec section 6.1, sweep) and returns their ids.
     async fn sweep(&self, _now: u64) -> Result<Vec<String>> {
         Ok(Vec::new())
+    }
+
+    /// The deployment's fleet state (M6.3 rule R1), opened with the secrets of `apply`;
+    /// `None` for a provider that keeps none, whose deployments serve their config's projects.
+    async fn fleet(&self, _secrets: &Secrets) -> Result<Option<std::sync::Arc<dyn FleetStore>>> {
+        Ok(None)
     }
 }
 

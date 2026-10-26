@@ -204,6 +204,7 @@ dependencies = [
  "ciburst-hetzner",
  "ciburst-scaleway",
  "clap",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

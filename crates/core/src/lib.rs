@@ -12,6 +12,7 @@ pub mod fake;
 pub mod fleet;
 pub mod gitlab;
 pub mod http;
+pub mod invite;
 pub mod lane;
 pub mod ledger;
 pub mod log;

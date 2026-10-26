@@ -2,12 +2,13 @@
 //! kept in the deployment's bucket so that a change takes effect without a function deploy.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
+use crate::store::Store;
 
 /// A project the fleet serves (M6.3 rule R2). The host is the first member.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,9 +89,92 @@ impl FleetStore for MemoryFleetStore {
     }
 }
 
+/// Fleet state in a JSON document slot, `{"config": <text>, "members": {<id>: <member>}}`, for
+/// the fake modules and the developer path. It keeps secrets in plain text.
+pub struct StoreFleet {
+    store: Arc<dyn Store>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct FleetDocument {
+    #[serde(default)]
+    config: Option<String>,
+    #[serde(default)]
+    members: BTreeMap<u64, Member>,
+}
+
+impl StoreFleet {
+    pub fn new(store: Arc<dyn Store>) -> StoreFleet {
+        StoreFleet { store }
+    }
+
+    async fn load(&self) -> Result<FleetDocument> {
+        Ok(match self.store.load().await? {
+            Some(value) => serde_json::from_value(value)?,
+            None => FleetDocument::default(),
+        })
+    }
+
+    async fn save(&self, document: &FleetDocument) -> Result<()> {
+        self.store.save(Some(serde_json::to_value(document)?)).await
+    }
+}
+
+#[async_trait]
+impl FleetStore for StoreFleet {
+    async fn config(&self) -> Result<Option<String>> {
+        Ok(self.load().await?.config)
+    }
+
+    async fn put_config(&self, json: &str) -> Result<()> {
+        let mut document = self.load().await?;
+        document.config = Some(json.to_string());
+        self.save(&document).await
+    }
+
+    async fn members(&self) -> Result<Vec<Member>> {
+        Ok(self.load().await?.members.into_values().collect())
+    }
+
+    async fn put_member(&self, member: &Member) -> Result<()> {
+        let mut document = self.load().await?;
+        document.members.insert(member.project_id, member.clone());
+        self.save(&document).await
+    }
+
+    async fn delete_member(&self, project_id: u64) -> Result<()> {
+        let mut document = self.load().await?;
+        if document.members.remove(&project_id).is_some() {
+            self.save(&document).await?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_store_fleet_keeps_its_state_in_the_slot() {
+        let slot: Arc<dyn Store> = Arc::new(crate::store::MemoryStore::new());
+        let fleet = StoreFleet::new(slot.clone());
+        assert_eq!(fleet.config().await.unwrap(), None);
+        fleet.put_config("{\"a\":1}").await.unwrap();
+        let member = Member {
+            project_id: 9,
+            hook_secret: "s".into(),
+            runners: [("vm".to_string(), "glrt-9".to_string())].into(),
+            joined_at: 3,
+        };
+        fleet.put_member(&member).await.unwrap();
+        let again = StoreFleet::new(slot);
+        assert_eq!(again.config().await.unwrap().as_deref(), Some("{\"a\":1}"));
+        assert_eq!(again.members().await.unwrap(), [member]);
+        again.delete_member(9).await.unwrap();
+        again.delete_member(9).await.unwrap();
+        assert!(fleet.members().await.unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn members_are_kept_by_project() {
