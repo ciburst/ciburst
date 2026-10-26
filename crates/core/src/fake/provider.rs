@@ -59,6 +59,9 @@ struct Vm {
     pool: String,
     state: VmState,
     free: u32,
+    /// Slots of the last report that poll with the spill runner (M6.2 rule R6).
+    #[serde(default)]
+    spill: u32,
     seen: Option<u64>,
     drain: Option<u64>,
     created_at: u64,
@@ -70,7 +73,7 @@ impl Vm {
             run_id: self.run_id.clone(),
             state: self.state,
             free: self.free,
-            spill: 0,
+            spill: self.spill,
             seen: self.seen,
             created_at: self.created_at,
         }
@@ -365,6 +368,7 @@ impl Provider for FakeProvider {
                 pool: run.pool.clone(),
                 state: VmState::Starting,
                 free: request.pool.slots.saturating_sub(request.taken),
+                spill: 0,
                 seen: None,
                 drain: None,
                 created_at,
@@ -418,6 +422,7 @@ impl Provider for FakeProvider {
         let vm = vm_mut(&mut state, run_id)?;
         vm.state = report.state;
         vm.free = report.free;
+        vm.spill = report.spill;
         vm.seen = Some(now);
         vm.drain = match report.state {
             VmState::Draining => vm.drain.or(Some(now)),

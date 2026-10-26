@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use crate::check::{Problem, Suggestion};
 #[cfg(feature = "pipeline")]
 use crate::check::{check_jobs, suggest_ignore_jobs, suggest_lanes};
-use crate::config::{CacheType, Config, Pool};
+use crate::config::{CacheType, Config, SPILL_SUFFIX};
 use crate::fake::Clock;
 use crate::gitlab::{DELIVERIES, Delivery, Gitlab, Hook, Job, REENABLE_TRIGGER};
 use crate::http::{HttpClient, Request};
@@ -77,6 +77,7 @@ pub mod keys {
         .contains(&key)
             || PROVIDER_ENV.contains(&key)
             || key.starts_with("CIBURST_RUNNER_TOKEN_")
+            || key.starts_with("CIBURST_SPILL_RUNNER_TOKEN_")
     }
 
     /// Keys a provider answers from every `apply` call; they replace stored values.
@@ -84,8 +85,8 @@ pub mod keys {
         PROVIDER_ENV.contains(&key) || DISPATCHER_ENV.contains(&key)
     }
 
-    /// Every output key of a deployment of `config`: the fixed ones and the runner keys of its
-    /// pools.
+    /// Every output key of a deployment of `config`: the fixed ones, the runner keys of its
+    /// pools and the spill runner keys of its VM pools (M6.2 rule R6).
     pub fn output_keys(config: &Config) -> Vec<String> {
         FIXED
             .iter()
@@ -96,6 +97,13 @@ pub mod keys {
                     .iter()
                     .flat_map(|pool| [runner_id(&pool.tag), runner_token(&pool.tag)]),
             )
+            .chain(
+                config
+                    .pools
+                    .iter()
+                    .filter(|pool| config.is_vm_pool(pool))
+                    .flat_map(|pool| [spill_runner_id(&pool.tag), spill_runner_token(&pool.tag)]),
+            )
             .collect()
     }
 
@@ -105,6 +113,16 @@ pub mod keys {
 
     pub fn runner_token(tag: &str) -> String {
         format!("CIBURST_RUNNER_TOKEN_{}", env_name(tag))
+    }
+
+    /// The id of the spill runner of VM pool `tag` (M6.2 rule R6).
+    pub fn spill_runner_id(tag: &str) -> String {
+        format!("CIBURST_SPILL_RUNNER_ID_{}", env_name(tag))
+    }
+
+    /// The token of the spill runner of VM pool `tag`, a secret (M6.2 rule R6).
+    pub fn spill_runner_token(tag: &str) -> String {
+        format!("CIBURST_SPILL_RUNNER_TOKEN_{}", env_name(tag))
     }
 
     fn env_name(tag: &str) -> String {
@@ -141,8 +159,16 @@ pub fn secrets_from_outputs(config: &Config, outputs: &Outputs) -> Secrets {
         vm_secret: outputs.get(keys::VM_SECRET).cloned(),
         sweep_token: outputs.get(keys::SWEEP_TOKEN).cloned(),
         runner_tokens,
-        // Filled from the spill runner outputs by M6.2 rule R6.
-        spill_tokens: Default::default(),
+        spill_tokens: config
+            .pools
+            .iter()
+            .filter(|pool| config.spill_tags(pool).is_some())
+            .filter_map(|pool| {
+                outputs
+                    .get(&keys::spill_runner_token(&pool.tag))
+                    .map(|token| (pool.tag.clone(), token.clone()))
+            })
+            .collect(),
         dispatch: pair(keys::DISPATCH_ACCESS_KEY, keys::DISPATCH_SECRET_KEY),
         cache: pair(keys::CACHE_ACCESS_KEY, keys::CACHE_SECRET_KEY),
         provider_env: keys::PROVIDER_ENV
@@ -154,6 +180,16 @@ pub fn secrets_from_outputs(config: &Config, outputs: &Outputs) -> Secrets {
             .filter_map(|key| outputs.get(*key).map(|v| (key.to_string(), v.clone())))
             .collect(),
     }
+}
+
+/// A GitLab runner the config wants: a pool's own runner, or a VM pool's spill runner (M6.2
+/// rule R6). `name` follows `<config name>-` in the description and `runner:` in step ids.
+struct RunnerSpec {
+    name: String,
+    tags: Vec<String>,
+    id_key: String,
+    token_key: String,
+    spill: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,8 +276,33 @@ impl Provisioner {
         self
     }
 
-    fn runner_description(&self, pool: &Pool) -> String {
-        format!("{}-{}", self.config.name, pool.tag)
+    fn runner_description(&self, name: &str) -> String {
+        format!("{}-{name}", self.config.name)
+    }
+
+    /// The runners the config wants, in config order: each pool's own runner, and after a VM
+    /// pool its spill runner when lanes spill onto it (M6.2 rule R6).
+    fn runner_specs(&self) -> Vec<RunnerSpec> {
+        let mut specs = Vec::new();
+        for pool in &self.config.pools {
+            specs.push(RunnerSpec {
+                name: pool.tag.clone(),
+                tags: self.config.runner_tags(pool),
+                id_key: keys::runner_id(&pool.tag),
+                token_key: keys::runner_token(&pool.tag),
+                spill: false,
+            });
+            if let Some(tags) = self.config.spill_tags(pool) {
+                specs.push(RunnerSpec {
+                    name: format!("{}{SPILL_SUFFIX}", pool.tag),
+                    tags,
+                    id_key: keys::spill_runner_id(&pool.tag),
+                    token_key: keys::spill_runner_token(&pool.tag),
+                    spill: true,
+                });
+            }
+        }
+        specs
     }
 
     fn primary_project(&self) -> u64 {
@@ -257,31 +318,35 @@ impl Provisioner {
             return Ok(Vec::new());
         };
         let runners = gitlab.list_runners(self.primary_project()).await?;
+        let specs = self.runner_specs();
         let mut steps = Vec::new();
-        for pool in &self.config.pools {
-            let description = self.runner_description(pool);
+        for spec in &specs {
+            let description = self.runner_description(&spec.name);
             let existing = runners.iter().find(|r| r.description == description);
-            let has_token = current.contains_key(&keys::runner_token(&pool.tag));
+            let has_token = current.contains_key(&spec.token_key);
             let mut step = Step::new(
-                format!("runner:{}", pool.tag),
+                format!("runner:{}", spec.name),
                 Action::Create,
                 format!("gitlab runner {description}"),
             );
+            if spec.spill {
+                step.detail = Some(format!("tags {}", spec.tags.join(", ")));
+            }
             if existing.is_some() && rotate {
                 step.action = Action::Update;
                 step.detail = Some("delete and recreate, new token".into());
             } else if let Some(runner) = existing
                 && has_token
             {
-                let wanted = self.config.runner_tags(pool);
                 let tagged = gitlab.runner(runner.id).await?.tag_list;
                 let same =
-                    wanted.len() == tagged.len() && wanted.iter().all(|t| tagged.contains(t));
+                    spec.tags.len() == tagged.len() && spec.tags.iter().all(|t| tagged.contains(t));
                 if same {
                     step.action = Action::Noop;
+                    step.detail = None;
                 } else {
                     step.action = Action::Update;
-                    step.detail = Some(format!("{RETAG}{}", wanted.join(", ")));
+                    step.detail = Some(format!("{RETAG}{}", spec.tags.join(", ")));
                 }
             } else if existing.is_some() {
                 step.action = Action::Update;
@@ -289,20 +354,20 @@ impl Provisioner {
             }
             steps.push(step);
         }
-        for tag in self.orphan_runner_tags(gitlab, &runners).await? {
+        for name in self.orphan_runners(gitlab, &runners, &specs).await? {
             steps.push(Step::new(
-                format!("runner:{tag}"),
+                format!("runner:{name}"),
                 Action::Delete,
-                format!("gitlab runner {}-{tag}", self.config.name),
+                format!("gitlab runner {}", self.runner_description(&name)),
             ));
         }
         for &project_id in self.other_projects() {
             let enabled = gitlab.list_runners(project_id).await?;
-            for pool in &self.config.pools {
-                let description = self.runner_description(pool);
+            for spec in &specs {
+                let description = self.runner_description(&spec.name);
                 let present = enabled.iter().any(|r| r.description == description);
                 steps.push(Step::new(
-                    format!("runner-enable:{project_id}:{}", pool.tag),
+                    format!("runner-enable:{project_id}:{}", spec.name),
                     if present {
                         Action::Noop
                     } else {
@@ -315,30 +380,39 @@ impl Provisioner {
         Ok(steps)
     }
 
-    /// Tags of runners this deployment created for pools gone from the config: described
-    /// `<name>-<tag>` and carrying the tag `<tag>`, so another deployment's runners never match.
-    async fn orphan_runner_tags(
+    /// Names of runners this deployment created that the config no longer wants: described
+    /// `<name>-<x>` and carrying the tag `<x>`, or for a spill runner `<name>-<vm tag>-spill` the
+    /// tag `<vm tag>`, so another deployment's runners never match.
+    async fn orphan_runners(
         &self,
         gitlab: &Gitlab,
         runners: &[crate::gitlab::Runner],
+        specs: &[RunnerSpec],
     ) -> Result<Vec<String>> {
         let prefix = format!("{}-", self.config.name);
-        let mut tags = Vec::new();
+        let mut names = Vec::new();
         for runner in runners {
-            let Some(tag) = runner.description.strip_prefix(&prefix) else {
+            let Some(name) = runner.description.strip_prefix(&prefix) else {
                 continue;
             };
-            if tag.is_empty() || self.config.pool_by_tag(tag).is_some() {
+            if name.is_empty() || specs.iter().any(|spec| spec.name == name) {
                 continue;
             }
-            let tagged = gitlab
-                .list_runners_tagged(self.primary_project(), tag)
-                .await?;
-            if tagged.iter().any(|r| r.id == runner.id) {
-                tags.push(tag.to_string());
+            let mut tags = vec![name];
+            if let Some(vm) = name.strip_suffix(SPILL_SUFFIX).filter(|t| !t.is_empty()) {
+                tags.push(vm);
+            }
+            for tag in tags {
+                let tagged = gitlab
+                    .list_runners_tagged(self.primary_project(), tag)
+                    .await?;
+                if tagged.iter().any(|r| r.id == runner.id) {
+                    names.push(name.to_string());
+                    break;
+                }
             }
         }
-        Ok(tags)
+        Ok(names)
     }
 
     async fn hook_steps(&self, rotate: bool) -> Result<Vec<Step>> {
@@ -391,40 +465,40 @@ impl Provisioner {
         let primary = self.primary_project();
         let runners = gitlab.list_runners(primary).await?;
         for step in steps.iter().filter(|s| s.action == Action::Delete) {
-            let Some(tag) = step.id.strip_prefix("runner:") else {
+            let Some(name) = step.id.strip_prefix("runner:") else {
                 continue;
             };
-            let description = format!("{}-{tag}", self.config.name);
+            let description = self.runner_description(name);
             if let Some(runner) = runners.iter().find(|r| r.description == description) {
                 gitlab.delete_runner(runner.id).await?;
                 self.log.info(
                     "runner_deleted",
-                    &[("pool", tag), ("id", &runner.id.to_string())],
+                    &[("pool", name), ("id", &runner.id.to_string())],
                 );
             }
         }
+        let specs = self.runner_specs();
         let mut created = Outputs::new();
-        for pool in &self.config.pools {
-            let id = format!("runner:{}", pool.tag);
+        for spec in &specs {
+            let id = format!("runner:{}", spec.name);
             let Some(step) = steps.iter().find(|s| s.id == id) else {
                 continue;
             };
             if step.is_noop() {
                 continue;
             }
-            let description = self.runner_description(pool);
-            let tags = self.config.runner_tags(pool);
+            let description = self.runner_description(&spec.name);
             let existing = runners.iter().find(|r| r.description == description);
             if let Some(existing) = existing
                 && step.detail.as_deref().is_some_and(|d| d.starts_with(RETAG))
             {
-                gitlab.update_runner_tags(existing.id, &tags).await?;
+                gitlab.update_runner_tags(existing.id, &spec.tags).await?;
                 self.log.info(
                     "runner_tags",
                     &[
-                        ("pool", &pool.tag),
+                        ("pool", &spec.name),
                         ("id", &existing.id.to_string()),
-                        ("tags", &tags.join(",")),
+                        ("tags", &spec.tags.join(",")),
                     ],
                 );
                 continue;
@@ -432,15 +506,17 @@ impl Provisioner {
             if let Some(existing) = existing {
                 gitlab.delete_runner(existing.id).await?;
             }
-            let runner = gitlab.create_runner(primary, &tags, &description).await?;
-            created.insert(keys::runner_id(&pool.tag), runner.id.to_string());
-            created.insert(keys::runner_token(&pool.tag), runner.token.clone());
+            let runner = gitlab
+                .create_runner(primary, &spec.tags, &description)
+                .await?;
+            created.insert(spec.id_key.clone(), runner.id.to_string());
+            created.insert(spec.token_key.clone(), runner.token.clone());
             for &project_id in self.other_projects() {
                 gitlab.enable_runner(project_id, runner.id).await?;
             }
             self.log.info(
                 "runner",
-                &[("pool", &pool.tag), ("id", &runner.id.to_string())],
+                &[("pool", &spec.name), ("id", &runner.id.to_string())],
             );
         }
         if !created.is_empty() {
@@ -454,14 +530,17 @@ impl Provisioner {
             if step.is_noop() {
                 continue;
             }
-            let Some((project, tag)) = rest.split_once(':') else {
+            let Some((project, name)) = rest.split_once(':') else {
                 continue;
             };
-            if created.contains_key(&keys::runner_id(tag)) {
+            let Some(spec) = specs.iter().find(|spec| spec.name == name) else {
+                continue;
+            };
+            if created.contains_key(&spec.id_key) {
                 continue;
             }
             match current
-                .get(&keys::runner_id(tag))
+                .get(&spec.id_key)
                 .and_then(|id| id.parse::<u64>().ok())
             {
                 Some(runner_id) => {
@@ -473,7 +552,7 @@ impl Provisioner {
                     "runner_enable_skipped",
                     &[
                         ("project", project),
-                        ("pool", tag),
+                        ("pool", name),
                         ("reason", "runner id unknown"),
                     ],
                 ),
@@ -765,17 +844,24 @@ impl Provisioner {
                 }
             }
             let runners = gitlab.list_runners(self.primary_project()).await?;
+            // Every VM pool's spill runner, also one whose lanes left the config since.
+            let mut named: Vec<(String, String)> = Vec::new();
             for pool in &self.config.pools {
-                let description = self.runner_description(pool);
+                named.push((pool.tag.clone(), keys::runner_id(&pool.tag)));
+                if self.config.is_vm_pool(pool) {
+                    named.push((
+                        format!("{}{SPILL_SUFFIX}", pool.tag),
+                        keys::spill_runner_id(&pool.tag),
+                    ));
+                }
+            }
+            for (name, id_key) in named {
+                let description = self.runner_description(&name);
                 let id = runners
                     .iter()
                     .find(|r| r.description == description)
                     .map(|r| r.id)
-                    .or_else(|| {
-                        current
-                            .get(&keys::runner_id(&pool.tag))
-                            .and_then(|id| id.parse().ok())
-                    });
+                    .or_else(|| current.get(&id_key).and_then(|id| id.parse().ok()));
                 if let Some(id) = id {
                     gitlab.delete_runner(id).await?;
                 }
@@ -946,9 +1032,17 @@ mod tests {
     fn output_keys_cover_the_pools_and_leave_provider_env_out() {
         let config = Config::ci_defaults(5, "https://gitlab.example");
         let all = keys::output_keys(&config);
-        assert_eq!(all.len(), keys::FIXED.len() + 2);
+        assert_eq!(all.len(), keys::FIXED.len() + 4);
         assert!(all.contains(&keys::runner_token("vm")));
         assert!(all.contains(&keys::runner_id("vm")));
+        assert!(all.contains(&"CIBURST_SPILL_RUNNER_ID_VM".to_string()));
+        assert!(all.contains(&"CIBURST_SPILL_RUNNER_TOKEN_VM".to_string()));
+        assert_eq!(
+            keys::spill_runner_token("node-24"),
+            "CIBURST_SPILL_RUNNER_TOKEN_NODE_24"
+        );
+        assert!(keys::is_secret(&keys::spill_runner_token("vm")));
+        assert!(!keys::is_secret(&keys::spill_runner_id("vm")));
         assert!(all.contains(&keys::AGENT_SHA256.to_string()));
         assert!(!all.iter().any(|k| keys::PROVIDER_ENV.contains(&k.as_str())));
         assert!(keys::is_refreshed("HCLOUD_TOKEN"));

@@ -130,6 +130,15 @@ pub fn parse_rfc3339(text: &str) -> Option<u64> {
     u64::try_from(seconds).ok()
 }
 
+/// Unix seconds of a timestamp of a GitLab hook, `2026-10-26 06:45:46 UTC`, or of an RFC 3339
+/// one; `None` for anything else.
+pub fn parse_gitlab_time(text: &str) -> Option<u64> {
+    match text.strip_suffix(" UTC") {
+        Some(utc) => parse_rfc3339(&format!("{utc}Z")),
+        None => parse_rfc3339(text),
+    }
+}
+
 /// The decimal number at `range` of `text`, digits only.
 fn number(text: &str, range: std::ops::Range<usize>) -> Option<i64> {
     let part = text.get(range)?;
@@ -206,6 +215,22 @@ mod tests {
             "+026-10-24T00:00:00Z",
         ] {
             assert_eq!(parse_rfc3339(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn parses_the_timestamps_of_gitlab_hooks() {
+        assert_eq!(parse_gitlab_time("2026-10-24 00:00:00 UTC"), Some(T0));
+        assert_eq!(parse_gitlab_time("2026-10-24 00:00:07 UTC"), Some(T0 + 7));
+        assert_eq!(parse_gitlab_time("2026-10-24T00:00:00Z"), Some(T0));
+        for bad in [
+            "",
+            "UTC",
+            "2026-10-24 00:00:00",
+            "2026-10-24 00:00:00 CET",
+            "2026-10-24 00:00:00 UTCZ",
+        ] {
+            assert_eq!(parse_gitlab_time(bad), None, "{bad}");
         }
     }
 }

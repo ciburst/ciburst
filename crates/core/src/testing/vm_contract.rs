@@ -245,6 +245,40 @@ pub async fn run_vm_provider_contract<F: VmProviderFactory>(factory: &F) {
         );
     }
 
+    // report sets the spill slots, which capacity reads back (M6.2 rule R6)
+    {
+        let (_backend, provider) = provisioned(factory, &config).await;
+        let run = provider.start(request(&pool, 1)).await.expect("start");
+        assert_eq!(vm(&*provider, "vm", &run).await.spill, 0, "a new VM");
+        for (spill, free, at) in [(2, 3, T0 + 60), (1, 1, T0 + 70), (0, 2, T0 + 80)] {
+            let report = VmReport {
+                spill,
+                ..report(VmState::Idle, free, 3)
+            };
+            provider.report(&run, &report, at).await.expect("report");
+            let reported = vm(&*provider, "vm", &run).await;
+            assert_eq!((reported.spill, reported.free), (spill, free), "at {at}");
+        }
+        provider
+            .report(
+                &run,
+                &VmReport {
+                    spill: 3,
+                    ..report(VmState::Idle, 3, 3)
+                },
+                T0 + 90,
+            )
+            .await
+            .expect("report");
+        provider.claim(&run).await.expect("claim");
+        let claimed = vm(&*provider, "vm", &run).await;
+        assert_eq!(
+            (claimed.spill, claimed.free),
+            (3, 2),
+            "a claim keeps the spill slots"
+        );
+    }
+
     // a silent VM is swept as core::vm::sweep_reason says, a reporting one is kept
     {
         let (_backend, provider) = provisioned(factory, &config).await;
