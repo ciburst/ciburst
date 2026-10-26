@@ -1,6 +1,10 @@
-//! The real binary with fake `gitlab-runner` and `docker` executables and a dispatcher on the
-//! loopback interface: config file, slot processes, `docker ps`, reports over HTTP and a token
-//! switch by `SIGQUIT`.
+//! The real binary with the pinned `gitlab-runner` (M6.3 rule R5), a fake `docker` and one
+//! loopback server playing both GitLab's job request API and the dispatcher: one `gitlab-runner
+//! run` polls with every runner entry, reloads the rewritten `config.toml`, and exits on
+//! `SIGQUIT`, after which the agent starts it again.
+//!
+//! The runner is `ciburst_core::cloud_init::RUNNER_URL`, downloaded once into the target
+//! directory and checked against `RUNNER_SHA256`, or the file `CIBURST_TEST_GITLAB_RUNNER` names.
 #![cfg(target_os = "linux")]
 
 use std::collections::BTreeMap;
@@ -10,30 +14,85 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ciburst_core::cloud_init::{RUNNER_SHA256, RUNNER_URL};
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
+
+const POOL: &str = "glrt-runner-secret";
+const SPILL: &str = "glrt-spill-secret";
+const MEMBER_A: &str = "glrt-member-a-secret";
+const MEMBER_B: &str = "glrt-member-b-secret";
+const JOB_REQUEST: &str = "/api/v4/jobs/request";
+
 #[derive(Clone)]
 struct Received {
+    at: Instant,
     path: String,
     headers: BTreeMap<String, String>,
     body: String,
 }
 
-type Inbox = Arc<Mutex<Vec<Received>>>;
+#[derive(Default)]
+struct Server {
+    inbox: Mutex<Vec<Received>>,
+    /// The body of every `/vm` answer.
+    answer: Mutex<String>,
+}
 
-/// Answers every `/vm` report with `spill` as the flag holds at that moment.
-fn serve(listener: TcpListener, inbox: Inbox, spill: Arc<AtomicBool>) {
-    for stream in listener.incoming() {
-        let Ok(stream) = stream else { return };
-        let inbox = Arc::clone(&inbox);
-        let spill = Arc::clone(&spill);
-        std::thread::spawn(move || connection(stream, &inbox, &spill));
+impl Server {
+    fn set_answer(&self, spill: bool, members: &[(u64, &str)]) {
+        let runners: Vec<serde_json::Value> = members
+            .iter()
+            .map(|(project, token)| serde_json::json!({"projectId": project, "token": token}))
+            .collect();
+        *self.answer.lock().unwrap() = serde_json::json!({
+            "result": "reported",
+            "spill": spill,
+            "nextReportS": 10,
+            "runners": runners,
+            "ms": 1,
+        })
+        .to_string();
+    }
+
+    /// Job requests per runner token since `since`.
+    fn requests(&self, since: Instant) -> BTreeMap<String, usize> {
+        let mut counts = BTreeMap::new();
+        for received in self.inbox.lock().unwrap().iter() {
+            if received.path != JOB_REQUEST || received.at < since {
+                continue;
+            }
+            let body: serde_json::Value =
+                serde_json::from_str(&received.body).expect("job request json");
+            let token = body["token"].as_str().unwrap_or_default().to_string();
+            *counts.entry(token).or_default() += 1;
+        }
+        counts
+    }
+
+    fn reports(&self) -> Vec<Received> {
+        self.inbox
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|received| received.path == "/vm")
+            .cloned()
+            .collect()
     }
 }
 
-fn connection(stream: TcpStream, inbox: &Inbox, spill: &AtomicBool) {
+fn serve(listener: TcpListener, server: Arc<Server>) {
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else { return };
+        let server = Arc::clone(&server);
+        std::thread::spawn(move || connection(stream, &server));
+    }
+}
+
+fn connection(stream: TcpStream, server: &Server) {
     let mut writer = stream.try_clone().expect("clone stream");
     let mut reader = BufReader::new(stream);
     loop {
@@ -68,23 +127,27 @@ fn connection(stream: TcpStream, inbox: &Inbox, spill: &AtomicBool) {
         if reader.read_exact(&mut body).is_err() {
             return;
         }
-        let answer = if path == "/vm" {
-            format!(
-                r#"{{"result":"reported","spill":{},"nextReportS":600,"ms":1}}"#,
-                spill.load(Ordering::SeqCst)
-            )
-        } else {
-            String::new()
+        let (status, answer) = match path.as_str() {
+            "/vm" => ("200 OK", server.answer.lock().unwrap().clone()),
+            "/terminate" => ("200 OK", String::new()),
+            // No job pending: the runner asks again after `check_interval`.
+            JOB_REQUEST => ("204 No Content", String::new()),
+            _ => ("404 Not Found", String::new()),
         };
-        inbox.lock().unwrap().push(Received {
+        server.inbox.lock().unwrap().push(Received {
+            at: Instant::now(),
             path,
             headers,
-            body: String::from_utf8(body).expect("utf-8 body"),
+            body: String::from_utf8_lossy(&body).into_owned(),
         });
-        let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{answer}",
-            answer.len()
-        );
+        let response = if status.starts_with("204") {
+            format!("HTTP/1.1 {status}\r\n\r\n")
+        } else {
+            format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{answer}",
+                answer.len()
+            )
+        };
         if writer.write_all(response.as_bytes()).is_err() {
             return;
         }
@@ -96,78 +159,77 @@ fn script(path: &Path, text: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-fn wait_for<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
-    let deadline = Instant::now() + Duration::from_secs(20);
+fn wait_for<T>(what: &str, seconds: u64, mut probe: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
     loop {
         if let Some(value) = probe() {
             return value;
         }
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
-/// The first `/vm` report whose body equals `body`.
-fn report(inbox: &Inbox, body: &serde_json::Value) -> Option<Received> {
-    inbox
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|received| {
-            received.path == "/vm"
-                && serde_json::from_str::<serde_json::Value>(&received.body)
-                    .ok()
-                    .as_ref()
-                    == Some(body)
-        })
-        .cloned()
+fn sha256(path: &Path) -> String {
+    let output = Command::new("sha256sum").arg(path).output().unwrap();
+    assert!(output.status.success(), "sha256sum failed");
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string()
 }
 
-/// Argument lines of every slot process started so far.
-fn slot_args(dir: &Path) -> Vec<Vec<String>> {
-    slot_files(dir, ".args")
-        .into_iter()
-        .map(|file| {
-            fs::read_to_string(file)
-                .unwrap()
-                .lines()
-                .map(String::from)
-                .collect()
-        })
+/// The pinned `gitlab-runner`, downloaded once per target directory.
+fn runner_binary() -> PathBuf {
+    if let Some(path) = std::env::var_os("CIBURST_TEST_GITLAB_RUNNER") {
+        return PathBuf::from(path);
+    }
+    let path =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("gitlab-runner-{RUNNER_SHA256}"));
+    if path.exists() && sha256(&path) == RUNNER_SHA256 {
+        return path;
+    }
+    let partial = path.with_extension("part");
+    let status = Command::new("curl")
+        .args(["-fsSL", "--retry", "3", "-o"])
+        .arg(&partial)
+        .arg(RUNNER_URL)
+        .status()
+        .expect("curl runs");
+    assert!(status.success(), "download of {RUNNER_URL} failed");
+    assert_eq!(sha256(&partial), RUNNER_SHA256, "{RUNNER_URL}");
+    fs::set_permissions(&partial, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::rename(&partial, &path).unwrap();
+    path
+}
+
+/// Process ids from the agent's `runner started` lines.
+fn runner_pids(log: &str) -> Vec<i32> {
+    log.lines()
+        .filter_map(|line| line.strip_prefix("info runner started pid=\""))
+        .filter_map(|pid| pid.trim_end_matches('"').parse().ok())
         .collect()
 }
 
-/// Non-empty files the fake runner wrote, `slot-<pid><suffix>`.
-fn slot_files(dir: &Path, suffix: &str) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = fs::read_dir(dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| {
-            let name = path.file_name().unwrap().to_string_lossy();
-            name.starts_with("slot-") && name.ends_with(suffix)
-        })
-        .filter(|path| fs::metadata(path).is_ok_and(|meta| meta.len() > 0))
-        .collect();
-    files.sort();
-    files
-}
-
-/// Ends the agent and its fake slots however the test ends.
+/// Ends the agent and every runner it started however the test ends.
 struct Stop {
     agent: Child,
-    running: PathBuf,
+    log: PathBuf,
 }
 
 impl Drop for Stop {
     fn drop(&mut self) {
         let _ = self.agent.kill();
         let _ = self.agent.wait();
-        let _ = fs::remove_file(&self.running);
+        for pid in runner_pids(&fs::read_to_string(&self.log).unwrap_or_default()) {
+            let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+        }
     }
 }
 
 #[test]
-fn the_binary_runs_slots_and_reports_over_http() {
+fn one_runner_process_serves_every_entry_and_reloads_its_config() {
     let uptime: f64 = fs::read_to_string("/proc/uptime")
         .unwrap()
         .split_whitespace()
@@ -181,48 +243,43 @@ fn the_binary_runs_slots_and_reports_over_http() {
         return;
     }
 
+    let runner = runner_binary();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let bin = root.join("bin");
     fs::create_dir(&bin).unwrap();
+    std::os::unix::fs::symlink(&runner, bin.join("gitlab-runner")).unwrap();
     let at = root.display();
     script(
-        &bin.join("gitlab-runner"),
-        &format!(
-            "#!/bin/sh\nenv > \"{at}/slot-$$.env\"\nprintf '%s\\n' \"$@\" > \"{at}/slot-$$.args\"\n\
-             trap 'exit 0' QUIT\nwhile [ -e \"{at}/running\" ]; do sleep 0.1; done\n"
-        ),
-    );
-    script(
         &bin.join("docker"),
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{at}/docker.args\"\ncat \"{at}/jobs\" 2> /dev/null\nexit 0\n"
-        ),
+        &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{at}/docker.args\"\nexit 0\n"),
     );
-    fs::write(root.join("running"), "").unwrap();
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let inbox: Inbox = Arc::default();
-    let server_inbox = Arc::clone(&inbox);
-    let spill = Arc::new(AtomicBool::new(false));
-    let server_spill = Arc::clone(&spill);
-    std::thread::spawn(move || serve(listener, server_inbox, server_spill));
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let server = Arc::new(Server::default());
+    server.set_answer(false, &[(42, MEMBER_A)]);
+    let serving = Arc::clone(&server);
+    std::thread::spawn(move || serve(listener, serving));
 
+    let state = root.join("state");
     let env_file = root.join("vm.env");
     fs::write(
         &env_file,
         format!(
             "CIBURST_RUN_ID=run-e2e\nCIBURST_VM_TOKEN=vm-token-secret\n\
-             CIBURST_DISPATCH_URL=http://127.0.0.1:{port}\nCI_SERVER_URL=https://gitlab.example.invalid\n\
-             RUNNER_TOKEN=glrt-runner-secret\nRUNNER_SPILL_TOKEN=glrt-spill-secret\n\
+             CIBURST_DISPATCH_URL={url}\nCI_SERVER_URL={url}\n\
+             RUNNER_TOKEN={POOL}\nRUNNER_SPILL_TOKEN={SPILL}\n\
              CIBURST_POOL=vm\nCIBURST_SLOTS=2\n\
-             CIBURST_DEFAULT_IMAGE=node:24\nCIBURST_TIMEOUT_S=3600\n"
+             CIBURST_DEFAULT_IMAGE=node:24\nCIBURST_TIMEOUT_S=3600\n\
+             CIBURST_STATE_DIR={}\n",
+            state.display()
         ),
     )
     .unwrap();
     let log_path = root.join("agent.log");
     let log = fs::File::create(&log_path).unwrap();
+    let runner_log = root.join("runner.log");
     let path = format!(
         "{}:{}",
         bin.display(),
@@ -232,69 +289,96 @@ fn the_binary_runs_slots_and_reports_over_http() {
         .env("PATH", path)
         .env("CIBURST_VM_ENV", &env_file)
         .stdin(Stdio::null())
-        .stdout(log.try_clone().unwrap())
+        .stdout(fs::File::create(&runner_log).unwrap())
         .stderr(log)
         .spawn()
         .unwrap();
-    let stop = Stop {
+    let _stop = Stop {
         agent,
-        running: root.join("running"),
+        log: log_path.clone(),
     };
+    let agent_log = || fs::read_to_string(&log_path).unwrap_or_default();
 
-    let idle = serde_json::json!({"state": "idle", "free": 2, "slots": 2, "spill": 0});
-    let idle = wait_for("the idle report", || report(&inbox, &idle));
-    assert_eq!(idle.headers["x-ciburst-run"], "run-e2e");
-    assert_eq!(idle.headers["x-ciburst-token"], "vm-token-secret");
-    assert_eq!(idle.headers["content-type"], "application/json");
-
-    let args = wait_for("two slots", || {
-        let args = slot_args(root);
-        (args.len() == 2).then_some(args)
+    // Two entries, one process: the pool runner and the member's.
+    let start = Instant::now();
+    wait_for("job requests of the pool and the member", 60, || {
+        let requests = server.requests(start);
+        (requests.contains_key(POOL) && requests.contains_key(MEMBER_A)).then_some(())
     });
-    let mut configs = Vec::new();
-    for lines in args {
-        assert_eq!(
-            lines[..15],
-            [
-                "run-single",
-                "--url",
-                "https://gitlab.example.invalid",
-                "--token",
-                "glrt-runner-secret",
-                "--executor",
-                "docker",
-                "--docker-image",
-                "node:24",
-                "--docker-privileged",
-                "--docker-volumes",
-                "/cache",
-                "--docker-volumes",
-                "/certs/client",
-                "--docker-cache-dir",
-            ]
-        );
-        assert_eq!(lines[16], "--docker-container-labels");
-        assert_eq!(
-            lines[18..23],
-            ["--max-builds", "0", "--wait-timeout", "0", "--config"]
-        );
-        assert_eq!(lines.len(), 24);
-        assert_eq!(lines[15], lines[23].replace("config.toml", "volumes"));
-        let slot = lines[17].strip_prefix("ciburst.slot:").expect("slot label");
-        assert_eq!(
-            lines[23],
-            format!("/var/lib/ciburst/slot-{slot}/config.toml")
-        );
-        configs.push(lines[23].clone());
-    }
-    configs.sort();
+    let config_path = state.join("config.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    assert!(config.contains("concurrent = 2\n"), "{config}");
+    assert_eq!(config.matches("[[runners]]").count(), 2, "{config}");
+    let mode = fs::metadata(&config_path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+    let report = &server.reports()[0];
+    assert_eq!(report.headers["x-ciburst-run"], "run-e2e");
+    assert_eq!(report.headers["x-ciburst-token"], "vm-token-secret");
+    let body: serde_json::Value = serde_json::from_str(&report.body).unwrap();
     assert_eq!(
-        configs,
-        [
-            "/var/lib/ciburst/slot-1/config.toml",
-            "/var/lib/ciburst/slot-2/config.toml"
-        ]
+        body,
+        serde_json::json!({"state": "idle", "free": 2, "slots": 2, "spill": 0})
     );
+
+    // A second member and spill: the next report's answer rewrites the file, the same process
+    // reloads it and polls with all four tokens.
+    server.set_answer(true, &[(42, MEMBER_A), (77, MEMBER_B)]);
+    let changed = Instant::now();
+    wait_for("job requests of the added runners", 60, || {
+        let requests = server.requests(changed);
+        (requests.contains_key(MEMBER_B) && requests.contains_key(SPILL)).then_some(())
+    });
+    let config = fs::read_to_string(&config_path).unwrap();
+    assert_eq!(config.matches("[[runners]]").count(), 4, "{config}");
+    wait_for("the spill report", 30, || {
+        server
+            .reports()
+            .iter()
+            .any(|report| {
+                serde_json::from_str::<serde_json::Value>(&report.body).unwrap()["spill"] == 1
+            })
+            .then_some(())
+    });
+
+    // Removed entries stop polling within a few seconds of the rewrite.
+    server.set_answer(false, &[(77, MEMBER_B)]);
+    wait_for("the config with two runners again", 30, || {
+        (agent_log()
+            .lines()
+            .filter(|line| *line == r#"info config written runners="2""#)
+            .count()
+            == 2)
+            .then_some(())
+    });
+    std::thread::sleep(Duration::from_secs(5));
+    let settled = Instant::now();
+    std::thread::sleep(Duration::from_secs(8));
+    let requests = server.requests(settled);
+    assert!(requests.contains_key(POOL), "{requests:?}");
+    assert!(requests.contains_key(MEMBER_B), "{requests:?}");
+    assert!(!requests.contains_key(MEMBER_A), "{requests:?}");
+    assert!(!requests.contains_key(SPILL), "{requests:?}");
+
+    // One process all along.
+    let pids = runner_pids(&agent_log());
+    assert_eq!(pids.len(), 1, "{}", agent_log());
+
+    // `SIGQUIT` ends the idle runner; the agent starts it again.
+    let quit = Instant::now();
+    kill(Pid::from_raw(pids[0]), Signal::SIGQUIT).unwrap();
+    wait_for("the runner's exit and restart", 30, || {
+        (runner_pids(&agent_log()).len() == 2).then_some(())
+    });
+    eprintln!(
+        "runner exited and restarted {:?} after SIGQUIT",
+        quit.elapsed()
+    );
+    let restarted = Instant::now();
+    wait_for("job requests of the restarted runner", 30, || {
+        let requests = server.requests(restarted);
+        (requests.contains_key(POOL) && requests.contains_key(MEMBER_B)).then_some(())
+    });
+
     let docker = fs::read_to_string(root.join("docker.args")).unwrap();
     assert_eq!(
         docker.lines().collect::<Vec<_>>(),
@@ -303,56 +387,23 @@ fn the_binary_runs_slots_and_reports_over_http() {
             "--filter",
             "label=com.gitlab.gitlab-runner.job.id",
             "--format",
-            "{{.Label \"com.gitlab.gitlab-runner.job.id\"}} {{.Label \"ciburst.slot\"}}"
+            "{{.Label \"com.gitlab.gitlab-runner.job.id\"}}"
         ]
     );
 
-    // Slot 1 takes a job, then the dispatcher allows spill: only slot 2 switches.
-    spill.store(true, Ordering::SeqCst);
-    // Renamed into place, so `docker ps` never prints half a file.
-    fs::write(root.join("jobs.new"), "42 1\n42 1\n").unwrap();
-    fs::rename(root.join("jobs.new"), root.join("jobs")).unwrap();
-    let busy = serde_json::json!({"state": "busy", "free": 1, "slots": 2, "spill": 0});
-    wait_for("the busy report", || report(&inbox, &busy));
-    let switched = serde_json::json!({"state": "busy", "free": 1, "slots": 2, "spill": 1});
-    wait_for("the switched report", || report(&inbox, &switched));
-    let args = wait_for("the restarted slot", || {
-        let args = slot_args(root);
-        (args.len() == 3).then_some(args)
-    });
-    let spill_args: Vec<&Vec<String>> = args
-        .iter()
-        .filter(|lines| lines[4] == "glrt-spill-secret")
-        .collect();
-    assert_eq!(spill_args.len(), 1);
-    assert_eq!(spill_args[0][17], "ciburst.slot:2");
-    assert_eq!(spill_args[0][23], "/var/lib/ciburst/slot-2/config.toml");
-
-    let envs = wait_for("three slot environments", || {
-        let envs = slot_files(root, ".env");
-        (envs.len() == 3).then_some(envs)
-    });
-    for file in envs {
-        let env = fs::read_to_string(file).unwrap();
-        assert!(!env.contains("secret"), "{env}");
-    }
-
-    drop(stop);
-    let log = fs::read_to_string(log_path).unwrap();
+    let log = agent_log();
     for line in [
         r#"info agent started run="run-e2e" pool="vm" slots="2" timeout_s="3600""#,
-        r#"info slot started slot="1" runner="pool""#,
-        r#"info slot started slot="2" runner="pool""#,
+        r#"info config written runners="2""#,
+        r#"info config written runners="4""#,
         r#"info state from="starting" to="idle" free="2""#,
-        r#"info state from="idle" to="busy" free="1""#,
         r#"info spill allowed="true""#,
-        r#"info slot switching slot="2" from="pool" to="spill""#,
-        r#"info slot exited slot="2" code="0""#,
-        r#"info slot started slot="2" runner="spill""#,
+        r#"info spill allowed="false""#,
+        r#"warn runner exited code="0""#,
     ] {
         assert!(log.lines().any(|l| l == line), "{line} not in:\n{log}");
     }
-    assert!(!log.contains(r#"slot switching slot="1""#), "{log}");
-    assert!(!log.contains("warn"), "{log}");
+    // The runner's own lines share the log, as in the journal, and name tokens by a short
+    // prefix only.
     assert!(!log.contains("secret"), "{log}");
 }

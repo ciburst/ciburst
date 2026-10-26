@@ -7,6 +7,8 @@ use std::fmt;
 pub const DEFAULT_PATH: &str = "/etc/ciburst/vm.env";
 /// Overrides [`DEFAULT_PATH`], for tests and manual runs.
 pub const PATH_ENV: &str = "CIBURST_VM_ENV";
+/// Directory of the runner's `config.toml`, unless `CIBURST_STATE_DIR` names another.
+pub const STATE_DIR: &str = "/var/lib/ciburst";
 
 const REQUIRED: [&str; 9] = [
     "CIBURST_RUN_ID",
@@ -43,6 +45,8 @@ pub struct Config {
     pub default_image: String,
     pub timeout_s: u64,
     pub cache: Option<S3Cache>,
+    /// Holds the runner's `config.toml` (M6.3 rule R5).
+    pub state_dir: String,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -66,6 +70,7 @@ impl fmt::Debug for Config {
             .field("default_image", &self.default_image)
             .field("timeout_s", &self.timeout_s)
             .field("cache", &self.cache.is_some())
+            .field("state_dir", &self.state_dir)
             .finish_non_exhaustive()
     }
 }
@@ -168,6 +173,10 @@ pub fn parse(text: &str) -> Result<Config, ConfigError> {
         default_image: required("CIBURST_DEFAULT_IMAGE"),
         timeout_s,
         cache,
+        state_dir: get("CIBURST_STATE_DIR")
+            .unwrap_or(STATE_DIR)
+            .trim_end_matches('/')
+            .to_string(),
     })
 }
 
@@ -245,6 +254,9 @@ CACHE_SHARED=true
         assert_eq!(cache.access_key, "SCWACCESSKEYSAMPLE");
         assert_eq!(cache.secret_key, "cache-secret-key");
         assert!(cache.shared);
+        assert_eq!(config.state_dir, "/var/lib/ciburst");
+        let config = parse(&with("CIBURST_STATE_DIR", "/srv/agent/")).unwrap();
+        assert_eq!(config.state_dir, "/srv/agent");
     }
 
     #[test]
