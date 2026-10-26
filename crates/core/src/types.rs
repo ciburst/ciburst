@@ -298,6 +298,18 @@ pub struct VmReportAnswer {
     pub spill: bool,
     #[serde(rename = "nextReportS", default = "default_next_report_s")]
     pub next_report_s: u64,
+    /// The runners of every member for the VM's pool (M6.3 rule R5); the agent runs one
+    /// `gitlab-runner run` with an entry for each. Empty from dispatchers before M6.3.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runners: Vec<VmRunner>,
+}
+
+/// One member runner a VM serves (M6.3 rule R5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmRunner {
+    #[serde(rename = "projectId")]
+    pub project_id: u64,
+    pub token: String,
 }
 
 fn default_next_report_s() -> u64 {

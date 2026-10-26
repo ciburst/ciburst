@@ -146,6 +146,7 @@ pub fn jobs(docker_ps: &str) -> Jobs {
 /// What a dispatcher before M6.2 answers, and what holds before the first answer.
 fn no_answer() -> VmReportAnswer {
     VmReportAnswer {
+        runners: Vec::new(),
         spill: false,
         next_report_s: vm::HEARTBEAT_S,
     }

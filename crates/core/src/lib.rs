@@ -9,6 +9,7 @@ pub mod config;
 pub mod dispatch;
 pub mod error;
 pub mod fake;
+pub mod fleet;
 pub mod gitlab;
 pub mod http;
 pub mod lane;

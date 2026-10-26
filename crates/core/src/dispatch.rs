@@ -1524,6 +1524,7 @@ impl Dispatcher {
     ) -> VmReportAnswer {
         let busy = report.state == VmState::Busy;
         let quiet = VmReportAnswer {
+            runners: Vec::new(),
             spill: false,
             next_report_s: next_report_s(false, false, busy),
         };
@@ -1561,6 +1562,7 @@ impl Dispatcher {
             && self.has_spill_runner(pool)
             && !self.unseen_vm_jobs(pool, now, at).await;
         VmReportAnswer {
+            runners: Vec::new(),
             spill,
             next_report_s: next_report_s(spill, !queued.is_empty(), busy),
         }
