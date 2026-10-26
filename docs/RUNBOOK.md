@@ -129,7 +129,7 @@ Every line reads `<level> <message> key="value" ...` and never holds a secret.
 | CLI | stderr; in pipeline mode the `ciburst-setup` job log | one line per action; `plan` warns `vm pools cannot start pool="<tag>" reason="..."`; `apply` logs `hook_reenabled`, `replayed` per replayed job, `replay_failed` and `output_unmasked` |
 | Deliveries | `ciburst status` with a GitLab token: the webhook's 20 newest deliveries, oldest first | `delivery <time> <job name, pipeline <id> or event kind> <http status> <result> <pool> <ms>`; `-` where the answer lacks the key, `?` for an unreadable body |
 | Lane run | the job run's stdout and stderr on Serverless Jobs; `ciburst status` lists the run and its state | `ciburst-lane: <reason>` before the bootstrap exits 64 (section Failure modes), then `gitlab-runner`'s own lines |
-| VM agent | the VM's journal, `journalctl -u ciburst-vm-agent`, through the provider's console view only | `agent started`, `state from=... to=...` (`starting`, `idle`, `busy`, `draining`, `quitting`), `slot started`, `slot exited`, `report failed`, `terminate accepted`, `terminate failed`, `terminate gave up` |
+| VM agent | the VM's journal, `journalctl -u ciburst-vm-agent`, through the provider's console view only | `agent started`, `state from=... to=...` (`starting`, `idle`, `busy`, `draining`, `quitting`), `slot started` (with `runner="pool"` or `runner="spill"`), `slot exited`, `slot switching from=... to=...`, `spill allowed=...`, `report failed`, `report answer unreadable`, `job without slot label` (switching held), `terminate accepted`, `terminate failed`, `terminate gave up` |
 
 ## Rotation and updates
 
@@ -455,6 +455,7 @@ Source: `gitlab-runner run-single --help` in `gitlab/gitlab-runner:v18.11.4` (`i
 | `--docker-volumes` | `/cache`, `/certs/client` | | `/certs/client` for Docker-in-Docker with TLS |
 | `--docker-cache-dir` | `/var/lib/ciburst/slot-<n>/volumes` | | the executor names volumes after token, system id, project id and concurrent id (`executors/docker/volume.go`); every slot reports concurrent id 0, so without it two jobs of one project on one VM share `/builds` and `/certs/client`; with it the volumes are host directories `<dir>/<unique name>/<md5 of path>`, and `CI_PROJECT_DIR` stays `/builds/<namespace>/<project>` |
 | `--config` | `/var/lib/ciburst/slot-<n>/config.toml` | | read only with `--runner`, so every slot of a VM gets the system id derived from the machine id, as one `gitlab-runner run` with `concurrent` slots does |
+| `--docker-container-labels ciburst.slot:<n>` | slot number | | marks build, helper and service containers with their slot, so the agent knows which slot is idle and may switch runners (M6.2) |
 | `--max-builds 0` | yes | yes | no build limit |
 | `--wait-timeout` | `0` | `waitTimeoutS` | 0 never exits for idleness (`checkFinishedConditions` tests `WaitTimeout > 0`); otherwise the timer restarts after every build |
 | `--cache-type s3`, `--cache-shared`, `--cache-s3-server-address`, `--cache-s3-bucket-name`, `--cache-s3-bucket-location`, `--cache-s3-access-key`, `--cache-s3-secret-key` | yes | yes | with an S3 cache |
