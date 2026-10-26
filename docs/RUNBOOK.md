@@ -379,6 +379,7 @@ Measured:
 | Price per VM-hour from the bill | DEV1-M 0.021 + IPv4 0.005 + local SSD 0.002 = 0.028 EUR; DEV1-L 0.044 + 0.005 + 0.004 = 0.053 EUR; local SSD is billed per clock hour (960 GB-hours for 8 DEV1-L hours of 80 GB) |
 | Cost per job-minute, drill consumer on VMs (3 pipelines, one DEV1-L per job, 2026-10-25) | 0.68 EUR for 146 job-minutes on 12 DEV1-L hours: 0.0046 EUR per job-minute, about half of GitLab's small runner (0.0089); the VMs were busy about 20 % of their paid hours |
 | One paid hour per VM, the bill against the job logs (`via <vm>`, 2026-10-25) | drill consumer: 8 VMs ran jobs, 8 DEV1-L hours billed, the longest ran jobs for 50 minutes across two pipelines; demo: 8 VMs ran jobs, 9 DEV1-M hours billed, the ninth most likely a VM woken by the pending events of its two hosted-runner jobs (D49). The drill consumer's first deployment paid 4 DEV1-L hours for VMs that got no job. A VM busy at minute 55 pays its next hour, by design |
+| VM start answers on a warm function (drill consumer, 2026-10-26) | 4,238 and 6,255 ms; the warm start 4,327 ms including the 2 s burst wait; lane starts 830 to 1,174 ms, claims 958 to 1,481 ms |
 
 ### M5 drill
 
@@ -410,7 +411,7 @@ Measured:
    Result (2026-10-25): with one idle VM, `lane-node` answered `{"lane":"node24","pool":"vm","result":"claimed"}` and ran on `<name>-vm` after 1.4 s in the queue; `lane-rust` (`vmFirst` false) answered `started` and ran in its lane after 6.8 s. Before the setup, the old dispatcher had routed both lane jobs by stage and started a VM, which took the node job as soon as the setup added `node24` to its runner. Finding: the delivery that started the VM answered after 10.4 s, beyond GitLab.com's 10 s webhook timeout, and counted as failed although the VM started (spec section 13, risks).
 4. The drill consumer: `ciburst check --suggest`, the proposed lanes in `ciburst.json` and the `tags:` in its pipeline, `ciburst-setup`, a pipeline.
    Check: `ciburst-check` passes; every job passes; wall clock and cost against its 18-minute warm VM pipeline.
-   Result: ____
+   Result (2026-10-26, drill consumer, four lanes rust, alpine, node, playwright, `vmFirst` default, warm start on): `ciburst-check` passed; a main pipeline took 20.4 minutes, 44.2 job-minutes on ciburst. All eleven lane jobs that found no free VM slot ran in their lanes (10 runs, 2,222 s, 8,147 vCPU-s, 16,294 GB-s: 0.11 EUR at list price, inside the free tier); Chromium (Lighthouse) runs in the sandbox; `rust-test` peaked at 6.5 GB on the lane disk. It still used 4 DEV1-L VMs (0.21 EUR): GitLab hands a pending lane job to any free VM slot, because the VM runner carries the lane tags, and four parallel lane claims raced onto two free slots past the reservation, so the Docker job `build-image` started another VM. Finding: with `vmFirst` lane jobs take the slots that Docker jobs need; the drill consumer sets `"vmFirst": false` on its lanes.
 
 ### M7 hardening drill
 
