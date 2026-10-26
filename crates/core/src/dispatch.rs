@@ -3402,6 +3402,7 @@ mod tests {
                   "gitlab": {{ "url": "https://gitlab.example", "projectIds": [7] }},
                   "host": {{ "type": "fake" }}, "provider": {{ "type": "fake" }},
                   "defaultPool": "{default}",
+                  "spillRunner": true,
                   "pools": [
                     {vm}
                     {{ "tag": "node-24", "image": "node:24-bookworm-slim", "runtime": "jobs",

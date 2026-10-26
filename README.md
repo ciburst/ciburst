@@ -14,7 +14,7 @@ Status: pre-release. `ciburst/ciburst` stays private until v1.0.0; the component
 2. The job's name, else its stage, selects its pool: the VM pool, or a lane of `ciburst.json`. Jobs in `ignoreJobs` run on other runners and start nothing.
 3. When a pipeline starts and any of its jobs will need a VM, one VM boots right away if none has a free slot, so a Docker job in a later stage finds it ready (`warmStart`, on by default; it costs one VM-hour, 0.03 EUR, when the pipeline ends before that job runs).
 4. A pending VM job claims a free slot on a running VM. When every slot is busy it waits in a queue, and GitLab hands it to the first slot that frees; ciburst buys another VM only when the wait would pass the pool's `maxQueueS` (default 90 s, about one VM boot), judged by how long the running jobs usually take. With no VM running, jobs that wait together share new VMs (two slots each, so five jobs start three VMs).
-5. A lane job runs on an idle slot of a paid VM while no VM job waits or is still to come in a running pipeline (`vmFirst`, on by default); otherwise, or when no slot took it within 20 s, it starts a Serverless Job, which runs it and exits after 60 idle seconds.
+5. A lane job starts a Serverless Job, which runs it and exits after 60 idle seconds; an idle slot of a running VM may take it first (`vmFirst`, on by default: the VM's runner carries the lane's tag).
 6. Each VM runs one `gitlab-runner run-single` per slot and reports its state to the dispatcher. An idle VM ends at minute 55; a sweep every 30 minutes removes VMs that stopped reporting.
 7. Setup, check and teardown run in your own pipeline on GitLab's hosted runners, from three manual jobs of the CI/CD component.
 

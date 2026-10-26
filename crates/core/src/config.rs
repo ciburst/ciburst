@@ -193,6 +193,14 @@ pub struct Config {
     /// Job name patterns (`*`, `?`) of jobs that run on other runners; they route nowhere (D49).
     #[serde(default, rename = "ignoreJobs", skip_serializing_if = "Vec::is_empty")]
     pub ignore_jobs: Vec<String>,
+    /// The spill runner of D54. Off by default (D55): GitLab sometimes delivers no job status
+    /// events for hours, and then only VM runners that carry the lane tags pick lane jobs up.
+    #[serde(
+        default,
+        rename = "spillRunner",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub spill_runner: bool,
 }
 
 impl Config {
@@ -236,6 +244,7 @@ impl Config {
             },
             providers: BTreeMap::new(),
             ignore_jobs: Vec::new(),
+            spill_runner: false,
         }
     }
 
@@ -296,9 +305,18 @@ impl Config {
             .or_else(|| self.pools.iter().find(|pool| self.is_vm_pool(pool)))
     }
 
-    /// M6.2 rule R6: the tags of a pool's own GitLab runner, its tag only.
+    /// The tags of a pool's own GitLab runner: its tag, and for a VM pool without the spill
+    /// runner (D55) the tag of each lane of [`Config::spill_lanes`], so its polling slots also
+    /// take those lanes' jobs when no job event arrives.
     pub fn runner_tags(&self, pool: &Pool) -> Vec<String> {
-        vec![pool.tag.clone()]
+        let lanes = if self.spill_runner {
+            Vec::new()
+        } else {
+            self.spill_lanes(pool)
+        };
+        std::iter::once(pool.tag.clone())
+            .chain(lanes.into_iter().map(|lane| lane.tag.clone()))
+            .collect()
     }
 
     /// M6.2 rule R6: the lanes whose jobs may spill onto idle slots of `vm_pool`, in config
@@ -314,11 +332,11 @@ impl Config {
     }
 
     /// M6.2 rule R6: the tags of the spill runner of `vm_pool`, the pool's tag and then the tag
-    /// of each lane of [`Config::spill_lanes`]; `None` when no lane spills onto the pool, which
-    /// then has no spill runner.
+    /// of each lane of [`Config::spill_lanes`]; `None` without `spillRunner` (D55) or when no
+    /// lane spills onto the pool, which then has no spill runner.
     pub fn spill_tags(&self, vm_pool: &Pool) -> Option<Vec<String>> {
         let lanes = self.spill_lanes(vm_pool);
-        if lanes.is_empty() {
+        if !self.spill_runner || lanes.is_empty() {
             return None;
         }
         Some(
@@ -813,7 +831,17 @@ mod tests {
 
     #[test]
     fn lanes_spill_onto_the_default_vm_pool_else_the_first() {
-        let config = parse_config(&lanes().to_string()).unwrap();
+        let plain = parse_config(&lanes().to_string()).unwrap();
+        let vm = plain.pool_by_tag("vm").unwrap();
+        assert_eq!(
+            plain.runner_tags(vm),
+            ["vm", "node-24", "ts-5"],
+            "D55: without the spill runner the VM runner carries the lane tags"
+        );
+        assert_eq!(plain.spill_tags(vm), None);
+        let mut raw = lanes();
+        raw["spillRunner"] = true.into();
+        let config = parse_config(&raw.to_string()).unwrap();
         let first = |tag: &str| {
             config
                 .vm_first_pool(config.pool_by_tag(tag).unwrap())
@@ -843,6 +871,7 @@ mod tests {
         assert_eq!(config.spill_tags(pool("node-24")), None, "no VM pool");
 
         let mut raw = lanes();
+        raw["spillRunner"] = true.into();
         raw["providers"] = serde_json::json!({ "hetzner": {} });
         let pools = raw["pools"].as_array_mut().unwrap();
         pools.insert(

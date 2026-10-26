@@ -400,7 +400,76 @@ fn lanes_config(rust_vm_first: bool) -> Arc<Config> {
 fn spill_config(node_vm_first: bool, rust_vm_first: bool) -> Arc<Config> {
     let mut config = (*lanes_config(rust_vm_first)).clone();
     config.pools[1].vm_first = Some(node_vm_first);
+    config.spill_runner = true;
     Arc::new(config)
+}
+
+/// D55: without `spillRunner` the VM pool's own runner carries the `vmFirst` lanes' tags, and a
+/// spill runner from before goes, so polling VM slots take lane jobs when no job event arrives.
+#[tokio::test]
+async fn without_the_spill_runner_the_vm_runner_carries_the_lane_tags() {
+    let fake = Arc::new(FakeGitlab::new());
+    let store = Arc::new(MemoryStore::new());
+    let host_store = Arc::new(MemoryStore::new());
+    let outputs = Arc::new(MemoryOutputs::new());
+    let provisioner = |config: Arc<Config>| {
+        Provisioner::new(
+            config.clone(),
+            Arc::new(FakeProvider::new(config.clone(), store.clone())),
+            Arc::new(FakeHost::new(config.clone(), host_store.clone())),
+            Some(Arc::new(Gitlab::new(
+                &config.gitlab.url,
+                FAKE_TOKEN,
+                fake.clone(),
+            ))),
+            outputs.clone(),
+            Log::silent(),
+        )
+    };
+    provisioner(spill_config(true, false))
+        .apply(&[])
+        .await
+        .unwrap();
+    assert!(
+        outputs
+            .read()
+            .await
+            .unwrap()
+            .contains_key("CIBURST_SPILL_RUNNER_ID_VM")
+    );
+
+    let mut plain = (*spill_config(true, false)).clone();
+    plain.spill_runner = false;
+    let plain = Arc::new(plain);
+    let deployment = provisioner(plain.clone());
+    let plan = deployment.plan(&[]).await.unwrap();
+    let runners: Vec<(String, Action, Option<String>)> = plan
+        .iter()
+        .filter(|s| s.id.starts_with("runner:"))
+        .map(|s| (s.id.clone(), s.action, s.detail.clone()))
+        .collect();
+    assert!(
+        runners.contains(&(
+            "runner:vm".to_string(),
+            Action::Update,
+            Some("set tags vm, node-24".to_string())
+        )),
+        "{runners:?}"
+    );
+    assert!(
+        runners.contains(&("runner:vm-spill".to_string(), Action::Delete, None)),
+        "{runners:?}"
+    );
+    deployment.apply(&[]).await.unwrap();
+    let values = outputs.read().await.unwrap();
+    let vm = values[&keys::runner_id("vm")].parse().unwrap();
+    assert_eq!(fake.runner_tags(vm).unwrap(), ["vm", "node-24"]);
+    assert_eq!(fake.runner_count(), 3, "vm, node-24, rust-1");
+    assert!(
+        secrets_from_outputs(&plain, &values)
+            .spill_tokens
+            .is_empty()
+    );
 }
 
 #[tokio::test]
