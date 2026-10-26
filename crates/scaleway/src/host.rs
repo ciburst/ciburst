@@ -15,9 +15,9 @@
 //! - secret: `HOOK_TOKEN`, `CIBURST_DISPATCH_KEY` (the dispatch key), `RUNNER_TOKEN_<TAG>` per pool,
 //!   `RUNNER_SPILL_TOKEN_<TAG>` per VM pool with a spill runner (`Secrets::spill_tokens`, M6.2
 //!   rule R6), `CACHE_S3_ACCESS_KEY` and `CACHE_S3_SECRET_KEY` when a cache key exists,
-//!   `CIBURST_VM_SECRET` and `CIBURST_SWEEP_TOKEN` when the provisioner made them, and every
-//!   credential of an added provider (`Secrets::provider_env`, for example `HCLOUD_TOKEN`) under
-//!   its own name.
+//!   `CIBURST_VM_SECRET`, `CIBURST_SWEEP_TOKEN` and `CIBURST_FLEET_KEY` (M6.3 rule R2) when the
+//!   provisioner made them, and every credential of an added provider (`Secrets::provider_env`,
+//!   for example `HCLOUD_TOKEN`) under its own name.
 //!
 //! On top, the plain variable `CIBURST_CODE_DIGEST` records the sha256 of the deployed zip for
 //! this host's plan; the function does not read it. The sha256 of the settings and both
@@ -82,6 +82,8 @@ pub mod vars {
     pub const CACHE_SECRET_KEY: &str = "CACHE_S3_SECRET_KEY";
     pub const VM_SECRET: &str = "CIBURST_VM_SECRET";
     pub const SWEEP_TOKEN: &str = "CIBURST_SWEEP_TOKEN";
+    /// Seals the fleet state in the bucket (M6.3 rule R2).
+    pub const FLEET_KEY: &str = "CIBURST_FLEET_KEY";
     pub const CODE_DIGEST: &str = "CIBURST_CODE_DIGEST";
     /// The agent VMs download (D38), from `Secrets::dispatcher_env`.
     pub const AGENT_SHA256: &str = ciburst_core::provision::keys::AGENT_SHA256;
@@ -125,6 +127,7 @@ pub mod vars {
             CACHE_SECRET_KEY,
             VM_SECRET,
             SWEEP_TOKEN,
+            FLEET_KEY,
             CODE_DIGEST,
             VM_SECURITY_GROUP,
             VM_IMAGES,
@@ -329,6 +332,9 @@ impl ScalewayFunction {
         }
         if let Some(sweep_token) = &secrets.sweep_token {
             secret.insert(vars::SWEEP_TOKEN.to_string(), sweep_token.clone());
+        }
+        if let Some(fleet_key) = &secrets.fleet_key {
+            secret.insert(vars::FLEET_KEY.to_string(), fleet_key.clone());
         }
         check_provider_env(secrets)?;
         for (name, value) in &secrets.provider_env {
