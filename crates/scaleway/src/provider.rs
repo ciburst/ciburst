@@ -347,6 +347,37 @@ async fn list_all(
 
 #[async_trait]
 impl Provider for Scaleway {
+    /// The fleet store in the deployment's cache bucket (M6.3 rule R1); `None` before the first
+    /// apply made the project and the bucket, or without the cache and fleet keys.
+    async fn fleet(
+        &self,
+        secrets: &ciburst_core::types::Secrets,
+    ) -> Result<Option<Arc<dyn ciburst_core::fleet::FleetStore>>> {
+        let (Some(cache), Some(key)) = (&secrets.cache, &secrets.fleet_key) else {
+            return Ok(None);
+        };
+        let Some(project_id) = self.client.find_project(&self.config.name).await? else {
+            return Ok(None);
+        };
+        if !self
+            .s3(&project_id)?
+            .bucket_exists(&self.bucket(&project_id))
+            .await?
+        {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(
+            crate::fleet::ScalewayFleetStore::in_cache_bucket(
+                self.client.http(),
+                &self.config,
+                &project_id,
+                self.client.region(),
+                cache,
+                crate::fleet::FleetKey::from_secret(key)?,
+            ),
+        )))
+    }
+
     fn capabilities(&self) -> Capabilities {
         let vm = self.default_runtime().unwrap_or(Runtime::Instances) == Runtime::Instances;
         Capabilities {

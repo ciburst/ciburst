@@ -19,7 +19,7 @@ use axum::body::Body;
 use ciburst_core::cloud_init::is_sha256;
 use ciburst_core::composite::Composite;
 use ciburst_core::config::{CacheType, Config, parse_config};
-use ciburst_core::dispatch::Dispatcher;
+use ciburst_core::dispatch::{Dispatcher, FleetCache};
 use ciburst_core::fleet::FleetStore;
 use ciburst_core::http::{HttpClient, ReqwestClient};
 use ciburst_core::ledger::{GROUP_WAIT_S, Ledger, PipelineRecords, Schedule};
@@ -332,6 +332,9 @@ impl Env {
     }
 }
 
+/// The fleet state of this warm instance (M6.3 rule R1), read at most every 30 s.
+static FLEET: std::sync::OnceLock<Arc<FleetCache>> = std::sync::OnceLock::new();
+
 /// One request as the dispatcher sees it.
 pub struct Incoming<'a> {
     pub method: &'a str,
@@ -359,6 +362,8 @@ pub async fn respond(
     .with_ledger(backends.ledger.clone())
     .with_records(backends.records.clone())
     .with_schedule(backends.schedule.clone())
+    .with_fleet(backends.fleet.clone())
+    .with_fleet_cache(FLEET.get_or_init(|| Arc::new(FleetCache::new())).clone())
     .with_group_wait(env.group_wait);
     let response = dispatcher
         .handle_request(
