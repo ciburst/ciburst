@@ -291,7 +291,7 @@ Serverless Jobs pull without credentials, so a lane image is public or lives in 
 | Symptom | Cause | Action |
 |---|---|---|
 | A VM job answers `queued` and waits longer than `maxQueueS` | no VM report arrived to re-evaluate the queue (a VM hangs), or the pool is at `maxRuns` | `ciburst status`: the VMs and their last reports; a hung VM ends by the sweep after 30 minutes; `ciburst-setup` replays waiting jobs |
-| Jobs stay pending for minutes, the deliveries show only `created` job events and pipeline events | GitLab sends no job status events (seen 2026-10-26 for hours, D55) | the VM slots that carry the job's tags still take it; `ciburst-setup` replays jobs pending longer than 60 s; keep `spillRunner` false |
+| Jobs stay pending for minutes; the deliveries show `created` job events and pipeline events on time, `pending`, `running`, `success` much later | GitLab delivers job status events late (2026-10-26: about 35 minutes for hours, D55); the late `pending` events then start lane runs for finished jobs, which idle `waitTimeoutS` and exit | the VM slots that carry the job's tags take it meanwhile; `ciburst-setup` replays jobs pending longer than 60 s; keep `spillRunner` false. Measure the delay: each delivery's `created_at` against the status time in its payload (`build_started_at`, `build_finished_at`) |
 | Lane jobs never answer `spilled` (`spillRunner` true) | no `vmFirst` lane, a queued VM job, an open pipeline with VM jobs still to come, or the agent logs `job without slot label` | the VM's journal (`spill allowed=...`, `slot switching`); the report answers in the deliveries |
 | `ciburst-setup` is missing from the pipeline | the default branch is not protected, or the pipeline runs on another branch | protect the default branch; run the pipeline there |
 | `ciburst-setup` refuses to run, naming `CI_COMMIT_REF_PROTECTED` | an unprotected ref: protected variables would be missing | run it on the protected default branch |
@@ -385,6 +385,7 @@ Measured:
 | Cost per job-minute, drill consumer on VMs (3 pipelines, one DEV1-L per job, 2026-10-25) | 0.68 EUR for 146 job-minutes on 12 DEV1-L hours: 0.0046 EUR per job-minute, about half of GitLab's small runner (0.0089); the VMs were busy about 20 % of their paid hours |
 | One paid hour per VM, the bill against the job logs (`via <vm>`, 2026-10-25) | drill consumer: 8 VMs ran jobs, 8 DEV1-L hours billed, the longest ran jobs for 50 minutes across two pipelines; demo: 8 VMs ran jobs, 9 DEV1-M hours billed, the ninth most likely a VM woken by the pending events of its two hosted-runner jobs (D49). The drill consumer's first deployment paid 4 DEV1-L hours for VMs that got no job. A VM busy at minute 55 pays its next hour, by design |
 | VM start answers on a warm function (drill consumer, 2026-10-26) | 4,238 and 6,255 ms; the warm start 4,327 ms including the 2 s burst wait; lane starts 830 to 1,174 ms, claims 958 to 1,481 ms |
+| GitLab job status webhook delay (both projects, 2026-10-26, from the hook event log) | 1 to 3 s in the morning; 2,003 to 2,125 s from the afternoon on, for `pending`, `running` and `success`; `created` job events and pipeline events 1 to 4 s throughout |
 
 ### M5 drill
 
@@ -449,10 +450,10 @@ Measured:
 
 1. Demo deployment: `ciburst-setup` with the M6.2 code.
    Check: the plan shows `update  gitlab runner <name>-vm  (set tags vm)` and `create  gitlab runner <name>-vm-spill  (tags vm, node24)`; the function has `RUNNER_SPILL_TOKEN_VM`.
-   Result: ____
+   Result (2026-10-26): the plan showed `update  gitlab runner <name>-vm  (set tags vm)` and `create  gitlab runner <name>-vm-spill  (tags vm, node24)` (10.2 hosted minutes). Superseded the same day by D55: the next setup puts the lane tags back on `<name>-vm` and deletes the spill runner.
 2. A Docker chain (two Docker jobs in successive stages, slots 1) while one VM runs.
    Check: the second job answers `queued` or `claimed`, never `started`; one VM in total.
-   Result: ____
+   Result (2026-10-26): with one idle VM, three 60 s VM jobs started at once: two ran at once on its two slots, the third took the first freed slot after 73 s in the queue; one VM in total. The job events of that hour arrived about 35 minutes late (D55), so the dispatcher answered nothing for them in time; the VM's polling slots carried the run.
 3. Two long Docker jobs at once on a pool with slots 1 whose job name has a typical duration above `maxQueueS`.
    Check: the second answers `queued` and a `queue_started` start follows within one report interval; two VMs.
    Result: ____
