@@ -179,6 +179,7 @@ pub fn secrets_from_outputs(config: &Config, outputs: &Outputs) -> Secrets {
             .iter()
             .filter_map(|key| outputs.get(*key).map(|v| (key.to_string(), v.clone())))
             .collect(),
+        fleet_key: None,
     }
 }
 

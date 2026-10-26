@@ -66,6 +66,7 @@ fn secrets() -> Secrets {
         sweep_token: Some("sweep-secret".into()),
         provider_env: BTreeMap::new(),
         dispatcher_env: BTreeMap::new(),
+        fleet_key: Some("fleet-secret".into()),
     }
 }
 
@@ -158,6 +159,7 @@ async fn plans_applies_and_converges() {
             "CACHE_S3_ACCESS_KEY",
             "CACHE_S3_SECRET_KEY",
             "CIBURST_DISPATCH_KEY",
+            "CIBURST_FLEET_KEY",
             "CIBURST_SWEEP_TOKEN",
             "CIBURST_VM_SECRET",
             "HOOK_TOKEN",
@@ -172,6 +174,10 @@ async fn plans_applies_and_converges() {
     assert_eq!(
         fake.secret(FUNCTION, vars::VM_SECRET).as_deref(),
         Some("vm-secret")
+    );
+    assert_eq!(
+        fake.secret(FUNCTION, vars::FLEET_KEY).as_deref(),
+        Some("fleet-secret")
     );
     let cron = fake.cron(CRON).unwrap();
     assert_eq!(cron["function_id"], function["id"]);
@@ -234,6 +240,34 @@ async fn a_changed_vm_secret_updates_the_function_only() {
         Some("vm-rotated")
     );
     assert!(host.plan(&rotated).await.unwrap().iter().all(Step::is_noop));
+}
+
+#[tokio::test]
+async fn a_new_fleet_key_updates_the_function_only() {
+    let fake = Arc::new(FakeFunctions::new());
+    let host = host(two_pools(), &fake);
+    let mut before = secrets();
+    before.fleet_key = None;
+    let plan = host.plan(&before).await.unwrap();
+    host.apply(&plan, &before).await.unwrap();
+    assert_eq!(fake.secret(FUNCTION, vars::FLEET_KEY), None);
+
+    let plan = host.plan(&secrets()).await.unwrap();
+    assert_eq!(
+        actions(&plan),
+        [
+            ("namespace", Action::Noop),
+            ("function", Action::Update),
+            ("code", Action::Noop),
+            ("cron", Action::Noop)
+        ]
+    );
+    assert!(!format!("{plan:?}").contains("fleet-secret"), "{plan:?}");
+    host.apply(&plan, &secrets()).await.unwrap();
+    assert_eq!(
+        fake.secret(FUNCTION, vars::FLEET_KEY).as_deref(),
+        Some("fleet-secret")
+    );
 }
 
 #[tokio::test]

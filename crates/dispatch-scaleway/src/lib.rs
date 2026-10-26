@@ -3,7 +3,8 @@
 //! method, path, headers, body and the current time to
 //! `ciburst_core::dispatch::Dispatcher::handle_request` with a `Scaleway` provider and, with an
 //! S3 cache, the burst ledger, the warm start records and the queue-first schedule in the cache
-//! bucket, all built from the function's environment. The variable names are
+//! bucket, with `CIBURST_FLEET_KEY` also the fleet state there (M6.3 rule R1), all built from
+//! the function's environment. The variable names are
 //! `ciburst_scaleway::host::vars`, the ones the host sets.
 //!
 //! A cron trigger arrives as `POST /` with its arguments as the JSON body (Scaleway docs, "Add a
@@ -19,12 +20,14 @@ use ciburst_core::cloud_init::is_sha256;
 use ciburst_core::composite::Composite;
 use ciburst_core::config::{CacheType, Config, parse_config};
 use ciburst_core::dispatch::Dispatcher;
+use ciburst_core::fleet::FleetStore;
 use ciburst_core::http::{HttpClient, ReqwestClient};
 use ciburst_core::ledger::{GROUP_WAIT_S, Ledger, PipelineRecords, Schedule};
 use ciburst_core::log::Log;
 use ciburst_core::types::{KeyPair, Provider, Secrets};
 use ciburst_hetzner::Hetzner;
 use ciburst_scaleway::client::{Credentials, ScalewayClient};
+use ciburst_scaleway::fleet::{FleetKey, ScalewayFleetStore};
 use ciburst_scaleway::host::vars;
 use ciburst_scaleway::ledger::ScalewayLedger;
 use ciburst_scaleway::provider::{Scaleway, VmStart};
@@ -55,6 +58,9 @@ pub struct Env {
     /// Pause between recording a burst intent and reading the burst (M4 rule R3); not read from
     /// the environment.
     pub group_wait: Duration,
+    /// `CIBURST_FLEET_KEY`, which seals the fleet state in the cache bucket (M6.3 rule R2);
+    /// without it the function keeps no fleet store.
+    pub fleet_key: Option<FleetKey>,
 }
 
 /// What the dispatcher works on besides the environment.
@@ -67,6 +73,9 @@ pub struct Backends {
     /// The queue-first schedule beside it (M6.2 rules R2 to R4); `None` without an S3 cache
     /// key.
     pub schedule: Option<Arc<dyn Schedule>>,
+    /// The fleet state beside it (M6.3 rule R1); `None` without an S3 cache key or the fleet
+    /// key.
+    pub fleet: Option<Arc<dyn FleetStore>>,
 }
 
 impl Backends {
@@ -76,7 +85,13 @@ impl Backends {
             ledger: None,
             records: None,
             schedule: None,
+            fleet: None,
         }
+    }
+
+    pub fn with_fleet(mut self, fleet: Option<Arc<dyn FleetStore>>) -> Backends {
+        self.fleet = fleet;
+        self
     }
 
     pub fn with_ledger(mut self, ledger: Option<Arc<dyn Ledger>>) -> Backends {
@@ -160,7 +175,12 @@ impl Env {
             sweep_token: optional(vars::SWEEP_TOKEN),
             provider_env: BTreeMap::new(),
             dispatcher_env: BTreeMap::new(),
+            fleet_key: None,
         };
+        let fleet_key = optional(vars::FLEET_KEY)
+            .map(|secret| FleetKey::from_secret(&secret))
+            .transpose()
+            .map_err(|_| EnvError::Invalid(vars::FLEET_KEY.to_string()))?;
         let credentials = Credentials {
             secret_key: required(vars::SECRET_KEY)?,
             access_key: None,
@@ -192,6 +212,7 @@ impl Env {
             agent_sha256,
             vm_start,
             group_wait: Duration::from_secs(GROUP_WAIT_S),
+            fleet_key,
         })
     }
 
@@ -219,11 +240,13 @@ impl Env {
         let ledger = self.ledger_on(http.clone());
         let records = self.records_on(http.clone());
         let schedule = self.schedule_on(http.clone());
+        let fleet = self.fleet_on(http.clone());
         let Some(token) = &self.hetzner_token else {
             return Backends::new(main)
                 .with_ledger(ledger)
                 .with_records(records)
-                .with_schedule(schedule);
+                .with_schedule(schedule)
+                .with_fleet(fleet);
         };
         let hetzner: Arc<dyn Provider> = Arc::new(Hetzner::new(
             self.config.clone(),
@@ -241,6 +264,22 @@ impl Env {
             .with_ledger(ledger)
             .with_records(records)
             .with_schedule(schedule)
+            .with_fleet(fleet)
+    }
+
+    /// The fleet state in the ledger's bucket, under the same key and condition, sealed with
+    /// `CIBURST_FLEET_KEY`; `None` without that key.
+    pub fn fleet_on(&self, http: Arc<dyn HttpClient>) -> Option<Arc<dyn FleetStore>> {
+        let fleet_key = self.fleet_key.clone()?;
+        let (key, project_id) = self.cache_bucket()?;
+        Some(Arc::new(ScalewayFleetStore::in_cache_bucket(
+            http,
+            &self.config,
+            project_id,
+            &self.region,
+            key,
+            fleet_key,
+        )))
     }
 
     /// The burst ledger in the cache bucket `<name>-cache-<CIBURST_PROJECT_ID>` of
@@ -615,6 +654,70 @@ mod tests {
         let mut no_vm = vars_map();
         no_vm.remove(vars::VM_SECRET);
         assert!(env_from(&no_vm).unwrap().secrets.vm_secret.is_none());
+    }
+
+    /// M6.3 rules R1 and R2: `CIBURST_FLEET_KEY` builds the fleet store in the cache bucket,
+    /// which reads what the setup wrote with the same key.
+    #[tokio::test]
+    async fn the_fleet_key_builds_the_fleet_store() {
+        use ciburst_core::fleet::Member;
+        use ciburst_scaleway::provider::s3::S3;
+        use ciburst_scaleway::testing::s3_api::FakeS3;
+        use ciburst_scaleway::testing::scaleway_fake::{FAKE_ACCESS_KEY, FAKE_SECRET_KEY};
+
+        const SECRET: &str = "fleetsecretfleetsecretfleetsecr1";
+        let fake = Arc::new(FakeS3::new());
+        let env = env_from(&vars_map()).unwrap();
+        assert!(env.fleet_key.is_none());
+        assert!(env.fleet_on(fake.clone()).is_none());
+
+        let mut map = vars_map();
+        map.insert(vars::FLEET_KEY.to_string(), "short".to_string());
+        assert_eq!(
+            env_from(&map).err(),
+            Some(EnvError::Invalid(vars::FLEET_KEY.to_string()))
+        );
+        map.insert(vars::FLEET_KEY.to_string(), SECRET.to_string());
+        let mut no_cache = map.clone();
+        no_cache.remove(vars::CACHE_ACCESS_KEY);
+        assert!(
+            env_from(&no_cache)
+                .unwrap()
+                .fleet_on(fake.clone())
+                .is_none()
+        );
+
+        let env = env_from(&map).unwrap();
+        assert!(env.secrets.fleet_key.is_none(), "the key stays in Env");
+        let bucket = "demo-cache-project";
+        let owner = S3 {
+            http: fake.clone(),
+            region: "fr-par".into(),
+            access_key: FAKE_ACCESS_KEY.into(),
+            secret_key: FAKE_SECRET_KEY.into(),
+        };
+        owner.create_bucket(bucket).await.unwrap();
+        fake.add_key("AK", "SK");
+        let setup = ScalewayFleetStore::new(
+            fake.clone(),
+            "fr-par",
+            bucket,
+            &env.secrets.cache.clone().unwrap(),
+            FleetKey::from_secret(SECRET).unwrap(),
+        );
+        setup.put_config(CONFIG).await.unwrap();
+        let member = Member {
+            project_id: 7,
+            hook_secret: "hook-7".into(),
+            runners: BTreeMap::from([("vm".to_string(), "glrt-7".to_string())]),
+            joined_at: NOW,
+        };
+        setup.put_member(&member).await.unwrap();
+
+        let backends = env.backends_on(fake.clone(), Log::silent());
+        let fleet = backends.fleet.expect("fleet store");
+        assert_eq!(fleet.config().await.unwrap().as_deref(), Some(CONFIG));
+        assert_eq!(fleet.members().await.unwrap(), [member]);
     }
 
     /// M6.2 rule R6: `RUNNER_SPILL_TOKEN_<TAG>` of a VM pool, optional, as the host sets it.
