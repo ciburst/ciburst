@@ -94,6 +94,7 @@ One setup serves many projects, from any group or organization: they share its d
        inputs:
          role: member
    ```
+   While `gitlab.com/ciburst/ciburst` is private, a project outside the group `ciburst` cannot pull the cli image: a maintainer of `ciburst/ciburst` adds the joining project's path under Settings, CI/CD, Job token permissions, otherwise `ciburst-join` fails with `pull access denied`.
 3. Add two project variables, protected, "Masked and hidden", environment scope `ciburst`: `CIBURST_JOIN` (the code) and `CIBURST_GITLAB_TOKEN` (a personal access token of an Owner of this project with `api` and `create_runner`). No Scaleway credentials.
 4. Run the manual job `ciburst-join` (about a minute).
    Check: its log ends with `joined fleet <name>`; Settings, CI/CD, Runners lists the fleet's runners; the next pipeline runs on them.

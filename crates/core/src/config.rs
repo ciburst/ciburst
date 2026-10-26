@@ -204,6 +204,24 @@ pub struct Config {
 }
 
 impl Config {
+    /// The config without the keys only routing reads, which a fleet's dispatcher takes from
+    /// the fleet config (M6.3 rule R1): a change of these alone needs no function deploy.
+    pub fn deployment_view(&self) -> Config {
+        let mut view = self.clone();
+        view.default_pool = None;
+        view.ignore_jobs.clear();
+        for pool in &mut view.pools {
+            pool.jobs.clear();
+            pool.stages.clear();
+            pool.vm_first = None;
+            pool.warm_start = None;
+            pool.max_queue_s = None;
+            pool.max_runs = 0;
+            pool.slots = 0;
+        }
+        view
+    }
+
     /// The config `ciburst --ci` starts from (M5 rule R1): one VM pool on Scaleway Instances
     /// that takes every stage.
     pub fn ci_defaults(project_id: u64, server_url: &str) -> Config {

@@ -202,7 +202,7 @@ State (D58, M6.3 rules R1 and R2), in the cache bucket:
 - `ciburst/fleet/config.json`: the routing config, written by `ciburst-setup`, bound to the deployment by a MAC under `CIBURST_FLEET_KEY`;
 - `ciburst/fleet/members/<project id>.json`: one record per member with the project id, its webhook secret, the token of each runner it registered by pool tag, and the join time; secret fields sealed with AES-256-GCM under `CIBURST_FLEET_KEY`, which never leaves the function and the setup.
 
-The dispatcher reads both and keeps them for at most 30 s (`FLEET_CACHE`), so a config or member change applies within 30 s without a function deploy. Without fleet state (no fleet key, no bucket) it serves the projects of its environment's config, as before M6.3.
+The dispatcher reads both and keeps them for at most 30 s (`FLEET_CACHE`), so a config or member change applies within 30 s without a function deploy. The function's `CIBURST_CONFIG` keeps the config of its last deploy as the fallback; the setup compares it without the routing keys (`defaultPool`, `ignoreJobs`, and per pool `jobs`, `stages`, `vmFirst`, `warmStart`, `maxQueueS`, `maxRuns`, `slots`; `Config::deployment_view`), so changing only these writes the fleet config and leaves the function as it is. Without fleet state (no fleet key, no bucket) it serves the projects of its environment's config, as before M6.3.
 
 Join code (rule R3, `crates/core/src/invite.rs`): base64url of `{"v":1,"url":<dispatcher url>,"project":<id>,"exp":<unix>}`, a `.`, and base64url of its HMAC-SHA256 under the hook token; valid 7 days. `ciburst-invite` (variable `CIBURST_INVITE`) and `ciburst invite <project>` print it. The member's webhook secret is `hex(HMAC-SHA256(hook token, "hook:<project id>"))`.
 

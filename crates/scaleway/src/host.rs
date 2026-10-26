@@ -199,11 +199,17 @@ struct Settings {
     sandbox: &'static str,
     environment_variables: BTreeMap<String, String>,
     secret_environment_variables: BTreeMap<String, String>,
+    /// `CIBURST_CONFIG` as the digest sees it: [`Config::deployment_view`], so a routing
+    /// change alone leaves the function as it is (M6.3 rule R1).
+    #[serde(skip)]
+    config_view: String,
 }
 
 impl Settings {
     fn description(&self) -> Result<String> {
-        let digest = Sha256::digest(serde_json::to_vec(self)?);
+        let mut compared = serde_json::to_value(self)?;
+        compared["environment_variables"][vars::CONFIG] = Value::String(self.config_view.clone());
+        let digest = Sha256::digest(serde_json::to_vec(&compared)?);
         Ok(format!("{DESCRIPTION_PREFIX}{}", hex::encode(digest)))
     }
 
@@ -308,6 +314,11 @@ impl ScalewayFunction {
             (vars::PROJECT_ID.to_string(), project_id.to_string()),
             (vars::REGION.to_string(), self.client.region().to_string()),
         ]);
+        // Without a fleet key the dispatcher routes by this config, so all of it counts.
+        let config_view = match &secrets.fleet_key {
+            Some(_) => serde_json::to_string(&self.config.deployment_view())?,
+            None => serde_json::to_string(&*self.config)?,
+        };
         let mut secret = BTreeMap::new();
         if let Some(token) = &secrets.hook_token {
             secret.insert(vars::HOOK_TOKEN.to_string(), token.clone());
@@ -352,6 +363,7 @@ impl ScalewayFunction {
             sandbox: SANDBOX,
             environment_variables,
             secret_environment_variables: secret,
+            config_view,
         })
     }
 
@@ -942,6 +954,7 @@ mod tests {
             sandbox: SANDBOX,
             environment_variables: BTreeMap::new(),
             secret_environment_variables: BTreeMap::new(),
+            config_view: String::new(),
         };
         assert_eq!(MEMORY_LIMIT_MB, 1024);
         assert_ne!(

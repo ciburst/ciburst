@@ -270,6 +270,46 @@ async fn a_new_fleet_key_updates_the_function_only() {
     );
 }
 
+/// M6.3 rule R1, found in the live drill: a routing change of a fleet redeployed the function.
+#[tokio::test]
+async fn a_fleet_routing_change_leaves_the_function_alone() {
+    let fake = Arc::new(FakeFunctions::new());
+    let first = host(two_pools(), &fake);
+    first
+        .apply(&first.plan(&secrets()).await.unwrap(), &secrets())
+        .await
+        .unwrap();
+
+    let mut routing = (*two_pools()).clone();
+    routing.ignore_jobs = vec!["prettier".into()];
+    routing.default_pool = Some("build-x".into());
+    routing.pools[0].jobs = vec!["lint-*".into()];
+    routing.pools[1].stages = vec!["build".into(), "test".into()];
+    routing.pools[1].max_runs = 9;
+    let routed = host(Arc::new(routing.clone()), &fake);
+    let plan = routed.plan(&secrets()).await.unwrap();
+    assert!(plan.iter().all(Step::is_noop), "{plan:?}");
+
+    let mut unfleeted = secrets();
+    unfleeted.fleet_key = None;
+    let plan = routed.plan(&unfleeted).await.unwrap();
+    assert_eq!(
+        plan[1].action,
+        Action::Update,
+        "without a fleet key routing counts"
+    );
+
+    let mut shape = routing;
+    shape.pools[1].image = "img/buildkit".into();
+    let reshaped = host(Arc::new(shape), &fake);
+    let plan = reshaped.plan(&secrets()).await.unwrap();
+    assert_eq!(
+        plan[1].action,
+        Action::Update,
+        "a pool's image is not routing"
+    );
+}
+
 #[tokio::test]
 async fn a_rotated_hook_token_updates_the_function_and_the_cron() {
     let fake = Arc::new(FakeFunctions::new());

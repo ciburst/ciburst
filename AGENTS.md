@@ -50,6 +50,7 @@ Goal: the project's jobs run on another project's ciburst setup (the host). You 
 2. Steps 2 to 5 and 7 of the adopt task apply unchanged: keep `image:`, handle Docker-in-Docker, hosted-runner jobs and lane tags. The lanes and `ignoreJobs` are the host's: lane tags must name the host's lanes, and new lanes or `ignoreJobs` entries go into the host's `ciburst.json`.
 3. Hand the human this list, unchanged:
    - In the host: the project variable `CIBURST_INVITE` with this project's id, then run `ciburst-invite` and copy the code.
+   - While `gitlab.com/ciburst/ciburst` is private and this project is outside the group `ciburst`: add this project's path to its job token allowlist (Settings, CI/CD, Job token permissions).
    - In this project: `CIBURST_JOIN` (the code) and `CIBURST_GITLAB_TOKEN` (an Owner's personal access token with `api` and `create_runner`): protected, "Masked and hidden", environment scope `ciburst`; the default branch protected.
    - Then run `ciburst-join`; its log ends with `joined fleet <name>`.
 

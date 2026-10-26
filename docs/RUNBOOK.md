@@ -483,6 +483,15 @@ Result (2026-10-26, `gitlab/gitlab-runner:v18.11.4` in Docker with the Docker ex
 - a runner removed from the live `config.toml` was dropped about 1 s later (`Configuration loaded`) and its jobs stayed pending; a runner added back took a waiting job 2 s after the change;
 - `SIGQUIT` logged `Starting graceful shutdown, waiting for builds to finish`, the two running jobs finished, and the process exited 22 s later.
 
+### M6.3 drill: a member in another namespace
+
+Result (2026-10-26, the demo as host in `nl-ams`, a member project in a personal namespace with three `node:24-alpine` jobs):
+
+- the first `ciburst-setup` after M6.3 wrote the fleet config and the host's member record (`update fleet config`, `create member <host id>`);
+- `ciburst-join` failed with `pull access denied` for the cli image until the member's path was on the job token allowlist of `ciburst/ciburst` (private until M7); then it registered the runners `vm`, `node24`, `rust`, created the webhook and logged `joined fleet <name>` within 3 s;
+- a host job and a member job ran on the same VM at once, under their own runners (`runner-<token prefix>-project-<id>-concurrent-0` each, so their volumes stay apart); the third pending job started a second VM, as `slots` 2 asks;
+- a routing-only config change (`ignoreJobs`) redeployed the function (about 10 minutes), against rule R1; fixed by comparing the function settings with `Config::deployment_view` (spec section 5.6).
+
 ## `run-single` flags
 
 Lanes use `run-single`. VMs used it per slot until D59 and now run one `gitlab-runner run` (spec section 6.1); the VM slot column is history.
