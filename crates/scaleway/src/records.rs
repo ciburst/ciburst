@@ -11,7 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ciburst_core::config::Config;
 use ciburst_core::http::HttpClient;
-use ciburst_core::ledger::{OpenPipeline, PipelineRecords, VmJobs, unseen_of};
+use ciburst_core::ledger::{Closed, OpenPipeline, PipelineRecords, VmJobs, unseen_of};
 use ciburst_core::types::KeyPair;
 use ciburst_core::{Error, Result};
 
@@ -70,6 +70,18 @@ pub fn pipeline_prefix(pipeline: &str) -> Result<String> {
         return Err(invalid(format!("pipeline id {pipeline:?} is not a number")));
     }
     Ok(format!("{PIPELINE_PREFIX}{pipeline}/"))
+}
+
+/// D56: the closed records sit outside `_pipelines/`, so the listing of open records stays short;
+/// the lifecycle rule of `ciburst/intents/` removes them.
+pub const CLOSED_PREFIX: &str = "ciburst/intents/_closed/";
+
+/// `ciburst/intents/_closed/<pipeline>`; the pipeline id is an [`is_id`] number.
+pub fn closed_key(pipeline: &str) -> Result<String> {
+    if !is_id(pipeline) {
+        return Err(invalid(format!("pipeline id {pipeline:?} is not a number")));
+    }
+    Ok(format!("{CLOSED_PREFIX}{pipeline}"))
 }
 
 pub fn vm_jobs_key(pipeline: &str) -> Result<String> {
@@ -152,6 +164,22 @@ impl PipelineRecords for ScalewayPipelineRecords {
             self.s3.delete_object(&self.bucket, &object.key).await?;
         }
         Ok(())
+    }
+
+    async fn mark_closed(&self, pipeline: &str, closed: &Closed) -> Result<()> {
+        let key = closed_key(pipeline)?;
+        let body = serde_json::to_vec(closed)?;
+        self.s3.put_object(&self.bucket, &key, body).await
+    }
+
+    async fn closed(&self, pipeline: &str) -> Result<Option<Closed>> {
+        let key = closed_key(pipeline)?;
+        let Some(body) = self.s3.get_object(&self.bucket, &key).await? else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&body)
+            .map(Some)
+            .map_err(|error| invalid(format!("{key}: {error}")))
     }
 
     /// One listing of every record (M6.2 rule R7): a pipeline is open while its `vm-jobs.json`

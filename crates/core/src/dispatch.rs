@@ -11,8 +11,8 @@ use tokio::time::Instant;
 use crate::check::is_own_job;
 use crate::config::{CacheType, Config, Pool};
 use crate::ledger::{
-    GROUP_WAIT_S, GROUP_WINDOW_S, Intent, Ledger, PipelineRecords, Queued, Running, Schedule,
-    VmJobs,
+    Closed, GROUP_WAIT_S, GROUP_WINDOW_S, Intent, Ledger, PipelineRecords, Queued, Running,
+    Schedule, VmJobs,
 };
 use crate::log::Log;
 use crate::provision::keys;
@@ -47,6 +47,19 @@ const WAITING_STATUSES: [&str; 5] = [
 
 /// M6.1 rule R3: the statuses that end a pipeline and its records.
 const FINAL_STATUSES: [&str; 4] = ["success", "failed", "canceled", "skipped"];
+
+/// D56: the ids of a pipeline event's builds with status `manual`.
+fn manual_jobs(event: &Value) -> Vec<String> {
+    event
+        .get("builds")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|build| build.get("status").and_then(Value::as_str) == Some("manual"))
+        .filter_map(|build| build.get("id").and_then(Value::as_u64))
+        .map(|id| id.to_string())
+        .collect()
+}
 
 /// M6.2 rule R3: the job statuses the schedule tracks, `running` and the final ones.
 const TRACKED_STATUSES: [&str; 5] = ["running", "success", "failed", "canceled", "skipped"];
@@ -354,6 +367,12 @@ impl Dispatcher {
             .get("pipeline_id")
             .and_then(Value::as_u64)
             .map(|id| id.to_string());
+        if let Some(pipeline) = &pipeline
+            && self.stale(event, pipeline, &labels["job"], at).await
+        {
+            self.info(at, "stale", &fields);
+            return ignored("pipeline_closed", json!({ "pipeline": pipeline }));
+        }
         if self.config.is_vm_pool(&pool)
             && let Some(pipeline) = &pipeline
         {
@@ -1076,6 +1095,28 @@ impl Dispatcher {
 
     /// M6.1 rules R3 and R4: a pending or running pipeline gets the warm step, a final status
     /// deletes the pipeline's records.
+    /// D56: a pending event of a job that existed before its pipeline's final event and was not
+    /// manual then. GitLab delivered it late, the job has run, and starting a VM or a lane run
+    /// for it would only cost money. A retried job is a new job created after the close.
+    async fn stale(&self, event: &Value, pipeline: &str, job: &str, at: Arrival) -> bool {
+        let Some(records) = &self.records else {
+            return false;
+        };
+        let closed = match records.closed(pipeline).await {
+            Ok(Some(closed)) => closed,
+            Ok(None) => return false,
+            Err(error) => {
+                self.records_failed(at, "closed", pipeline, &error);
+                return false;
+            }
+        };
+        let created = event
+            .get("build_created_at")
+            .and_then(Value::as_str)
+            .and_then(crate::time::parse_gitlab_time);
+        !closed.manual.iter().any(|id| id == job) && created.is_some_and(|c| c < closed.at)
+    }
+
     async fn pipeline_event(
         &self,
         headers: &[(String, String)],
@@ -1106,10 +1147,17 @@ impl Dispatcher {
             ("project", project.as_str()),
         ];
         if FINAL_STATUSES.contains(&status) {
-            if let Some(records) = &self.records
-                && let Err(error) = records.close(&pipeline).await
-            {
-                self.records_failed(at, "close", &pipeline, &error);
+            if let Some(records) = &self.records {
+                if let Err(error) = records.close(&pipeline).await {
+                    self.records_failed(at, "close", &pipeline, &error);
+                }
+                let closed = Closed {
+                    at: now,
+                    manual: manual_jobs(event),
+                };
+                if let Err(error) = records.mark_closed(&pipeline, &closed).await {
+                    self.records_failed(at, "mark_closed", &pipeline, &error);
+                }
             }
             self.info(at, "closed", &names);
             return reply(200, "closed", json!({ "pipeline": id }));
@@ -3944,6 +3992,84 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    /// D56: after its pipeline's final event, a pending event of a job that existed before the
+    /// close starts nothing; a manual job played later and a retried job still start.
+    #[tokio::test(start_paused = true)]
+    async fn late_pending_events_of_a_closed_pipeline_start_nothing() {
+        let records = Arc::new(MemoryPipelineRecords::new());
+        let s = warm_setup(
+            records_config(""),
+            vm_secrets(),
+            None,
+            Some(records.clone()),
+        )
+        .await;
+        let now = T0 + 600;
+        s.set_clock(now);
+        let mut manual = build(4, "release", "deploy");
+        manual["status"] = "manual".into();
+        let closed = s
+            .pipeline_at(9, "success", &[build(2, "unit", "test"), manual], now)
+            .await;
+        assert_eq!(closed.body["result"], "closed");
+        assert_eq!(
+            records.closed("9").await.unwrap(),
+            Some(Closed {
+                at: now,
+                manual: vec!["4".to_string()]
+            })
+        );
+        let pending = |job: u64, created: &str| {
+            json!({
+                "object_kind": "build", "build_id": job, "build_name": "unit",
+                "build_stage": "test", "build_status": "pending", "pipeline_id": 9,
+                "project_id": 7, "build_created_at": created
+            })
+            .to_string()
+        };
+        let before = crate::time::rfc3339(T0);
+        let after = crate::time::rfc3339(now + 5);
+        let late = s
+            .dispatcher
+            .handle_request(
+                "POST",
+                "/",
+                &headers("hook-secret"),
+                pending(2, &before).as_bytes(),
+                now + 2000,
+            )
+            .await;
+        assert_eq!(
+            late.body,
+            json!({ "result": "ignored", "reason": "pipeline_closed", "pipeline": "9", "ms": 0 })
+        );
+        assert!(s.recording.started.lock().unwrap().is_empty());
+        assert!(s.lines().iter().any(|l| l.starts_with("info stale ")));
+
+        for (job, created) in [(4, before.as_str()), (5, after.as_str())] {
+            let served = s
+                .dispatcher
+                .handle_request(
+                    "POST",
+                    "/",
+                    &headers("hook-secret"),
+                    pending(job, created).as_bytes(),
+                    now + 10,
+                )
+                .await;
+            assert_ne!(
+                served.body["reason"], "pipeline_closed",
+                "job {job}: {}",
+                served.body
+            );
+        }
+        assert_eq!(
+            s.recording.started.lock().unwrap().len(),
+            2,
+            "both start capacity"
+        );
     }
 
     #[tokio::test(start_paused = true)]

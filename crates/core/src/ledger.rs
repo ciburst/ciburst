@@ -86,6 +86,17 @@ pub struct OpenPipeline {
     pub unseen: VmJobs,
 }
 
+/// A finished pipeline (D56): when it ended and which of its jobs were still manual then, so a
+/// pending event that GitLab delivers late for one of its jobs can be told from a new one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Closed {
+    /// Unix seconds of the pipeline's final event.
+    pub at: u64,
+    /// Ids of the jobs with status `manual` in that event; playing one later is a new run.
+    #[serde(default)]
+    pub manual: Vec<String>,
+}
+
 /// Warm start records of a pipeline (M6.1 rules R4 to R6): the pipeline's VM jobs per pool and
 /// a marker per VM job that went pending. Lives beside the intents, under
 /// `ciburst/intents/_pipelines/<pipeline>/` in the cache bucket.
@@ -108,6 +119,15 @@ pub trait PipelineRecords: Send + Sync {
             "the records cannot list open pipelines",
         ))
     }
+    /// Records that `pipeline` finished (D56); a later call replaces the earlier one.
+    async fn mark_closed(&self, _pipeline: &str, _closed: &Closed) -> Result<()> {
+        Ok(())
+    }
+    /// The [`Closed`] record of `pipeline`, `None` while it runs or after the lifecycle rule
+    /// removed it.
+    async fn closed(&self, _pipeline: &str) -> Result<Option<Closed>> {
+        Ok(None)
+    }
 }
 
 /// One pipeline's record in [`MemoryPipelineRecords`].
@@ -121,6 +141,7 @@ struct MemoryRecord {
 #[derive(Default)]
 pub struct MemoryPipelineRecords {
     records: Mutex<BTreeMap<String, MemoryRecord>>,
+    closed: Mutex<BTreeMap<String, Closed>>,
     clock: Option<crate::fake::Clock>,
 }
 
@@ -192,6 +213,18 @@ impl PipelineRecords for MemoryPipelineRecords {
                 unseen: unseen_of(&record.jobs, &record.seen),
             })
             .collect())
+    }
+
+    async fn mark_closed(&self, pipeline: &str, closed: &Closed) -> Result<()> {
+        self.closed
+            .lock()
+            .expect("records")
+            .insert(pipeline.to_string(), closed.clone());
+        Ok(())
+    }
+
+    async fn closed(&self, pipeline: &str) -> Result<Option<Closed>> {
+        Ok(self.closed.lock().expect("records").get(pipeline).cloned())
     }
 }
 

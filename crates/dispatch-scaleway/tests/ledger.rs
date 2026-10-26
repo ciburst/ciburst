@@ -472,12 +472,13 @@ async fn vm_start_calls(backend: &Arc<ScalewayFake>, env: &Env) -> (Vec<String>,
     )
 }
 
-/// M7 hardening rule R3, measured on the fake: a pending job that starts a VM makes nine
+/// M7 hardening rule R3, measured on the fake: a pending job that starts a VM makes ten
 /// Scaleway calls through a function without `CIBURST_VM_SECURITY_GROUP` and
 /// `CIBURST_VM_IMAGES`: the capacity read, both lookups, create, user data and power on, the
-/// burst intent's write and read, and the read of its pipeline's warm start record (M6.1 rule
-/// R5). The second start makes no lookup; it finds the first VM alive, so it also reads the
-/// queue and the running jobs of the pool before it starts (M6.2 rule R2), nine calls again.
+/// burst intent's write and read, and the reads of its pipeline's closed record (D56) and warm
+/// start record (M6.1 rule R5). The second start makes no lookup; it finds the first VM alive,
+/// so it also reads the queue and the running jobs of the pool before it starts (M6.2 rule
+/// R2), ten calls again.
 #[tokio::test]
 async fn the_function_starts_a_vm_without_lookups_on_the_resolved_variables() {
     let (backend, mut vars) = deployed("instances").await;
@@ -491,7 +492,7 @@ async fn the_function_starts_a_vm_without_lookups_on_the_resolved_variables() {
     assert_eq!(looked_up.len(), 6, "{looked_up:#?}");
     assert_eq!(looked_up[0], format!("{zone}/servers"), "capacity");
     assert_eq!(looked_up[1..3], lookups);
-    assert_eq!(total, 9);
+    assert_eq!(total, 10);
 
     let config = Arc::new(parse_config(&vars[vars::CONFIG]).unwrap());
     let provider = Scaleway::new(config, backend.client(), Log::silent());
@@ -508,5 +509,5 @@ async fn the_function_starts_a_vm_without_lookups_on_the_resolved_variables() {
         direct.iter().all(|call| !lookups.contains(call)),
         "{direct:#?}"
     );
-    assert_eq!(total, 9);
+    assert_eq!(total, 10);
 }

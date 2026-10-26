@@ -100,6 +100,7 @@ Where to look when a job waits:
 | 200 | `ignored`, reason `project` | a project not in `gitlab.projectIds` |
 | 200 | `ignored`, reason `unmapped_stage` (`stage`) | no `jobs` pattern matches the job's name, no pool lists its stage and there is no `defaultPool` |
 | 200 | `ignored`, reason `own_job` | a job named `ciburst-*`, the component's own jobs |
+| 200 | `ignored`, reason `pipeline_closed` (`pipeline`) | a pending event GitLab delivered after its pipeline had ended, for a job that existed before the end and was not manual (D56); nothing starts |
 | 200 | `ignored`, reason `ignore_jobs` | a job named in `ignoreJobs`, which runs on other runners |
 | 200 | `warm` (`pipeline`, `pools[]` with `pool`, `action`, `vmJobs`, `runId`) | a pipeline event: per VM pool `started` (a warm VM boots with every slot free), `capacity` (a VM with a free slot exists or one is starting), `at_capacity`, `disabled` (`warmStart` false) |
 | 200 | `ignored`, reason `no_vm_jobs` | a pipeline event whose open jobs all run in lanes or elsewhere |

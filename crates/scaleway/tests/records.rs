@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use ciburst_core::config::parse_config;
-use ciburst_core::ledger::{Intent, Ledger, PipelineRecords, VmJobs};
+use ciburst_core::ledger::{Closed, Intent, Ledger, PipelineRecords, VmJobs};
 use ciburst_core::types::KeyPair;
 use ciburst_scaleway::ledger::{MAX_PAGES, ScalewayLedger};
 use ciburst_scaleway::provider::s3::S3;
@@ -476,4 +476,31 @@ async fn open_pipelines_lists_the_records_without_their_seen_jobs() {
         open.iter().map(|p| p.pipeline.as_str()).collect::<Vec<_>>(),
         ["90"]
     );
+}
+
+#[tokio::test]
+async fn closed_records_sit_beside_the_open_ones() {
+    let (fake, records) = records().await;
+    assert_eq!(records.closed("9").await.unwrap(), None);
+    records
+        .open("9", &vm_jobs(&[("vm", &["11"])]))
+        .await
+        .unwrap();
+    records.close("9").await.unwrap();
+    let closed = Closed {
+        at: NOW,
+        manual: vec!["12".to_string()],
+    };
+    records.mark_closed("9", &closed).await.unwrap();
+    assert_eq!(records.closed("9").await.unwrap(), Some(closed));
+    assert_eq!(records.closed("90").await.unwrap(), None);
+    assert!(records.open_pipelines().await.unwrap().is_empty());
+    assert_eq!(
+        fake.objects(BUCKET),
+        [(
+            "ciburst/intents/_closed/9".to_string(),
+            br#"{"at":1800000000,"manual":["12"]}"#.to_vec()
+        )]
+    );
+    assert!(records.closed("x").await.is_err());
 }
