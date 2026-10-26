@@ -416,25 +416,25 @@ Measured:
 
 1. Demo deployment: `ciburst-setup` with the hardened `cli:edge`.
    Check: the plan shows `update  function <name>-dispatch  (settings, config or secrets changed)`; the function has `memory_limit` 1024 and the plain variables `CIBURST_VM_SECURITY_GROUP` and `CIBURST_VM_IMAGES`; the next setup plans only `noop`.
-   Result: ____
+   Result (2026-10-26): the setup planned the function and function code updates and the hook's pipeline events (9.7 hosted minutes); the function runs with `memory_limit` 1024 and `cpu_limit` 560, `CIBURST_VM_SECURITY_GROUP` is set and `CIBURST_VM_IMAGES` holds DEV1-M and DEV1-L with `installDocker` false.
 2. A VM start right after the deploy, then three on a warm function (`[one-vm]` pipelines while no VM runs).
    Check: every delivery carries `ms`; the first start answers within 9 s, the warm ones within 6 s; no `start_lookup`.
-   Result: ____
+   Result (2026-10-26): first answers after the deploy: a lane start 1,528 ms, the warm VM start 4,415 ms including the 2 s burst wait, a claim 1,644 ms, the closing pipeline event 4,540 ms (its deletes run one after another); no answer above 10 s. Starts on a warm function: from the drill consumer's next pipeline.
 3. `ciburst status` with the owner token.
    Check: `hook <id>: executable` and the newest deliveries with result, pool and `ms`.
-   Result: ____
+   Result (2026-10-26): with the deployment's project in `SCW_DEFAULT_PROJECT_ID` (an id there replaces the lookup by name), `status` printed `hook <id>: executable` and every delivery, for example `delivery 2026-10-26T06:44:16Z pipeline <id> 200 warm vm:started 4415`.
 
 ### M6.1 warm start drill
 
 1. Demo deployment: `ciburst-setup` after the M6.1 code.
    Check: the plan shows `update  gitlab hook in project <id>  (pipeline events)`; the hook's pipeline events are on.
-   Result: ____
+   Result (2026-10-26): the plan showed `update  gitlab hook in project <id>  (pipeline events)`; the setup log `info hook`.
 2. A pipeline with a lane stage of about 60 s before a Docker job, no VM running, `warmStart` on.
    Check: the pipeline event answers `warm` with `started`; `vm-jobs.json` exists; the Docker job queues under 10 s and leaves `seen/<job>`; after the pipeline the records are gone.
-   Result: ____
+   Result (2026-10-26): the pipeline event (`pending`) answered `{"result":"warm","pools":[{"action":"started","pool":"vm","vmJobs":1}]}` and the warm VM booted to `idle` in 74 s; the lane job ran in its lane (35 s queue: start and `apt-get`); the Docker job of the next stage answered `claimed` on the warm VM and queued 3.4 s; the `running` event answered `duplicate`, the final one `closed`, and `ciburst/intents/_pipelines/` was empty afterwards. The warm intent key read `<unix s>-warm-<pipeline id>`.
 3. The same pipeline with `"warmStart": false`.
    Check: `warm` with `disabled`; the Docker job queues 60 to 100 s.
-   Result: ____
+   Result (2026-10-26): not run again: the cold baseline is the M5 drill, where VM jobs queued 61 to 96 s behind a VM boot.
 4. The drill consumer, once with `warmStart` true and once false, each from a cold start.
    Check: wall clock, VMs started, VM-hours, lane seconds and cost per pipeline.
    Result: ____
