@@ -36,6 +36,8 @@ pub struct Config {
     pub dispatch_url: String,
     pub server_url: String,
     pub runner_token: String,
+    /// Token of the pool's spill runner (M6.2 rule R6); without it the VM never spills.
+    pub spill_token: Option<String>,
     pub pool: String,
     pub slots: u32,
     pub default_image: String,
@@ -160,6 +162,7 @@ pub fn parse(text: &str) -> Result<Config, ConfigError> {
             .to_string(),
         server_url: required("CI_SERVER_URL"),
         runner_token: required("RUNNER_TOKEN"),
+        spill_token: get("RUNNER_SPILL_TOKEN").map(String::from),
         pool: required("CIBURST_POOL"),
         slots,
         default_image: required("CIBURST_DEFAULT_IMAGE"),
@@ -188,6 +191,7 @@ CIBURST_VM_TOKEN=vm-token-secret
 CIBURST_DISPATCH_URL=https://dispatch.example.invalid/
 CI_SERVER_URL=https://gitlab.example.invalid
 RUNNER_TOKEN=glrt-runner-secret
+RUNNER_SPILL_TOKEN=glrt-spill-secret
 CIBURST_POOL=vm
 CIBURST_SLOTS=2
 CIBURST_DEFAULT_IMAGE=registry.example.invalid/ciburst/node:1
@@ -226,6 +230,7 @@ CACHE_SHARED=true
         assert_eq!(config.dispatch_url, "https://dispatch.example.invalid");
         assert_eq!(config.server_url, "https://gitlab.example.invalid");
         assert_eq!(config.runner_token, "glrt-runner-secret");
+        assert_eq!(config.spill_token.as_deref(), Some("glrt-spill-secret"));
         assert_eq!(config.pool, "vm");
         assert_eq!(config.slots, 2);
         assert_eq!(
@@ -256,6 +261,7 @@ CACHE_SHARED=true
         );
         for secret in [
             "glrt-runner-secret",
+            "glrt-spill-secret",
             "cache-secret-key",
             "SCWACCESSKEYSAMPLE",
         ] {
@@ -305,6 +311,18 @@ CACHE_SHARED=true
     }
 
     #[test]
+    fn the_spill_token_is_optional() {
+        assert_eq!(
+            parse(&without("RUNNER_SPILL_TOKEN")).unwrap().spill_token,
+            None
+        );
+        assert_eq!(
+            parse(&with("RUNNER_SPILL_TOKEN", "")).unwrap().spill_token,
+            None
+        );
+    }
+
+    #[test]
     fn quotes_and_spaces_are_trimmed() {
         let config = parse(&with("CIBURST_POOL", "\"vm\"")).unwrap();
         assert_eq!(config.pool, "vm");
@@ -318,6 +336,7 @@ CACHE_SHARED=true
         for secret in [
             "vm-token-secret",
             "glrt-runner-secret",
+            "glrt-spill-secret",
             "cache-secret-key",
             "SCWACCESSKEYSAMPLE",
         ] {
