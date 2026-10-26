@@ -137,6 +137,10 @@ pub struct Secrets {
     /// (`CIBURST_AGENT_SHA256`); the host stores them as ordinary environment variables.
     #[serde(default)]
     pub dispatcher_env: BTreeMap<String, String>,
+    /// Seals the fleet's member records and binds its config (M6.3 rule R2); never leaves the
+    /// dispatcher and the setup.
+    #[serde(default)]
+    pub fleet_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
