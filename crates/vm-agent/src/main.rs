@@ -1,9 +1,10 @@
-//! VM supervisor, spec section 6.1: runs `gitlab-runner run-single` slots, reports the VM's
-//! state to the dispatcher, drains at minute 55 of a paid hour and asks the dispatcher to
-//! terminate the VM.
+//! VM supervisor, spec section 6.1: runs one `gitlab-runner run` with an entry for every member
+//! runner of its pool, reports the VM's state to the dispatcher, drains at minute 55 of a paid
+//! hour and asks the dispatcher to terminate the VM.
 
 mod agent;
 mod config;
+mod runners;
 mod system;
 
 use std::process::ExitCode;
@@ -12,7 +13,7 @@ use std::sync::Arc;
 use ciburst_core::http::ReqwestClient;
 use ciburst_core::log::Log;
 
-use crate::system::{DockerCli, ProcUptime, ProcessSlots, System, SystemClock};
+use crate::system::{DockerCli, LocalFiles, LocalProcess, ProcUptime, System, SystemClock};
 
 const USAGE: u8 = 64;
 
@@ -68,7 +69,8 @@ fn main() -> ExitCode {
     let sys = System {
         clock: Arc::new(SystemClock::new()),
         uptime: Arc::new(ProcUptime),
-        slots: Box::new(ProcessSlots::default()),
+        process: Box::new(LocalProcess::default()),
+        files: Arc::new(LocalFiles),
         docker: Arc::new(DockerCli),
         http: Arc::new(http),
     };

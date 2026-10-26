@@ -1,8 +1,9 @@
 //! Every interaction of the agent with the operating system, behind traits so the protocol in
 //! `agent.rs` runs against fakes with a fake clock. Production implementations are below.
 
-use std::collections::BTreeMap;
-use std::io;
+use std::fs;
+use std::io::{self, Write};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,8 +13,6 @@ use ciburst_core::http::HttpClient;
 
 /// Label the Docker executor puts on every job container (`executors/docker/internal/labels`).
 pub const JOB_LABEL: &str = "com.gitlab.gitlab-runner.job.id";
-/// Label every container of a slot's jobs carries, from `--docker-container-labels`.
-pub const SLOT_LABEL: &str = "ciburst.slot";
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[async_trait]
@@ -28,24 +27,32 @@ pub trait Uptime: Send + Sync {
     fn seconds(&self) -> io::Result<u64>;
 }
 
-/// One `gitlab-runner run-single` process per slot.
-pub trait Slots: Send {
-    fn spawn(&mut self, command: &SlotCommand) -> io::Result<()>;
-    /// `Some(code)` once the slot's process has exited, `-1` when a signal ended it.
-    fn try_exit(&mut self, slot: u32) -> io::Result<Option<i32>>;
-    /// Sends `SIGQUIT`: the runner stops requesting jobs, finishes the current one and exits.
-    fn quit(&mut self, slot: u32) -> io::Result<()>;
+/// The VM's one `gitlab-runner run` process (M6.3 rule R5).
+pub trait Process: Send {
+    /// Starts the process and returns its id.
+    fn spawn(&mut self, command: &ProcessCommand) -> io::Result<u32>;
+    /// `Some(code)` once the process has exited, `-1` when a signal ended it; an error while
+    /// none runs.
+    fn try_exit(&mut self) -> io::Result<Option<i32>>;
+    /// Sends `SIGQUIT`: the runner stops requesting jobs, finishes the running ones and exits.
+    fn quit(&mut self) -> io::Result<()>;
+}
+
+/// The runner's `config.toml`.
+pub trait Files: Send + Sync {
+    /// Replaces `path` with `content` in one rename, readable by its owner only.
+    fn write_atomic(&self, path: &Path, content: &str) -> io::Result<()>;
 }
 
 #[async_trait]
 pub trait Docker: Send + Sync {
-    /// Output of `docker ps` printing the job id and slot labels of every running job
-    /// container, one container per line.
+    /// Output of `docker ps` printing the job id label of every running job container, one
+    /// container per line.
     async fn job_labels(&self) -> io::Result<String>;
 }
 
-pub struct SlotCommand {
-    pub slot: u32,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessCommand {
     pub program: String,
     pub args: Vec<String>,
 }
@@ -53,7 +60,8 @@ pub struct SlotCommand {
 pub struct System {
     pub clock: Arc<dyn Clock>,
     pub uptime: Arc<dyn Uptime>,
-    pub slots: Box<dyn Slots>,
+    pub process: Box<dyn Process>,
+    pub files: Arc<dyn Files>,
     pub docker: Arc<dyn Docker>,
     pub http: Arc<dyn HttpClient>,
 }
@@ -85,7 +93,7 @@ pub struct ProcUptime;
 
 impl Uptime for ProcUptime {
     fn seconds(&self) -> io::Result<u64> {
-        parse_uptime(&std::fs::read_to_string("/proc/uptime")?)
+        parse_uptime(&fs::read_to_string("/proc/uptime")?)
     }
 }
 
@@ -128,19 +136,46 @@ pub fn docker_ps_args() -> Vec<String> {
         "--filter".to_string(),
         format!("label={JOB_LABEL}"),
         "--format".to_string(),
-        format!("{{{{.Label \"{JOB_LABEL}\"}}}} {{{{.Label \"{SLOT_LABEL}\"}}}}"),
+        format!("{{{{.Label \"{JOB_LABEL}\"}}}}"),
     ]
 }
 
-#[derive(Default)]
-pub struct ProcessSlots {
-    children: BTreeMap<u32, Child>,
+pub struct LocalFiles;
+
+impl Files for LocalFiles {
+    fn write_atomic(&self, path: &Path, content: &str) -> io::Result<()> {
+        let dir = path
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no parent directory"))?;
+        fs::create_dir_all(dir)?;
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(".new");
+        let temp = dir.join(name);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // The file holds runner tokens and the cache key.
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp, path)
+    }
 }
 
-impl Slots for ProcessSlots {
-    fn spawn(&mut self, command: &SlotCommand) -> io::Result<()> {
+#[derive(Default)]
+pub struct LocalProcess {
+    child: Option<Child>,
+}
+
+impl Process for LocalProcess {
+    fn spawn(&mut self, command: &ProcessCommand) -> io::Result<u32> {
         let mut process = Command::new(&command.program);
-        // The runner reads many settings from its environment; the flags are the only source.
+        // The runner reads settings from its environment; `config.toml` is the only source.
         process.args(&command.args).env_clear().stdin(Stdio::null());
         for key in ["PATH", "HOME"] {
             if let Some(value) = std::env::var_os(key) {
@@ -148,29 +183,30 @@ impl Slots for ProcessSlots {
             }
         }
         let child = process.spawn()?;
-        self.children.insert(command.slot, child);
-        Ok(())
+        let id = child.id();
+        self.child = Some(child);
+        Ok(id)
     }
 
-    fn try_exit(&mut self, slot: u32) -> io::Result<Option<i32>> {
-        let child = self.child(slot)?;
+    fn try_exit(&mut self) -> io::Result<Option<i32>> {
+        let child = self.child()?;
         let Some(status) = child.try_wait()? else {
             return Ok(None);
         };
-        self.children.remove(&slot);
+        self.child = None;
         Ok(Some(status.code().unwrap_or(-1)))
     }
 
-    fn quit(&mut self, slot: u32) -> io::Result<()> {
-        send_sigquit(self.child(slot)?.id())
+    fn quit(&mut self) -> io::Result<()> {
+        send_sigquit(self.child()?.id())
     }
 }
 
-impl ProcessSlots {
-    fn child(&mut self, slot: u32) -> io::Result<&mut Child> {
-        self.children
-            .get_mut(&slot)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no slot {slot}")))
+impl LocalProcess {
+    fn child(&mut self) -> io::Result<&mut Child> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no runner process"))
     }
 }
 
@@ -210,28 +246,28 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn wait_exit(slots: &mut ProcessSlots, slot: u32) -> i32 {
+    fn wait_exit(process: &mut LocalProcess) -> i32 {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if let Some(code) = slots.try_exit(slot).unwrap() {
+            if let Some(code) = process.try_exit().unwrap() {
                 return code;
             }
-            assert!(Instant::now() < deadline, "slot {slot} did not exit");
+            assert!(Instant::now() < deadline, "the process did not exit");
             std::thread::sleep(Duration::from_millis(20));
         }
     }
 
     #[cfg(unix)]
     #[test]
-    fn slot_processes_get_sigquit_and_a_clean_environment() {
+    fn the_process_gets_sigquit_and_a_clean_environment() {
         let dir = tempfile::tempdir().unwrap();
         let ready = dir.path().join("ready");
         let env = dir.path().join("env");
         let script = "env > \"$2\"; trap 'exit 3' QUIT; : > \"$1\"; while :; do sleep 0.05; done";
-        let mut slots = ProcessSlots::default();
-        slots
-            .spawn(&SlotCommand {
-                slot: 1,
+        let mut process = LocalProcess::default();
+        assert!(process.try_exit().is_err());
+        let id = process
+            .spawn(&ProcessCommand {
                 program: "sh".to_string(),
                 args: vec![
                     "-c".to_string(),
@@ -242,17 +278,19 @@ mod tests {
                 ],
             })
             .unwrap();
+        assert!(id > 0);
         let deadline = Instant::now() + Duration::from_secs(10);
         while !ready.exists() {
-            assert!(Instant::now() < deadline, "slot never became ready");
+            assert!(Instant::now() < deadline, "the process never became ready");
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(slots.try_exit(1).unwrap(), None);
-        slots.quit(1).unwrap();
-        assert_eq!(wait_exit(&mut slots, 1), 3);
-        assert!(slots.try_exit(1).is_err());
+        assert_eq!(process.try_exit().unwrap(), None);
+        process.quit().unwrap();
+        assert_eq!(wait_exit(&mut process), 3);
+        assert!(process.try_exit().is_err());
+        assert!(process.quit().is_err());
 
-        let env = std::fs::read_to_string(env).unwrap();
+        let env = fs::read_to_string(env).unwrap();
         let keys: Vec<&str> = env
             .lines()
             .filter_map(|line| line.split_once('=').map(|(key, _)| key))
@@ -268,6 +306,27 @@ mod tests {
     }
 
     #[test]
+    fn config_files_are_replaced_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state").join("config.toml");
+        LocalFiles.write_atomic(&path, "concurrent = 1\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "concurrent = 1\n");
+        LocalFiles.write_atomic(&path, "concurrent = 2\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "concurrent = 2\n");
+        let names: Vec<String> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["config.toml"]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
     fn docker_query_filters_and_prints_the_job_label() {
         assert_eq!(
             docker_ps_args(),
@@ -276,7 +335,7 @@ mod tests {
                 "--filter",
                 "label=com.gitlab.gitlab-runner.job.id",
                 "--format",
-                "{{.Label \"com.gitlab.gitlab-runner.job.id\"}} {{.Label \"ciburst.slot\"}}",
+                "{{.Label \"com.gitlab.gitlab-runner.job.id\"}}",
             ]
         );
     }
