@@ -35,6 +35,8 @@ pub mod keys {
     pub const HOOK_TOKEN: &str = "CIBURST_HOOK_TOKEN";
     pub const VM_SECRET: &str = "CIBURST_VM_SECRET";
     pub const SWEEP_TOKEN: &str = "CIBURST_SWEEP_TOKEN";
+    /// Seals the fleet state in the bucket (M6.3 rule R2); written once, never rotated.
+    pub const FLEET_KEY: &str = "CIBURST_FLEET_KEY";
     pub const DISPATCH_URL: &str = "CIBURST_DISPATCH_URL";
     pub const DISPATCH_ACCESS_KEY: &str = "CIBURST_DISPATCH_ACCESS_KEY";
     pub const DISPATCH_SECRET_KEY: &str = "CIBURST_DISPATCH_SECRET_KEY";
@@ -51,9 +53,10 @@ pub mod keys {
 
     /// Output keys that do not depend on the pools. `PROVIDER_ENV` is not among them: in
     /// pipeline mode its values never leave memory.
-    pub const FIXED: [&str; 11] = [
+    pub const FIXED: [&str; 12] = [
         HOOK_TOKEN,
         VM_SECRET,
+        FLEET_KEY,
         SWEEP_TOKEN,
         DISPATCH_URL,
         DISPATCH_ACCESS_KEY,
@@ -71,6 +74,7 @@ pub mod keys {
         [
             HOOK_TOKEN,
             VM_SECRET,
+            FLEET_KEY,
             SWEEP_TOKEN,
             DISPATCH_SECRET_KEY,
             CACHE_SECRET_KEY,
@@ -180,7 +184,7 @@ pub fn secrets_from_outputs(config: &Config, outputs: &Outputs) -> Secrets {
             .iter()
             .filter_map(|key| outputs.get(*key).map(|v| (key.to_string(), v.clone())))
             .collect(),
-        fleet_key: None,
+        fleet_key: outputs.get(keys::FLEET_KEY).cloned(),
     }
 }
 
@@ -804,6 +808,7 @@ impl Provisioner {
             self.refuse_vm_rotation_while_running().await?;
         }
         let vm_secret = self.ensure_secret(keys::VM_SECRET, rotate_vm).await?;
+        let fleet_key = self.ensure_secret(keys::FLEET_KEY, false).await?;
 
         let provider_rotate = provider_rotations(rotate);
         let provider_steps = self.provider.plan(&provider_rotate).await?;
@@ -836,6 +841,7 @@ impl Provisioner {
         let mut secrets = secrets_from_outputs(&self.config, &self.outputs.read().await?);
         secrets.hook_token = Some(hook_token.clone());
         secrets.vm_secret = Some(vm_secret);
+        secrets.fleet_key = Some(fleet_key);
         secrets.sweep_token = Some(sweep_token);
         // M6.3 rule R1: the dispatcher reads the config from the fleet state, so a config change
         // needs no deploy; the host still redeploys when code or secrets change.
