@@ -17,6 +17,7 @@ pub mod log;
 pub mod pipeline;
 pub mod plan;
 pub mod provision;
+pub mod queue;
 pub mod store;
 pub mod time;
 pub mod types;

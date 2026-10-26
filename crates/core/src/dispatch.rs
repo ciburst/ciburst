@@ -10,10 +10,20 @@ use tokio::time::Instant;
 
 use crate::check::is_own_job;
 use crate::config::{CacheType, Config, Pool};
-use crate::ledger::{GROUP_WAIT_S, GROUP_WINDOW_S, Intent, Ledger, PipelineRecords, VmJobs};
+use crate::ledger::{
+    GROUP_WAIT_S, GROUP_WINDOW_S, Intent, Ledger, PipelineRecords, Queued, Running, Schedule,
+    VmJobs,
+};
 use crate::log::Log;
 use crate::provision::keys;
-use crate::types::{Provider, Secrets, StartRequest, VmCapacity, VmReport, VmState};
+use crate::queue::{
+    QUEUED_MAX_AGE_S, RuleInput, RulePlan, RunningJob, SPILL_FRESH_S, SPILL_WAIT_S, next_report_s,
+    start_rule,
+};
+use crate::time::parse_gitlab_time;
+use crate::types::{
+    Provider, Secrets, StartRequest, VmCapacity, VmReport, VmReportAnswer, VmState,
+};
 use crate::vm;
 use crate::{Error, Result};
 
@@ -37,6 +47,24 @@ const WAITING_STATUSES: [&str; 5] = [
 
 /// M6.1 rule R3: the statuses that end a pipeline and its records.
 const FINAL_STATUSES: [&str; 4] = ["success", "failed", "canceled", "skipped"];
+
+/// M6.2 rule R3: the job statuses the schedule tracks, `running` and the final ones.
+const TRACKED_STATUSES: [&str; 5] = ["running", "success", "failed", "canceled", "skipped"];
+
+/// M6.2 rule R4: VMs started for the queue carry the label `job` with this prefix and the id of
+/// the oldest job that needs one.
+pub const QUEUE_PREFIX: &str = "queue:";
+
+/// M6.2 rule R6: the start environment key of a VM pool's spill runner token.
+pub const SPILL_TOKEN_KEY: &str = "RUNNER_SPILL_TOKEN";
+
+/// M6.2 rule R7: a pipeline record older than this counts as closed, a lost final event, so it
+/// cannot keep spill off for good.
+pub const RECORD_MAX_AGE_S: u64 = 2 * 3600;
+
+/// A running entry older than this is a lost finished event: no VM, and so no job, lives longer
+/// ([`vm::SWEEP_MAX_AGE_S`]).
+pub const RUNNING_MAX_AGE_S: u64 = vm::SWEEP_MAX_AGE_S;
 
 /// When a request arrived, on tokio's clock, which tests pause and advance (M7 rule R1).
 #[derive(Debug, Clone, Copy)]
@@ -93,6 +121,9 @@ pub fn run_env(
             .filter(|s| !s.is_empty())
             .ok_or_else(|| Error::other(format!("no VM secret for pool {}", pool.tag)))?;
         env.insert(keys::VM_SECRET.to_string(), secret.clone());
+        if let Some(token) = secrets.spill_tokens.get(&pool.tag) {
+            env.insert(SPILL_TOKEN_KEY.to_string(), token.clone());
+        }
     }
     Ok(env)
 }
@@ -107,8 +138,10 @@ pub struct Dispatcher {
     dispatch_url: Option<String>,
     /// Burst intents (M4 rule R3); `None` keeps the M3 rule.
     ledger: Option<Arc<dyn Ledger>>,
-    /// Warm start records (M6.1 rule R5); `None` starts no warm VM and reserves no slot.
+    /// Warm start records (M6.1 rule R5); `None` starts no warm VM.
     records: Option<Arc<dyn PipelineRecords>>,
+    /// Queue-first scheduling (M6.2); `None` queues nothing and allows no spill (rule R9).
+    schedule: Option<Arc<dyn Schedule>>,
     /// Pause between recording an intent and reading the burst.
     group_wait: Duration,
 }
@@ -128,6 +161,7 @@ impl Dispatcher {
             dispatch_url: None,
             ledger: None,
             records: None,
+            schedule: None,
             group_wait: Duration::from_secs(GROUP_WAIT_S),
         }
     }
@@ -139,9 +173,16 @@ impl Dispatcher {
     }
 
     /// The warm start records (M6.1 rule R5). Without them a pipeline event answers every VM
-    /// pool `disabled` and a lane job reserves no slot.
+    /// pool `disabled`.
     pub fn with_records(mut self, records: Option<Arc<dyn PipelineRecords>>) -> Dispatcher {
         self.records = records;
+        self
+    }
+
+    /// The queue-first schedule (M6.2). Without it VM jobs never queue, job events other than
+    /// `pending` are ignored and lane jobs never spill (rule R9).
+    pub fn with_schedule(mut self, schedule: Option<Arc<dyn Schedule>>) -> Dispatcher {
+        self.schedule = schedule;
         self
     }
 
@@ -269,7 +310,9 @@ impl Dispatcher {
             .get("build_status")
             .and_then(Value::as_str)
             .unwrap_or("");
-        if status != "pending" {
+        let schedule = self.schedule.as_deref();
+        let tracked = schedule.is_some() && TRACKED_STATUSES.contains(&status);
+        if status != "pending" && !tracked {
             return ignored("status", json!({ "status": status }));
         }
         let project_id = event.get("project_id").and_then(Value::as_u64).unwrap_or(0);
@@ -301,6 +344,11 @@ impl Dispatcher {
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
+        if let Some(schedule) = schedule.filter(|_| tracked) {
+            return self
+                .track(schedule, &pool, status, event, fields, now, at)
+                .await;
+        }
         // Records are keyed by GitLab's numeric pipeline id only.
         let pipeline = event
             .get("pipeline_id")
@@ -312,40 +360,37 @@ impl Dispatcher {
             self.mark_seen(pipeline, &labels["job"], &pool.tag, at)
                 .await;
         }
-        let mut reserved = None;
-        if let Some(vm_pool) = self.config.vm_first_pool(&pool) {
-            match self
-                .claim_for_lane(vm_pool, &pool, &labels["job"], pipeline.as_deref(), now, at)
+        let callback = self.callback(headers);
+        if let Some(schedule) = schedule
+            && let Some(vm_pool) = self.config.vm_first_pool(&pool)
+            && let Some(vm) = self
+                .spill(
+                    schedule,
+                    vm_pool,
+                    &pool,
+                    name,
+                    &labels,
+                    now,
+                    callback.as_deref(),
+                    at,
+                )
                 .await
-            {
-                LaneClaim::Claimed { run_id, free } => {
-                    let free = free.to_string();
-                    fields.extend([
-                        ("pool", vm_pool.tag.as_str()),
-                        ("run", run_id.as_str()),
-                        ("free", free.as_str()),
-                        ("lane", pool.tag.as_str()),
-                    ]);
-                    self.info(at, "claimed", &fields);
-                    return reply(
-                        200,
-                        "claimed",
-                        json!({ "pool": vm_pool.tag, "lane": pool.tag, "runId": run_id }),
-                    );
-                }
-                LaneClaim::Reserved(reserve) => reserved = Some(reserve.to_string()),
-                LaneClaim::Lane => {}
-            }
+        {
+            fields.extend([("pool", pool.tag.as_str()), ("vm", vm.as_str())]);
+            self.info(at, "spilled", &fields);
+            return reply(200, "spilled", json!({ "pool": pool.tag, "vm": vm }));
         }
         fields.push(("pool", &pool.tag));
-        if let Some(reserve) = &reserved {
-            fields.push(("reserve", reserve));
-        }
-        let callback = self.callback(headers);
         match self
-            .schedule(&pool, labels.clone(), now, callback.as_deref(), at)
+            .schedule(&pool, name, labels.clone(), now, callback.as_deref(), at)
             .await
         {
+            Ok(Decision::Queued { wait_s }) => {
+                let eta = wait_s.map_or_else(|| "null".to_string(), |s| s.to_string());
+                fields.push(("eta_s", &eta));
+                self.info(at, "queued", &fields);
+                reply(200, "queued", json!({ "pool": pool.tag, "etaS": wait_s }))
+            }
             Ok(Decision::Claimed { run_id, free }) => {
                 let free = free.to_string();
                 fields.push(("run", &run_id));
@@ -389,12 +434,14 @@ impl Dispatcher {
     }
 
     /// Spec 6.1, scheduling, M4 rules R1 to R6: a free slot of a claim candidate is claimed;
-    /// otherwise the job joins the burst ledger, or without one a VM starts unless `maxRuns`
-    /// VMs are live (not draining). Providers without VMs answer `None` from `capacity` and
-    /// count live runs.
+    /// otherwise, with a schedule and a live VM, the job queues unless the start rule gives it a
+    /// VM (M6.2 rule R2); else it joins the burst ledger, or without one a VM starts unless
+    /// `maxRuns` VMs are live (not draining), where it queues with a schedule. Providers without
+    /// VMs answer `None` from `capacity` and count live runs.
     async fn schedule(
         &self,
         pool: &Pool,
+        name: &str,
         labels: BTreeMap<String, String>,
         now: u64,
         callback: Option<&str>,
@@ -434,8 +481,116 @@ impl Dispatcher {
                 }
             }
         }
+        let schedule = self.schedule.as_deref().filter(|_| !job.is_empty());
+        let mut wait_s = None;
+        let entry = Queued {
+            job: job.clone(),
+            name: name.to_string(),
+            pipeline: labels.get("pipeline").cloned().unwrap_or_default(),
+            at: now,
+        };
+        if let Some(schedule) = schedule {
+            match self
+                .queue_first(schedule, pool, &vms, &entry, now, callback, at)
+                .await
+            {
+                QueueFirst::Queued { wait_s } => return Ok(Decision::Queued { wait_s }),
+                QueueFirst::Burst { wait_s: wait } => wait_s = wait,
+            }
+        }
+        let decision = self
+            .burst_path(pool, &vms, labels, &job, now, callback, at)
+            .await?;
+        match (decision, schedule) {
+            // M6.2 rule R2: at `maxRuns` live VMs a VM job queues instead.
+            (Decision::AtCapacity(live), Some(schedule)) => {
+                match schedule.enqueue(&pool.tag, &entry).await {
+                    Ok(()) => Ok(Decision::Queued { wait_s }),
+                    Err(error) => {
+                        self.schedule_failed(at, "enqueue", &pool.tag, &error);
+                        Ok(Decision::AtCapacity(live))
+                    }
+                }
+            }
+            (decision, _) => Ok(decision),
+        }
+    }
+
+    /// M6.2 rules R2 and R4 for a pending VM job without a free slot: with no live VM it takes
+    /// the burst path; else the start rule runs with the job as the newest queued one. A job the
+    /// rule gives a VM takes the burst path when no VM has a ready slot (rule R4 step 3); every
+    /// other job queues, and the VMs the rule starts for the queue start (rule R5). A schedule
+    /// error takes the burst path (rule R9).
+    #[allow(clippy::too_many_arguments)]
+    async fn queue_first(
+        &self,
+        schedule: &dyn Schedule,
+        pool: &Pool,
+        vms: &[VmCapacity],
+        entry: &Queued,
+        now: u64,
+        callback: Option<&str>,
+        at: Arrival,
+    ) -> QueueFirst {
+        let live = live_count(vms);
+        if live == 0 {
+            return QueueFirst::Burst { wait_s: None };
+        }
+        let mut queued = match self.live_queue(schedule, &pool.tag, now).await {
+            Ok(queued) => queued,
+            Err((op, error)) => {
+                self.schedule_failed(at, op, &pool.tag, &error);
+                return QueueFirst::Burst { wait_s: None };
+            }
+        };
+        // A repeated event keeps the job's place in the queue.
+        let known = queued.iter().any(|q| q.job == entry.job);
+        if !known {
+            queued.push(entry.clone());
+        }
+        let plan = match self.evaluate(schedule, pool, vms, &queued, now).await {
+            Ok(plan) => plan,
+            Err((op, error)) => {
+                self.schedule_failed(at, op, &pool.tag, &error);
+                return QueueFirst::Burst { wait_s: None };
+            }
+        };
+        let (wait_s, needs_vm) = plan
+            .verdict(&entry.job)
+            .map_or((None, true), |v| (v.wait_s, v.needs_vm));
+        // The burst ledger hands the free slots of the VMs of its window to late followers, the
+        // start rule to the oldest queued jobs. While such slots exist the start rule alone
+        // decides, so no job rides on a slot a queued job already expects; a job already queued
+        // stays there too.
+        let ready = ready_slots(vms, now);
+        if needs_vm && live < pool.max_runs as usize && !known && ready == 0 {
+            return QueueFirst::Burst { wait_s };
+        }
+        if !known && let Err(error) = schedule.enqueue(&pool.tag, entry).await {
+            self.schedule_failed(at, "enqueue", &pool.tag, &error);
+            return QueueFirst::Burst { wait_s };
+        }
+        self.start_for_queue(schedule, pool, &queued, &plan, now, callback, at)
+            .await;
+        self.spill_fallback(schedule, pool, now, at).await;
+        QueueFirst::Queued { wait_s }
+    }
+
+    /// M4 rules R3 to R6: the job joins the burst ledger and a leader starts a VM for its group;
+    /// without a ledger, or when it fails, a VM starts unless `maxRuns` VMs are live.
+    #[allow(clippy::too_many_arguments)]
+    async fn burst_path(
+        &self,
+        pool: &Pool,
+        vms: &[VmCapacity],
+        labels: BTreeMap<String, String>,
+        job: &str,
+        now: u64,
+        callback: Option<&str>,
+        at: Arrival,
+    ) -> Result<Decision> {
         if let Some(ledger) = self.ledger.as_deref().filter(|_| !job.is_empty()) {
-            match self.burst(ledger, pool, &job, now).await {
+            match self.burst(ledger, pool, job, now).await {
                 Ok(Burst::Duplicate) => return Ok(Decision::Duplicate),
                 Ok(Burst::Follower { leader }) => return Ok(Decision::Grouped { leader }),
                 Ok(Burst::Leader { group, taken }) => {
@@ -457,105 +612,435 @@ impl Dispatcher {
                     self.warn(
                         at,
                         "ledger_failed",
-                        &[("pool", &pool.tag), ("job", &job), ("error", &message)],
+                        &[("pool", &pool.tag), ("job", job), ("error", &message)],
                     );
                 }
             }
         }
-        let live = vms.iter().filter(|v| v.state != VmState::Draining).count();
+        let live = live_count(vms);
         if live >= pool.max_runs as usize {
             return Ok(Decision::AtCapacity(live));
         }
         self.start(pool, labels, true, callback, 1, at).await
     }
 
-    /// D47, M6.1 rule R6: a pending job of `lane` claims a free slot of `vm_pool` when the
-    /// claim candidates (M4 rules R1, R2) have more free slots than the reserve of the job's
-    /// pipeline; otherwise it is left to the lane. A failed read or claim logs `claim_failed`
-    /// and also leaves it to the lane, which never uses the ledger.
-    async fn claim_for_lane(
+    /// M6.2 rule R4 over the queue `queued` of VM pool `pool`, reading the running jobs and
+    /// their typical durations; an empty queue reads nothing more. A running job that started
+    /// more than [`RUNNING_MAX_AGE_S`] ago is a lost finished event and is removed.
+    async fn evaluate(
         &self,
-        vm_pool: &Pool,
-        lane: &Pool,
-        job: &str,
-        pipeline: Option<&str>,
+        schedule: &dyn Schedule,
+        pool: &Pool,
+        vms: &[VmCapacity],
+        queued: &[Queued],
         now: u64,
-        at: Arrival,
-    ) -> LaneClaim {
-        let vms = match self.provider.capacity(&vm_pool.tag).await {
-            Ok(Some(vms)) => vms,
-            Ok(None) => return LaneClaim::Lane,
-            Err(error) => {
-                let message = error.to_string();
-                self.warn(
-                    at,
-                    "claim_failed",
-                    &[
-                        ("pool", &vm_pool.tag),
-                        ("lane", &lane.tag),
-                        ("error", &message),
-                    ],
-                );
-                return LaneClaim::Lane;
+    ) -> std::result::Result<RulePlan, (&'static str, Error)> {
+        let mut running = Vec::new();
+        if !queued.is_empty() {
+            let (jobs, lost): (Vec<Running>, Vec<Running>) = schedule
+                .running(&pool.tag)
+                .await
+                .map_err(|e| ("running", e))?
+                .into_iter()
+                .partition(|job| now.saturating_sub(job.started) <= RUNNING_MAX_AGE_S);
+            for job in lost {
+                schedule
+                    .finished(&pool.tag, &job.job, &job.name, None)
+                    .await
+                    .map_err(|e| ("finished", e))?;
             }
-        };
-        let Some((target, free)) = claim_target(&vms, job, now) else {
-            return LaneClaim::Lane;
-        };
-        let reserve = match pipeline {
-            Some(pipeline) => self.reserve(vm_pool, pipeline, at).await,
-            None => 0,
-        };
-        if free <= reserve {
-            return LaneClaim::Reserved(reserve);
+            let mut typical: BTreeMap<String, Option<u64>> = BTreeMap::new();
+            for job in &jobs {
+                if !typical.contains_key(&job.name) {
+                    let value = schedule
+                        .typical(&pool.tag, &job.name)
+                        .await
+                        .map_err(|e| ("typical", e))?;
+                    typical.insert(job.name.clone(), value);
+                }
+            }
+            running = jobs
+                .iter()
+                .map(|job| RunningJob {
+                    started: job.started,
+                    typical: typical.get(&job.name).copied().flatten(),
+                })
+                .collect();
         }
-        match self.provider.claim(&target.run_id).await {
-            Ok(()) => LaneClaim::Claimed {
-                run_id: target.run_id.clone(),
-                free,
-            },
+        Ok(start_rule(&RuleInput {
+            now,
+            queued,
+            running: &running,
+            ready: ready_slots(vms, now),
+            slots: pool.slots,
+            max_queue_s: pool.max_queue_s(),
+            max_runs: pool.max_runs,
+            live: live_count(vms),
+        }))
+    }
+
+    /// M6.2 rule R4 step 6: starts the VMs `plan` gives the queue, each with every slot free and
+    /// the labels `job=queue:<oldest job that needs one>` and its `pipeline`, once the pool's
+    /// start marker is taken. A start begins only within [`START_RETRY_WITHIN`] of the arrival,
+    /// so the answer stays inside GitLab's 10 s; the next evaluation starts the rest.
+    #[allow(clippy::too_many_arguments)]
+    async fn start_for_queue(
+        &self,
+        schedule: &dyn Schedule,
+        pool: &Pool,
+        queued: &[Queued],
+        plan: &RulePlan,
+        now: u64,
+        callback: Option<&str>,
+        at: Arrival,
+    ) {
+        if plan.start == 0 {
+            return;
+        }
+        let Some(oldest) = plan
+            .verdicts
+            .iter()
+            .find(|v| v.needs_vm)
+            .and_then(|v| queued.iter().find(|q| q.job == v.job))
+        else {
+            return;
+        };
+        match schedule.take_start(&pool.tag, now).await {
+            Ok(true) => {}
+            Ok(false) => return,
             Err(error) => {
-                let message = error.to_string();
-                self.warn(
-                    at,
-                    "claim_failed",
-                    &[
-                        ("run", &target.run_id),
-                        ("lane", &lane.tag),
-                        ("error", &message),
-                    ],
-                );
-                LaneClaim::Lane
+                self.schedule_failed(at, "take_start", &pool.tag, &error);
+                return;
+            }
+        }
+        let job = format!("{QUEUE_PREFIX}{}", oldest.job);
+        let labels = BTreeMap::from([
+            ("job".to_string(), job.clone()),
+            ("pipeline".to_string(), oldest.pipeline.clone()),
+        ]);
+        let mut runs = Vec::new();
+        for _ in 0..plan.start {
+            if at.elapsed() >= START_RETRY_WITHIN {
+                break;
+            }
+            match self
+                .start_run(pool, labels.clone(), true, callback, 0, at)
+                .await
+            {
+                Ok(run) => runs.push(run),
+                Err(error) => {
+                    let message = error.to_string();
+                    self.error(
+                        at,
+                        "start_failed",
+                        &[("pool", &pool.tag), ("job", &job), ("error", &message)],
+                    );
+                    break;
+                }
+            }
+        }
+        if !runs.is_empty() {
+            let (vms, needing, runs) = (
+                runs.len().to_string(),
+                plan.needing.to_string(),
+                runs.join(","),
+            );
+            self.info(
+                at,
+                "queue_started",
+                &[
+                    ("pool", &pool.tag),
+                    ("job", &job),
+                    ("vms", &vms),
+                    ("needing", &needing),
+                    ("runs", &runs),
+                ],
+            );
+        }
+    }
+
+    /// M6.2 rule R8: each spilled job of a lane of `vm_pool` that no VM slot took within
+    /// [`SPILL_WAIT_S`] gets a lane run through the lane's start path, below the lane's
+    /// `maxRuns`, and leaves the queue.
+    async fn spill_fallback(&self, schedule: &dyn Schedule, vm_pool: &Pool, now: u64, at: Arrival) {
+        for lane in self.config.spill_lanes(vm_pool) {
+            let mut due: Vec<Queued> = match self.live_queue(schedule, &lane.tag, now).await {
+                Ok(queued) => queued
+                    .into_iter()
+                    .filter(|q| now.saturating_sub(q.at) > SPILL_WAIT_S)
+                    .collect(),
+                Err((op, error)) => {
+                    self.schedule_failed(at, op, &lane.tag, &error);
+                    continue;
+                }
+            };
+            if due.is_empty() {
+                continue;
+            }
+            due.sort_by(|a, b| (a.at, JobKey::parse(&a.job)).cmp(&(b.at, JobKey::parse(&b.job))));
+            let mut live = match self.provider.list(Some(&lane.tag)).await {
+                Ok(runs) => runs.iter().filter(|run| run.state.is_live()).count(),
+                Err(error) => {
+                    self.capacity_failed(at, &lane.tag, &error);
+                    continue;
+                }
+            };
+            for job in due {
+                if live >= lane.max_runs as usize || at.elapsed() >= START_RETRY_WITHIN {
+                    break;
+                }
+                let labels = BTreeMap::from([
+                    ("job".to_string(), job.job.clone()),
+                    ("pipeline".to_string(), job.pipeline.clone()),
+                ]);
+                match self.start_run(lane, labels, false, None, 1, at).await {
+                    Ok(run) => {
+                        live += 1;
+                        if let Err(error) = schedule
+                            .finished(&lane.tag, &job.job, &job.name, None)
+                            .await
+                        {
+                            self.schedule_failed(at, "finished", &lane.tag, &error);
+                        }
+                        self.info(
+                            at,
+                            "spill_fallback",
+                            &[("lane", &lane.tag), ("job", &job.job), ("run", &run)],
+                        );
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        self.error(
+                            at,
+                            "start_failed",
+                            &[("lane", &lane.tag), ("job", &job.job), ("error", &message)],
+                        );
+                        break;
+                    }
+                }
             }
         }
     }
 
-    /// M6.1 rule R6: the slots of `vm_pool` the VM jobs of `pipeline` still need, its VM jobs
-    /// in the record without a seen marker, at most one VM's slots; 0 without a record.
-    async fn reserve(&self, vm_pool: &Pool, pipeline: &str, at: Arrival) -> u64 {
+    /// The queue of `pool` without entries older than [`QUEUED_MAX_AGE_S`], which it removes
+    /// (M6.2 rule R5).
+    async fn live_queue(
+        &self,
+        schedule: &dyn Schedule,
+        pool: &str,
+        now: u64,
+    ) -> std::result::Result<Vec<Queued>, (&'static str, Error)> {
+        let (fresh, stale): (Vec<Queued>, Vec<Queued>) = schedule
+            .queued(pool)
+            .await
+            .map_err(|e| ("queued", e))?
+            .into_iter()
+            .partition(|q| now.saturating_sub(q.at) <= QUEUED_MAX_AGE_S);
+        for job in stale {
+            schedule
+                .finished(pool, &job.job, &job.name, None)
+                .await
+                .map_err(|e| ("finished", e))?;
+        }
+        Ok(fresh)
+    }
+
+    /// M6.2 rule R3: a `running` job event of a VM job or lane job records it as running, a
+    /// final one as finished, with its duration for `success` and `failed`. Other pools, and a
+    /// schedule error (rule R9), answer as without a schedule.
+    #[allow(clippy::too_many_arguments)]
+    async fn track(
+        &self,
+        schedule: &dyn Schedule,
+        pool: &Pool,
+        status: &str,
+        event: &Value,
+        mut fields: Vec<(&str, &str)>,
+        now: u64,
+        at: Arrival,
+    ) -> DispatchResponse {
+        let job = number(event, "build_id");
+        if job.is_empty() || !(self.config.is_vm_pool(pool) || self.config.is_lane(pool)) {
+            return ignored("status", json!({ "status": status }));
+        }
+        let name = event
+            .get("build_name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let (op, done, duration) = if status == "running" {
+            let started = event
+                .get("build_started_at")
+                .and_then(Value::as_str)
+                .and_then(parse_gitlab_time)
+                .unwrap_or(now);
+            let running = Running { job, name, started };
+            ("started", schedule.started(&pool.tag, &running).await, None)
+        } else {
+            let duration = matches!(status, "success" | "failed")
+                .then(|| event.get("build_duration").and_then(Value::as_f64))
+                .flatten()
+                .map(|seconds| seconds.max(0.0).round() as u64);
+            let done = schedule.finished(&pool.tag, &job, &name, duration).await;
+            ("finished", done, duration)
+        };
+        if let Err(error) = done {
+            self.schedule_failed(at, op, &pool.tag, &error);
+            return ignored("status", json!({ "status": status }));
+        }
+        let duration = duration.map(|d| d.to_string());
+        fields.extend([("pool", pool.tag.as_str()), ("status", status)]);
+        if let Some(duration) = &duration {
+            fields.push(("duration_s", duration));
+        }
+        self.info(at, "tracked", &fields);
+        reply(
+            200,
+            "tracked",
+            json!({ "status": status, "pool": pool.tag }),
+        )
+    }
+
+    /// M6.2 rules R5 and R8 for a pending job of a `vmFirst` lane: the run id of the VM whose
+    /// idle slots take the job, which then queues under the lane's tag; `None` leaves the job
+    /// to its lane. Queued VM jobs of the pool re-run the start rule and keep spill off.
+    #[allow(clippy::too_many_arguments)]
+    async fn spill(
+        &self,
+        schedule: &dyn Schedule,
+        vm_pool: &Pool,
+        lane: &Pool,
+        name: &str,
+        labels: &BTreeMap<String, String>,
+        now: u64,
+        callback: Option<&str>,
+        at: Arrival,
+    ) -> Option<String> {
+        let queued = match self.live_queue(schedule, &vm_pool.tag, now).await {
+            Ok(queued) => queued,
+            Err((op, error)) => {
+                self.schedule_failed(at, op, &vm_pool.tag, &error);
+                return None;
+            }
+        };
+        if !queued.is_empty() {
+            if let Some(vms) = self.vms_of(vm_pool, at).await {
+                self.reevaluate(schedule, vm_pool, &vms, &queued, now, callback, at)
+                    .await;
+            }
+            return None;
+        }
+        if !self.has_spill_runner(vm_pool) {
+            return None;
+        }
+        let job = labels.get("job").cloned().unwrap_or_default();
+        let vms = self.vms_of(vm_pool, at).await?;
+        let target = spill_target(&vms, &job, now)?;
+        if job.is_empty() || self.unseen_vm_jobs(vm_pool, now, at).await {
+            return None;
+        }
+        let entry = Queued {
+            job,
+            name: name.to_string(),
+            pipeline: labels.get("pipeline").cloned().unwrap_or_default(),
+            at: now,
+        };
+        if let Err(error) = schedule.enqueue(&lane.tag, &entry).await {
+            self.schedule_failed(at, "enqueue", &lane.tag, &error);
+            return None;
+        }
+        Some(target)
+    }
+
+    /// M6.2 rule R5: the start rule over the queue of `pool`, its VM starts and the spill
+    /// fallback of its lanes.
+    #[allow(clippy::too_many_arguments)]
+    async fn reevaluate(
+        &self,
+        schedule: &dyn Schedule,
+        pool: &Pool,
+        vms: &[VmCapacity],
+        queued: &[Queued],
+        now: u64,
+        callback: Option<&str>,
+        at: Arrival,
+    ) {
+        if !queued.is_empty() {
+            match self.evaluate(schedule, pool, vms, queued, now).await {
+                Ok(plan) => {
+                    self.start_for_queue(schedule, pool, queued, &plan, now, callback, at)
+                        .await
+                }
+                Err((op, error)) => self.schedule_failed(at, op, &pool.tag, &error),
+            }
+        }
+        self.spill_fallback(schedule, pool, now, at).await;
+    }
+
+    /// The VMs of `pool`; `None` for a pool without VMs and after a failed read, which logs
+    /// `capacity_failed`.
+    async fn vms_of(&self, pool: &Pool, at: Arrival) -> Option<Vec<VmCapacity>> {
+        match self.provider.capacity(&pool.tag).await {
+            Ok(vms) => vms,
+            Err(error) => {
+                self.capacity_failed(at, &pool.tag, &error);
+                None
+            }
+        }
+    }
+
+    /// M6.2 rule R6: whether `vm_pool` has a spill runner the dispatcher holds the token of.
+    fn has_spill_runner(&self, vm_pool: &Pool) -> bool {
+        self.config.spill_tags(vm_pool).is_some()
+            && self.secrets.spill_tokens.contains_key(&vm_pool.tag)
+    }
+
+    /// M6.2 rule R7: whether an open pipeline's record lists a VM job of `vm_pool` without a
+    /// seen marker. A record older than [`RECORD_MAX_AGE_S`] counts as closed; a failed read
+    /// counts as such a job, so a records error never turns spill on.
+    async fn unseen_vm_jobs(&self, vm_pool: &Pool, now: u64, at: Arrival) -> bool {
         let Some(records) = &self.records else {
-            return 0;
+            return false;
         };
-        let jobs = match records.vm_jobs(pipeline).await {
-            Ok(Some(jobs)) => jobs,
-            Ok(None) => return 0,
+        match records.open_pipelines().await {
+            Ok(open) => open.iter().any(|pipeline| {
+                pipeline
+                    .opened
+                    .is_none_or(|opened| now.saturating_sub(opened) <= RECORD_MAX_AGE_S)
+                    && pipeline
+                        .unseen
+                        .get(&vm_pool.tag)
+                        .is_some_and(|jobs| !jobs.is_empty())
+            }),
             Err(error) => {
-                self.records_failed(at, "vm_jobs", pipeline, &error);
-                return 0;
+                let message = error.to_string();
+                self.warn(
+                    at,
+                    "records_failed",
+                    &[("op", "open_pipelines"), ("error", &message)],
+                );
+                true
             }
-        };
-        let Some(ids) = jobs.get(&vm_pool.tag).filter(|ids| !ids.is_empty()) else {
-            return 0;
-        };
-        let seen = match records.seen_jobs(pipeline).await {
-            Ok(seen) => seen,
-            Err(error) => {
-                self.records_failed(at, "seen_jobs", pipeline, &error);
-                return 0;
-            }
-        };
-        let unseen = ids.iter().filter(|id| !seen.contains(id)).count();
-        (unseen as u64).min(u64::from(vm_pool.slots))
+        }
+    }
+
+    /// M6.2 rule R9: a schedule error never fails an answer; the caller goes on as without one.
+    fn schedule_failed(&self, at: Arrival, op: &str, pool: &str, error: &Error) {
+        let message = error.to_string();
+        self.warn(
+            at,
+            "schedule_failed",
+            &[("op", op), ("pool", pool), ("error", &message)],
+        );
+    }
+
+    fn capacity_failed(&self, at: Arrival, pool: &str, error: &Error) {
+        let message = error.to_string();
+        self.warn(
+            at,
+            "capacity_failed",
+            &[("pool", pool), ("error", &message)],
+        );
     }
 
     /// M6.1 rule R5: marks a pending VM job of `pool` that its pipeline's record lists.
@@ -942,7 +1427,15 @@ impl Dispatcher {
         };
         match self.provider.report(run, &report, now).await {
             Ok(()) => {
-                let free = report.free.to_string();
+                let answer = self
+                    .report_answer(run, &report, self.callback(headers).as_deref(), now, at)
+                    .await;
+                let (free, spilling, spill, next) = (
+                    report.free.to_string(),
+                    report.spill.to_string(),
+                    answer.spill.to_string(),
+                    answer.next_report_s.to_string(),
+                );
                 self.info(
                     at,
                     "reported",
@@ -950,15 +1443,78 @@ impl Dispatcher {
                         ("run", run),
                         ("state", report.state.as_str()),
                         ("free", &free),
+                        ("spilling", &spilling),
+                        ("spill", &spill),
+                        ("next_report_s", &next),
                     ],
                 );
-                reply(200, "reported", json!({}))
+                reply(
+                    200,
+                    "reported",
+                    json!({ "spill": answer.spill, "nextReportS": answer.next_report_s }),
+                )
             }
             Err(error) => {
                 let message = error.to_string();
                 self.error(at, "report_failed", &[("run", run), ("error", &message)]);
                 reply(500, "error", json!({}))
             }
+        }
+    }
+
+    /// M6.2 rules R5 and R7, after the provider stored the report of `run`: the start rule and
+    /// the spill fallback of the VM's pool run, then idle slots may spill while the pool has a
+    /// spill runner, no queued VM job and no VM job still to come in an open pipeline, and the
+    /// VM is not draining. Without a schedule nothing spills (rule R9).
+    async fn report_answer(
+        &self,
+        run: &str,
+        report: &VmReport,
+        callback: Option<&str>,
+        now: u64,
+        at: Arrival,
+    ) -> VmReportAnswer {
+        let busy = report.state == VmState::Busy;
+        let quiet = VmReportAnswer {
+            spill: false,
+            next_report_s: next_report_s(false, false, busy),
+        };
+        let Some(schedule) = self.schedule.as_deref() else {
+            return quiet;
+        };
+        let mut found = None;
+        for pool in self
+            .config
+            .pools
+            .iter()
+            .filter(|p| self.config.is_vm_pool(p))
+        {
+            if let Some(vms) = self.vms_of(pool, at).await
+                && vms.iter().any(|vm| vm.run_id == run)
+            {
+                found = Some((pool, vms));
+                break;
+            }
+        }
+        let Some((pool, vms)) = found else {
+            return quiet;
+        };
+        let queued = match self.live_queue(schedule, &pool.tag, now).await {
+            Ok(queued) => queued,
+            Err((op, error)) => {
+                self.schedule_failed(at, op, &pool.tag, &error);
+                return quiet;
+            }
+        };
+        self.reevaluate(schedule, pool, &vms, &queued, now, callback, at)
+            .await;
+        let spill = queued.is_empty()
+            && report.state != VmState::Draining
+            && self.has_spill_runner(pool)
+            && !self.unseen_vm_jobs(pool, now, at).await;
+        VmReportAnswer {
+            spill,
+            next_report_s: next_report_s(spill, !queued.is_empty(), busy),
         }
     }
 
@@ -1016,18 +1572,17 @@ enum Decision {
     },
     /// The job's intent was already recorded by an earlier event (M4 rule R3).
     Duplicate,
+    /// The job waits for a paid slot, expected in `wait_s` seconds (M6.2 rule R2).
+    Queued {
+        wait_s: Option<u64>,
+    },
 }
 
-/// What a lane job found on the VM pool it claims slots of (D47, M6.1 rule R6).
-enum LaneClaim {
-    Claimed {
-        run_id: String,
-        free: u64,
-    },
-    /// The candidates' free slots do not exceed the reserve of the job's pipeline.
-    Reserved(u64),
-    /// No candidate, or a failed read or claim.
-    Lane,
+/// The start rule's answer for a pending VM job (M6.2 rule R2); `wait_s` is the job's expected
+/// wait, which a burst path that ends at `maxRuns` answers with.
+enum QueueFirst {
+    Queued { wait_s: Option<u64> },
+    Burst { wait_s: Option<u64> },
 }
 
 /// A VM pool of the warm step between the capacity read and the read of the burst window.
@@ -1064,6 +1619,46 @@ fn is_candidate(vm: &VmCapacity, now: u64) -> bool {
 
 fn claim_candidates(vms: &[VmCapacity], now: u64) -> Vec<&VmCapacity> {
     vms.iter().filter(|v| is_candidate(v, now)).collect()
+}
+
+/// VMs that are not draining.
+fn live_count(vms: &[VmCapacity]) -> usize {
+    vms.iter().filter(|v| v.state != VmState::Draining).count()
+}
+
+/// M6.2 rule R4 step 3: the free slots of VMs in state `starting` younger than
+/// [`vm::SWEEP_STARTING_S`], and of the claim candidates, whose free slots take a queued job as
+/// soon as GitLab hands it out.
+fn ready_slots(vms: &[VmCapacity], now: u64) -> u32 {
+    vms.iter()
+        .filter(|v| {
+            let starting = v.state == VmState::Starting
+                && now.saturating_sub(v.created_at) < vm::SWEEP_STARTING_S;
+            starting || is_candidate(v, now)
+        })
+        .map(|v| v.free)
+        .sum()
+}
+
+/// M6.2 rule R8: the run id of a live VM with idle slots that poll with the spill runner,
+/// `min(free, spill) > 0`, reported within [`SPILL_FRESH_S`]; among those with the most such
+/// slots, `job` picks one (M4 rule R2).
+fn spill_target(vms: &[VmCapacity], job: &str, now: u64) -> Option<String> {
+    let spilling: Vec<VmCapacity> = vms
+        .iter()
+        .filter(|v| {
+            v.state != VmState::Draining
+                && v.seen
+                    .is_some_and(|seen| now.saturating_sub(seen) <= SPILL_FRESH_S)
+                && v.free.min(v.spill) > 0
+        })
+        .map(|v| VmCapacity {
+            free: v.free.min(v.spill),
+            ..v.clone()
+        })
+        .collect();
+    let refs: Vec<&VmCapacity> = spilling.iter().collect();
+    spread(&refs, job).map(|v| v.run_id.clone())
 }
 
 /// The VM `job` claims (M4 rules R1, R2) and the free slots of every candidate.
@@ -1281,7 +1876,7 @@ mod tests {
     use super::*;
     use crate::config::parse_config;
     use crate::fake::FakeProvider;
-    use crate::ledger::{MemoryLedger, MemoryPipelineRecords};
+    use crate::ledger::{MemoryLedger, MemoryPipelineRecords, MemorySchedule};
     use crate::store::MemoryStore;
     use crate::types::{KeyPair, Run};
     use async_trait::async_trait;
@@ -2323,7 +2918,11 @@ mod tests {
             .post("/vm/", &headers, br#"{"state":"busy","free":1,"slots":2}"#)
             .await;
         assert_eq!(response.status, 200);
-        assert_eq!(response.body, json!({ "result": "reported", "ms": 0 }));
+        assert_eq!(
+            response.body,
+            json!({ "result": "reported", "spill": false, "nextReportS": 30, "ms": 0 }),
+            "without a schedule nothing spills; a busy VM reports every 30 s"
+        );
         let vm = &s.vms().await[0];
         assert_eq!(
             (vm.state, vm.free, vm.seen),
@@ -2861,29 +3460,23 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_lane_job_claims_a_free_vm_slot_first() {
+    async fn without_a_schedule_a_lane_job_never_takes_a_vm_slot() {
         let ledger = Arc::new(MemoryLedger::new());
-        let s = setup_of(lane_config(true), lane_secrets(), Some(ledger.clone())).await;
-        let vm = idle_vm(&s, 1, 2).await;
-        let claimed = s.named_at("lint", 2, T0 + 60).await;
-        assert_eq!(claimed.status, 200);
+        let mut secrets = lane_secrets();
+        secrets.spill_tokens = BTreeMap::from([("vm".to_string(), "glrt-spill".to_string())]);
+        let s = setup_of(lane_config(true), secrets, Some(ledger.clone())).await;
+        idle_vm(&s, 1, 2).await;
+        let lane = s.named_at("lint", 2, T0 + 60).await;
+        assert_eq!(lane.body["result"], "started", "{}", lane.body);
+        assert_eq!(lane.body["pool"], "node-24");
+        assert_eq!(s.vms().await[0].free, 2);
+        assert!(s.recording.claimed.lock().unwrap().is_empty());
         assert_eq!(
-            claimed.body,
-            json!({ "result": "claimed", "pool": "vm", "lane": "node-24", "runId": vm, "ms": 0 })
+            *s.recording.asked.lock().unwrap(),
+            ["vm", "node-24"],
+            "M6.2 rule R9: no read of the VM pool"
         );
-        assert_eq!(s.vms().await[0].free, 1);
-        assert!(s.lines().contains(&format!(
-            r#"info claimed job="2" pipeline="9" project="7" stage="test" pool="vm" run="{vm}" free="2" lane="node-24" ms="0""#
-        )));
-        let second = s.named_at("unit-api", 3, T0 + 60).await;
-        assert_eq!(second.body["result"], "claimed", "{}", second.body);
-        assert_eq!(second.body["lane"], "node-24");
-        assert_eq!(s.vms().await[0].free, 0);
-        let full = s.named_at("lint", 4, T0 + 60).await;
-        assert_eq!(full.body["result"], "started", "{}", full.body);
-        assert_eq!(full.body["pool"], "node-24");
         assert_eq!(s.started_pools(), ["vm", "node-24"]);
-        assert_eq!(*s.recording.claimed.lock().unwrap(), [vm.clone(), vm]);
         assert_eq!(ledger.all().len(), 1, "only the VM job's intent");
     }
 
@@ -2958,25 +3551,6 @@ mod tests {
         assert!(ledger.all().is_empty());
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_failed_claim_leaves_the_job_to_its_lane() {
-        let s = setup_of(lane_config(true), lane_secrets(), None).await;
-        let vm = idle_vm(&s, 1, 2).await;
-        s.recording.fail_claim.store(true, Ordering::SeqCst);
-        let response = s.named_at("lint", 2, T0 + 60).await;
-        assert_eq!(response.body["result"], "started", "{}", response.body);
-        assert_eq!(response.body["pool"], "node-24");
-        assert!(s.lines().iter().any(|l| l.starts_with(&format!(
-            r#"warn claim_failed run="{vm}" lane="node-24" error="#
-        ))));
-        assert_eq!(s.vms().await[0].free, 2);
-        assert_eq!(
-            s.recording.claim_calls.load(Ordering::SeqCst),
-            1,
-            "a retryable claim failure is not retried"
-        );
-    }
-
     /// The value of the `ms` field that ends a log line.
     fn ms_of(line: &str) -> Option<u64> {
         line.rsplit_once(" ms=\"")?
@@ -3020,7 +3594,7 @@ mod tests {
                 hook.clone(),
                 event("build", "pending", 7, 3),
                 "started",
-                1000,
+                750,
             ),
             (
                 "/",
@@ -3061,7 +3635,7 @@ mod tests {
         s.recording.fail_starts([Error::provider("scaleway: 400")]);
         let failed = s.pending("build", 4).await;
         assert_eq!(failed.status, 500);
-        assert_eq!(failed.body, json!({ "result": "error", "ms": 1000 }));
+        assert_eq!(failed.body, json!({ "result": "error", "ms": 750 }));
         let refused = s.post("/vm", &vm_headers(&run, "0"), b"{}").await;
         assert_eq!(
             (refused.status, refused.body),
@@ -3078,11 +3652,11 @@ mod tests {
             decisions,
             [
                 ("claimed", Some(500)),
-                ("started", Some(1000)),
+                ("started", Some(750)),
                 ("reported", Some(250)),
                 ("swept", Some(250)),
                 ("terminated", Some(250)),
-                ("start_failed", Some(1000)),
+                ("start_failed", Some(750)),
                 ("unauthorized", Some(0)),
             ],
             "{lines:?}"
@@ -3727,76 +4301,13 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_lane_job_leaves_the_slots_its_pipelines_vm_jobs_still_need() {
-        let records = Arc::new(MemoryPipelineRecords::new());
-        let s = warm_setup(
-            lane_config(true),
-            lane_secrets(),
-            None,
-            Some(records.clone()),
-        )
-        .await;
-        let vm = idle_vm(&s, 1, 2).await;
-        let builds = [
-            build(11, "lint", "test"),
-            build(12, "unit-a", "test"),
-            build(13, "e2e", "test"),
-            build(14, "image", "test"),
-            build(15, "unit-c", "test"),
-        ];
-        let now = T0 + 60;
-        let warm = s.pipeline_at(20, "pending", &builds, now).await;
-        assert_eq!(
-            warm_pools(&warm),
-            json!([{ "pool": "vm", "action": "capacity", "vmJobs": 2 }])
-        );
-
-        let lint = s.job_at("lint", "test", 11, 20, now).await;
-        assert_eq!(lint.body["result"], "started", "{}", lint.body);
-        assert_eq!(lint.body["pool"], "node-24");
-        let lint_run = run_of(&lint);
-        assert!(s.lines().contains(&format!(
-            r#"info started job="11" pipeline="20" project="7" stage="test" pool="node-24" reserve="2" run="{lint_run}" taken="1" ms="0""#
-        )));
-        let other = s.job_at("unit-b", "test", 31, 30, now).await;
-        assert_eq!(
-            other.body["result"], "claimed",
-            "the reserve of another pipeline does not count"
-        );
-        assert_eq!(s.vms().await[0].free, 1);
-
-        let e2e = s.job_at("e2e", "test", 13, 20, now).await;
-        assert_eq!(e2e.body["result"], "claimed", "{}", e2e.body);
-        s.report(&vm, VmState::Busy, 1).await;
-        let unit = s.job_at("unit-a", "test", 12, 20, now).await;
-        assert_eq!(unit.body["result"], "started", "{}", unit.body);
-        assert!(s.lines().iter().any(|l| l.starts_with("info started")
-            && l.contains(r#"job="12""#)
-            && l.contains(r#"reserve="1""#)));
-        let image = s.job_at("image", "test", 14, 20, now).await;
-        assert_eq!(image.body["result"], "claimed", "{}", image.body);
-        let mut seen = records.seen_jobs("20").await.unwrap();
-        seen.sort();
-        assert_eq!(seen, ["13", "14"]);
-
-        s.report(&vm, VmState::Busy, 1).await;
-        let late = s.job_at("unit-c", "test", 15, 20, now).await;
-        assert_eq!(
-            late.body,
-            json!({ "result": "claimed", "pool": "vm", "lane": "node-24", "runId": vm, "ms": 0 }),
-            "the seen markers free the reserved slots"
-        );
-        assert_eq!(s.started_pools(), ["vm", "node-24", "node-24"]);
-    }
-
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum Op {
         Open,
         VmJobs,
         Seen,
-        SeenJobs,
         Close,
+        OpenPipelines,
     }
 
     impl Op {
@@ -3805,8 +4316,8 @@ mod tests {
                 Op::Open => "open",
                 Op::VmJobs => "vm_jobs",
                 Op::Seen => "seen",
-                Op::SeenJobs => "seen_jobs",
                 Op::Close => "close",
+                Op::OpenPipelines => "open_pipelines",
             }
         }
     }
@@ -3840,18 +4351,21 @@ mod tests {
             self.inner.seen(pipeline, job).await
         }
         async fn seen_jobs(&self, pipeline: &str) -> Result<Vec<String>> {
-            self.check(Op::SeenJobs)?;
             self.inner.seen_jobs(pipeline).await
         }
         async fn close(&self, pipeline: &str) -> Result<()> {
             self.check(Op::Close)?;
             self.inner.close(pipeline).await
         }
+        async fn open_pipelines(&self) -> Result<Vec<crate::ledger::OpenPipeline>> {
+            self.check(Op::OpenPipelines)?;
+            self.inner.open_pipelines().await
+        }
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_failing_record_never_fails_an_answer() {
-        for op in [Op::Open, Op::VmJobs, Op::Seen, Op::SeenJobs, Op::Close] {
+        for op in [Op::Open, Op::VmJobs, Op::Seen, Op::Close] {
             let records = Arc::new(FaultyRecords {
                 inner: MemoryPipelineRecords::new(),
                 failing: op,
@@ -3872,7 +4386,8 @@ mod tests {
                 "{op:?}"
             );
             let lint = s.job_at("lint", "test", 11, 20, now).await;
-            assert_eq!(lint.body["result"], "claimed", "{op:?} {}", lint.body);
+            assert_eq!(lint.body["result"], "started", "{op:?} {}", lint.body);
+            assert_eq!(lint.body["pool"], "node-24", "{op:?}");
             let e2e = s.job_at("e2e", "test", 13, 20, now).await;
             assert_eq!(e2e.body["result"], "claimed", "{op:?} {}", e2e.body);
             let closed = s.pipeline_at(20, "failed", &builds, now).await;
@@ -4043,5 +4558,945 @@ mod tests {
             }
             assert_eq!(ledger.all().len(), 3);
         }
+    }
+
+    fn spill_secrets() -> Secrets {
+        let mut secrets = lane_secrets();
+        secrets.spill_tokens = BTreeMap::from([("vm".to_string(), "glrt-spill".to_string())]);
+        secrets
+    }
+
+    /// A dispatcher with ledger, records and `schedule`; the records take the setup's clock.
+    async fn queue_setup(
+        config: Arc<Config>,
+        secrets: Secrets,
+        schedule: Arc<dyn Schedule>,
+    ) -> (VmSetup, Arc<MemoryPipelineRecords>) {
+        let mut s = setup_of(config, secrets, Some(Arc::new(MemoryLedger::new()))).await;
+        let clock = s.clock.clone();
+        let records = Arc::new(
+            MemoryPipelineRecords::new().with_clock(Arc::new(move || clock.load(Ordering::SeqCst))),
+        );
+        s.dispatcher = s
+            .dispatcher
+            .with_records(Some(records.clone()))
+            .with_schedule(Some(schedule));
+        (s, records)
+    }
+
+    /// Unix second `t` as GitLab's hooks write it.
+    fn gitlab_time(t: u64) -> String {
+        let at = crate::time::DateTime::from_unix(t);
+        format!("{} {} UTC", at.date(), at.time())
+    }
+
+    fn reported(spill: bool, next: u64) -> Value {
+        json!({ "result": "reported", "spill": spill, "nextReportS": next, "ms": 0 })
+    }
+
+    impl VmSetup {
+        /// A job event of job `job` named `name` in pipeline `pipeline` with `status` and the
+        /// fields of `extra`, at `now`.
+        async fn event_at(
+            &self,
+            name: &str,
+            job: u64,
+            pipeline: u64,
+            status: &str,
+            extra: Value,
+            now: u64,
+        ) -> DispatchResponse {
+            let mut body = json!({
+                "object_kind": "build", "build_id": job, "build_name": name,
+                "build_stage": "test", "build_status": status,
+                "pipeline_id": pipeline, "project_id": 7
+            });
+            if let (Value::Object(body), Value::Object(extra)) = (&mut body, extra) {
+                body.extend(extra);
+            }
+            self.dispatcher
+                .handle_request(
+                    "POST",
+                    "/",
+                    &headers("hook-secret"),
+                    body.to_string().as_bytes(),
+                    now,
+                )
+                .await
+        }
+
+        async fn pending_job(&self, name: &str, job: u64, now: u64) -> DispatchResponse {
+            self.event_at(name, job, 9, "pending", json!({}), now).await
+        }
+
+        /// The running event of job `job`, which started at `started`.
+        async fn running(&self, name: &str, job: u64, started: u64) -> DispatchResponse {
+            let extra = json!({ "build_started_at": gitlab_time(started), "build_duration": 0.05 });
+            self.event_at(name, job, 9, "running", extra, started).await
+        }
+
+        async fn finished(
+            &self,
+            name: &str,
+            job: u64,
+            status: &str,
+            duration: f64,
+            now: u64,
+        ) -> DispatchResponse {
+            let extra = json!({ "build_duration": duration });
+            self.event_at(name, job, 9, status, extra, now).await
+        }
+
+        async fn report_at(
+            &self,
+            run: &str,
+            state: VmState,
+            free: u32,
+            spill: u32,
+            now: u64,
+        ) -> DispatchResponse {
+            let body = serde_json::to_vec(&VmReport {
+                state,
+                free,
+                slots: 2,
+                spill,
+            })
+            .unwrap();
+            let headers = vm_headers(run, &vm::token(VM_SECRET, run));
+            self.dispatcher
+                .handle_request("POST", "/vm", &headers, &body, now)
+                .await
+        }
+    }
+
+    /// A VM of pool `vm` started at `T0` for job 1 of `image-a`; jobs 1 and 2 (`image-b`) run on
+    /// it since `T0 + 2` and it reports both slots busy at `T0 + 60`. `typical` are the
+    /// durations of one earlier finished run of each name.
+    async fn busy_vm(s: &VmSetup, typical: [Option<f64>; 2]) -> String {
+        for (id, name, duration) in [(101, "image-a", typical[0]), (102, "image-b", typical[1])] {
+            if let Some(duration) = duration {
+                let done = s.finished(name, id, "success", duration, T0).await;
+                assert_eq!(done.body["result"], "tracked", "{}", done.body);
+            }
+        }
+        let vm = run_of(&s.pending_job("image-a", 1, T0).await);
+        s.pending_job("image-b", 2, T0).await;
+        for (name, job) in [("image-a", 1), ("image-b", 2)] {
+            let running = s.running(name, job, T0 + 2).await;
+            assert_eq!(running.body["result"], "tracked", "{}", running.body);
+        }
+        let report = s.report_at(&vm, VmState::Busy, 0, 0, T0 + 60).await;
+        assert_eq!(report.body["result"], "reported", "{}", report.body);
+        vm
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn job_events_track_running_and_finished_jobs() {
+        let schedule = Arc::new(MemorySchedule::new());
+        let (s, _) = queue_setup(lane_config(true), spill_secrets(), schedule.clone()).await;
+        let extra = json!({ "build_started_at": gitlab_time(T0 - 30), "build_duration": 0.05 });
+        let running = s.event_at("image", 5, 9, "running", extra, T0).await;
+        assert_eq!(running.status, 200);
+        assert_eq!(
+            running.body,
+            json!({ "result": "tracked", "status": "running", "pool": "vm", "ms": 0 })
+        );
+        assert!(s.lines().contains(
+            &r#"info tracked job="5" pipeline="9" project="7" stage="test" pool="vm" status="running" ms="0""#
+                .to_string()
+        ));
+        let lint = s.event_at("lint", 6, 9, "running", json!({}), T0 + 1).await;
+        assert_eq!(lint.body["pool"], "node-24", "a lane job under its lane");
+        let odd = json!({ "build_started_at": "yesterday" });
+        s.event_at("image", 7, 9, "running", odd, T0 + 2).await;
+        let running_of = |pool: &'static str| {
+            let schedule = schedule.clone();
+            async move {
+                let mut jobs = schedule.running(pool).await.unwrap();
+                jobs.sort_by(|a, b| a.job.cmp(&b.job));
+                jobs
+            }
+        };
+        let run = |job: &str, name: &str, started| Running {
+            job: job.into(),
+            name: name.into(),
+            started,
+        };
+        assert_eq!(
+            running_of("vm").await,
+            [run("5", "image", T0 - 30), run("7", "image", T0 + 2)],
+            "no start time is the event's time"
+        );
+        assert_eq!(running_of("node-24").await, [run("6", "lint", T0 + 1)]);
+
+        let done = s.finished("image", 5, "success", 61.6, T0 + 32).await;
+        assert_eq!(
+            done.body,
+            json!({ "result": "tracked", "status": "success", "pool": "vm", "ms": 0 })
+        );
+        assert!(s.lines().contains(
+            &r#"info tracked job="5" pipeline="9" project="7" stage="test" pool="vm" status="success" duration_s="62" ms="0""#
+                .to_string()
+        ));
+        assert_eq!(schedule.typical("vm", "image").await.unwrap(), Some(62));
+        s.finished("image", 7, "failed", 30.4, T0 + 33).await;
+        assert_eq!(schedule.typical("vm", "image").await.unwrap(), Some(52));
+        s.finished("lint", 6, "canceled", 12.0, T0 + 34).await;
+        s.finished("image", 8, "skipped", 0.0, T0 + 34).await;
+        assert_eq!(schedule.typical("node-24", "lint").await.unwrap(), None);
+        assert_eq!(schedule.typical("vm", "image").await.unwrap(), Some(52));
+        assert!(running_of("vm").await.is_empty());
+        assert!(running_of("node-24").await.is_empty());
+
+        for status in ["created", "waiting_for_resource", "preparing", "manual"] {
+            let other = s.event_at("image", 9, 9, status, json!({}), T0).await;
+            assert_eq!(
+                other.body,
+                json!({ "result": "ignored", "reason": "status", "status": status, "ms": 0 })
+            );
+        }
+        let own = s
+            .event_at("ciburst-check", 10, 9, "running", json!({}), T0)
+            .await;
+        assert_eq!(own.body["reason"], "own_job");
+        assert!(s.recording.started.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_vm_job_behind_a_slot_that_frees_soon_queues_and_that_slot_takes_it() {
+        let schedule = Arc::new(MemorySchedule::new());
+        let (s, _) = queue_setup(lane_config(true), spill_secrets(), schedule.clone()).await;
+        let vm = busy_vm(&s, [Some(60.0), Some(600.0)]).await;
+        let deploy = s.pending_job("deploy", 3, T0 + 60).await;
+        assert_eq!(deploy.status, 200);
+        assert_eq!(
+            deploy.body,
+            json!({ "result": "queued", "pool": "vm", "etaS": 2, "ms": 0 })
+        );
+        assert!(s.lines().contains(
+            &r#"info queued job="3" pipeline="9" project="7" stage="test" pool="vm" eta_s="2" ms="0""#
+                .to_string()
+        ));
+        assert_eq!(
+            schedule.queued("vm").await.unwrap(),
+            [Queued {
+                job: "3".into(),
+                name: "deploy".into(),
+                pipeline: "9".into(),
+                at: T0 + 60,
+            }]
+        );
+        assert_eq!(
+            s.report_at(&vm, VmState::Busy, 0, 0, T0 + 61).await.body,
+            reported(false, 15),
+            "a queued VM job keeps spill off"
+        );
+        let done = s.finished("image-a", 1, "success", 60.4, T0 + 62).await;
+        assert_eq!(done.body["result"], "tracked");
+        assert_eq!(
+            s.report_at(&vm, VmState::Busy, 1, 0, T0 + 62).await.body,
+            reported(false, 15),
+            "the free slot takes the queued job, no VM starts"
+        );
+        assert_eq!(
+            s.running("deploy", 3, T0 + 63).await.body,
+            json!({ "result": "tracked", "status": "running", "pool": "vm", "ms": 0 })
+        );
+        assert!(schedule.queued("vm").await.unwrap().is_empty());
+        assert_eq!(s.started_pools(), ["vm"], "one VM");
+        assert_eq!(schedule.typical("vm", "image-a").await.unwrap(), Some(60));
+        assert_eq!(
+            s.report_at(&vm, VmState::Busy, 0, 0, T0 + 64).await.body,
+            reported(true, 15)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_vm_job_whose_wait_would_pass_max_queue_s_starts_a_vm() {
+        let schedule = Arc::new(MemorySchedule::new());
+        let (s, _) = queue_setup(lane_config(true), spill_secrets(), schedule.clone()).await;
+        busy_vm(&s, [Some(400.0), Some(600.0)]).await;
+        let deploy = s.pending_job("deploy", 3, T0 + 60).await;
+        assert_eq!(deploy.body["result"], "started", "{}", deploy.body);
+        assert_eq!(s.taken(), [1, 1]);
+        assert!(schedule.queued("vm").await.unwrap().is_empty());
+
+        let mut eager = (*lane_config(true)).clone();
+        eager.pools[0].max_queue_s = Some(0);
+        let (s, _) = queue_setup(
+            Arc::new(eager),
+            spill_secrets(),
+            Arc::new(MemorySchedule::new()),
+        )
+        .await;
+        busy_vm(&s, [Some(60.0), Some(600.0)]).await;
+        let deploy = s.pending_job("deploy", 3, T0 + 60).await;
+        assert_eq!(
+            deploy.body["result"], "started",
+            "maxQueueS 0 buys a VM for any wait"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unknown_durations_queue_until_max_queue_s_passed() {
+        let schedule = Arc::new(MemorySchedule::new());
+        let (s, _) = queue_setup(lane_config(true), spill_secrets(), schedule.clone()).await;
+        let vm = busy_vm(&s, [None, None]).await;
+        let deploy = s.pending_job("deploy", 3, T0 + 60).await;
+        assert_eq!(
+            deploy.body,
+            json!({ "result": "queued", "pool": "vm", "etaS": 0, "ms": 0 })
+        );
+        let again = s.pending_job("deploy", 3, T0 + 100).await;
+        assert_eq!(again.body["result"], "queued");
+        assert_eq!(
+            schedule.queued("vm").await.unwrap()[0].at,
+            T0 + 60,
+            "a repeated event keeps the job's place"
+        );
+        assert_eq!(
+            s.report_at(&vm, VmState::Busy, 0, 0, T0 + 150).await.body,
+            reported(false, 15)
+        );
+        assert_eq!(s.started_pools(), ["vm"], "90 s are allowed");
+        s.set_clock(T0 + 151);
+        assert_eq!(
+            s.report_at(&vm, VmState::Busy, 0, 0, T0 + 151).await.body,
+            reported(false, 15)
+        );
+        let started = s.recording.started.lock().unwrap().clone();
+        assert_eq!(started.len(), 2);
+        assert_eq!(started[1].taken, 0, "every slot free");
+        assert_eq!(
+            started[1].labels,
+            BTreeMap::from([
+                ("job".to_string(), "queue:3".to_string()),
+                ("pipeline".to_string(), "9".to_string()),
+            ])
+        );
+        assert_eq!(started[1].env[SPILL_TOKEN_KEY], "glrt-spill");
+        let queued_vm = started.len();
+        let run = s
+            .vms()
+            .await
+            .iter()
+            .map(|v| v.run_id.clone())
+            .find(|r| *r != vm);
+        assert!(s.lines().contains(&format!(
+            r#"info queue_started pool="vm" job="queue:3" vms="1" needing="1" runs="{}" ms="0""#,
+            run.unwrap()
+        )));
+        s.report_at(&vm, VmState::Busy, 0, 0, T0 + 170).await;
+        assert_eq!(
+            s.recording.started.lock().unwrap().len(),
+            queued_vm,
+            "the starting VM takes the job"
+        );
+        assert_eq!(schedule.queued("vm").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn two_evaluations_at_once_start_one_vm() {
+        let (s, _) = queue_setup(
+            lane_config(true),
+            spill_secrets(),
+            Arc::new(MemorySchedule::new()),
+        )
+        .await;
+        let vm = busy_vm(&s, [None, None]).await;
+        s.pending_job("deploy", 3, T0 + 60).await;
+        *s.recording.delay.lock().unwrap() = Duration::from_millis(100);
+        let (a, b) = tokio::join!(
+            s.report_at(&vm, VmState::Busy, 0, 0, T0 + 151),
+            s.report_at(&vm, VmState::Busy, 0, 0, T0 + 151),
+        );
+        assert_eq!((a.status, b.status), (200, 200));
+        assert_eq!(s.started_pools(), ["vm", "vm"], "one VM for the queue");
+        let starts = s
+            .lines()
+            .iter()
+            .filter(|l| l.starts_with("info queue_started"))
+            .count();
+        assert_eq!(starts, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn at_max_runs_a_vm_job_queues_instead_of_answering_at_capacity() {
+        let schedule = Arc::new(MemorySchedule::new());
+        let (s, _) = queue_setup(vm_config(), vm_secrets(), schedule.clone()).await;
+        let a = run_of(&s.pending_job("image-a", 1, T0).await);
+        s.report_at(&a, VmState::Busy, 0, 0, T0 + 60).await;
+        let second = s.pending_job("image-b", 2, T0 + 60).await;
+        assert_eq!(
+            second.body["result"], "started",
+            "no running job will free a slot"
+        );
+        let b = run_of(&second);
+        s.report_at(&b, VmState::Busy, 0, 0, T0 + 61).await;
+        let third = s.pending_job("deploy", 3, T0 + 62).await;
+        assert_eq!(
+            third.body,
+            json!({ "result": "queued", "pool": "vm", "etaS": null, "ms": 0 })
+        );
+        assert!(s.lines().contains(
+            &r#"info queued job="3" pipeline="9" project="7" stage="test" pool="vm" eta_s="null" ms="0""#
+                .to_string()
+        ));
+        assert_eq!(
+            s.report_at(&a, VmState::Busy, 0, 0, T0 + 200).await.body,
+            reported(false, 15)
+        );
+        assert_eq!(s.started_pools(), ["vm", "vm"], "maxRuns 2");
+        assert_eq!(schedule.queued("vm").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_past_max_runs_queues_its_last_jobs() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let schedule = Arc::new(MemorySchedule::new());
+        let s = vm_setup_with(vm_secrets(), Some(ledger.clone())).await;
+        let dispatcher = Dispatcher::new(
+            vm_config(),
+            s.recording.clone(),
+            Arc::new(vm_secrets()),
+            Log::silent(),
+        )
+        .with_ledger(Some(ledger.clone()))
+        .with_schedule(Some(schedule.clone()));
+        let hook = headers("hook-secret");
+        let bodies: Vec<Vec<u8>> = (1..=5)
+            .map(|job| event("test", "pending", 7, job))
+            .collect();
+        let (a, b, c, d, e) = tokio::join!(
+            dispatcher.handle_request("POST", "/", &hook, &bodies[0], T0),
+            dispatcher.handle_request("POST", "/", &hook, &bodies[1], T0),
+            dispatcher.handle_request("POST", "/", &hook, &bodies[2], T0),
+            dispatcher.handle_request("POST", "/", &hook, &bodies[3], T0),
+            dispatcher.handle_request("POST", "/", &hook, &bodies[4], T0),
+        );
+        let results: Vec<Value> = [a, b, c, d, e]
+            .into_iter()
+            .map(|r| r.body["result"].clone())
+            .collect();
+        assert_eq!(
+            results,
+            ["started", "grouped", "started", "grouped", "queued"],
+            "rank 4 is group 2 and maxRuns is 2"
+        );
+        let queued = schedule.queued("vm").await.unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].job, "5");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_entries_older_than_30_minutes_are_dropped_when_read() {
+        let schedule = Arc::new(MemorySchedule::new());
+        let (s, _) = queue_setup(lane_config(true), spill_secrets(), schedule.clone()).await;
+        let vm = busy_vm(&s, [Some(60.0), Some(600.0)]).await;
+        let lost = |job: &str, at: u64| Queued {
+            job: job.into(),
+            name: "lost".into(),
+            pipeline: "8".into(),
+            at,
+        };
+        let now = T0 + 2000;
+        schedule
+            .enqueue("vm", &lost("90", now - 1801))
+            .await
+            .unwrap();
+        schedule
+            .enqueue("vm", &lost("91", now - 1800))
+            .await
+            .unwrap();
+        schedule
+            .enqueue("node-24", &lost("92", now - 1801))
+            .await
+            .unwrap();
+        let ghost = |job: &str, started: u64| Running {
+            job: job.into(),
+            name: "ghost".into(),
+            started,
+        };
+        schedule
+            .started("vm", &ghost("80", now - RUNNING_MAX_AGE_S - 1))
+            .await
+            .unwrap();
+        schedule
+            .started("vm", &ghost("81", now - RUNNING_MAX_AGE_S))
+            .await
+            .unwrap();
+        s.report_at(&vm, VmState::Busy, 0, 0, now).await;
+        assert_eq!(
+            schedule.queued("vm").await.unwrap(),
+            [lost("91", now - 1800)]
+        );
+        let mut running: Vec<String> = schedule
+            .running("vm")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.job)
+            .collect();
+        running.sort();
+        assert_eq!(running, ["1", "2", "81"], "a running entry lives 24 h");
+        assert!(schedule.queued("node-24").await.unwrap().is_empty());
+        assert!(
+            s.lines()
+                .iter()
+                .any(|l| l.starts_with(r#"info queue_started pool="vm" job="queue:91""#)),
+            "30 minutes still count"
+        );
+        assert_eq!(
+            s.started_pools(),
+            ["vm", "vm"],
+            "the lost lane job starts no run"
+        );
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum ScheduleOp {
+        Enqueue,
+        Queued,
+        Started,
+        Running,
+        Finished,
+        Typical,
+        TakeStart,
+    }
+
+    struct FaultySchedule {
+        inner: MemorySchedule,
+        failing: ScheduleOp,
+    }
+
+    impl FaultySchedule {
+        fn new(failing: ScheduleOp) -> Arc<FaultySchedule> {
+            Arc::new(FaultySchedule {
+                inner: MemorySchedule::new(),
+                failing,
+            })
+        }
+
+        fn check(&self, op: ScheduleOp) -> Result<()> {
+            if op == self.failing {
+                return Err(Error::provider("bucket refused"));
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Schedule for FaultySchedule {
+        async fn enqueue(&self, pool: &str, job: &Queued) -> Result<()> {
+            self.check(ScheduleOp::Enqueue)?;
+            self.inner.enqueue(pool, job).await
+        }
+        async fn queued(&self, pool: &str) -> Result<Vec<Queued>> {
+            self.check(ScheduleOp::Queued)?;
+            self.inner.queued(pool).await
+        }
+        async fn started(&self, pool: &str, job: &Running) -> Result<()> {
+            self.check(ScheduleOp::Started)?;
+            self.inner.started(pool, job).await
+        }
+        async fn running(&self, pool: &str) -> Result<Vec<Running>> {
+            self.check(ScheduleOp::Running)?;
+            self.inner.running(pool).await
+        }
+        async fn finished(
+            &self,
+            pool: &str,
+            job: &str,
+            name: &str,
+            duration_s: Option<u64>,
+        ) -> Result<()> {
+            self.check(ScheduleOp::Finished)?;
+            self.inner.finished(pool, job, name, duration_s).await
+        }
+        async fn typical(&self, pool: &str, name: &str) -> Result<Option<u64>> {
+            self.check(ScheduleOp::Typical)?;
+            self.inner.typical(pool, name).await
+        }
+        async fn take_start(&self, pool: &str, now: u64) -> Result<bool> {
+            self.check(ScheduleOp::TakeStart)?;
+            self.inner.take_start(pool, now).await
+        }
+    }
+
+    fn schedule_warnings(s: &VmSetup) -> Vec<String> {
+        s.lines()
+            .into_iter()
+            .filter(|l| l.starts_with("warn schedule_failed"))
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_schedule_falls_back_to_the_burst_path() {
+        for (failing, op) in [
+            (ScheduleOp::Queued, "queued"),
+            (ScheduleOp::Running, "running"),
+            (ScheduleOp::Typical, "typical"),
+            (ScheduleOp::Enqueue, "enqueue"),
+        ] {
+            let (s, _) = queue_setup(
+                lane_config(true),
+                spill_secrets(),
+                FaultySchedule::new(failing),
+            )
+            .await;
+            let vm = busy_vm(&s, [Some(60.0), Some(600.0)]).await;
+            let deploy = s.pending_job("deploy", 3, T0 + 60).await;
+            assert_eq!(deploy.status, 200, "{op}");
+            assert_eq!(deploy.body["result"], "started", "{op}: {}", deploy.body);
+            let warnings = schedule_warnings(&s);
+            assert!(
+                warnings.iter().any(|l| l.starts_with(&format!(
+                    r#"warn schedule_failed op="{op}" pool="vm" error="bucket refused""#
+                ))),
+                "{op}: {warnings:?}"
+            );
+            let report = s.report_at(&vm, VmState::Busy, 0, 0, T0 + 61).await;
+            assert_eq!(report.status, 200, "{op}");
+            if failing == ScheduleOp::Queued {
+                assert_eq!(report.body, reported(false, 30), "nothing spills");
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_schedule_never_fails_an_answer() {
+        let (s, _) = queue_setup(
+            lane_config(true),
+            spill_secrets(),
+            FaultySchedule::new(ScheduleOp::Started),
+        )
+        .await;
+        let running = s.running("image", 5, T0).await;
+        assert_eq!(
+            running.body,
+            json!({ "result": "ignored", "reason": "status", "status": "running", "ms": 0 })
+        );
+        assert_eq!(
+            schedule_warnings(&s),
+            [r#"warn schedule_failed op="started" pool="vm" error="bucket refused" ms="0""#]
+        );
+
+        let (s, _) = queue_setup(
+            lane_config(true),
+            spill_secrets(),
+            FaultySchedule::new(ScheduleOp::Finished),
+        )
+        .await;
+        let done = s.finished("lint", 6, "success", 3.0, T0).await;
+        assert_eq!(
+            done.body,
+            json!({ "result": "ignored", "reason": "status", "status": "success", "ms": 0 })
+        );
+
+        let (s, _) = queue_setup(
+            lane_config(true),
+            spill_secrets(),
+            FaultySchedule::new(ScheduleOp::TakeStart),
+        )
+        .await;
+        let vm = busy_vm(&s, [None, None]).await;
+        s.pending_job("deploy", 3, T0 + 60).await;
+        let report = s.report_at(&vm, VmState::Busy, 0, 0, T0 + 151).await;
+        assert_eq!(report.body, reported(false, 15));
+        assert_eq!(s.started_pools(), ["vm"], "no marker, no start");
+        assert!(schedule_warnings(&s)[0].starts_with(r#"warn schedule_failed op="take_start""#));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lane_job_spills_while_no_vm_job_waits_and_falls_back_after_20_s() {
+        let schedule = Arc::new(MemorySchedule::new());
+        let (s, _) = queue_setup(lane_config(true), spill_secrets(), schedule.clone()).await;
+        let vm = run_of(&s.pending_job("image", 1, T0).await);
+        assert_eq!(
+            s.recording.started.lock().unwrap()[0].env[SPILL_TOKEN_KEY],
+            "glrt-spill"
+        );
+        let report = s.report_at(&vm, VmState::Idle, 2, 2, T0 + 60).await;
+        assert_eq!(report.body, reported(true, 15));
+        assert!(s.lines().contains(&format!(
+            r#"info reported run="{vm}" state="idle" free="2" spilling="2" spill="true" next_report_s="15" ms="0""#
+        )));
+        let lint = s.pending_job("lint", 2, T0 + 61).await;
+        assert_eq!(lint.status, 200);
+        assert_eq!(
+            lint.body,
+            json!({ "result": "spilled", "pool": "node-24", "vm": vm, "ms": 0 })
+        );
+        assert!(s.lines().contains(&format!(
+            r#"info spilled job="2" pipeline="9" project="7" stage="test" pool="node-24" vm="{vm}" ms="0""#
+        )));
+        let unit = s.pending_job("unit-a", 3, T0 + 61).await;
+        assert_eq!(unit.body["result"], "spilled", "{}", unit.body);
+        assert_eq!(schedule.queued("node-24").await.unwrap().len(), 2);
+        assert_eq!(
+            s.running("lint", 2, T0 + 63).await.body,
+            json!({ "result": "tracked", "status": "running", "pool": "node-24", "ms": 0 }),
+            "a slot took the lint job"
+        );
+
+        assert_eq!(
+            s.report_at(&vm, VmState::Busy, 1, 1, T0 + 81).await.body,
+            reported(true, 15)
+        );
+        assert_eq!(s.started_pools(), ["vm"], "20 s have not passed");
+        s.report_at(&vm, VmState::Busy, 1, 1, T0 + 82).await;
+        assert_eq!(s.started_pools(), ["vm", "node-24"]);
+        let lane = s.recording.started.lock().unwrap()[1].clone();
+        assert_eq!(
+            lane.labels,
+            BTreeMap::from([
+                ("job".to_string(), "3".to_string()),
+                ("pipeline".to_string(), "9".to_string()),
+            ])
+        );
+        assert_eq!(lane.env["RUNNER_TOKEN"], "glrt-node-24");
+        assert!(!lane.env.contains_key(SPILL_TOKEN_KEY));
+        assert!(!lane.env.contains_key(keys::VM_SECRET));
+        assert!(schedule.queued("node-24").await.unwrap().is_empty());
+        assert!(
+            s.lines()
+                .iter()
+                .any(|l| l.starts_with(r#"info spill_fallback lane="node-24" job="3" run="fake-"#))
+        );
+        s.report_at(&vm, VmState::Busy, 1, 1, T0 + 100).await;
+        assert_eq!(s.started_pools().len(), 2, "one lane run per job");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn spill_needs_idle_spill_slots_reported_lately_a_token_and_a_vm_first_lane() {
+        let (s, _) = queue_setup(
+            lane_config(true),
+            spill_secrets(),
+            Arc::new(MemorySchedule::new()),
+        )
+        .await;
+        let vm = run_of(&s.pending_job("image", 1, T0).await);
+        assert_eq!(
+            s.report_at(&vm, VmState::Idle, 2, 0, T0 + 60).await.body,
+            reported(true, 15)
+        );
+        // The lane's start path: a lane run, or `at_capacity` at the lane's two runs.
+        let lane = |response: DispatchResponse| {
+            let result = response.body["result"].as_str().unwrap_or("");
+            assert!(
+                ["started", "at_capacity"].contains(&result),
+                "{}",
+                response.body
+            );
+            response.body["pool"].as_str().unwrap().to_string()
+        };
+        assert_eq!(
+            lane(s.pending_job("lint", 2, T0 + 60).await),
+            "node-24",
+            "no slot polls with the spill runner yet"
+        );
+        s.report_at(&vm, VmState::Idle, 2, 2, T0 + 61).await;
+        assert_eq!(
+            lane(s.pending_job("clippy", 3, T0 + 61).await),
+            "rust-1",
+            "vmFirst false"
+        );
+        assert_eq!(
+            lane(s.pending_job("lint", 4, T0 + 92).await),
+            "node-24",
+            "the report is 31 s old"
+        );
+        s.report_at(&vm, VmState::Busy, 0, 2, T0 + 93).await;
+        assert_eq!(
+            lane(s.pending_job("lint", 5, T0 + 93).await),
+            "node-24",
+            "min(free, spill) is 0"
+        );
+        assert_eq!(
+            s.report_at(&vm, VmState::Draining, 2, 2, T0 + 94)
+                .await
+                .body,
+            reported(false, 600)
+        );
+        assert_eq!(
+            lane(s.pending_job("lint", 6, T0 + 94).await),
+            "node-24",
+            "a draining VM"
+        );
+
+        let (s, _) = queue_setup(
+            lane_config(true),
+            lane_secrets(),
+            Arc::new(MemorySchedule::new()),
+        )
+        .await;
+        let vm = run_of(&s.pending_job("image", 1, T0).await);
+        assert!(
+            !s.recording.started.lock().unwrap()[0]
+                .env
+                .contains_key(SPILL_TOKEN_KEY)
+        );
+        assert_eq!(
+            s.report_at(&vm, VmState::Idle, 2, 2, T0 + 60).await.body,
+            reported(false, 600),
+            "no spill token"
+        );
+        assert_eq!(lane(s.pending_job("lint", 2, T0 + 60).await), "node-24");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pipeline_with_an_unseen_vm_job_turns_spill_off() {
+        let (s, records) = queue_setup(
+            lane_config(true),
+            spill_secrets(),
+            Arc::new(MemorySchedule::new()),
+        )
+        .await;
+        let vm = run_of(&s.pending_job("image", 1, T0).await);
+        assert_eq!(
+            s.report_at(&vm, VmState::Idle, 2, 2, T0 + 60).await.body,
+            reported(true, 15)
+        );
+        let builds = [
+            build(11, "lint", "test"),
+            build(13, "e2e", "test"),
+            build(15, "unit-c", "test"),
+        ];
+        let warm = s.pipeline_at(20, "pending", &builds, T0 + 61).await;
+        assert_eq!(
+            warm_pools(&warm),
+            json!([{ "pool": "vm", "action": "capacity", "vmJobs": 1 }])
+        );
+        assert_eq!(
+            s.report_at(&vm, VmState::Idle, 2, 2, T0 + 62).await.body,
+            reported(false, 600),
+            "e2e of pipeline 20 is still to come"
+        );
+        let lint = s
+            .event_at("lint", 11, 20, "pending", json!({}), T0 + 62)
+            .await;
+        assert_eq!(lint.body["result"], "started", "{}", lint.body);
+        assert_eq!(lint.body["pool"], "node-24");
+        let e2e = s
+            .event_at("e2e", 13, 20, "pending", json!({}), T0 + 63)
+            .await;
+        assert_eq!(e2e.body["result"], "claimed", "{}", e2e.body);
+        assert_eq!(
+            s.report_at(&vm, VmState::Busy, 1, 1, T0 + 64).await.body,
+            reported(true, 15),
+            "the seen marker turns spill on"
+        );
+        let unit = s
+            .event_at("unit-c", 15, 20, "pending", json!({}), T0 + 64)
+            .await;
+        assert_eq!(unit.body["result"], "spilled", "{}", unit.body);
+
+        s.set_clock(T0 + 100);
+        s.pipeline_at(21, "pending", &[build(31, "e2e-b", "test")], T0 + 100)
+            .await;
+        assert_eq!(
+            s.report_at(&vm, VmState::Busy, 1, 1, T0 + 100).await.body,
+            reported(false, 30)
+        );
+        let late = T0 + 100 + RECORD_MAX_AGE_S + 1;
+        assert_eq!(
+            s.report_at(&vm, VmState::Busy, 1, 1, late).await.body,
+            reported(true, 15),
+            "a record older than two hours counts as closed"
+        );
+        assert_eq!(records.open_pipelines().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_record_read_keeps_spill_off() {
+        let records = Arc::new(FaultyRecords {
+            inner: MemoryPipelineRecords::new(),
+            failing: Op::OpenPipelines,
+        });
+        let (mut s, _) = queue_setup(
+            lane_config(true),
+            spill_secrets(),
+            Arc::new(MemorySchedule::new()),
+        )
+        .await;
+        s.dispatcher = s.dispatcher.with_records(Some(records));
+        let vm = run_of(&s.pending_job("image", 1, T0).await);
+        assert_eq!(
+            s.report_at(&vm, VmState::Idle, 2, 2, T0 + 60).await.body,
+            reported(false, 600)
+        );
+        let lint = s.pending_job("lint", 2, T0 + 60).await;
+        assert_eq!(lint.body["result"], "started", "{}", lint.body);
+        assert!(s.lines().contains(
+            &r#"warn records_failed op="open_pipelines" error="bucket refused" ms="0""#.to_string()
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lane_job_runs_the_start_rule_while_vm_jobs_queue() {
+        let (s, _) = queue_setup(
+            lane_config(true),
+            spill_secrets(),
+            Arc::new(MemorySchedule::new()),
+        )
+        .await;
+        busy_vm(&s, [None, None]).await;
+        let deploy = s.pending_job("deploy", 3, T0 + 60).await;
+        assert_eq!(deploy.body["result"], "queued");
+        let lint = s.pending_job("lint", 4, T0 + 151).await;
+        assert_eq!(lint.body["result"], "started", "{}", lint.body);
+        assert_eq!(
+            lint.body["pool"], "node-24",
+            "no spill while a VM job waits"
+        );
+        assert_eq!(s.started_pools(), ["vm", "vm", "node-24"]);
+        assert!(
+            s.lines()
+                .iter()
+                .any(|l| l.starts_with(r#"info queue_started pool="vm" job="queue:3""#))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_job_beyond_the_slots_of_a_starting_vm_gets_a_vm_of_its_own() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let (mut s, _) = queue_setup(
+            lane_config(true),
+            spill_secrets(),
+            Arc::new(MemorySchedule::new()),
+        )
+        .await;
+        s.dispatcher = s.dispatcher.with_ledger(Some(ledger.clone()));
+        let builds = [
+            build(2, "e2e-a", "test"),
+            build(3, "e2e-b", "test"),
+            build(4, "e2e-c", "test"),
+        ];
+        let warm = s.pipeline_at(9, "pending", &builds, T0).await;
+        assert_eq!(warm.body["pools"][0]["action"], "started", "{}", warm.body);
+        let mut answers = Vec::new();
+        for (job, name) in [(2, "e2e-a"), (3, "e2e-b"), (4, "e2e-c")] {
+            let response = s.event_at(name, job, 9, "pending", json!({}), T0 + 5).await;
+            answers.push((
+                response.body["result"].clone(),
+                response.body["etaS"].clone(),
+            ));
+        }
+        assert_eq!(
+            answers,
+            [
+                (json!("queued"), json!(0)),
+                (json!("queued"), json!(0)),
+                (json!("queued"), Value::Null),
+            ],
+            "the warm VM's two slots go to the first two"
+        );
+        assert_eq!(s.taken(), [0, 0], "the warm VM and one for the third job");
+        assert_eq!(ledger.all().len(), 1, "only the warm intent");
+        assert!(
+            s.lines()
+                .iter()
+                .any(|l| l.starts_with(r#"info queue_started pool="vm" job="queue:4""#))
+        );
     }
 }

@@ -15,6 +15,13 @@ pub const DEFAULT_WAIT_TIMEOUT_S: u32 = 60;
 pub const DEFAULT_MAX_RUNS: u32 = 10;
 pub const DEFAULT_EXPIRE_DAYS: u32 = 30;
 pub const DEFAULT_SLOTS: u32 = 2;
+/// M6.2 rule R1: seconds a VM job waits for a paid slot before another VM is bought, about one
+/// VM boot.
+pub const DEFAULT_MAX_QUEUE_S: u32 = 90;
+/// M6.2 rule R1: the largest `maxQueueS`.
+pub const MAX_QUEUE_S_LIMIT: u32 = 3600;
+/// M6.2 rule R6: a VM pool's spill runner is described `<name>-<vm tag>` and this suffix.
+pub const SPILL_SUFFIX: &str = "-spill";
 
 /// The runtime of VM pools on the main provider.
 pub const INSTANCES_RUNTIME: &str = "instances";
@@ -77,8 +84,8 @@ pub struct Pool {
     /// Job name patterns (`*`, `?`) routed to this pool before any stage (D46).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub jobs: Vec<String>,
-    /// Lanes: a pending job claims a free slot of the VM pool before a lane run starts (D47);
-    /// `None` means yes when a VM pool exists.
+    /// Lanes: jobs may run on idle paid slots of the VM pool while the dispatcher allows spill
+    /// (D54, M6.2 rules R6 and R8); `None` means yes when a VM pool exists.
     #[serde(default, rename = "vmFirst", skip_serializing_if = "Option::is_none")]
     pub vm_first: Option<bool>,
     #[serde(default = "d_vcpu")]
@@ -107,12 +114,21 @@ pub struct Pool {
     /// (D48); `None` means yes.
     #[serde(default, rename = "warmStart", skip_serializing_if = "Option::is_none")]
     pub warm_start: Option<bool>,
+    /// VM pools: seconds a VM job may wait for a paid slot before another VM is bought (D53);
+    /// `None` means [`DEFAULT_MAX_QUEUE_S`], 0 starts a VM at once as before M6.2.
+    #[serde(default, rename = "maxQueueS", skip_serializing_if = "Option::is_none")]
+    pub max_queue_s: Option<u32>,
 }
 
 impl Pool {
     /// D48: whether pipeline events may start a VM of this pool ahead of its jobs.
     pub fn warm_start(&self) -> bool {
         self.warm_start != Some(false)
+    }
+
+    /// D53, M6.2 rule R1: the seconds a VM job of this pool may wait for a paid slot.
+    pub fn max_queue_s(&self) -> u64 {
+        u64::from(self.max_queue_s.unwrap_or(DEFAULT_MAX_QUEUE_S))
     }
 }
 
@@ -212,6 +228,7 @@ impl Config {
                 slots: DEFAULT_SLOTS,
                 instance_types: vec!["DEV1-M".to_string(), "DEV1-L".to_string()],
                 warm_start: None,
+                max_queue_s: None,
             }],
             cache: CacheConfig {
                 kind: CacheType::S3,
@@ -267,9 +284,9 @@ impl Config {
             .find(|pool| pool.jobs.iter().any(|pattern| glob_match(pattern, name)))
     }
 
-    /// D47: the VM pool whose free slots a pending job of `lane` claims before a lane run
-    /// starts: the default pool when it is a VM pool, else the first VM pool. None for a pool
-    /// that is no lane and for a lane with `vmFirst: false`.
+    /// D54: the VM pool whose idle slots may take the jobs of `lane`: the default pool when it
+    /// is a VM pool, else the first VM pool. None for a pool that is no lane and for a lane with
+    /// `vmFirst: false`.
     pub fn vm_first_pool(&self, lane: &Pool) -> Option<&Pool> {
         if !self.is_lane(lane) || lane.vm_first == Some(false) {
             return None;
@@ -279,20 +296,36 @@ impl Config {
             .or_else(|| self.pools.iter().find(|pool| self.is_vm_pool(pool)))
     }
 
-    /// D47: the tags of a pool's GitLab runner. Its own tag, and on the VM pool that lanes
-    /// claim slots of, the tag of every lane with `vmFirst` in config order.
+    /// M6.2 rule R6: the tags of a pool's own GitLab runner, its tag only.
     pub fn runner_tags(&self, pool: &Pool) -> Vec<String> {
-        std::iter::once(pool.tag.clone())
-            .chain(
-                self.pools
-                    .iter()
-                    .filter(|lane| {
-                        self.vm_first_pool(lane)
-                            .is_some_and(|vm| vm.tag == pool.tag)
-                    })
-                    .map(|lane| lane.tag.clone()),
-            )
+        vec![pool.tag.clone()]
+    }
+
+    /// M6.2 rule R6: the lanes whose jobs may spill onto idle slots of `vm_pool`, in config
+    /// order; empty for a pool that is no VM pool.
+    pub fn spill_lanes(&self, vm_pool: &Pool) -> Vec<&Pool> {
+        self.pools
+            .iter()
+            .filter(|lane| {
+                self.vm_first_pool(lane)
+                    .is_some_and(|vm| vm.tag == vm_pool.tag)
+            })
             .collect()
+    }
+
+    /// M6.2 rule R6: the tags of the spill runner of `vm_pool`, the pool's tag and then the tag
+    /// of each lane of [`Config::spill_lanes`]; `None` when no lane spills onto the pool, which
+    /// then has no spill runner.
+    pub fn spill_tags(&self, vm_pool: &Pool) -> Option<Vec<String>> {
+        let lanes = self.spill_lanes(vm_pool);
+        if lanes.is_empty() {
+            return None;
+        }
+        Some(
+            std::iter::once(vm_pool.tag.clone())
+                .chain(lanes.into_iter().map(|lane| lane.tag.clone()))
+                .collect(),
+        )
     }
 
     /// The added provider a pool belongs to, `None` for the main provider.
@@ -437,6 +470,27 @@ pub fn validate(mut config: Config) -> Result<Config> {
             if pool.warm_start.is_some() && !config.is_vm_pool(pool) {
                 errors.push(format!(
                     "{where_}.warmStart: VM pools only (runtime {INSTANCES_RUNTIME} or a key of providers)"
+                ));
+            }
+            if let Some(max_queue_s) = pool.max_queue_s {
+                if !config.is_vm_pool(pool) {
+                    errors.push(format!(
+                        "{where_}.maxQueueS: VM pools only (runtime {INSTANCES_RUNTIME} or a key of providers)"
+                    ));
+                } else if max_queue_s > MAX_QUEUE_S_LIMIT {
+                    errors.push(format!(
+                        "{where_}.maxQueueS: whole number 0 to {MAX_QUEUE_S_LIMIT}"
+                    ));
+                }
+            }
+            if let Some(vm) = config
+                .pools
+                .iter()
+                .find(|vm| config.is_vm_pool(vm) && pool.tag == format!("{}{SPILL_SUFFIX}", vm.tag))
+            {
+                errors.push(format!(
+                    "{where_}.tag: {} names the spill runner of pool {}",
+                    pool.tag, vm.tag
                 ));
             }
         }
@@ -758,7 +812,7 @@ mod tests {
     }
 
     #[test]
-    fn lanes_claim_slots_of_the_default_vm_pool_else_the_first() {
+    fn lanes_spill_onto_the_default_vm_pool_else_the_first() {
         let config = parse_config(&lanes().to_string()).unwrap();
         let first = |tag: &str| {
             config
@@ -769,10 +823,24 @@ mod tests {
         assert_eq!(first("rust-1"), None, "vmFirst false");
         assert_eq!(first("ts-5"), Some("vm"));
         assert_eq!(first("vm"), None, "no lane");
-        let tags = |tag: &str| config.runner_tags(config.pool_by_tag(tag).unwrap());
-        assert_eq!(tags("vm"), ["vm", "node-24", "ts-5"]);
-        assert_eq!(tags("node-24"), ["node-24"]);
-        assert_eq!(tags("rust-1"), ["rust-1"]);
+        let pool = |tag: &str| config.pool_by_tag(tag).unwrap();
+        for tag in ["vm", "node-24", "rust-1"] {
+            assert_eq!(config.runner_tags(pool(tag)), [tag], "its own tag only");
+        }
+        assert_eq!(
+            config.spill_tags(pool("vm")).unwrap(),
+            ["vm", "node-24", "ts-5"]
+        );
+        let lanes_of = |tag: &str| -> Vec<&str> {
+            config
+                .spill_lanes(pool(tag))
+                .iter()
+                .map(|p| p.tag.as_str())
+                .collect()
+        };
+        assert_eq!(lanes_of("vm"), ["node-24", "ts-5"]);
+        assert!(lanes_of("node-24").is_empty());
+        assert_eq!(config.spill_tags(pool("node-24")), None, "no VM pool");
 
         let mut raw = lanes();
         raw["providers"] = serde_json::json!({ "hetzner": {} });
@@ -788,10 +856,7 @@ mod tests {
             "vm",
             "the default pool"
         );
-        assert_eq!(
-            config.runner_tags(config.pool_by_tag("hz").unwrap()),
-            ["hz"]
-        );
+        assert_eq!(config.spill_tags(config.pool_by_tag("hz").unwrap()), None);
 
         raw["defaultPool"] = "node-24".into();
         let config = parse_config(&raw.to_string()).unwrap();
@@ -802,13 +867,12 @@ mod tests {
             "the first VM pool"
         );
         assert_eq!(
-            config.runner_tags(config.pool_by_tag("hz").unwrap()),
+            config
+                .spill_tags(config.pool_by_tag("hz").unwrap())
+                .unwrap(),
             ["hz", "node-24", "ts-5"]
         );
-        assert_eq!(
-            config.runner_tags(config.pool_by_tag("vm").unwrap()),
-            ["vm"]
-        );
+        assert_eq!(config.spill_tags(config.pool_by_tag("vm").unwrap()), None);
 
         let mut raw = lanes();
         raw["pools"].as_array_mut().unwrap().remove(0);
@@ -818,10 +882,77 @@ mod tests {
             config
                 .pools
                 .iter()
-                .all(|p| config.vm_first_pool(p).is_none()),
+                .all(|p| config.vm_first_pool(p).is_none() && config.spill_tags(p).is_none()),
             "no VM pool"
         );
         assert_eq!(config.runner_tags(&config.pools[0]), ["node-24"]);
+    }
+
+    #[test]
+    fn max_queue_s_belongs_to_vm_pools_and_defaults_to_90() {
+        let mut raw = lanes();
+        raw["providers"] = serde_json::json!({ "hetzner": {} });
+        raw["pools"].as_array_mut().unwrap().push(
+            serde_json::json!({ "tag": "hz", "image": "x", "runtime": "hetzner", "maxQueueS": 0 }),
+        );
+        raw["pools"][0]["maxQueueS"] = 3600.into();
+        let config = parse_config(&raw.to_string()).unwrap();
+        let wait = |tag: &str| config.pool_by_tag(tag).unwrap().max_queue_s();
+        assert_eq!((wait("vm"), wait("hz"), wait("node-24")), (3600, 0, 90));
+        let back = serde_json::to_value(&config).unwrap();
+        assert_eq!(back["pools"][0]["maxQueueS"], 3600);
+        assert!(back["pools"][1].get("maxQueueS").is_none());
+        assert_eq!(merge_config(&config, "{}").unwrap(), config);
+
+        raw["pools"][0]["maxQueueS"] = 3601.into();
+        raw["pools"][1]["maxQueueS"] = 30.into();
+        raw["pools"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({ "tag": "plain", "image": "x", "maxQueueS": 10 }));
+        assert_eq!(
+            errors_of(raw.clone()),
+            [
+                "pools[0].maxQueueS: whole number 0 to 3600",
+                "pools[1].maxQueueS: VM pools only (runtime instances or a key of providers)",
+                "pools[5].maxQueueS: VM pools only (runtime instances or a key of providers)",
+            ]
+        );
+        for bad in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("90"),
+        ] {
+            let mut raw = lanes();
+            raw["pools"][0]["maxQueueS"] = bad.clone();
+            assert_eq!(errors_of(raw).len(), 1, "{bad}: serde refuses it");
+        }
+        assert_eq!(
+            Config::ci_defaults(5, "https://gitlab.example").pools[0].max_queue_s(),
+            90
+        );
+    }
+
+    #[test]
+    fn no_pool_takes_the_name_of_a_spill_runner() {
+        let mut raw = lanes();
+        raw["pools"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({ "tag": "vm-spill", "image": "x", "runtime": "jobs" }));
+        assert_eq!(
+            errors_of(raw),
+            ["pools[4].tag: vm-spill names the spill runner of pool vm"]
+        );
+        let mut raw = lanes();
+        raw["pools"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({ "tag": "node-24-spill", "image": "x", "runtime": "jobs" }));
+        assert!(
+            parse_config(&raw.to_string()).is_ok(),
+            "only VM pools have spill runners"
+        );
     }
 
     #[test]

@@ -372,3 +372,45 @@ async fn a_disabled_hook_is_enabled_before_the_replay() {
         .unwrap();
     assert!(reenabled < replayed, "{lines:?}");
 }
+
+/// M6.2 rule R6: lane jobs that no spill slot took wait for their lane's tag.
+#[tokio::test]
+async fn jobs_waiting_for_a_lane_tag_are_replayed_too() {
+    let mut s = Setup::new();
+    s.config = Arc::new(
+        parse_config(
+            &json!({
+                "name": "demo",
+                "gitlab": { "url": "https://gitlab.example", "projectIds": [7] },
+                "host": { "type": "fake" },
+                "provider": { "type": "fake" },
+                "defaultPool": "vm",
+                "pools": [
+                    { "tag": "vm", "image": "ubuntu:24.04", "runtime": "instances" },
+                    { "tag": "node-24", "image": "node:24", "runtime": "jobs", "jobs": ["lint"] }
+                ],
+                "cache": { "type": "s3" }
+            })
+            .to_string(),
+        )
+        .unwrap(),
+    );
+    s.provider = Arc::new(FakeProvider::new(
+        s.config.clone(),
+        Arc::new(MemoryStore::new()),
+    ));
+    s.fake.add_job(7, pending(32, "image", "test", &["vm"], 90));
+    s.fake
+        .add_job(7, pending(31, "lint", "test", &["node-24"], 90));
+    let recorder = Recorder::new(started);
+    s.provisioner(true, Some(recorder.clone()))
+        .apply(&[])
+        .await
+        .unwrap();
+    let jobs: Vec<Value> = recorder
+        .bodies()
+        .iter()
+        .map(|body| body["build_id"].clone())
+        .collect();
+    assert_eq!(jobs, [json!(31), json!(32)]);
+}
