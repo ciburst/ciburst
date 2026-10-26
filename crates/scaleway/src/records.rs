@@ -5,12 +5,13 @@
 //! never share this prefix; the lifecycle rule of `ciburst/intents/` expires what a pipeline's
 //! final event did not delete. Signed with the cache key, like the ledger.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use ciburst_core::config::Config;
 use ciburst_core::http::HttpClient;
-use ciburst_core::ledger::{PipelineRecords, VmJobs};
+use ciburst_core::ledger::{OpenPipeline, PipelineRecords, VmJobs, unseen_of};
 use ciburst_core::types::KeyPair;
 use ciburst_core::{Error, Result};
 
@@ -151,6 +152,50 @@ impl PipelineRecords for ScalewayPipelineRecords {
             self.s3.delete_object(&self.bucket, &object.key).await?;
         }
         Ok(())
+    }
+
+    /// One listing of every record (M6.2 rule R7): a pipeline is open while its `vm-jobs.json`
+    /// is listed, `opened` is that object's `LastModified`; its jobs come from one GET each, and
+    /// the listed seen markers are subtracted. Markers without a record are ignored.
+    async fn open_pipelines(&self) -> Result<Vec<OpenPipeline>> {
+        let objects = self
+            .s3
+            .list_all(&self.bucket, PIPELINE_PREFIX, MAX_PAGES)
+            .await?;
+        let mut opened: BTreeMap<String, Option<u64>> = BTreeMap::new();
+        let mut seen: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for object in &objects {
+            let Some((pipeline, rest)) = object
+                .key
+                .strip_prefix(PIPELINE_PREFIX)
+                .and_then(|key| key.split_once('/'))
+            else {
+                continue;
+            };
+            if !is_id(pipeline) {
+                continue;
+            }
+            if rest == VM_JOBS {
+                opened.insert(pipeline.to_string(), object.modified);
+            } else if let Some(job) = rest.strip_prefix(SEEN).filter(|job| is_id(job)) {
+                seen.entry(pipeline.to_string())
+                    .or_default()
+                    .push(job.to_string());
+            }
+        }
+        let mut open = Vec::new();
+        for (pipeline, opened) in opened {
+            let Some(jobs) = self.vm_jobs(&pipeline).await? else {
+                continue;
+            };
+            let marked = seen.get(&pipeline).map(Vec::as_slice).unwrap_or(&[]);
+            open.push(OpenPipeline {
+                unseen: unseen_of(&jobs, marked),
+                pipeline,
+                opened,
+            });
+        }
+        Ok(open)
     }
 }
 

@@ -437,3 +437,43 @@ async fn destroy_deletes_the_records_with_the_bucket() {
     owner(&fake).empty_and_delete(BUCKET).await.unwrap();
     assert!(fake.buckets().is_empty());
 }
+
+#[tokio::test]
+async fn open_pipelines_lists_the_records_without_their_seen_jobs() {
+    let (fake, records) = records().await;
+    records
+        .open("9", &vm_jobs(&[("vm", &["11", "12"]), ("big", &["13"])]))
+        .await
+        .unwrap();
+    records
+        .open("90", &vm_jobs(&[("vm", &["21"])]))
+        .await
+        .unwrap();
+    records.seen("9", "11").await.unwrap();
+    records.seen("9", "13").await.unwrap();
+    let owner = owner(&fake);
+    for key in [
+        "ciburst/intents/_pipelines/7/seen/1",
+        "ciburst/intents/_pipelines/x/vm-jobs.json",
+        "ciburst/intents/_pipelines/9/notes",
+    ] {
+        owner.put_object(BUCKET, key, Vec::new()).await.unwrap();
+    }
+
+    let open = records.open_pipelines().await.unwrap();
+    let found: Vec<(String, VmJobs)> = open.into_iter().map(|p| (p.pipeline, p.unseen)).collect();
+    assert_eq!(
+        found,
+        [
+            ("9".to_string(), vm_jobs(&[("vm", &["12"])])),
+            ("90".to_string(), vm_jobs(&[("vm", &["21"])])),
+        ]
+    );
+
+    records.close("9").await.unwrap();
+    let open = records.open_pipelines().await.unwrap();
+    assert_eq!(
+        open.iter().map(|p| p.pipeline.as_str()).collect::<Vec<_>>(),
+        ["90"]
+    );
+}

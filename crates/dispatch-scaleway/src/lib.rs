@@ -319,6 +319,7 @@ pub async fn respond(
     .with_dispatch_url(env.dispatch_url.clone())
     .with_ledger(backends.ledger.clone())
     .with_records(backends.records.clone())
+    .with_schedule(backends.schedule.clone())
     .with_group_wait(env.group_wait);
     let response = dispatcher
         .handle_request(
@@ -936,7 +937,10 @@ mod tests {
             .await;
             assert_eq!(status, 200, "{uri}");
             assert_eq!(content_type.as_deref(), Some("application/json"));
-            assert_eq!(parse(&body), json!({ "result": "reported" }));
+            assert_eq!(
+                parse(&body),
+                json!({ "result": "reported", "spill": false, "nextReportS": 600 })
+            );
         }
         let vms = provider.capacity("vm").await.unwrap().unwrap();
         assert_eq!(vms[0].state, ciburst_core::types::VmState::Idle);

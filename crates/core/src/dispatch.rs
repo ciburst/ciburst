@@ -56,7 +56,7 @@ const TRACKED_STATUSES: [&str; 5] = ["running", "success", "failed", "canceled",
 pub const QUEUE_PREFIX: &str = "queue:";
 
 /// M6.2 rule R6: the start environment key of a VM pool's spill runner token.
-pub const SPILL_TOKEN_KEY: &str = "RUNNER_SPILL_TOKEN";
+pub const SPILL_TOKEN_KEY: &str = crate::cloud_init::SPILL_TOKEN;
 
 /// M6.2 rule R7: a pipeline record older than this counts as closed, a lost final event, so it
 /// cannot keep spill off for good.
