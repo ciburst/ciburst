@@ -465,6 +465,14 @@ Measured:
    Check: VMs per pipeline (target 1, at most 2), VM-hours, lane seconds and cost against pipeline 2988692655.
    Result: ____
 
+### M6.3 phase 0: one `gitlab-runner run` for several runners
+
+Result (2026-10-26, `gitlab/gitlab-runner:v18.11.4` in Docker with the Docker executor, two runners of the demo project with the tags `p0a` and `p0b` in one `config.toml`, `concurrent = 2`, four 60 s jobs, two per tag):
+- never more than 2 jobs at once; the four ran in two waves;
+- each runner gave its parallel jobs the concurrency ids 0 and 1 (`runner-<token prefix>-project-<id>-concurrent-<n>`), so the volumes of parallel jobs stay apart, unlike `run-single`, which always reports 0;
+- a runner removed from the live `config.toml` was dropped about 1 s later (`Configuration loaded`) and its jobs stayed pending; a runner added back took a waiting job 2 s after the change;
+- `SIGQUIT` logged `Starting graceful shutdown, waiting for builds to finish`, the two running jobs finished, and the process exited 22 s later.
+
 ## `run-single` flags
 
 Source: `gitlab-runner run-single --help` in `gitlab/gitlab-runner:v18.11.4` (`images/test/runner-help.sh`) and `commands/single.go` at `v18.11.4`; every flag below is present there.
