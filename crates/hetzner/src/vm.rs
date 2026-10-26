@@ -24,6 +24,9 @@ pub const LABEL_STATE: &str = "ciburst-state";
 pub const LABEL_FREE: &str = "ciburst-free";
 pub const LABEL_SEEN: &str = "ciburst-seen";
 pub const LABEL_DRAIN: &str = "ciburst-drain";
+/// Slots of the last report that poll with the spill runner (M6.2 rule R6); set only when there
+/// are any, like the Scaleway tag.
+pub const LABEL_SPILL: &str = "ciburst-spill";
 
 /// Longest server name: Hetzner wants an RFC 1123 hostname, and the name has no dots, so it is
 /// one hostname label.
@@ -98,8 +101,12 @@ pub fn reported(labels: &Labels, report: &VmReport, now: u64) -> Labels {
     });
     let mut out = labels.clone();
     out.remove(LABEL_DRAIN);
+    out.remove(LABEL_SPILL);
     out.insert(LABEL_STATE.to_string(), report.state.as_str().to_string());
     out.insert(LABEL_FREE.to_string(), report.free.to_string());
+    if report.spill > 0 {
+        out.insert(LABEL_SPILL.to_string(), report.spill.to_string());
+    }
     out.insert(LABEL_SEEN.to_string(), now.to_string());
     if let Some(since) = drain_since {
         out.insert(LABEL_DRAIN.to_string(), since.to_string());
@@ -145,8 +152,10 @@ pub fn capacity(server: &Value) -> Option<VmCapacity> {
             .get(LABEL_FREE)
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
-        // Read from the report's spill tag by M6.2 rule R6.
-        spill: 0,
+        spill: labels
+            .get(LABEL_SPILL)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
         seen: labels.get(LABEL_SEEN).and_then(|v| v.parse().ok()),
         created_at: parse_rfc3339(server["created"].as_str()?)?,
     })
@@ -342,6 +351,31 @@ mod tests {
         );
     }
 
+    /// M6.2 rule R6: the spill label holds the spilling slots of the last report and disappears
+    /// at zero.
+    #[test]
+    fn reports_set_the_spill_label_while_slots_spill() {
+        let before = initial_labels("demo", "vm", Some("42"), 1);
+        let spilling = VmReport {
+            state: VmState::Idle,
+            free: 2,
+            slots: 2,
+            spill: 2,
+        };
+        let after = reported(&before, &spilling, T0);
+        assert_eq!(after[LABEL_SPILL], "2");
+        assert_eq!(after.len(), before.len() + 2, "seen and spill");
+        assert!(valid_label_value(&after[LABEL_SPILL]));
+        let off = VmReport {
+            spill: 0,
+            ..spilling
+        };
+        let off = reported(&after, &off, T0 + 15);
+        assert!(!off.contains_key(LABEL_SPILL));
+        assert_eq!(off.len(), before.len() + 1);
+        assert_eq!(claimed(&after)[LABEL_SPILL], "2", "a claim keeps it");
+    }
+
     #[test]
     fn claims_floor_at_zero() {
         let start = labels(&[("ciburst", "true"), ("ciburst-free", "2")]);
@@ -384,9 +418,17 @@ mod tests {
         let fresh = json!({ "name": "demo-ci-1", "created": rfc3339(T0), "labels": {} });
         let fresh = capacity(&fresh).unwrap();
         assert_eq!(
-            (fresh.state, fresh.free, fresh.seen),
-            (VmState::Starting, 0, None)
+            (fresh.state, fresh.free, fresh.spill, fresh.seen),
+            (VmState::Starting, 0, 0, None)
         );
+        for (value, spill) in [("2", 2), ("x", 0)] {
+            let spilling = json!({
+                "name": "demo-ci-2",
+                "created": rfc3339(T0),
+                "labels": { "ciburst-free": "2", "ciburst-spill": value },
+            });
+            assert_eq!(capacity(&spilling).unwrap().spill, spill, "{value}");
+        }
         assert_eq!(capacity(&json!({ "name": "x", "labels": {} })), None);
         assert_eq!(capacity(&json!({ "created": rfc3339(T0) })), None);
         assert!(is_deployment(&server, "demo"));

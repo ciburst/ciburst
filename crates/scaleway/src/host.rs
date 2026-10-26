@@ -13,9 +13,11 @@
 //!   this host resolves on every plan and apply (`Scaleway::resolve_vm_start`, M7 hardening
 //!   rule R3), so a changed image or security group plans a function update;
 //! - secret: `HOOK_TOKEN`, `CIBURST_DISPATCH_KEY` (the dispatch key), `RUNNER_TOKEN_<TAG>` per pool,
-//!   `CACHE_S3_ACCESS_KEY` and `CACHE_S3_SECRET_KEY` when a cache key exists, `CIBURST_VM_SECRET`
-//!   and `CIBURST_SWEEP_TOKEN` when the provisioner made them, and every credential of an added
-//!   provider (`Secrets::provider_env`, for example `HCLOUD_TOKEN`) under its own name.
+//!   `RUNNER_SPILL_TOKEN_<TAG>` per VM pool with a spill runner (`Secrets::spill_tokens`, M6.2
+//!   rule R6), `CACHE_S3_ACCESS_KEY` and `CACHE_S3_SECRET_KEY` when a cache key exists,
+//!   `CIBURST_VM_SECRET` and `CIBURST_SWEEP_TOKEN` when the provisioner made them, and every
+//!   credential of an added provider (`Secrets::provider_env`, for example `HCLOUD_TOKEN`) under
+//!   its own name.
 //!
 //! On top, the plain variable `CIBURST_CODE_DIGEST` records the sha256 of the deployed zip for
 //! this host's plan; the function does not read it. The sha256 of the settings and both
@@ -97,7 +99,7 @@ pub mod vars {
                 .chars()
                 .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
         let taken = [HOOK_TOKEN, CACHE_ACCESS_KEY, CACHE_SECRET_KEY].contains(&name)
-            || ["CIBURST_", "RUNNER_TOKEN_", "SCW_"]
+            || ["CIBURST_", RUNNER_TOKEN_PREFIX, SPILL_TOKEN_PREFIX, "SCW_"]
                 .iter()
                 .any(|prefix| name.starts_with(prefix));
         shaped && !taken
@@ -105,7 +107,8 @@ pub mod vars {
 
     /// Whether `name` can carry a plain variable of the dispatcher (`Secrets::dispatcher_env`,
     /// for example `CIBURST_AGENT_SHA256`): upper-case like a provider variable, outside the
-    /// names of this module, `RUNNER_TOKEN_<TAG>` and Scaleway's reserved `SCW_`.
+    /// names of this module, `RUNNER_TOKEN_<TAG>`, `RUNNER_SPILL_TOKEN_<TAG>` and Scaleway's
+    /// reserved `SCW_`.
     pub fn dispatcher_name_ok(name: &str) -> bool {
         let shaped = name.starts_with(|c: char| c.is_ascii_uppercase())
             && name
@@ -127,17 +130,19 @@ pub mod vars {
             VM_IMAGES,
         ]
         .contains(&name)
-            || ["RUNNER_TOKEN_", "SCW_"]
+            || [RUNNER_TOKEN_PREFIX, SPILL_TOKEN_PREFIX, "SCW_"]
                 .iter()
                 .any(|prefix| name.starts_with(prefix));
         shaped && !taken
     }
 
-    /// `RUNNER_TOKEN_<TAG>`: tag upper-cased, every other character than ASCII letters and
-    /// digits replaced by `_`, the rule of `ciburst_core::provision::keys`.
-    pub fn runner_token(tag: &str) -> String {
-        let name: String = tag
-            .chars()
+    const RUNNER_TOKEN_PREFIX: &str = "RUNNER_TOKEN_";
+    const SPILL_TOKEN_PREFIX: &str = "RUNNER_SPILL_TOKEN_";
+
+    /// A tag as a variable name suffix: upper-cased, every other character than ASCII letters
+    /// and digits replaced by `_`, the rule of `ciburst_core::provision::keys`.
+    fn tag_suffix(tag: &str) -> String {
+        tag.chars()
             .map(|c| {
                 if c.is_ascii_alphanumeric() {
                     c.to_ascii_uppercase()
@@ -145,8 +150,18 @@ pub mod vars {
                     '_'
                 }
             })
-            .collect();
-        format!("RUNNER_TOKEN_{name}")
+            .collect()
+    }
+
+    /// `RUNNER_TOKEN_<TAG>`.
+    pub fn runner_token(tag: &str) -> String {
+        format!("{RUNNER_TOKEN_PREFIX}{}", tag_suffix(tag))
+    }
+
+    /// `RUNNER_SPILL_TOKEN_<TAG>`: the token of the spill runner of VM pool `tag` (M6.2 rule
+    /// R6), named like [`runner_token`].
+    pub fn spill_token(tag: &str) -> String {
+        format!("{SPILL_TOKEN_PREFIX}{}", tag_suffix(tag))
     }
 }
 
@@ -300,6 +315,9 @@ impl ScalewayFunction {
         for pool in &self.config.pools {
             if let Some(token) = secrets.runner_tokens.get(&pool.tag) {
                 secret.insert(vars::runner_token(&pool.tag), token.clone());
+            }
+            if let Some(token) = secrets.spill_tokens.get(&pool.tag) {
+                secret.insert(vars::spill_token(&pool.tag), token.clone());
             }
         }
         if let Some(cache) = &secrets.cache {
@@ -865,6 +883,11 @@ mod tests {
             ciburst_core::provision::keys::runner_token("rust-1.96"),
             format!("CIBURST_{}", vars::runner_token("rust-1.96"))
         );
+        assert_eq!(vars::spill_token("vm"), "RUNNER_SPILL_TOKEN_VM");
+        assert_eq!(
+            vars::spill_token("rust-1.96"),
+            "RUNNER_SPILL_TOKEN_RUST_1_96"
+        );
     }
 
     #[test]
@@ -887,9 +910,14 @@ mod tests {
             vars::CODE_DIGEST,
             "CIBURST_DISPATCH_URL",
             &vars::runner_token("ci"),
+            &vars::spill_token("vm"),
         ] {
             assert!(!vars::provider_name_ok(name), "{name}");
         }
+        for name in [vars::runner_token("ci"), vars::spill_token("vm")] {
+            assert!(!vars::dispatcher_name_ok(&name), "{name}");
+        }
+        assert!(vars::provider_name_ok("RUNNER_SPILL"));
     }
 
     /// D50: a function deployed with 128 MB carries another description, so it plans

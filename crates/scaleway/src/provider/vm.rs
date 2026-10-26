@@ -16,9 +16,12 @@ pub const TAG_STATE: &str = "ciburst-state";
 pub const TAG_FREE: &str = "ciburst-free";
 pub const TAG_SEEN: &str = "ciburst-seen";
 pub const TAG_DRAIN: &str = "ciburst-drain";
+/// Slots of the last report that poll with the spill runner (M6.2 rule R6); written only when
+/// there are any, so a VM that never spills keeps the tags of M6.1.
+pub const TAG_SPILL: &str = "ciburst-spill";
 
-/// The tags `report` rewrites; every other tag of a server is kept.
-const STATE_TAGS: [&str; 4] = [TAG_STATE, TAG_FREE, TAG_SEEN, TAG_DRAIN];
+/// The tags `report` rewrites, each at most once; every other tag of a server is kept.
+const STATE_TAGS: [&str; 5] = [TAG_STATE, TAG_FREE, TAG_SPILL, TAG_SEEN, TAG_DRAIN];
 
 /// The value of the first `key:value` tag.
 pub fn tag_value<'a>(tags: &'a [String], key: &str) -> Option<&'a str> {
@@ -80,6 +83,9 @@ pub fn reported(tags: &[String], report: &VmReport, now: u64) -> Vec<String> {
         .collect();
     out.push(format!("{TAG_STATE}:{}", report.state.as_str()));
     out.push(format!("{TAG_FREE}:{}", report.free));
+    if report.spill > 0 {
+        out.push(format!("{TAG_SPILL}:{}", report.spill));
+    }
     out.push(format!("{TAG_SEEN}:{now}"));
     if let Some(since) = drain_since {
         out.push(format!("{TAG_DRAIN}:{since}"));
@@ -123,8 +129,9 @@ pub fn capacity(server: &Value) -> Option<VmCapacity> {
         free: tag_value(&tags, TAG_FREE)
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
-        // Read from the report's spill tag by M6.2 rule R6.
-        spill: 0,
+        spill: tag_value(&tags, TAG_SPILL)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
         seen: tag_value(&tags, TAG_SEEN).and_then(|v| v.parse().ok()),
         created_at: parse_rfc3339(server["creation_date"].as_str()?)?,
     })
@@ -278,6 +285,52 @@ mod tests {
         );
     }
 
+    /// M6.2 rule R6: the spill tag sits next to the free tag while slots spill, replaces itself
+    /// and disappears at zero, so a report never adds a tag twice.
+    #[test]
+    fn reports_write_the_spill_tag_while_slots_spill() {
+        let before = initial_tags("demo", "vm", Some("42"), 1);
+        let spilling = VmReport {
+            state: VmState::Idle,
+            free: 2,
+            slots: 2,
+            spill: 2,
+        };
+        let after = reported(&before, &spilling, T0);
+        assert_eq!(
+            after,
+            tags(&[
+                "ciburst",
+                "demo",
+                "pool:vm",
+                "job:42",
+                "ciburst-state:idle",
+                "ciburst-free:2",
+                "ciburst-spill:2",
+                &format!("ciburst-seen:{T0}"),
+            ])
+        );
+        let one = VmReport {
+            state: VmState::Busy,
+            free: 1,
+            spill: 1,
+            ..spilling
+        };
+        let again = reported(&reported(&after, &one, T0 + 15), &one, T0 + 30);
+        assert_eq!(again.len(), after.len());
+        assert_eq!(tag_value(&again, TAG_SPILL), Some("1"));
+        let off = VmReport { spill: 0, ..one };
+        let off = reported(&again, &off, T0 + 45);
+        assert!(
+            !off.iter().any(|t| t.starts_with("ciburst-spill")),
+            "{off:?}"
+        );
+        assert_eq!(off.len(), after.len() - 1);
+        let mut doubled = after.clone();
+        doubled.push("ciburst-spill:7".into());
+        assert_eq!(reported(&doubled, &spilling, T0), after);
+    }
+
     #[test]
     fn claims_floor_at_zero_and_keep_order() {
         let start = tags(&["ciburst", "ciburst-free:2", "pool:ci"]);
@@ -316,9 +369,17 @@ mod tests {
         let fresh = json!({ "id": "s-2", "creation_date": rfc3339(T0), "tags": ["ciburst"] });
         let fresh = capacity(&fresh).unwrap();
         assert_eq!(
-            (fresh.state, fresh.free, fresh.seen),
-            (VmState::Starting, 0, None)
+            (fresh.state, fresh.free, fresh.spill, fresh.seen),
+            (VmState::Starting, 0, 0, None)
         );
+        for (tag, spill) in [("ciburst-spill:2", 2), ("ciburst-spill:x", 0)] {
+            let spilling = json!({
+                "id": "s-4",
+                "creation_date": rfc3339(T0),
+                "tags": ["ciburst", "ciburst-free:2", tag],
+            });
+            assert_eq!(capacity(&spilling).unwrap().spill, spill, "{tag}");
+        }
         assert_eq!(capacity(&json!({ "id": "s-3", "tags": [] })), None);
         assert!(is_deployment(&server, "demo"));
         assert!(!is_deployment(&server, "other"));

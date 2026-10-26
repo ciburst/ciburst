@@ -20,6 +20,17 @@ pub const SWAP: &str = "4G";
 pub const RUN_ID: &str = "CIBURST_RUN_ID";
 pub const VM_TOKEN: &str = "CIBURST_VM_TOKEN";
 pub const DISPATCH_URL: &str = "CIBURST_DISPATCH_URL";
+/// The token of the pool's spill runner (M6.2 rule R6), in the start env and `vm.env` when the
+/// pool has one; without it a VM never spills.
+pub const SPILL_TOKEN: &str = "RUNNER_SPILL_TOKEN";
+
+/// `vm.env` plus the spill token of `request`, when it carries a non-empty one (M6.2 rule R6).
+/// Every VM provider builds `vm.env` from named keys of the start env and calls this.
+pub fn with_spill_token(env: &mut BTreeMap<String, String>, request: &BTreeMap<String, String>) {
+    if let Some(token) = request.get(SPILL_TOKEN).filter(|t| !t.is_empty()) {
+        env.insert(SPILL_TOKEN.to_string(), token.clone());
+    }
+}
 /// `shared_env` key with the HTTPS URL a VM downloads the agent from (D38).
 pub const AGENT_URL_KEY: &str = "CIBURST_AGENT_URL";
 /// `shared_env` key with the agent's SHA-256, which cloud-init checks.
@@ -229,6 +240,34 @@ mod tests {
         assert!(!text.contains("docker cp"));
         let with_docker = render(&BTreeMap::new(), runner(), agent(), true).unwrap();
         assert!(runcmd(&with_docker)[1].contains("apt-get install -y docker.io"));
+    }
+
+    /// M6.2 rule R6: a non-empty spill token of the start env goes into `vm.env`.
+    #[test]
+    fn the_spill_token_goes_into_vm_env_when_the_start_carries_one() {
+        let base = BTreeMap::from([("RUNNER_TOKEN".to_string(), "glrt-vm".to_string())]);
+        for request in [
+            BTreeMap::new(),
+            BTreeMap::from([(SPILL_TOKEN.to_string(), String::new())]),
+        ] {
+            let mut env = base.clone();
+            with_spill_token(&mut env, &request);
+            assert_eq!(env, base, "{request:?}");
+        }
+        let mut env = base.clone();
+        let request = BTreeMap::from([
+            (SPILL_TOKEN.to_string(), "glrt-spill".to_string()),
+            ("CIBURST_VM_SECRET".to_string(), "never".to_string()),
+        ]);
+        with_spill_token(&mut env, &request);
+        assert_eq!(env.len(), 2);
+        let text = render(&env, runner(), agent(), false).unwrap();
+        assert!(
+            text.contains("\n      RUNNER_SPILL_TOKEN=glrt-spill\n"),
+            "{text}"
+        );
+        assert!(text.contains("\n      RUNNER_TOKEN=glrt-vm\n"), "{text}");
+        assert!(!text.contains("never"));
     }
 
     #[test]
