@@ -70,6 +70,7 @@ impl Vm {
             run_id: self.run_id.clone(),
             state: self.state,
             free: self.free,
+            spill: 0,
             seen: self.seen,
             created_at: self.created_at,
         }
@@ -549,6 +550,7 @@ mod tests {
             state,
             free,
             slots: 2,
+            spill: 0,
         }
     }
 
@@ -589,6 +591,7 @@ mod tests {
                 run_id: run.clone(),
                 state: VmState::Starting,
                 free: 1,
+                spill: 0,
                 seen: None,
                 created_at: T0,
             }

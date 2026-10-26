@@ -614,6 +614,7 @@ async fn capacity_reads_the_pool_servers_and_ignores_other_deployments() {
         state: VmState::Busy,
         free: 1,
         slots: 2,
+        spill: 0,
     };
     provider
         .report(&first, &report, FAKE_CLOCK + 120)
@@ -691,6 +692,7 @@ async fn report_rewrites_the_state_tags_and_keeps_every_other_tag() {
         state: VmState::Draining,
         free: 1,
         slots: 1,
+        spill: 0,
     };
     provider.report(&id, &draining, 1_000).await.unwrap();
     provider.report(&id, &draining, 1_060).await.unwrap();
@@ -716,6 +718,7 @@ async fn report_rewrites_the_state_tags_and_keeps_every_other_tag() {
         state: VmState::Idle,
         free: 1,
         slots: 1,
+        spill: 0,
     };
     provider.report(&id, &idle, 1_100).await.unwrap();
     let after = tags(&backend.instance.server(&id).unwrap());
@@ -736,6 +739,7 @@ async fn claim_report_and_stop_refuse_servers_of_others() {
         state: VmState::Idle,
         free: 1,
         slots: 1,
+        spill: 0,
     };
     let message = format!("scaleway: server {foreign} does not belong to contract");
     assert_eq!(

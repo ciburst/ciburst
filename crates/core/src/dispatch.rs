@@ -1308,6 +1308,7 @@ mod tests {
 
     fn secrets() -> Arc<Secrets> {
         Arc::new(Secrets {
+            spill_tokens: Default::default(),
             hook_token: Some("hook-secret".into()),
             runner_tokens: BTreeMap::from([
                 ("ci".to_string(), "glrt-ci".to_string()),
@@ -1706,6 +1707,7 @@ mod tests {
             run_id: id.into(),
             state,
             free,
+            spill: 0,
             seen,
             created_at,
         }
@@ -2020,6 +2022,7 @@ mod tests {
 
     fn vm_secrets() -> Secrets {
         Secrets {
+            spill_tokens: Default::default(),
             hook_token: Some("hook-secret".into()),
             runner_tokens: BTreeMap::from([
                 ("vm".to_string(), "glrt-vm".to_string()),
@@ -2122,6 +2125,7 @@ mod tests {
                 state,
                 free,
                 slots: 2,
+                spill: 0,
             })
             .unwrap();
             let response = self
@@ -2266,6 +2270,7 @@ mod tests {
             state: VmState::Idle,
             free: 2,
             slots: 2,
+            spill: 0,
         })
         .unwrap();
         let good = vm::token(VM_SECRET, &run);
@@ -2993,6 +2998,7 @@ mod tests {
             state: VmState::Idle,
             free: 1,
             slots: 2,
+            spill: 0,
         })
         .unwrap();
         let pipeline = json!({

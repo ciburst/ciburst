@@ -202,6 +202,7 @@ impl Agent {
                         state: VmState::Draining,
                         free: 0,
                         slots: self.config.slots,
+                        spill: 0,
                     };
                     // The grace starts only once the dispatcher stopped counting this VM.
                     if self.send_report(&report).await {
@@ -248,6 +249,7 @@ impl Agent {
             state,
             free: self.free_in(self.phase)?,
             slots: self.config.slots,
+            spill: 0,
         })
     }
 

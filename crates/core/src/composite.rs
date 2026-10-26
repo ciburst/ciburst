@@ -302,6 +302,7 @@ mod tests {
                 run_id: self.run_id(),
                 state: VmState::Idle,
                 free: 1,
+                spill: 0,
                 seen: None,
                 created_at: 0,
             }]))
@@ -493,6 +494,7 @@ mod tests {
             state: VmState::Idle,
             free: 2,
             slots: 2,
+            spill: 0,
         };
         for (run, member) in [
             ("hetzner:demo-vm-0a1b2c3d", "hetzner"),

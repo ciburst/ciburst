@@ -134,6 +134,8 @@ impl Env {
             _ => None,
         };
         let secrets = Secrets {
+            // Read from RUNNER_SPILL_TOKEN_<TAG> by M6.2 rule R6.
+            spill_tokens: Default::default(),
             hook_token: Some(required(vars::HOOK_TOKEN)?),
             runner_tokens,
             dispatch: None,

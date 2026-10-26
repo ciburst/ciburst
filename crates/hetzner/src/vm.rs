@@ -145,6 +145,8 @@ pub fn capacity(server: &Value) -> Option<VmCapacity> {
             .get(LABEL_FREE)
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
+        // Read from the report's spill tag by M6.2 rule R6.
+        spill: 0,
         seen: labels.get(LABEL_SEEN).and_then(|v| v.parse().ok()),
         created_at: parse_rfc3339(server["created"].as_str()?)?,
     })
@@ -297,6 +299,7 @@ mod tests {
             state: VmState::Busy,
             free: 1,
             slots: 2,
+            spill: 0,
         };
         let after = reported(&before, &busy, T0);
         let mut expected = before.clone();
@@ -309,6 +312,7 @@ mod tests {
             state: VmState::Draining,
             free: 2,
             slots: 2,
+            spill: 0,
         };
         let first = reported(&after, &draining, T0 + 10);
         assert_eq!(first[LABEL_DRAIN], (T0 + 10).to_string());
@@ -319,6 +323,7 @@ mod tests {
             state: VmState::Idle,
             free: 2,
             slots: 2,
+            spill: 0,
         };
         let back = reported(&again, &idle, T0 + 80);
         assert!(!back.contains_key(LABEL_DRAIN));
@@ -371,6 +376,7 @@ mod tests {
                 run_id: "hetzner:demo-ci-0000abcd".into(),
                 state: VmState::Busy,
                 free: 3,
+                spill: 0,
                 seen: Some(17),
                 created_at: T0,
             })

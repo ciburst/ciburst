@@ -48,6 +48,7 @@ fn two_pools() -> Arc<Config> {
 
 fn secrets() -> Secrets {
     Secrets {
+        spill_tokens: Default::default(),
         hook_token: Some("hook-secret".into()),
         runner_tokens: BTreeMap::from([
             ("ci".to_string(), "glrt-ci".to_string()),

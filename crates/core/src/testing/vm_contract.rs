@@ -96,7 +96,12 @@ fn request(pool: &Pool, taken: u32) -> StartRequest {
 }
 
 fn report(state: VmState, free: u32, slots: u32) -> VmReport {
-    VmReport { state, free, slots }
+    VmReport {
+        state,
+        free,
+        slots,
+        spill: 0,
+    }
 }
 
 /// A provisioned provider on a fresh backend, its clock at [`T0`].

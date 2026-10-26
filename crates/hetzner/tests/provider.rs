@@ -773,6 +773,7 @@ async fn capacity_reads_the_pool_servers_and_ignores_other_deployments() {
         state: VmState::Busy,
         free: 1,
         slots: 2,
+        spill: 0,
     };
     provider
         .report(&first, &report, FAKE_CLOCK + 120)
@@ -855,6 +856,7 @@ async fn report_rewrites_the_state_labels_and_keeps_every_other_label() {
         state: VmState::Draining,
         free: 1,
         slots: 2,
+        spill: 0,
     };
     provider.report(&run_id, &draining, 1_000).await.unwrap();
     provider.report(&run_id, &draining, 1_060).await.unwrap();
@@ -876,6 +878,7 @@ async fn report_rewrites_the_state_labels_and_keeps_every_other_label() {
         state: VmState::Idle,
         free: 2,
         slots: 2,
+        spill: 0,
     };
     provider.report(&run_id, &idle, 1_100).await.unwrap();
     let after = labels(&fake.server(&name).unwrap());
@@ -900,6 +903,7 @@ async fn claim_report_and_stop_refuse_servers_of_others() {
         state: VmState::Idle,
         free: 1,
         slots: 1,
+        spill: 0,
     };
     let message = "hetzner: server other-ci-00000000 does not belong to contract";
     assert_eq!(
@@ -1433,6 +1437,7 @@ async fn the_composite_routes_steps_starts_and_run_ids_here() {
         state: VmState::Idle,
         free: 2,
         slots: 2,
+        spill: 0,
     };
     composite.report(&run_id, &report, 5).await.unwrap();
     let capacity = composite.capacity("ci").await.unwrap().unwrap();

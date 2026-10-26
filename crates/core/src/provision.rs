@@ -141,6 +141,8 @@ pub fn secrets_from_outputs(config: &Config, outputs: &Outputs) -> Secrets {
         vm_secret: outputs.get(keys::VM_SECRET).cloned(),
         sweep_token: outputs.get(keys::SWEEP_TOKEN).cloned(),
         runner_tokens,
+        // Filled from the spill runner outputs by M6.2 rule R6.
+        spill_tokens: Default::default(),
         dispatch: pair(keys::DISPATCH_ACCESS_KEY, keys::DISPATCH_SECRET_KEY),
         cache: pair(keys::CACHE_ACCESS_KEY, keys::CACHE_SECRET_KEY),
         provider_env: keys::PROVIDER_ENV

@@ -123,6 +123,8 @@ pub fn capacity(server: &Value) -> Option<VmCapacity> {
         free: tag_value(&tags, TAG_FREE)
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
+        // Read from the report's spill tag by M6.2 rule R6.
+        spill: 0,
         seen: tag_value(&tags, TAG_SEEN).and_then(|v| v.parse().ok()),
         created_at: parse_rfc3339(server["creation_date"].as_str()?)?,
     })
@@ -183,6 +185,7 @@ mod tests {
             run_id: "s".into(),
             state,
             free: 1,
+            spill: 0,
             seen,
             created_at,
         }
@@ -229,6 +232,7 @@ mod tests {
             state: VmState::Busy,
             free: 1,
             slots: 2,
+            spill: 0,
         };
         let after = reported(&before, &busy, T0);
         assert_eq!(
@@ -248,6 +252,7 @@ mod tests {
             state: VmState::Draining,
             free: 2,
             slots: 2,
+            spill: 0,
         };
         let first = reported(&after, &draining, T0 + 10);
         assert_eq!(tag_value(&first, TAG_DRAIN), Some(&*format!("{}", T0 + 10)));
@@ -258,6 +263,7 @@ mod tests {
             state: VmState::Idle,
             free: 2,
             slots: 2,
+            spill: 0,
         };
         let back = reported(&again, &idle, T0 + 80);
         assert_eq!(tag_value(&back, TAG_DRAIN), None);
@@ -302,6 +308,7 @@ mod tests {
                 run_id: "s-1".into(),
                 state: VmState::Busy,
                 free: 3,
+                spill: 0,
                 seen: Some(17),
                 created_at: T0,
             })

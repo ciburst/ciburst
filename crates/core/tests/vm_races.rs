@@ -231,6 +231,7 @@ impl Sim {
             interleave: AtomicBool::new(false),
         });
         let secrets = Secrets {
+            spill_tokens: Default::default(),
             hook_token: Some(HOOK.into()),
             runner_tokens: BTreeMap::from([("vm".to_string(), "glrt-vm".to_string())]),
             dispatch: None,
@@ -563,6 +564,7 @@ impl Sim {
                         state,
                         free: current.1,
                         slots,
+                        spill: 0,
                     }
                 });
             let terminate = vm.phase == Phase::Quitting && vm.slots.iter().all(|slot| slot.exited);
