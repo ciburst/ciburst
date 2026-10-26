@@ -14,7 +14,7 @@ Rules and design: `docs/SPEC.md`. Below, `ciburst` stands for the release binary
 | Burst intents | empty objects `ciburst/intents/<pool>/<unix s, 10 digits>-<job id, 20 digits>` in the cache bucket, expired by its lifecycle rules |
 | Image | `registry.gitlab.com/ciburst/ciburst/cli` (the setup jobs, with `ciburst` and `ciburst-vm-agent`); `edge` from `main`, `X.Y.Z`, `X.Y`, `X` and `latest` from a tag `vX.Y.Z` |
 | Binary | `ciburst-x86_64-unknown-linux-musl` in the framework project's generic package registry, linked from each release |
-| Runner | `gitlab-runner` 18.11.4, `run-single`. VM pools: Docker executor, `slots` processes per VM. Lanes: shell executor in the lane's image, one run per pending job that found no free VM slot, exits after `waitTimeoutS` idle seconds |
+| Runner | `gitlab-runner` 18.11.4. VM pools: one `run` per VM with the Docker executor and `concurrent = slots`, an entry per member runner (D59). Lanes: shell executor in the lane's image, one run per pending job that found no free VM slot, exits after `waitTimeoutS` idle seconds |
 | VM cost | DEV1-M 0.0272 EUR per hour by price list (VM 0.020196, IPv4 0.005, 40 GB local SSD 0.00196), about 0.030 in practice because the SSD bills per clock hour; Hetzner CX33 0.0144 with IPv4 |
 | VM network | VMs need IPv4: `registry.gitlab.com` and the Scaleway APIs have no IPv6 address (2026-10-24); a VM accepts no inbound connection |
 | Instance quotas | per organization, zone and commercial type, resource `cp_servers_type_<TYPE>` with `_` for `-` (`cp_servers_type_DEV1_M`); read with `GET https://api.scaleway.com/iam/v1alpha1/quota/cp_servers_type_<TYPE>?organization_id=<org id>` |
@@ -142,7 +142,7 @@ Every line reads `<level> <message> key="value" ...` and never holds a secret.
 | CLI | stderr; in pipeline mode the `ciburst-setup` job log | one line per action; `plan` warns `vm pools cannot start pool="<tag>" reason="..."`; `apply` logs `hook_reenabled`, `replayed` per replayed job, `replay_failed` and `output_unmasked` |
 | Deliveries | `ciburst status` with a GitLab token: the webhook's 20 newest deliveries, oldest first | `delivery <time> <job name, pipeline <id> or event kind> <http status> <result> <pool> <ms>`; `-` where the answer lacks the key, `?` for an unreadable body |
 | Lane run | the job run's stdout and stderr on Serverless Jobs; `ciburst status` lists the run and its state | `ciburst-lane: <reason>` before the bootstrap exits 64 (section Failure modes), then `gitlab-runner`'s own lines |
-| VM agent | the VM's journal, `journalctl -u ciburst-vm-agent`, through the provider's console view only | `agent started`, `state from=... to=...` (`starting`, `idle`, `busy`, `draining`, `quitting`), `slot started` (with `runner="pool"` or `runner="spill"`), `slot exited`, `slot switching from=... to=...`, `spill allowed=...`, `report failed`, `report answer unreadable`, `job without slot label` (switching held), `terminate accepted`, `terminate failed`, `terminate gave up` |
+| VM agent | the VM's journal, `journalctl -u ciburst-vm-agent`, through the provider's console view only | `agent started`, `state from=... to=...` (`starting`, `idle`, `busy`, `draining`, `quitting`), `config written runners=<n>`, `runner started pid=...`, `runner exited code=...` (a warning when not draining; the agent starts it again), `runner start failed`, `config write failed`, `docker ps failed`, `spill allowed=...`, `report failed`, `report answer unreadable`, `terminate accepted`, `terminate failed`, `terminate gave up` |
 
 ## Rotation and updates
 
@@ -303,7 +303,7 @@ Serverless Jobs pull without credentials, so a lane image is public or lives in 
 |---|---|---|
 | A VM job answers `queued` and waits longer than `maxQueueS` | no VM report arrived to re-evaluate the queue (a VM hangs), or the pool is at `maxRuns` | `ciburst status`: the VMs and their last reports; a hung VM ends by the sweep after 30 minutes; `ciburst-setup` replays waiting jobs |
 | Jobs stay pending for minutes; the deliveries show `created` job events and pipeline events on time, `pending`, `running`, `success` much later | GitLab delivers job status events late (2026-10-26: about 35 minutes for hours, D55); the late `pending` events then start lane runs for finished jobs, which idle `waitTimeoutS` and exit | the VM slots that carry the job's tags take it meanwhile; `ciburst-setup` replays jobs pending longer than 60 s; keep `spillRunner` false. Measure the delay: each delivery's `created_at` against the status time in its payload (`build_started_at`, `build_finished_at`) |
-| Lane jobs never answer `spilled` (`spillRunner` true) | no `vmFirst` lane, a queued VM job, an open pipeline with VM jobs still to come, or the agent logs `job without slot label` | the VM's journal (`spill allowed=...`, `slot switching`); the report answers in the deliveries |
+| Lane jobs never answer `spilled` (`spillRunner` true) | no `vmFirst` lane, a queued VM job, an open pipeline with VM jobs still to come | the VM's journal (`spill allowed=...`, `slot switching`); the report answers in the deliveries |
 | `ciburst-setup` is missing from the pipeline | the default branch is not protected, or the pipeline runs on another branch | protect the default branch; run the pipeline there |
 | `ciburst-setup` refuses to run, naming `CI_COMMIT_REF_PROTECTED` | an unprotected ref: protected variables would be missing | run it on the protected default branch |
 | `ciburst-setup` fails naming a `CIBURST_*` variable | the variable is missing, unprotected, or scoped to another environment | add it protected with environment scope `ciburst` |
@@ -469,7 +469,7 @@ Measured:
    Check: the second answers `queued` and a `queue_started` start follows within one report interval; two VMs.
    Result: ____
 4. Lane jobs within the paid hour, no VM job waiting.
-   Check: `reported` answers carry `spill: true`; lane jobs answer `spilled` and run on `<name>-vm-spill`; the VM journal shows `slot switching`.
+   Check: `reported` answers carry `spill: true`; lane jobs answer `spilled` and run on `<name>-vm-spill`; the VM journal shows `slot switching` (agents before D59; now `config written`).
    Result: ____
 5. The drill consumer, one main pipeline from a cold start.
    Check: VMs per pipeline (target 1, at most 2), VM-hours, lane seconds and cost against pipeline 2988692655.
@@ -484,6 +484,8 @@ Result (2026-10-26, `gitlab/gitlab-runner:v18.11.4` in Docker with the Docker ex
 - `SIGQUIT` logged `Starting graceful shutdown, waiting for builds to finish`, the two running jobs finished, and the process exited 22 s later.
 
 ## `run-single` flags
+
+Lanes use `run-single`. VMs used it per slot until D59 and now run one `gitlab-runner run` (spec section 6.1); the VM slot column is history.
 
 Source: `gitlab-runner run-single --help` in `gitlab/gitlab-runner:v18.11.4` (`images/test/runner-help.sh`) and `commands/single.go` at `v18.11.4`; every flag below is present there.
 

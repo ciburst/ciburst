@@ -115,7 +115,7 @@ Backlog, not v1: providers `fly-machines`, `aws-lambda-microvms` (amd64 support 
 | Compute, default | Scaleway Instances DEV1-M (3 vCPU, 4 GB, 40 GB local SSD), two slots, 4 GiB swap | a Docker daemon per VM; billed per started hour with a 60 minute minimum, about 0.03 EUR per hour |
 | Compute, optional | Hetzner Cloud CX33 (4 vCPU, 8 GB, 80 GB); Scaleway Serverless Jobs lanes (up to 6 vCPU, 16 GB) | CX33 at about half the price; lanes start in seconds from the job's own image and bill per second, without a Docker daemon |
 | Cache | Scaleway Object Storage bucket, S3 API | shared by every run; also holds the burst intents, the agent object and the runner object |
-| Runner | `gitlab-runner` 18.11.4 `run-single` from the runner object: Docker executor on VMs, shell executor in lanes | no runner manager, no registration state |
+| Runner | `gitlab-runner` 18.11.4 from the runner object: one `run` with the Docker executor on VMs, `run-single` with the shell executor in lanes | no runner manager, no registration state |
 | Tests | `cargo test`, contract harnesses, in-memory API fakes behind the `HttpClient` trait | no sockets, no cloud |
 
 ### 5.2 Runtime topology
@@ -123,7 +123,7 @@ Backlog, not v1: providers `fly-machines`, `aws-lambda-microvms` (amd64 support 
 1. GitLab sends a job event (`X-Gitlab-Event: Job Hook`) to the dispatcher URL with the hook token.
 2. The dispatcher verifies the token and answers `200 ignored` for anything but a pending job of a configured project, for jobs named `ciburst-*` (D41), and for a job no pool takes when there is no default pool (D36). Otherwise the job's name, else its stage selects the pool (section 5.4); the event carries no tags.
 3. VM pool: the dispatcher claims a free slot on a VM of the pool; without one the job joins the burst ledger, and every `slots`-th job of a burst starts a VM, up to `maxRuns` VMs (section 6.1, scheduling).
-4. The VM boots; cloud-init installs `gitlab-runner` from the runner object and the agent from the agent object; the agent runs `slots` `run-single` processes with the Docker executor, which poll GitLab for jobs with the tags of the pool's runner. Any polling slot takes any pending job with those tags.
+4. The VM boots; cloud-init installs `gitlab-runner` from the runner object and the agent from the agent object; the agent runs one `gitlab-runner run` with the Docker executor, `concurrent = slots`, and an entry for the pool's runner and for every member's runner of the pool (D59). A free slot takes any pending job with the tags of any of those runners.
 5. An idle VM drains at minute 55 of its paid hour and asks the dispatcher to terminate it; the cron sweep ends VMs that stop reporting.
 6. Lane: with `vmFirst`, while spill is allowed and a VM of the lane's VM pool has an idle slot on the spill runner, the job answers `spilled` and that slot takes it; a lane run starts if none did within 20 s (D54). Otherwise it counts the lane's live runs; below `maxRuns` it starts one Serverless Job from the lane's image, whose bootstrap runs `run-single` with the shell executor until `waitTimeoutS` idle seconds pass (section 6.3). Lanes never use the burst ledger.
 7. A job whose tags do not match the pool its name or stage selects stays pending; `ciburst check` reports such jobs.
@@ -194,6 +194,28 @@ docs/                      SPEC.md RUNBOOK.md PROVIDERS.md milestones/
 .gitlab-ci.yml  .local/ (gitignored)
 ```
 
+### 5.6 Fleet (D57 to D59, M6.3)
+
+A fleet is a deployment and the projects it serves. The host ran the first `ciburst-setup` and is the first member; any further project, in any group or organization, joins with `ciburst-join` and never touches Scaleway.
+
+State (D58, M6.3 rules R1 and R2), in the cache bucket:
+- `ciburst/fleet/config.json`: the routing config, written by `ciburst-setup`, bound to the deployment by a MAC under `CIBURST_FLEET_KEY`;
+- `ciburst/fleet/members/<project id>.json`: one record per member with the project id, its webhook secret, the token of each runner it registered by pool tag, and the join time; secret fields sealed with AES-256-GCM under `CIBURST_FLEET_KEY`, which never leaves the function and the setup.
+
+The dispatcher reads both and keeps them for at most 30 s (`FLEET_CACHE`), so a config or member change applies within 30 s without a function deploy. Without fleet state (no fleet key, no bucket) it serves the projects of its environment's config, as before M6.3.
+
+Join code (rule R3, `crates/core/src/invite.rs`): base64url of `{"v":1,"url":<dispatcher url>,"project":<id>,"exp":<unix>}`, a `.`, and base64url of its HMAC-SHA256 under the hook token; valid 7 days. `ciburst-invite` (variable `CIBURST_INVITE`) and `ciburst invite <project>` print it. The member's webhook secret is `hex(HMAC-SHA256(hook token, "hook:<project id>"))`.
+
+Endpoints, each authenticated by the code in the header `X-Ciburst-Join`, which must name the calling project and not be expired: `GET /fleet` (the fleet's name, its pools with the tags of their runners, and the member's webhook secret), `POST /join` (the member's runner tokens; joining again replaces the record), `POST /leave` (deletes the record). A forged, expired or foreign code answers `401`; `/join` answers `400 unknown_pools` for a pool tag the fleet lacks and `503 no_fleet` without fleet state; a code for the host answers `400 refused`, reason `host`.
+
+Events (rule R6): a job or pipeline event is accepted when its project is a member and its `X-Gitlab-Token` equals that member's secret; the host's hook token stays valid for the host. Queue, warm start, records, the burst ledger, `ignoreJobs` and the lanes are fleet-wide.
+
+VMs (rule R5, D59): the answer to a VM report lists in `runners` the member runners of the VM's pool; the agent writes them into its one `gitlab-runner run` (section 6.1). A lane run starts with the lane runner token of the job's own project.
+
+Migration (rule R9): an existing deployment becomes a fleet with the host as its only member on its next `ciburst-setup`; `gitlab.projectIds` beyond the first become member records with the host's runners enabled there.
+
+Trust (rule R8): VM jobs of all members share VMs and run privileged, so a member's job can reach another member's job data on the same VM. Untrusted projects belong in separate fleets.
+
 ## 6. Scaleway implementation
 
 Provider `scaleway`, region from the config, Instances in `provider.zone` (default `<region>-1`):
@@ -237,9 +259,9 @@ GitLab steps (`crates/core/src/gitlab.rs`), per project id: one runner per pool,
 
 ### 6.1 VM lifecycle
 
-Facts from `gitlab-runner` v18.11.4 (`commands/single.go`, `common/consts.go`): a runner receives a job only by requesting one, about every 3 s while idle; `run-single` runs one job at a time; `SIGQUIT` stops further requests, lets the current job finish, then exits; a runner whose requests fail waits 300 s between requests, and `SIGQUIT` does not shorten that wait, so a draining VM cut off from GitLab ends minutes late while it keeps reporting.
+Facts from `gitlab-runner` v18.11.4 (`commands/multi.go`, `common/consts.go`) and the M6.3 phase 0 measurement (`docs/RUNBOOK.md`): a runner receives a job only by requesting one, about every 3 s while idle; one `gitlab-runner run` runs at most `concurrent` jobs over all its `[[runners]]` entries and gives parallel jobs of one runner distinct concurrency ids, so their volumes stay apart; it reloads a changed `config.toml` within about 2 s; `SIGQUIT` stops further requests, lets the running jobs finish, then exits; a runner whose requests fail waits 300 s between requests, and `SIGQUIT` does not shorten that wait, so a draining VM cut off from GitLab ends minutes late while it keeps reporting.
 
-Detection, on the VM. The agent (`crates/vm-agent`) runs `slots` `run-single` processes with the Docker executor, `--docker-privileged` and the volumes `/cache` and `/certs/client` (Docker-in-Docker with TLS needs the latter). All slots share the VM's system id, because `run-single` reads `--config` only with `--runner`; every slot therefore reports concurrent id 0, and the executor would give two jobs of one project the same volumes, `/builds` included, so each slot gets its own `--docker-cache-dir`, which turns them into host directories of that slot. Every slot labels its containers `ciburst.slot:<n>` (`--docker-container-labels`); busy slots are the distinct `com.gitlab.gitlab-runner.job.id` labels over `docker ps`, read every 5 s, each with its slot. Each slot polls with the pool runner's token, or, while the dispatcher's last answer allowed spill and the VM has `RUNNER_SPILL_TOKEN`, an idle slot polls with the spill runner's token (D54): the agent sends an idle slot `SIGQUIT` and starts it again with the other token; a busy slot changes after its job. The agent posts `{state, free, slots, spill}` (`spill`: slots on the spill runner) to the dispatcher's `/vm` (headers `X-Ciburst-Run` and `X-Ciburst-Token`) on every change and after the answer's `nextReportS` (10 to 600 s; 600 before the first answer); the provider writes the report into the server's tags `ciburst-state:<state>`, `ciburst-free:<n>`, `ciburst-spill:<n>` (when not 0), `ciburst-seen:<unix time>` and, once draining, `ciburst-drain:<unix time>`. The tags are the only shared state; the function stays stateless.
+Detection, on the VM (D59). The agent (`crates/vm-agent`) runs one `gitlab-runner run --config <state dir>/config.toml` (state dir `CIBURST_STATE_DIR`, default `/var/lib/ciburst`). The agent writes the file with `concurrent = slots`, `check_interval = 3` and one Docker executor entry per distinct token, in this order: `pool` (the pool runner), `member-<project id>` for each runner of the last report answer's `runners` (M6.3 rule R5), and `spill` (the spill runner, D54) while the last answer allowed spill, the VM has `RUNNER_SPILL_TOKEN` and is not draining. Every entry runs privileged with the pool's `image` as default, the volumes `/cache` and `/certs/client` (Docker-in-Docker with TLS needs the latter) and, with an S3 cache, the cache settings and `FF_USE_FASTZIP=true`, `CACHE_COMPRESSION_LEVEL=fastest` (D44). The agent rewrites the file atomically only when its content changes; the runner starts once the file exists, again after an unexpected exit, and `free` is 0 while no runner process runs. Busy slots are the distinct `com.gitlab.gitlab-runner.job.id` labels over `docker ps`, read every 5 s. The agent posts `{state, free, slots, spill}` (`spill`: 1 while `config.toml` holds the spill entry) to the dispatcher's `/vm` (headers `X-Ciburst-Run` and `X-Ciburst-Token`) on every change and after the answer's `nextReportS` (10 to 600 s; 600 before the first answer); the provider writes the report into the server's tags `ciburst-state:<state>`, `ciburst-free:<n>`, `ciburst-spill:<n>` (when not 0), `ciburst-seen:<unix time>` and, once draining, `ciburst-drain:<unix time>`. The tags are the only shared state; the function stays stateless.
 
 States and transitions:
 
@@ -248,14 +270,14 @@ States and transitions:
 | `starting` | created, no report accepted yet | `idle` or `busy` on the first report |
 | `idle` | every slot polling, no job | `busy` when a slot takes a job; `draining` at minute 55 of a paid hour |
 | `busy` | at least one slot runs a job | `idle` when all slots are free |
-| `draining` | idle at minute 55, `free` 0; slots keep polling for a 30 s grace, then get `SIGQUIT` | `busy` if a slot takes a job during the grace; `POST /terminate` after the last slot exited |
+| `draining` | idle at minute 55, `free` 0; the runner keeps polling for a 30 s grace, then gets one `SIGQUIT` | `busy` if it takes a job during the grace; `POST /terminate` after the runner exited |
 
 Drain protocol, which keeps every job served:
 
 1. The VM reports `draining` first. From then on the dispatcher no longer counts it as capacity.
-2. Its slots keep polling for the 30 s grace, which starts once the dispatcher accepted the report. A job that went pending before step 1 was routed to this VM, and a polling slot takes it within about 3 s.
+2. Its runner keeps polling for the 30 s grace, which starts once the dispatcher accepted the report. A job that went pending before step 1 was routed to this VM, and the runner takes it within about 3 s.
 3. After the grace the agent sends `SIGQUIT`. A job taken in the last request still runs to its end.
-4. When all slots have exited, no request can reach GitLab, so no job can be assigned to the VM. Only then does it post `/terminate`; the dispatcher checks the token and terminates the server.
+4. When the runner has exited, no request can reach GitLab, so no job can be assigned to the VM. Only then does it post `/terminate`; the dispatcher checks the token and terminates the server.
 
 Scheduling, on a pending job event (M4 rules R1 to R7): a free slot is claimed on a VM created more than 30 s ago that is `idle` or `busy` and reported within 21 minutes, or is `starting` and younger than 10 minutes; among the VMs with the most free slots the job id picks one, so parallel claims spread. Otherwise the job joins the burst ledger (D33): every `slots`-th job of the last 30 s starts a VM with that many slots already taken, the others ride on it, and leaders count toward `maxRuns` by rank. A failed claim or ledger falls back to starting a VM.
 
@@ -319,6 +341,7 @@ With `vmFirst`, a lane job that may spill answers `200 {"result":"spilled","pool
 - The dispatch key holds `ServerlessJobsFullAccess`, `InstancesFullAccess` and `ContainerRegistryReadOnly` on the dedicated project only. The dispatcher holds no GitLab token. With Hetzner pools it holds a Hetzner project token, which Hetzner cannot narrow further: use a Hetzner project for ciburst alone.
 - A lane job can read its lane's runner token and the cache key, as on any runner: the bootstrap passes them to `run-single` as flags and unsets them before `exec`, so job scripts do not inherit them, but a job can read the runner's command line. Lane jobs run as the image's user, root included; the Serverless Jobs sandbox drops root's capabilities and offers no privileged mode. The dispatch key never enters a run; the cache key can only read and write the cache bucket.
 - A VM runs jobs privileged (Docker-in-Docker), so every job can read the VM's user data: its pool's runner token, the cache key and the VM's own token. This equals GitLab's own privileged runners; the VM token can only report for and end its own VM. Scaleway and Hetzner keep the user data with the server until it is deleted; it never holds the VM secret, the dispatch key or the Hetzner token.
+- Fleet (D57, rule R8): a VM's `config.toml` holds the runner token of every member of its pool, and the cache key is fleet-wide, so a privileged job of one member can read the others' runner tokens and caches on a shared VM. A join code lets its project join until it expires and can be replayed within that time. Untrusted projects belong in separate fleets.
 - The agent and runner objects are public and hold no secret. Any job can read the cache key and overwrite them, so cloud-init and the lane bootstrap check each download against its pinned sha256 and stop on a mismatch.
 - Burst intents live in the cache bucket, which every job can write with the cache key. A forged intent can at most cost one VM-hour or delay one job until a slot frees.
 - Pipeline mode (D39): inputs and outputs are protected project variables scoped to the environment `ciburst`, masked and hidden where GitLab allows, so only the component's jobs on the protected default branch receive them; `--ci` never reads `SCW_*`, so a project's own Scaleway variables cannot redirect the setup.
@@ -427,7 +450,7 @@ Risks:
 | A lane image lacks `git` or `curl` and cannot install them (RPM-based, non-root) | the run fails with `ciburst-lane:` naming the gap; the lane takes an image that contains them |
 | Free tiers or prices change | prices in the runbook; the consumption page |
 
-Glossary: pool (tag, runtime, image, jobs, stages; one GitLab runner), run (a VM, or one Serverless Job of a lane), slot (one `run-single` process on a VM, one job at a time), burst intent (an empty object in the cache bucket recording a pending job that found no free slot), lane (a Serverless Jobs pool for jobs that need no Docker daemon, run in the job's own image), bootstrap (`lane-bootstrap.sh`, the command of every lane run), agent object and runner object (`ciburst-vm-agent` and `gitlab-runner` in the cache bucket, each named by its sha256), dispatcher (the webhook handler), host (where the dispatcher runs), provider (where runs execute), job definition (Scaleway's template for a Serverless Job).
+Glossary: pool (tag, runtime, image, jobs, stages; one GitLab runner), run (a VM, or one Serverless Job of a lane), slot (one of the `concurrent` jobs of a VM's `gitlab-runner run`), burst intent (an empty object in the cache bucket recording a pending job that found no free slot), lane (a Serverless Jobs pool for jobs that need no Docker daemon, run in the job's own image), bootstrap (`lane-bootstrap.sh`, the command of every lane run), agent object and runner object (`ciburst-vm-agent` and `gitlab-runner` in the cache bucket, each named by its sha256), dispatcher (the webhook handler), host (where the dispatcher runs), provider (where runs execute), job definition (Scaleway's template for a Serverless Job).
 
 ## 14. Owner inputs
 
