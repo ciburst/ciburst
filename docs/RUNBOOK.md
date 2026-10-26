@@ -113,6 +113,16 @@ Where to look when a job waits:
 
 Every answer with a body carries `ms`, the dispatcher's elapsed milliseconds; GitLab.com counts an answer after 10 s as a failed delivery and disables the webhook after four failures in a row (section Webhook health). Every 200 answer of a job event except `ignored` also names the `pool`. A `grouped` job depends on its leader's delivery: `started` (the VM boots), `at_capacity` (the group waits for a slot) or 500 (the group waits for the next VM). Lane jobs never answer `grouped` or `duplicate`: lanes do not use the burst ledger.
 
+## Fleet members
+
+Rules: spec D57 to D59 and `docs/milestones/M6.3-fleet.md`.
+
+- State: `ciburst/fleet/config.json` (the routing config with a MAC; `ciburst-setup` writes it, the dispatcher reads it within 30 s) and `ciburst/fleet/members/<project id>.json` (webhook secret and runner tokens, AES-256-GCM with `CIBURST_FLEET_KEY`). These keys never expire; never edit them by hand: a forged config or record makes the reads fail (`warn fleet_failed`).
+- Invite: `ciburst-invite` with `CIBURST_INVITE`, or `ciburst invite <project>`; the code carries the dispatcher URL, the project id and a 7-day expiry, signed with the hook token. Rotating the hook token (`ciburst rotate hook`) invalidates open codes; joined members keep the webhook secret stored at their join.
+- Join: the member's `ciburst-join` reads `GET /fleet`, registers one runner per pool in its own project, creates its webhook and posts `/join` (`joined`). Answers: 401 for an expired or forged code (`warn join_refused reason=...`), 400 `unknown_pools`, 400 `refused` for the host itself, 503 `no_fleet` without the fleet store.
+- VMs serve every member: each VM runs one `gitlab-runner run` with an entry per member runner of its pool, from the `runners` of the report answer.
+- Status: `ciburst status` prints `member <id> joined <time>` and each member's deliveries; `ciburst check` lints every member; `ciburst-destroy` refuses with `fleet <name> has members <ids>: run ciburst-leave there first`.
+
 ## Webhook health
 
 GitLab disables a webhook after four failed deliveries in a row, and GitLab.com counts an answer after 10 s as failed. A disabled webhook delivers nothing, so pending jobs wait without a trace.

@@ -81,6 +81,25 @@ Customize with `ciburst.json` at the repository root, then run `ciburst-setup` a
 Undo: add the project variable `CIBURST_DESTROY` with the deployment's name (`ci-<project id>` unless `ciburst.json` sets `name`), protected, environment scope `ciburst`, then run `ciburst-destroy`.
 Check: the log ends with `destroyed <name>`; the webhook, the runners, the output variables and the Scaleway project are gone. Then remove the include and `ciburst.json`, and delete the five variables. Removing the include first leaves the webhook behind, and every later job still starts a VM.
 
+## Join an existing setup
+
+One setup serves many projects, from any group or organization: they share its dispatcher, its VMs and its lanes, so a VM's paid hour serves all of them. Jobs of all projects share the VMs, and VM jobs run privileged: join only projects you trust.
+
+1. In the project that ran `ciburst-setup` (the host): add the project variable `CIBURST_INVITE` with the joining project's id or path (protected, environment scope `ciburst`), run `ciburst-invite` and copy the code from its log. The code is valid for 7 days; treat it as a secret.
+   Check: the log reads `join code for project <id>, valid until <time>`.
+2. In the joining project: include the component with `role: member`:
+   ```yaml
+   include:
+     - component: gitlab.com/ciburst/ciburst/ciburst@main
+       inputs:
+         role: member
+   ```
+3. Add two project variables, protected, "Masked and hidden", environment scope `ciburst`: `CIBURST_JOIN` (the code) and `CIBURST_GITLAB_TOKEN` (a personal access token of an Owner of this project with `api` and `create_runner`). No Scaleway credentials.
+4. Run the manual job `ciburst-join` (about a minute).
+   Check: its log ends with `joined fleet <name>`; Settings, CI/CD, Runners lists the fleet's runners; the next pipeline runs on them.
+
+Leave: run `ciburst-leave` in the member; it removes the member's runners, webhook and record. The host's `ciburst-destroy` refuses while members are joined.
+
 ## Lanes
 
 A lane is a pool on Scaleway Serverless Jobs for jobs that need no Docker daemon. Each run starts from the job's own image, installs `git` and `curl` when the image lacks them, fetches the pinned `gitlab-runner` from the deployment's bucket and runs the job with the shell executor.

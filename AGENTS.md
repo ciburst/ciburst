@@ -42,6 +42,19 @@ Limits: `linux/amd64` images only; a VM ends after 24 hours at the latest. Job v
 
 Undo, in this order: the human adds the project variable `CIBURST_DESTROY` with the deployment's name (`ci-<project id>`), protected, scope `ciburst`, and runs `ciburst-destroy`; its log ends with `destroyed <name>`. Only then remove the `include` and `ciburst.json`, and the human deletes the five variables. A plain revert of the include leaves the webhook, the runner and the cloud resources behind, every later job still starts a VM, and the `ciburst-destroy` job is gone with the include.
 
+## Join a project to an existing ciburst setup
+
+Goal: the project's jobs run on another project's ciburst setup (the host). You change the project's repository; a human issues the code and creates credentials. Never create, read, print or store a secret.
+
+1. Add the component with `role: member` to `.gitlab-ci.yml` on the default branch (README, Join an existing setup). It sets `default: tags` to the fleet's VM pool and adds the manual jobs `ciburst-join` and `ciburst-leave`; no `ciburst.json` in the member.
+2. Steps 2 to 5 and 7 of the adopt task apply unchanged: keep `image:`, handle Docker-in-Docker, hosted-runner jobs and lane tags. The lanes and `ignoreJobs` are the host's: lane tags must name the host's lanes, and new lanes or `ignoreJobs` entries go into the host's `ciburst.json`.
+3. Hand the human this list, unchanged:
+   - In the host: the project variable `CIBURST_INVITE` with this project's id, then run `ciburst-invite` and copy the code.
+   - In this project: `CIBURST_JOIN` (the code) and `CIBURST_GITLAB_TOKEN` (an Owner's personal access token with `api` and `create_runner`): protected, "Masked and hidden", environment scope `ciburst`; the default branch protected.
+   - Then run `ciburst-join`; its log ends with `joined fleet <name>`.
+
+Undo: run `ciburst-leave`, then remove the `include` and the two variables.
+
 ## Work on this repository
 
 Read first: `docs/SPEC.md` (decision log in section 0, then the design), `docs/milestones/` (binding rules cited in code as `M4 rule R3`), `docs/PROVIDERS.md` (ports, adding a provider), `docs/RUNBOOK.md` (operations, failure modes).
