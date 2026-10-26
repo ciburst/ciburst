@@ -1,5 +1,6 @@
 //! The real binary with fake `gitlab-runner` and `docker` executables and a dispatcher on the
-//! loopback interface: config file, slot processes, `docker ps` and reports over HTTP.
+//! loopback interface: config file, slot processes, `docker ps`, reports over HTTP and a token
+//! switch by `SIGQUIT`.
 #![cfg(target_os = "linux")]
 
 use std::collections::BTreeMap;
@@ -9,6 +10,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,15 +23,17 @@ struct Received {
 
 type Inbox = Arc<Mutex<Vec<Received>>>;
 
-fn serve(listener: TcpListener, inbox: Inbox) {
+/// Answers every `/vm` report with `spill` as the flag holds at that moment.
+fn serve(listener: TcpListener, inbox: Inbox, spill: Arc<AtomicBool>) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { return };
         let inbox = Arc::clone(&inbox);
-        std::thread::spawn(move || connection(stream, &inbox));
+        let spill = Arc::clone(&spill);
+        std::thread::spawn(move || connection(stream, &inbox, &spill));
     }
 }
 
-fn connection(stream: TcpStream, inbox: &Inbox) {
+fn connection(stream: TcpStream, inbox: &Inbox, spill: &AtomicBool) {
     let mut writer = stream.try_clone().expect("clone stream");
     let mut reader = BufReader::new(stream);
     loop {
@@ -64,15 +68,24 @@ fn connection(stream: TcpStream, inbox: &Inbox) {
         if reader.read_exact(&mut body).is_err() {
             return;
         }
+        let answer = if path == "/vm" {
+            format!(
+                r#"{{"result":"reported","spill":{},"nextReportS":600,"ms":1}}"#,
+                spill.load(Ordering::SeqCst)
+            )
+        } else {
+            String::new()
+        };
         inbox.lock().unwrap().push(Received {
             path,
             headers,
             body: String::from_utf8(body).expect("utf-8 body"),
         });
-        if writer
-            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
-            .is_err()
-        {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{answer}",
+            answer.len()
+        );
+        if writer.write_all(response.as_bytes()).is_err() {
             return;
         }
     }
@@ -94,15 +107,34 @@ fn wait_for<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
     }
 }
 
-fn report(inbox: &Inbox, state: &str) -> Option<Received> {
+/// The first `/vm` report whose body equals `body`.
+fn report(inbox: &Inbox, body: &serde_json::Value) -> Option<Received> {
     inbox
         .lock()
         .unwrap()
         .iter()
         .find(|received| {
-            received.path == "/vm" && received.body.contains(&format!("\"state\":\"{state}\""))
+            received.path == "/vm"
+                && serde_json::from_str::<serde_json::Value>(&received.body)
+                    .ok()
+                    .as_ref()
+                    == Some(body)
         })
         .cloned()
+}
+
+/// Argument lines of every slot process started so far.
+fn slot_args(dir: &Path) -> Vec<Vec<String>> {
+    slot_files(dir, ".args")
+        .into_iter()
+        .map(|file| {
+            fs::read_to_string(file)
+                .unwrap()
+                .lines()
+                .map(String::from)
+                .collect()
+        })
+        .collect()
 }
 
 /// Non-empty files the fake runner wrote, `slot-<pid><suffix>`.
@@ -173,7 +205,9 @@ fn the_binary_runs_slots_and_reports_over_http() {
     let port = listener.local_addr().unwrap().port();
     let inbox: Inbox = Arc::default();
     let server_inbox = Arc::clone(&inbox);
-    std::thread::spawn(move || serve(listener, server_inbox));
+    let spill = Arc::new(AtomicBool::new(false));
+    let server_spill = Arc::clone(&spill);
+    std::thread::spawn(move || serve(listener, server_inbox, server_spill));
 
     let env_file = root.join("vm.env");
     fs::write(
@@ -181,7 +215,8 @@ fn the_binary_runs_slots_and_reports_over_http() {
         format!(
             "CIBURST_RUN_ID=run-e2e\nCIBURST_VM_TOKEN=vm-token-secret\n\
              CIBURST_DISPATCH_URL=http://127.0.0.1:{port}\nCI_SERVER_URL=https://gitlab.example.invalid\n\
-             RUNNER_TOKEN=glrt-runner-secret\nCIBURST_POOL=vm\nCIBURST_SLOTS=2\n\
+             RUNNER_TOKEN=glrt-runner-secret\nRUNNER_SPILL_TOKEN=glrt-spill-secret\n\
+             CIBURST_POOL=vm\nCIBURST_SLOTS=2\n\
              CIBURST_DEFAULT_IMAGE=node:24\nCIBURST_TIMEOUT_S=3600\n"
         ),
     )
@@ -206,27 +241,18 @@ fn the_binary_runs_slots_and_reports_over_http() {
         running: root.join("running"),
     };
 
-    let idle = wait_for("the idle report", || report(&inbox, "idle"));
+    let idle = serde_json::json!({"state": "idle", "free": 2, "slots": 2, "spill": 0});
+    let idle = wait_for("the idle report", || report(&inbox, &idle));
     assert_eq!(idle.headers["x-ciburst-run"], "run-e2e");
     assert_eq!(idle.headers["x-ciburst-token"], "vm-token-secret");
     assert_eq!(idle.headers["content-type"], "application/json");
-    let body: serde_json::Value = serde_json::from_str(&idle.body).unwrap();
-    assert_eq!(
-        body,
-        serde_json::json!({"state": "idle", "free": 2, "slots": 2})
-    );
 
     let args = wait_for("two slots", || {
-        let files = slot_files(root, ".args");
-        (files.len() == 2).then_some(files)
+        let args = slot_args(root);
+        (args.len() == 2).then_some(args)
     });
     let mut configs = Vec::new();
-    for file in args {
-        let lines: Vec<String> = fs::read_to_string(file)
-            .unwrap()
-            .lines()
-            .map(String::from)
-            .collect();
+    for lines in args {
         assert_eq!(
             lines[..15],
             [
@@ -247,13 +273,19 @@ fn the_binary_runs_slots_and_reports_over_http() {
                 "--docker-cache-dir",
             ]
         );
+        assert_eq!(lines[16], "--docker-container-labels");
         assert_eq!(
-            lines[16..21],
+            lines[18..23],
             ["--max-builds", "0", "--wait-timeout", "0", "--config"]
         );
-        assert_eq!(lines.len(), 22);
-        assert_eq!(lines[15], lines[21].replace("config.toml", "volumes"));
-        configs.push(lines[21].clone());
+        assert_eq!(lines.len(), 24);
+        assert_eq!(lines[15], lines[23].replace("config.toml", "volumes"));
+        let slot = lines[17].strip_prefix("ciburst.slot:").expect("slot label");
+        assert_eq!(
+            lines[23],
+            format!("/var/lib/ciburst/slot-{slot}/config.toml")
+        );
+        configs.push(lines[23].clone());
     }
     configs.sort();
     assert_eq!(
@@ -263,12 +295,6 @@ fn the_binary_runs_slots_and_reports_over_http() {
             "/var/lib/ciburst/slot-2/config.toml"
         ]
     );
-    let envs = slot_files(root, ".env");
-    assert_eq!(envs.len(), 2);
-    for file in envs {
-        let env = fs::read_to_string(file).unwrap();
-        assert!(!env.contains("secret"), "{env}");
-    }
     let docker = fs::read_to_string(root.join("docker.args")).unwrap();
     assert_eq!(
         docker.lines().collect::<Vec<_>>(),
@@ -277,28 +303,56 @@ fn the_binary_runs_slots_and_reports_over_http() {
             "--filter",
             "label=com.gitlab.gitlab-runner.job.id",
             "--format",
-            "{{.Label \"com.gitlab.gitlab-runner.job.id\"}}"
+            "{{.Label \"com.gitlab.gitlab-runner.job.id\"}} {{.Label \"ciburst.slot\"}}"
         ]
     );
 
-    fs::write(root.join("jobs"), "42\n42\n").unwrap();
-    let busy = wait_for("the busy report", || report(&inbox, "busy"));
-    let body: serde_json::Value = serde_json::from_str(&busy.body).unwrap();
-    assert_eq!(
-        body,
-        serde_json::json!({"state": "busy", "free": 1, "slots": 2})
-    );
+    // Slot 1 takes a job, then the dispatcher allows spill: only slot 2 switches.
+    spill.store(true, Ordering::SeqCst);
+    // Renamed into place, so `docker ps` never prints half a file.
+    fs::write(root.join("jobs.new"), "42 1\n42 1\n").unwrap();
+    fs::rename(root.join("jobs.new"), root.join("jobs")).unwrap();
+    let busy = serde_json::json!({"state": "busy", "free": 1, "slots": 2, "spill": 0});
+    wait_for("the busy report", || report(&inbox, &busy));
+    let switched = serde_json::json!({"state": "busy", "free": 1, "slots": 2, "spill": 1});
+    wait_for("the switched report", || report(&inbox, &switched));
+    let args = wait_for("the restarted slot", || {
+        let args = slot_args(root);
+        (args.len() == 3).then_some(args)
+    });
+    let spill_args: Vec<&Vec<String>> = args
+        .iter()
+        .filter(|lines| lines[4] == "glrt-spill-secret")
+        .collect();
+    assert_eq!(spill_args.len(), 1);
+    assert_eq!(spill_args[0][17], "ciburst.slot:2");
+    assert_eq!(spill_args[0][23], "/var/lib/ciburst/slot-2/config.toml");
+
+    let envs = wait_for("three slot environments", || {
+        let envs = slot_files(root, ".env");
+        (envs.len() == 3).then_some(envs)
+    });
+    for file in envs {
+        let env = fs::read_to_string(file).unwrap();
+        assert!(!env.contains("secret"), "{env}");
+    }
 
     drop(stop);
     let log = fs::read_to_string(log_path).unwrap();
     for line in [
         r#"info agent started run="run-e2e" pool="vm" slots="2" timeout_s="3600""#,
-        r#"info slot started slot="1""#,
-        r#"info slot started slot="2""#,
+        r#"info slot started slot="1" runner="pool""#,
+        r#"info slot started slot="2" runner="pool""#,
         r#"info state from="starting" to="idle" free="2""#,
         r#"info state from="idle" to="busy" free="1""#,
+        r#"info spill allowed="true""#,
+        r#"info slot switching slot="2" from="pool" to="spill""#,
+        r#"info slot exited slot="2" code="0""#,
+        r#"info slot started slot="2" runner="spill""#,
     ] {
         assert!(log.lines().any(|l| l == line), "{line} not in:\n{log}");
     }
+    assert!(!log.contains(r#"slot switching slot="1""#), "{log}");
+    assert!(!log.contains("warn"), "{log}");
     assert!(!log.contains("secret"), "{log}");
 }

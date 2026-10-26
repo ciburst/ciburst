@@ -12,6 +12,8 @@ use ciburst_core::http::HttpClient;
 
 /// Label the Docker executor puts on every job container (`executors/docker/internal/labels`).
 pub const JOB_LABEL: &str = "com.gitlab.gitlab-runner.job.id";
+/// Label every container of a slot's jobs carries, from `--docker-container-labels`.
+pub const SLOT_LABEL: &str = "ciburst.slot";
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[async_trait]
@@ -37,7 +39,8 @@ pub trait Slots: Send {
 
 #[async_trait]
 pub trait Docker: Send + Sync {
-    /// Output of `docker ps` printing the job id label of every running job container.
+    /// Output of `docker ps` printing the job id and slot labels of every running job
+    /// container, one container per line.
     async fn job_labels(&self) -> io::Result<String>;
 }
 
@@ -125,7 +128,7 @@ pub fn docker_ps_args() -> Vec<String> {
         "--filter".to_string(),
         format!("label={JOB_LABEL}"),
         "--format".to_string(),
-        format!("{{{{.Label \"{JOB_LABEL}\"}}}}"),
+        format!("{{{{.Label \"{JOB_LABEL}\"}}}} {{{{.Label \"{SLOT_LABEL}\"}}}}"),
     ]
 }
 
@@ -273,7 +276,7 @@ mod tests {
                 "--filter",
                 "label=com.gitlab.gitlab-runner.job.id",
                 "--format",
-                "{{.Label \"com.gitlab.gitlab-runner.job.id\"}}",
+                "{{.Label \"com.gitlab.gitlab-runner.job.id\"}} {{.Label \"ciburst.slot\"}}",
             ]
         );
     }
