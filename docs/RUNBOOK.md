@@ -88,7 +88,9 @@ Where to look when a job waits:
 | Status | `result` | Meaning |
 |---|---|---|
 | 200 | `claimed` (`runId`) | a free slot on a VM created more than 30 s ago; `runId` names the VM |
-| 200 | `claimed` (`runId`, `lane`) | a lane job on a free slot of the lane's VM pool (VM slots first); `pool` names the VM pool, `lane` the lane; no lane run starts |
+| 200 | `queued` (`etaS`) | a VM job behind busy slots: it waits for the first slot that frees; `etaS` is the expected wait, `null` when no running job will free a slot (then a VM starts at the next evaluation) |
+| 200 | `spilled` (`vm`) | a lane job an idle slot of the paid VM `vm` takes; `pool` names the lane; a lane run starts if no slot took it within 20 s |
+| 200 | `tracked` (`status`) | a running or finished VM or lane job; feeds the queue and the typical durations |
 | 200 | `started` (`runId`) | VM pool: the job leads its burst group and started a VM with the group's slots taken; lane: a lane run started, `runId` names it |
 | 200 | `grouped` (`leader`) | rides on the VM its leader's delivery starts; any polling slot of the pool takes it, GitLab does not bind it to that VM |
 | 200 | `duplicate` | GitLab delivered this job's pending event again within 30 s; nothing started |
@@ -103,7 +105,7 @@ Where to look when a job waits:
 | 200 | `ignored`, reason `no_vm_jobs` | a pipeline event whose open jobs all run in lanes or elsewhere |
 | 200 | `duplicate` (`pipeline`) | a pipeline event for a pipeline whose record exists; nothing started |
 | 200 | `closed` (`pipeline`) | a pipeline event with a final status; the pipeline's records are deleted |
-| 200 | `reported`, `terminated`, `swept` (`runs`) | a VM report, a VM's termination, the cron sweep |
+| 200 | `reported` (`spill`, `nextReportS`), `terminated`, `swept` (`runs`) | a VM report (with whether idle slots may take lane jobs and when to report next), a VM's termination, the cron sweep |
 | 400 | `bad_request` | the body is not JSON, or a VM report is malformed |
 | 401 | no body | wrong or missing hook, VM or sweep token |
 | 500 | `error` | the provider failed (start, report, terminate, sweep) or the function's environment is incomplete; the body carries nothing more |
@@ -125,7 +127,7 @@ Every line reads `<level> <message> key="value" ...` and never holds a secret.
 
 | Source | Where | Lines |
 |---|---|---|
-| Dispatcher | the function's stderr, which Cockpit does not show (2026-10-24): read the answers on the webhook's recent events instead | `info` `claimed` (with `lane` for a lane job on a VM slot), `started`, `grouped`, `duplicate`, `at_capacity` with `project`, `pipeline`, `job`, `stage`, `pool`, `run`; `warn` `claim_failed`, `ledger_failed`, `start_retry` (a 429 or 503 of the provider, retried once after 300 ms within 5 s), `start_lookup` (a VM start looked up its image or security group: a type not in `CIBURST_VM_IMAGES`, or a create refused for a removed image; the next `ciburst apply` resolves them again), `unauthorized`; every line ends with `ms`; `error` `start_failed`, `report_failed`, `terminate_failed`, `sweep_failed`, and `env` naming a missing variable |
+| Dispatcher | the function's stderr, which Cockpit does not show (2026-10-24): read the answers on the webhook's recent events instead | `info` `claimed`, `started`, `grouped`, `duplicate`, `at_capacity`, `queued` (`eta_s`), `spilled` (`vm`), `tracked` (`status`, `duration_s`) with `project`, `pipeline`, `job`, `stage`, `pool`, `run`; `queue_started` (`vms`, `needing`), `spill_fallback` (`lane`, `job`), `reported` (`spilling`, `spill`, `next_report_s`); `warn` `claim_failed`, `ledger_failed`, `schedule_failed` (`op`), `records_failed` (`op`), `capacity_failed`, `start_retry` (a 429 or 503 of the provider, retried once after 300 ms within 5 s), `start_lookup` (a VM start looked up its image or security group: a type not in `CIBURST_VM_IMAGES`, or a create refused for a removed image; the next `ciburst apply` resolves them again), `unauthorized`; every line ends with `ms`; `error` `start_failed`, `report_failed`, `terminate_failed`, `sweep_failed`, and `env` naming a missing variable |
 | CLI | stderr; in pipeline mode the `ciburst-setup` job log | one line per action; `plan` warns `vm pools cannot start pool="<tag>" reason="..."`; `apply` logs `hook_reenabled`, `replayed` per replayed job, `replay_failed` and `output_unmasked` |
 | Deliveries | `ciburst status` with a GitLab token: the webhook's 20 newest deliveries, oldest first | `delivery <time> <job name, pipeline <id> or event kind> <http status> <result> <pool> <ms>`; `-` where the answer lacks the key, `?` for an unreadable body |
 | Lane run | the job run's stdout and stderr on Serverless Jobs; `ciburst status` lists the run and its state | `ciburst-lane: <reason>` before the bootstrap exits 64 (section Failure modes), then `gitlab-runner`'s own lines |
@@ -236,18 +238,18 @@ Add lanes:
    ```
    Check: `ciburst check` reports no problem.
 4. `ciburst apply`, or `ciburst-setup` in pipeline mode.
-   Check: Settings, CI/CD, Runners lists `<name>-node24` with the tag `node24` and `<name>-vm` with `vm` and `node24`; a lane job's delivery answers `started` (a lane run) or `claimed` with `lane` (a VM slot), and the job passes.
+   Check: Settings, CI/CD, Runners lists `<name>-node24` with the tag `node24`, `<name>-vm` with `vm` and `<name>-vm-spill` with `vm` and `node24`; a lane job's delivery answers `started` (a lane run) or `spilled` (a VM slot), and the job passes.
 
-### VM slots first
+### Queue first and spill
 
-A lane with `vmFirst` (the default when the config has a VM pool) borrows the slots of `defaultPool` when that is a VM pool, else of the first VM pool; that pool's runner carries the lane's tag.
+Rules: spec D53, D54 and section 6.1.
 
-- A pending lane job claims a free slot by the VM rule (spec section 6.1): `200 {"result":"claimed","pool":"vm","lane":"node24","runId":"<server id>"}`, logged as `claimed` with `lane="node24"`. The VM runs the job in its `image:` with the Docker executor.
-- Without a free slot the dispatcher starts a lane run below the lane's `maxRuns` (`started`), else answers `at_capacity`. A lane job never starts a VM and never joins the burst ledger.
-- A lane run whose job a VM slot took first idles `waitTimeoutS` and exits; those seconds are billed.
-- A lane job whose claimed slot another job took first waits for the next free VM slot or a lane run that still polls.
-- A failed claim or capacity read logs `warn claim_failed` with `lane` and starts a lane run instead.
-- While the lane job's pipeline still has VM jobs that have not gone pending, it leaves that many free slots, at most one VM's `slots`, for them (warm start reservation); its decision line then carries `reserve`.
+- A VM job that finds every slot busy answers `queued` and waits; the slot that frees first takes it. A VM starts for it only when its wait plus the expected remainder of the running job it waits for would pass the pool's `maxQueueS` (default 90 s), or when no running job will free a slot; `queue_started` logs those starts. `"maxQueueS": 0` restores starting a VM at once.
+- Typical durations come from the job events: `ciburst/intents/_stats/<pool>/<16 hex>` holds `{name, typicalS, runs}` per job name. A new job name counts as ending now until it has finished once.
+- Queue state in the cache bucket: `ciburst/intents/_queue/<pool>/<job>` (waiting), `_running/<pool>/<job>` (running), `_queue/<pool>/.started` (start marker, 15 s). Never edit them by hand; entries older than 30 minutes (waiting) or 24 hours (running) are dropped when read.
+- A `vmFirst` lane's jobs go through the VM pool's second runner `<name>-<vm tag>-spill`. The agent points idle slots at it only while the report answer says `"spill": true`: no VM job queued, no running pipeline with a VM job still to come, the VM not draining. Such a lane job answers `spilled` and runs on the paid VM in its `image:`; if no slot took it within 20 s, `spill_fallback` starts a lane run.
+- Busy VMs report every 30 s, VMs with spill slots every 15 s; each report re-evaluates the queue.
+- Check the queue of a pool: `aws s3api list-objects-v2 ... --prefix ciburst/intents/_queue/<pool>/` with the cache key (section Burst grouping).
 
 ### Lane bootstrap
 
@@ -288,6 +290,8 @@ Serverless Jobs pull without credentials, so a lane image is public or lives in 
 
 | Symptom | Cause | Action |
 |---|---|---|
+| A VM job answers `queued` and waits longer than `maxQueueS` | no VM report arrived to re-evaluate the queue (a VM hangs), or the pool is at `maxRuns` | `ciburst status`: the VMs and their last reports; a hung VM ends by the sweep after 30 minutes; `ciburst-setup` replays waiting jobs |
+| Lane jobs never answer `spilled` | no `vmFirst` lane, a queued VM job, an open pipeline with VM jobs still to come, or the agent logs `job without slot label` | the VM's journal (`spill allowed=...`, `slot switching`); the report answers in the deliveries |
 | `ciburst-setup` is missing from the pipeline | the default branch is not protected, or the pipeline runs on another branch | protect the default branch; run the pipeline there |
 | `ciburst-setup` refuses to run, naming `CI_COMMIT_REF_PROTECTED` | an unprotected ref: protected variables would be missing | run it on the protected default branch |
 | `ciburst-setup` fails naming a `CIBURST_*` variable | the variable is missing, unprotected, or scoped to another environment | add it protected with environment scope `ciburst` |
@@ -438,6 +442,24 @@ Measured:
    Result (2026-10-26): not run again: the cold baseline is the M5 drill, where VM jobs queued 61 to 96 s behind a VM boot.
 4. The drill consumer, once with `warmStart` true and once false, each from a cold start.
    Check: wall clock, VMs started, VM-hours, lane seconds and cost per pipeline.
+   Result: ____
+
+### M6.2 queue first drill
+
+1. Demo deployment: `ciburst-setup` with the M6.2 code.
+   Check: the plan shows `update  gitlab runner <name>-vm  (set tags vm)` and `create  gitlab runner <name>-vm-spill  (tags vm, node24)`; the function has `RUNNER_SPILL_TOKEN_VM`.
+   Result: ____
+2. A Docker chain (two Docker jobs in successive stages, slots 1) while one VM runs.
+   Check: the second job answers `queued` or `claimed`, never `started`; one VM in total.
+   Result: ____
+3. Two long Docker jobs at once on a pool with slots 1 whose job name has a typical duration above `maxQueueS`.
+   Check: the second answers `queued` and a `queue_started` start follows within one report interval; two VMs.
+   Result: ____
+4. Lane jobs within the paid hour, no VM job waiting.
+   Check: `reported` answers carry `spill: true`; lane jobs answer `spilled` and run on `<name>-vm-spill`; the VM journal shows `slot switching`.
+   Result: ____
+5. The drill consumer, one main pipeline from a cold start.
+   Check: VMs per pipeline (target 1, at most 2), VM-hours, lane seconds and cost against pipeline 2988692655.
    Result: ____
 
 ## `run-single` flags
