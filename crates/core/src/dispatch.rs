@@ -10,6 +10,7 @@ use tokio::time::Instant;
 
 use crate::check::is_own_job;
 use crate::config::{CacheType, Config, Pool};
+use crate::fleet::FleetStore;
 use crate::ledger::{
     Closed, GROUP_WAIT_S, GROUP_WINDOW_S, Intent, Ledger, PipelineRecords, Queued, Running,
     Schedule, VmJobs,
@@ -26,6 +27,11 @@ use crate::types::{
 };
 use crate::vm;
 use crate::{Error, Result};
+
+mod members;
+
+use members::RunnerOf;
+pub use members::{FLEET_CACHE, FleetCache, PATH_FLEET, PATH_JOIN, PATH_LEAVE};
 
 /// M7 rule R4: the pause before the one retry of a start that failed with a retryable error.
 pub const START_RETRY_PAUSE: Duration = Duration::from_millis(300);
@@ -144,7 +150,8 @@ pub fn run_env(
 /// Routes one request: GitLab job and pipeline events, VM reports, VM termination and the
 /// sweep trigger. Pure apart from the provider, ledger and record calls.
 pub struct Dispatcher {
-    config: Arc<Config>,
+    /// The config of the environment; [`Dispatcher::config`] answers the fleet's when it has one.
+    base: Arc<Config>,
     provider: Arc<dyn Provider>,
     secrets: Arc<Secrets>,
     log: Log,
@@ -157,6 +164,9 @@ pub struct Dispatcher {
     schedule: Option<Arc<dyn Schedule>>,
     /// Pause between recording an intent and reading the burst.
     group_wait: Duration,
+    /// Fleet state (M6.3 rule R1); `None` serves the projects of the config.
+    fleet: Option<Arc<dyn FleetStore>>,
+    fleet_cache: Arc<FleetCache>,
 }
 
 impl Dispatcher {
@@ -167,7 +177,7 @@ impl Dispatcher {
         log: Log,
     ) -> Dispatcher {
         Dispatcher {
-            config,
+            base: config,
             provider,
             secrets,
             log,
@@ -176,6 +186,8 @@ impl Dispatcher {
             records: None,
             schedule: None,
             group_wait: Duration::from_secs(GROUP_WAIT_S),
+            fleet: None,
+            fleet_cache: Arc::new(FleetCache::new()),
         }
     }
 
@@ -231,17 +243,25 @@ impl Dispatcher {
         now: u64,
         at: Arrival,
     ) -> DispatchResponse {
-        if method.eq_ignore_ascii_case("POST") {
-            let path = path.trim_end_matches('/');
-            if path == vm::PATH_REPORT {
-                return self.vm_report(headers, body, now, at).await;
-            }
-            if path == vm::PATH_TERMINATE {
-                return self.vm_terminate(headers, at).await;
-            }
+        let path = path.trim_end_matches('/');
+        let post = method.eq_ignore_ascii_case("POST");
+        if post && path == vm::PATH_TERMINATE {
+            return self.vm_terminate(headers, at).await;
         }
         if let Some(given) = sweep_arg(body) {
             return self.sweep(given.as_deref(), now, at).await;
+        }
+        self.refresh_fleet(at).await;
+        if method.eq_ignore_ascii_case("GET") && path == PATH_FLEET {
+            return self.fleet_info(headers, now, at).await;
+        }
+        if post {
+            match path {
+                vm::PATH_REPORT => return self.vm_report(headers, body, now, at).await,
+                PATH_JOIN => return self.join(headers, body, now, at).await,
+                PATH_LEAVE => return self.leave(headers, now, at).await,
+                _ => {}
+            }
         }
         self.webhook(headers, body, now, at).await
     }
@@ -260,6 +280,7 @@ impl Dispatcher {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        self.refresh_fleet(at).await;
         stamp(self.webhook(headers, body, now, at).await, at)
     }
 
@@ -286,15 +307,23 @@ impl Dispatcher {
         now: u64,
         at: Arrival,
     ) -> DispatchResponse {
-        if !token_matches(
-            header(headers, "x-gitlab-token"),
-            self.secrets.hook_token.as_deref(),
-        ) {
-            return unauthorized();
-        }
+        let token = header(headers, "x-gitlab-token");
         let Ok(event) = serde_json::from_slice::<Value>(body) else {
+            if !token_matches(token, self.secrets.hook_token.as_deref()) {
+                return unauthorized();
+            }
             return reply(400, "bad_request", json!({}));
         };
+        // Job events name the project in `project_id`, pipeline events in `project.id`.
+        let project_id = event.get("project_id").and_then(Value::as_u64).or_else(|| {
+            event
+                .get("project")
+                .and_then(|project| project.get("id"))
+                .and_then(Value::as_u64)
+        });
+        if !self.authorized(token, project_id) {
+            return unauthorized();
+        }
         match event.get("object_kind").and_then(Value::as_str) {
             Some("build") => self.job_event(headers, &event, now, at).await,
             Some("pipeline") => self.pipeline_event(headers, &event, now, at).await,
@@ -329,9 +358,10 @@ impl Dispatcher {
             return ignored("status", json!({ "status": status }));
         }
         let project_id = event.get("project_id").and_then(Value::as_u64).unwrap_or(0);
-        if !self.config.gitlab.project_ids.contains(&project_id) {
+        if self.member(project_id).is_none() {
             return ignored("project", json!({}));
         }
+        let config = self.config();
         let name = event
             .get("build_name")
             .and_then(Value::as_str)
@@ -339,14 +369,19 @@ impl Dispatcher {
         if is_own_job(name) {
             return ignored("own_job", json!({ "name": name }));
         }
-        if self.config.ignores(name) {
+        if config.ignores(name) {
             return ignored("ignore_jobs", json!({}));
         }
 
         let stage = event.get("build_stage").and_then(Value::as_str);
-        let Some(pool) = self.config.pool_for(name, stage).cloned() else {
+        let Some(pool) = config.pool_for(name, stage).cloned() else {
             return ignored("unmapped_stage", json!({ "stage": stage.unwrap_or("") }));
         };
+        // M6.3 rule R5: only the project's own runner of the pool takes the job.
+        let runner = self.runner_of(project_id, &pool.tag);
+        if runner == RunnerOf::Missing {
+            return ignored("no_runner", json!({ "pool": pool.tag }));
+        }
         let labels = BTreeMap::from([
             ("project".to_string(), project_id.to_string()),
             ("pipeline".to_string(), number(event, "pipeline_id")),
@@ -373,15 +408,17 @@ impl Dispatcher {
             self.info(at, "stale", &fields);
             return ignored("pipeline_closed", json!({ "pipeline": pipeline }));
         }
-        if self.config.is_vm_pool(&pool)
+        if config.is_vm_pool(&pool)
             && let Some(pipeline) = &pipeline
         {
             self.mark_seen(pipeline, &labels["job"], &pool.tag, at)
                 .await;
         }
         let callback = self.callback(headers);
+        // Spill slots poll with the host's spill runner, which sees the host's jobs only.
         if let Some(schedule) = schedule
-            && let Some(vm_pool) = self.config.vm_first_pool(&pool)
+            && runner == RunnerOf::Host
+            && let Some(vm_pool) = config.vm_first_pool(&pool)
             && let Some(vm) = self
                 .spill(
                     schedule,
@@ -782,7 +819,8 @@ impl Dispatcher {
     /// [`SPILL_WAIT_S`] gets a lane run through the lane's start path, below the lane's
     /// `maxRuns`, and leaves the queue.
     async fn spill_fallback(&self, schedule: &dyn Schedule, vm_pool: &Pool, now: u64, at: Arrival) {
-        for lane in self.config.spill_lanes(vm_pool) {
+        let config = self.config();
+        for lane in config.spill_lanes(vm_pool) {
             let mut due: Vec<Queued> = match self.live_queue(schedule, &lane.tag, now).await {
                 Ok(queued) => queued
                     .into_iter()
@@ -879,7 +917,8 @@ impl Dispatcher {
         at: Arrival,
     ) -> DispatchResponse {
         let job = number(event, "build_id");
-        if job.is_empty() || !(self.config.is_vm_pool(pool) || self.config.is_lane(pool)) {
+        let config = self.config();
+        if job.is_empty() || !(config.is_vm_pool(pool) || config.is_lane(pool)) {
             return ignored("status", json!({ "status": status }));
         }
         let name = event
@@ -1010,7 +1049,7 @@ impl Dispatcher {
 
     /// M6.2 rule R6: whether `vm_pool` has a spill runner the dispatcher holds the token of.
     fn has_spill_runner(&self, vm_pool: &Pool) -> bool {
-        self.config.spill_tags(vm_pool).is_some()
+        self.config().spill_tags(vm_pool).is_some()
             && self.secrets.spill_tokens.contains_key(&vm_pool.tag)
     }
 
@@ -1129,7 +1168,7 @@ impl Dispatcher {
             .and_then(|project| project.get("id"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        if !self.config.gitlab.project_ids.contains(&project_id) {
+        if self.member(project_id).is_none() {
             return ignored("project", json!({}));
         }
         let attributes = event.get("object_attributes");
@@ -1198,6 +1237,7 @@ impl Dispatcher {
     /// pool.
     fn vm_jobs_of(&self, event: &Value) -> VmJobs {
         let mut jobs = VmJobs::new();
+        let config = self.config();
         let builds = event.get("builds").and_then(Value::as_array);
         for build in builds.into_iter().flatten() {
             let text = |key: &str| build.get(key).and_then(Value::as_str).unwrap_or("");
@@ -1210,10 +1250,9 @@ impl Dispatcher {
                 continue;
             };
             let stage = build.get("stage").and_then(Value::as_str);
-            if let Some(pool) = self
-                .config
+            if let Some(pool) = config
                 .pool_for(name, stage)
-                .filter(|pool| self.config.is_vm_pool(pool))
+                .filter(|pool| config.is_vm_pool(pool))
             {
                 jobs.entry(pool.tag.clone())
                     .or_default()
@@ -1238,8 +1277,8 @@ impl Dispatcher {
         at: Arrival,
     ) -> std::result::Result<Vec<Value>, DispatchResponse> {
         let warm_job = format!("{WARM_PREFIX}{}", names[0].1);
-        let pools: Vec<(&Pool, usize)> = self
-            .config
+        let config = self.config();
+        let pools: Vec<(&Pool, usize)> = config
             .pools
             .iter()
             .filter_map(|pool| Some((pool, vm_jobs.get(&pool.tag)?.len())))
@@ -1409,9 +1448,16 @@ impl Dispatcher {
         taken: u32,
         at: Arrival,
     ) -> Result<String> {
-        let mut env = run_env(&self.config, &self.secrets, pool, vm)?;
+        let mut env = run_env(&self.config(), &self.secrets, pool, vm)?;
         if vm && let Some(url) = callback {
             env.insert("CIBURST_DISPATCH_URL".to_string(), url.to_string());
+        }
+        // M6.3 rule R5: a lane run takes the job with the runner of the job's project.
+        if !vm
+            && let Some(project) = labels.get("project").and_then(|p| p.parse::<u64>().ok())
+            && let RunnerOf::Member(token) = self.runner_of(project, &pool.tag)
+        {
+            env.insert("RUNNER_TOKEN".to_string(), token);
         }
         let job = labels.get("job").cloned().unwrap_or_default();
         let request = StartRequest {
@@ -1496,11 +1542,12 @@ impl Dispatcher {
                         ("next_report_s", &next),
                     ],
                 );
-                reply(
-                    200,
-                    "reported",
-                    json!({ "spill": answer.spill, "nextReportS": answer.next_report_s }),
-                )
+                let mut body =
+                    json!({ "spill": answer.spill, "nextReportS": answer.next_report_s });
+                if !answer.runners.is_empty() {
+                    body["runners"] = json!(answer.runners);
+                }
+                reply(200, "reported", body)
             }
             Err(error) => {
                 let message = error.to_string();
@@ -1523,21 +1570,27 @@ impl Dispatcher {
         at: Arrival,
     ) -> VmReportAnswer {
         let busy = report.state == VmState::Busy;
-        let quiet = VmReportAnswer {
+        let mut quiet = VmReportAnswer {
             runners: Vec::new(),
             spill: false,
             next_report_s: next_report_s(false, false, busy),
         };
-        let Some(schedule) = self.schedule.as_deref() else {
-            return quiet;
-        };
-        let mut found = None;
-        for pool in self
-            .config
+        let config = self.config();
+        let vm_pools: Vec<&Pool> = config
             .pools
             .iter()
-            .filter(|p| self.config.is_vm_pool(p))
-        {
+            .filter(|p| config.is_vm_pool(p))
+            .collect();
+        // M6.3 rule R5: the VM's pool is looked up for the member runners too.
+        let members = vm_pools
+            .iter()
+            .any(|pool| !self.member_runners(&pool.tag).is_empty());
+        let schedule = self.schedule.as_deref();
+        if schedule.is_none() && !members {
+            return quiet;
+        }
+        let mut found = None;
+        for pool in vm_pools {
             if let Some(vms) = self.vms_of(pool, at).await
                 && vms.iter().any(|vm| vm.run_id == run)
             {
@@ -1546,6 +1599,10 @@ impl Dispatcher {
             }
         }
         let Some((pool, vms)) = found else {
+            return quiet;
+        };
+        quiet.runners = self.member_runners(&pool.tag);
+        let Some(schedule) = schedule else {
             return quiet;
         };
         let queued = match self.live_queue(schedule, &pool.tag, now).await {
@@ -1562,7 +1619,7 @@ impl Dispatcher {
             && self.has_spill_runner(pool)
             && !self.unseen_vm_jobs(pool, now, at).await;
         VmReportAnswer {
-            runners: Vec::new(),
+            runners: quiet.runners,
             spill,
             next_report_s: next_report_s(spill, !queued.is_empty(), busy),
         }
@@ -2244,7 +2301,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn without_a_default_pool_unmapped_stages_start_nothing() {
         let (d, recording, _) = setup(false).await;
-        let mut config = (*d.config).clone();
+        let mut config = (*d.config()).clone();
         config.default_pool = None;
         let d = Dispatcher::new(
             Arc::new(config),

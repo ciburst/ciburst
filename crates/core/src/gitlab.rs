@@ -21,6 +21,14 @@ pub struct Runner {
     pub tag_list: Vec<String>,
 }
 
+/// A project as `GET /projects/:id` returns it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Project {
+    pub id: u64,
+    #[serde(default)]
+    pub path_with_namespace: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct CreatedRunner {
     pub id: u64,
@@ -347,6 +355,12 @@ impl Gitlab {
                 _ => return Ok(items),
             }
         }
+    }
+
+    /// The project of an id or a full path such as `group/project`.
+    pub async fn project(&self, id_or_path: &str) -> Result<Project> {
+        let encoded = id_or_path.trim_matches('/').replace('/', "%2F");
+        self.get(&format!("/projects/{encoded}"), &[]).await
     }
 
     pub async fn list_runners(&self, project_id: u64) -> Result<Vec<Runner>> {

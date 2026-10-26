@@ -85,8 +85,10 @@ async fn dry_run_is_idempotent_and_destroy_asks_for_the_name() {
     assert_eq!(code, 0, "{out}");
     assert!(out.contains("create  project demo"), "{out}");
     assert!(out.contains("create  job definition demo-build"), "{out}");
+    assert!(out.contains("update  fleet config"), "{out}");
+    assert!(out.contains("create  member 1"), "{out}");
     assert!(
-        out.contains("7 to create, 0 to update, 0 to delete, 0 unchanged"),
+        out.contains("8 to create, 1 to update, 0 to delete, 0 unchanged"),
         "{out}"
     );
 
@@ -104,7 +106,7 @@ async fn dry_run_is_idempotent_and_destroy_asks_for_the_name() {
     let (code, out) = ciburst(dir.path(), &["plan"]).await;
     assert_eq!(code, 0, "{out}");
     assert!(
-        out.contains("0 to create, 0 to update, 0 to delete, 7 unchanged"),
+        out.contains("0 to create, 0 to update, 0 to delete, 9 unchanged"),
         "{out}"
     );
 
@@ -115,6 +117,7 @@ async fn dry_run_is_idempotent_and_destroy_asks_for_the_name() {
         "{out}"
     );
     assert!(out.contains("pool build: 0 live of 2"), "{out}");
+    assert!(out.contains("\nmember 1 joined "), "{out}");
 
     let (code, out) = ciburst(dir.path(), &["destroy"]).await;
     assert_eq!(code, 2, "{out}");
@@ -151,7 +154,7 @@ async fn the_dry_run_config_shows_the_default_vm_pool() {
     assert_eq!(code, 0, "{out}");
     assert!(out.contains("create  job definition demo-vm"), "{out}");
     assert!(
-        out.contains("6 to create, 0 to update, 0 to delete, 0 unchanged"),
+        out.contains("7 to create, 1 to update, 0 to delete, 0 unchanged"),
         "{out}"
     );
     let config =
@@ -546,8 +549,13 @@ async fn status_lists_the_deliveries_and_check_a_disabled_hook() {
     let status = ["--config", &config, "--local", &local, "status"];
     let (code, out) = run(env(Some(fake.clone())), &status).await;
     assert_eq!(code, 0, "{out}");
+    let (members, out): (Vec<&str>, Vec<&str>) = out
+        .split_inclusive('\n')
+        .partition(|l| l.starts_with("member "));
+    assert_eq!(members.len(), 1);
+    assert!(members[0].starts_with("member 1 joined 20"), "{members:?}");
     assert_eq!(
-        out,
+        out.concat(),
         format!(
             concat!(
                 "dispatcher: https://demo-dispatch.fake.invalid/\n",

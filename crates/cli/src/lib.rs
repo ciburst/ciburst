@@ -1,5 +1,7 @@
 //! The `ciburst` command. `run` is the whole program so tests can drive it in process.
 
+mod fleet;
+
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -11,6 +13,7 @@ use ciburst_core::config::{
     Config, JOBS_RUNTIME, check_capabilities, load_config, merge_config, read_config_file,
 };
 use ciburst_core::fake::{FakeHost, FakeProvider};
+use ciburst_core::fleet::StoreFleet;
 use ciburst_core::gitlab::Gitlab;
 use ciburst_core::http::{HttpClient, ReqwestClient};
 use ciburst_core::log::Log;
@@ -18,9 +21,10 @@ use ciburst_core::plan::{
     FileOutputs, GitlabOutputs, MemoryOutputs, OUTPUTS_SCOPE, OutputsStore, format_plan,
     read_env_file, summarize_plan,
 };
-use ciburst_core::provision::{self, ProjectReport, Provisioner, keys};
+use ciburst_core::provision::{self, ProjectReport, Provisioner, keys, secrets_from_outputs};
 use ciburst_core::store::{FileStore, MemoryStore, Store};
-use ciburst_core::types::{Host, Provider, Rotation};
+use ciburst_core::time::rfc3339;
+use ciburst_core::types::{Host, Outputs, Provider, Rotation};
 use ciburst_core::{Error, Result};
 use ciburst_hetzner::Hetzner;
 use ciburst_scaleway::client::{Credentials, DEFAULT_REGION, ScalewayClient};
@@ -105,6 +109,16 @@ enum Command {
     },
     /// Replace a secret and redeploy: runner, hook, key, cache or vm
     Rotate { kind: String },
+    /// Print a code that lets another project join this fleet [--ci: the project in
+    /// CIBURST_INVITE]
+    Invite {
+        /// Project id or path
+        project: Option<String>,
+    },
+    /// Join the fleet of the code in CIBURST_JOIN with this project (--ci only)
+    Join,
+    /// Leave the fleet of the code in CIBURST_JOIN (--ci only)
+    Leave,
 }
 
 /// What a command reads besides its arguments; tests inject every part.
@@ -264,14 +278,50 @@ impl Modules {
     /// The dispatcher's URL from the outputs of an earlier `apply`: the job's variables in
     /// pipeline mode, `outputs.env` otherwise.
     async fn dispatch_url(&self) -> Result<Option<String>> {
-        let outputs = match &self.mode {
-            Mode::Ci { .. } => self.vars.clone(),
-            Mode::Local(local) => read_env_file(&local.join("outputs.env")).await?,
-        };
-        Ok(outputs
+        Ok(self
+            .stored_outputs()
+            .await?
             .get(keys::DISPATCH_URL)
             .filter(|url| !url.is_empty())
             .cloned())
+    }
+
+    /// The outputs of an earlier `apply`: the job's variables in pipeline mode, `outputs.env`
+    /// otherwise.
+    async fn stored_outputs(&self) -> Result<Outputs> {
+        Ok(match &self.mode {
+            Mode::Ci { .. } => {
+                let wanted = keys::output_keys(&self.config);
+                self.vars
+                    .iter()
+                    .filter(|(key, value)| wanted.contains(key) && !value.is_empty())
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            }
+            Mode::Local(local) => read_env_file(&local.join("outputs.env")).await?,
+        })
+    }
+
+    /// The projects `check` looks at: the config's, then the members that joined the fleet
+    /// (M6.3 rule R7). Without the provider's credentials only the config's.
+    async fn fleet_projects(&mut self) -> Result<Vec<u64>> {
+        let mut projects = self.config.gitlab.project_ids.clone();
+        let Ok(provider) = self.provider().await else {
+            return Ok(projects);
+        };
+        let secrets = secrets_from_outputs(&self.config, &self.stored_outputs().await?);
+        if let Some(fleet) = provider.fleet(&secrets).await? {
+            let mut joined: Vec<u64> = fleet
+                .members()
+                .await?
+                .into_iter()
+                .map(|m| m.project_id)
+                .filter(|id| !projects.contains(id))
+                .collect();
+            joined.sort_unstable();
+            projects.extend(joined);
+        }
+        Ok(projects)
     }
 
     async fn hetzner_token(&self) -> Result<String> {
@@ -348,10 +398,10 @@ impl Modules {
 
     async fn main_provider(&mut self) -> Result<Arc<dyn Provider>> {
         match self.config.provider.kind.as_str() {
-            "fake" => Ok(Arc::new(FakeProvider::new(
-                self.config.clone(),
-                self.store("provider"),
-            ))),
+            "fake" => Ok(Arc::new(
+                FakeProvider::new(self.config.clone(), self.store("provider"))
+                    .with_fleet(Arc::new(StoreFleet::new(self.store("fleet")))),
+            )),
             "scaleway" | "scaleway-jobs" => {
                 let agent = self.agent()?;
                 let client = self.scaleway().await?;
@@ -495,6 +545,9 @@ pub async fn run_with_env(args: Vec<String>, env: Env, out: &mut dyn Write) -> R
         }
     };
 
+    if matches!(cli.command, Command::Join | Command::Leave) {
+        return member(&cli, env, out).await;
+    }
     let (mode, config) = if cli.ci {
         if cli.skip_gitlab {
             return Err(Error::other(
@@ -544,8 +597,15 @@ pub async fn run_with_env(args: Vec<String>, env: Env, out: &mut dyn Write) -> R
             } else {
                 modules.dispatch_url().await?
             };
-            let report =
-                provision::check(&config, &gitlab, content_ref.as_deref(), url.as_deref()).await?;
+            let projects = modules.fleet_projects().await?;
+            let report = provision::check_projects(
+                &config,
+                &gitlab,
+                &projects,
+                content_ref.as_deref(),
+                url.as_deref(),
+            )
+            .await?;
             if *suggest {
                 return write_suggestions(out, &report);
             }
@@ -559,16 +619,43 @@ pub async fn run_with_env(args: Vec<String>, env: Env, out: &mut dyn Write) -> R
             } else {
                 modules.gitlab_if_token().await?
             };
+            let outputs = MemoryOutputs::new();
+            outputs
+                .write(&modules.stored_outputs().await?, true)
+                .await?;
             let provisioner = Provisioner::new(
                 config.clone(),
                 provider,
                 host,
                 gitlab,
-                Arc::new(MemoryOutputs::new()),
+                Arc::new(outputs),
                 log,
             );
             return write_status(out, &provisioner).await;
         }
+        Command::Invite { project } => {
+            let project = match (&modules.mode, project) {
+                (_, Some(project)) => project.clone(),
+                (Mode::Ci { .. }, None) => modules.input(fleet::INVITE_VAR)?,
+                (Mode::Local(_), None) => {
+                    writeln!(out, "invite needs a project id or path")?;
+                    return Ok(2);
+                }
+            };
+            let outputs = modules.stored_outputs().await?;
+            let gitlab = modules.gitlab_if_token().await?;
+            return fleet::invite(
+                out,
+                gitlab,
+                config.gitlab.project_ids[0],
+                &project,
+                outputs.get(keys::HOOK_TOKEN).cloned(),
+                modules.dispatch_url().await?,
+                fleet::now(),
+            )
+            .await;
+        }
+        Command::Join | Command::Leave => unreachable!("handled before the config"),
         Command::Destroy { yes } if yes.as_deref() != Some(config.name.as_str()) => {
             writeln!(
                 out,
@@ -655,6 +742,14 @@ async fn write_status(out: &mut dyn Write, provisioner: &Provisioner) -> Result<
             pool.tag, pool.live, pool.max_runs
         )?;
     }
+    for member in &status.members {
+        writeln!(
+            out,
+            "member {} joined {}",
+            member.project_id,
+            rfc3339(member.joined_at)
+        )?;
+    }
     let skip = status.runs.len().saturating_sub(20);
     for run in status.runs.iter().skip(skip) {
         writeln!(
@@ -668,6 +763,14 @@ async fn write_status(out: &mut dyn Write, provisioner: &Provisioner) -> Result<
         )?;
     }
     for project in provisioner.hook_deliveries(status.url.as_deref()).await? {
+        if let Some(reason) = &project.unreadable {
+            writeln!(
+                out,
+                "project {}: hook not readable with this token: {reason}",
+                project.project_id
+            )?;
+            continue;
+        }
         let Some(hook) = &project.hook else {
             writeln!(
                 out,
@@ -695,6 +798,14 @@ async fn write_status(out: &mut dyn Write, provisioner: &Provisioner) -> Result<
 fn write_check(out: &mut dyn Write, report: &[ProjectReport]) -> Result<i32> {
     let mut failed = false;
     for project in report {
+        if let Some(reason) = &project.unreadable {
+            writeln!(
+                out,
+                "project {}: not readable with this token, check it in its own pipeline: {reason}",
+                project.project_id
+            )?;
+            continue;
+        }
         if let Some(hook) = project.hook.as_ref().filter(|hook| !hook.is_executable()) {
             failed = true;
             writeln!(
@@ -741,6 +852,10 @@ fn write_suggestions(out: &mut dyn Write, report: &[ProjectReport]) -> Result<i3
     let mut failed = false;
     for project in report {
         let id = project.project_id;
+        if project.unreadable.is_some() {
+            writeln!(out, "project {id}: not readable with this token")?;
+            continue;
+        }
         if !project.valid {
             failed = true;
             writeln!(
@@ -766,6 +881,58 @@ fn write_suggestions(out: &mut dyn Write, report: &[ProjectReport]) -> Result<i3
         }
     }
     Ok(if failed { 1 } else { 0 })
+}
+
+/// `ciburst --ci join` and `ciburst --ci leave` (M6.3 rule R4) in a member's pipeline: the
+/// code in `CIBURST_JOIN` and the member's own `CIBURST_GITLAB_TOKEN`, no config.
+async fn member(cli: &Cli, env: Env, out: &mut dyn Write) -> Result<i32> {
+    if !cli.ci {
+        return Err(Error::other(
+            "join and leave run in the member's pipeline: ciburst --ci join",
+        ));
+    }
+    let (project_id, server_url) = ci_project(&env.vars)?;
+    let input = |key: &str| {
+        env.vars
+            .get(key)
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .ok_or_else(|| Error::other(format!("{key} missing")))
+    };
+    let code = input(fleet::JOIN_VAR)?;
+    let token = input(ci_vars::GITLAB_TOKEN)?;
+    let http: Arc<dyn HttpClient> = match env.http {
+        Some(http) => http,
+        None => Arc::new(ReqwestClient::new()?),
+    };
+    let gitlab = Gitlab::new(&server_url, token, http.clone());
+    let now = fleet::now();
+    match cli.command {
+        Command::Join => {
+            fleet::join(
+                out,
+                &gitlab,
+                http.as_ref(),
+                &env.log,
+                project_id,
+                &code,
+                now,
+            )
+            .await
+        }
+        _ => {
+            fleet::leave(
+                out,
+                &gitlab,
+                http.as_ref(),
+                &env.log,
+                project_id,
+                &code,
+                now,
+            )
+            .await
+        }
+    }
 }
 
 /// M6.1 rule R8: the `ignoreJobs` key of `ciburst.json` for jobs of other runners.
