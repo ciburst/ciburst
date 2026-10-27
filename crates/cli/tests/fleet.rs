@@ -82,11 +82,8 @@ async fn setup() -> Setup {
               "name": "demo",
               "gitlab": {{ "url": "https://gitlab.example", "projectIds": [{HOST}] }},
               "host": {{ "type": "fake" }}, "provider": {{ "type": "fake" }},
-              "defaultPool": "vm",
-              "pools": [
-                {{ "tag": "vm", "image": "img/node", "runtime": "instances" }},
-                {{ "tag": "node", "image": "node:24", "jobs": ["lint"], "runtime": "jobs" }}
-              ],
+              "vm": {{ "image": "img/node" }},
+              "lanes": [ {{ "tag": "node", "image": "node:24", "jobs": ["lint"] }} ],
               "cache": {{ "type": "s3" }}
             }}"#
         ))
@@ -140,14 +137,26 @@ fn vars(project: u64, extra: &[(&str, &str)]) -> BTreeMap<String, String> {
 
 impl Setup {
     async fn run(&self, vars: BTreeMap<String, String>, args: &[&str]) -> (i32, String) {
+        let config = fake_modules(self.dir.path());
+        self.run_with(vars, Some(config), args).await
+    }
+
+    async fn run_with(
+        &self,
+        vars: BTreeMap<String, String>,
+        config: Option<String>,
+        args: &[&str],
+    ) -> (i32, String) {
         let env = Env {
             vars,
             http: Some(self.router.clone()),
             exe: None,
             log: Log::silent(),
         };
-        let config = fake_modules(self.dir.path());
-        let mut all = vec!["ciburst".to_string(), "--config".to_string(), config];
+        let mut all = vec!["ciburst".to_string()];
+        if let Some(config) = config {
+            all.extend(["--config".to_string(), config]);
+        }
         all.extend(args.iter().map(|s| s.to_string()));
         let mut out = Vec::new();
         let code = ciburst::run_with_env(all, env, &mut out)
@@ -172,9 +181,38 @@ impl Setup {
         self.run(vars, &["--ci", "invite"]).await
     }
 
+    /// `ciburst-join` or `ciburst-leave` in the member, without a `ciburst.json`.
     async fn member(&self, command: &str, code: &str) -> (i32, String) {
-        self.run(vars(MEMBER, &[("CIBURST_JOIN", code)]), &["--ci", command])
+        self.member_with(command, code, None).await
+    }
+
+    /// The same with the member's own `ciburst.json` holding `file`.
+    async fn member_with(&self, command: &str, code: &str, file: Option<&str>) -> (i32, String) {
+        let config = file.map(|text| {
+            let path = self.dir.path().join("member.json");
+            std::fs::write(&path, text).unwrap();
+            path.display().to_string()
+        });
+        let vars = vars(MEMBER, &[("CIBURST_JOIN", code)]);
+        self.run_with(vars, config, &["--ci", command]).await
+    }
+
+    /// A pending event of job `job` named `name` of the member, answered by the dispatcher.
+    async fn member_event(&self, secret: &str, name: &str, job: u64) -> Value {
+        let event = json!({
+            "object_kind": "build", "build_id": job, "build_name": name, "build_stage": "test",
+            "build_status": "pending", "pipeline_id": 2, "project_id": MEMBER
+        });
+        let answer = self
+            .router
+            .send(
+                Request::new("POST", format!("{URL}/"))
+                    .header("X-Gitlab-Token", secret.to_string())
+                    .json(&event),
+            )
             .await
+            .unwrap();
+        answer.json().unwrap()
     }
 
     /// The ids and tags of the member project's runners.
@@ -245,15 +283,11 @@ async fn a_member_joins_and_leaves_with_one_code() {
     let (status, out) = s.member("join", &code).await;
     assert_eq!((status, out.as_str()), (0, "joined fleet demo\n"));
 
-    let mut runners = s.runners();
-    runners.sort();
-    let tags: Vec<Vec<String>> = runners.iter().map(|(_, tags)| tags.clone()).collect();
+    let tags: Vec<Vec<String>> = s.runners().into_iter().map(|(_, tags)| tags).collect();
     assert_eq!(
         tags,
-        [
-            vec!["vm".to_string(), "node".to_string()],
-            vec!["node".to_string()]
-        ]
+        [vec!["vm".to_string()]],
+        "no lanes without a ciburst.json"
     );
     let hooks = s.gitlab.hooks();
     assert_eq!(hooks.len(), 1);
@@ -266,45 +300,70 @@ async fn a_member_joins_and_leaves_with_one_code() {
     assert_eq!(members.len(), 1);
     assert_eq!(members[0].project_id, MEMBER);
     assert_eq!(members[0].hook_secret, secret);
+    assert_eq!(members[0].runners.keys().collect::<Vec<_>>(), ["vm"]);
+    assert!(members[0].lanes.is_empty() && members[0].ignore_jobs.is_empty());
+    let lint = s.member_event(&secret, "lint", 1).await;
+    assert_eq!(lint["result"], "started", "{lint}");
+    assert_eq!(lint["pool"], "vm", "the host's lane is not the member's");
+
+    // M6.4 rule R5: the member's own lanes and ignoreJobs from its own ciburst.json.
+    let file = r#"{
+      "lanes": [ { "tag": "node", "image": "node:24", "jobs": ["lint"], "vcpu": 1 } ],
+      "ignoreJobs": ["pages"]
+    }"#;
+    let (status, out) = s.member_with("join", &code, Some(file)).await;
     assert_eq!(
-        members[0].runners.keys().collect::<Vec<_>>(),
-        ["node", "vm"]
+        (status, out.as_str()),
+        (0, "lane node (node:24)\njoined fleet demo\n")
     );
-
-    let event = json!({
-        "object_kind": "build", "build_id": 1, "build_name": "lint", "build_stage": "test",
-        "build_status": "pending", "pipeline_id": 2, "project_id": MEMBER
-    });
-    let answer = s
-        .router
-        .send(
-            Request::new("POST", format!("{URL}/"))
-                .header("X-Gitlab-Token", secret.clone())
-                .json(&event),
-        )
-        .await
-        .unwrap();
-    let body: Value = answer.json().unwrap();
-    assert_eq!(body["result"], "started", "{body}");
-
-    let (status, out) = s.member("join", &code).await;
-    assert_eq!((status, out.as_str()), (0, "joined fleet demo\n"));
-    assert_eq!(s.runners().len(), 2, "joining twice replaces the runners");
-    assert_eq!(s.gitlab.hooks().len(), 1);
-    let tokens: Vec<String> = s.fleet.members().await.unwrap()[0]
-        .runners
-        .values()
-        .cloned()
-        .collect();
+    let mut tags: Vec<Vec<String>> = s.runners().into_iter().map(|(_, tags)| tags).collect();
+    tags.sort();
+    assert_eq!(tags, [vec!["node".to_string()], vec!["vm".to_string()]]);
+    let member = s.fleet.members().await.unwrap().remove(0);
+    assert_eq!(member.lanes.len(), 1);
+    assert_eq!(member.lanes[0].definition_id, "def-8-node");
+    assert_eq!(member.ignore_jobs, ["pages"]);
     assert_ne!(
-        tokens,
-        members[0].runners.values().cloned().collect::<Vec<_>>()
+        member.runners, members[0].runners,
+        "joining again replaces the runners"
     );
+    assert_eq!(s.gitlab.hooks().len(), 1);
+    let lint = s.member_event(&secret, "lint", 2).await;
+    assert_eq!(lint["pool"], "8-node", "{lint}");
+    let pages = s.member_event(&secret, "pages", 3).await;
+    assert_eq!(pages["reason"], "ignore_jobs", "{pages}");
 
     let (status, out) = s.member("leave", &code).await;
     assert_eq!((status, out.as_str()), (0, "left fleet demo\n"));
     assert!(s.runners().is_empty());
     assert!(s.gitlab.hooks().is_empty());
+    assert!(s.fleet.members().await.unwrap().is_empty());
+}
+
+/// D60, M6.4 rule R1: a member's ciburst.json holds only lanes and ignoreJobs; a fleet
+/// setting or a removed key is refused before anything is registered.
+#[tokio::test]
+async fn a_member_file_with_a_fleet_setting_is_refused() {
+    let s = setup().await;
+    let code = code_of(&s.invite("8").await.1);
+    for (file, error) in [
+        (
+            r#"{ "vm": { "slots": 1 }, "lanes": [] }"#,
+            "invalid config:\n  vm: a fleet setting; it belongs in the host's ciburst.json",
+        ),
+        (
+            r#"{ "pools": [] }"#,
+            "invalid config:\n  pools: replaced by vm (the VM runner) and lanes (Serverless Jobs lanes of this project)",
+        ),
+        (
+            r#"{ "lanes": [ { "tag": "vm", "image": "x", "jobs": ["a"] } ] }"#,
+            "invalid config:\n  lanes[0].tag: vm is the VM runner's tag",
+        ),
+    ] {
+        let (status, out) = s.member_with("join", &code, Some(file)).await;
+        assert_eq!((status, out.as_str()), (1, error));
+    }
+    assert!(s.runners().is_empty() && s.gitlab.hooks().is_empty());
     assert!(s.fleet.members().await.unwrap().is_empty());
 }
 

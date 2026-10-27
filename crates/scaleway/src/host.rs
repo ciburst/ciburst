@@ -8,16 +8,14 @@
 //! [`vars`]:
 //! - plain: `CIBURST_CONFIG` (config JSON), `CIBURST_ORGANIZATION_ID`, `CIBURST_PROJECT_ID`,
 //!   `CIBURST_REGION` (Scaleway reserves the `SCW_` prefix), every variable of
-//!   `Secrets::dispatcher_env` under its own name (`CIBURST_AGENT_SHA256`, D38), and with VM
-//!   pools of the `scaleway` provider `CIBURST_VM_SECURITY_GROUP` and `CIBURST_VM_IMAGES`, which
+//!   `Secrets::dispatcher_env` under its own name (`CIBURST_AGENT_SHA256`, D38), and
+//!   `CIBURST_VM_SECURITY_GROUP` and `CIBURST_VM_IMAGES`, which
 //!   this host resolves on every plan and apply (`Scaleway::resolve_vm_start`, M7 hardening
 //!   rule R3), so a changed image or security group plans a function update;
-//! - secret: `HOOK_TOKEN`, `CIBURST_DISPATCH_KEY` (the dispatch key), `RUNNER_TOKEN_<TAG>` per pool,
-//!   `RUNNER_SPILL_TOKEN_<TAG>` per VM pool with a spill runner (`Secrets::spill_tokens`, M6.2
-//!   rule R6), `CACHE_S3_ACCESS_KEY` and `CACHE_S3_SECRET_KEY` when a cache key exists,
-//!   `CIBURST_VM_SECRET`, `CIBURST_SWEEP_TOKEN` and `CIBURST_FLEET_KEY` (M6.3 rule R2) when the
-//!   provisioner made them, and every credential of an added provider (`Secrets::provider_env`,
-//!   for example `HCLOUD_TOKEN`) under its own name.
+//! - secret: `HOOK_TOKEN`, `CIBURST_DISPATCH_KEY` (the dispatch key), `RUNNER_TOKEN_<TAG>` for
+//!   the VM runner and each host lane, `CACHE_S3_ACCESS_KEY` and `CACHE_S3_SECRET_KEY` when a
+//!   cache key exists, `CIBURST_VM_SECRET`, `CIBURST_SWEEP_TOKEN` and `CIBURST_FLEET_KEY` (M6.3
+//!   rule R2) when the provisioner made them.
 //!
 //! On top, the plain variable `CIBURST_CODE_DIGEST` records the sha256 of the deployed zip for
 //! this host's plan; the function does not read it. The sha256 of the settings and both
@@ -91,25 +89,9 @@ pub mod vars {
     pub const VM_SECURITY_GROUP: &str = crate::provider::SECURITY_GROUP_VAR;
     pub const VM_IMAGES: &str = crate::provider::IMAGES_VAR;
 
-    /// Whether `name` can carry a credential of an added provider (`Secrets::provider_env`,
-    /// for example `HCLOUD_TOKEN`): upper-case letters, digits and `_`, not starting with a
-    /// digit, outside the names and prefixes of this module and outside Scaleway's reserved
-    /// `SCW_`.
-    pub fn provider_name_ok(name: &str) -> bool {
-        let shaped = name.starts_with(|c: char| c.is_ascii_uppercase())
-            && name
-                .chars()
-                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-        let taken = [HOOK_TOKEN, CACHE_ACCESS_KEY, CACHE_SECRET_KEY].contains(&name)
-            || ["CIBURST_", RUNNER_TOKEN_PREFIX, SPILL_TOKEN_PREFIX, "SCW_"]
-                .iter()
-                .any(|prefix| name.starts_with(prefix));
-        shaped && !taken
-    }
-
     /// Whether `name` can carry a plain variable of the dispatcher (`Secrets::dispatcher_env`,
-    /// for example `CIBURST_AGENT_SHA256`): upper-case like a provider variable, outside the
-    /// names of this module, `RUNNER_TOKEN_<TAG>`, `RUNNER_SPILL_TOKEN_<TAG>` and Scaleway's
+    /// for example `CIBURST_AGENT_SHA256`): upper-case letters, digits and `_`, not starting
+    /// with a digit, outside the names of this module, `RUNNER_TOKEN_<TAG>` and Scaleway's
     /// reserved `SCW_`.
     pub fn dispatcher_name_ok(name: &str) -> bool {
         let shaped = name.starts_with(|c: char| c.is_ascii_uppercase())
@@ -133,14 +115,13 @@ pub mod vars {
             VM_IMAGES,
         ]
         .contains(&name)
-            || [RUNNER_TOKEN_PREFIX, SPILL_TOKEN_PREFIX, "SCW_"]
+            || [RUNNER_TOKEN_PREFIX, "SCW_"]
                 .iter()
                 .any(|prefix| name.starts_with(prefix));
         shaped && !taken
     }
 
     const RUNNER_TOKEN_PREFIX: &str = "RUNNER_TOKEN_";
-    const SPILL_TOKEN_PREFIX: &str = "RUNNER_SPILL_TOKEN_";
 
     /// A tag as a variable name suffix: upper-cased, every other character than ASCII letters
     /// and digits replaced by `_`, the rule of `ciburst_core::provision::keys`.
@@ -159,12 +140,6 @@ pub mod vars {
     /// `RUNNER_TOKEN_<TAG>`.
     pub fn runner_token(tag: &str) -> String {
         format!("{RUNNER_TOKEN_PREFIX}{}", tag_suffix(tag))
-    }
-
-    /// `RUNNER_SPILL_TOKEN_<TAG>`: the token of the spill runner of VM pool `tag` (M6.2 rule
-    /// R6), named like [`runner_token`].
-    pub fn spill_token(tag: &str) -> String {
-        format!("{SPILL_TOKEN_PREFIX}{}", tag_suffix(tag))
     }
 }
 
@@ -326,12 +301,9 @@ impl ScalewayFunction {
         if let Some(dispatch) = &secrets.dispatch {
             secret.insert(vars::SECRET_KEY.to_string(), dispatch.secret_key.clone());
         }
-        for pool in &self.config.pools {
-            if let Some(token) = secrets.runner_tokens.get(&pool.tag) {
-                secret.insert(vars::runner_token(&pool.tag), token.clone());
-            }
-            if let Some(token) = secrets.spill_tokens.get(&pool.tag) {
-                secret.insert(vars::spill_token(&pool.tag), token.clone());
+        for tag in ciburst_core::provision::keys::runner_tags(&self.config) {
+            if let Some(token) = secrets.runner_tokens.get(&tag) {
+                secret.insert(vars::runner_token(&tag), token.clone());
             }
         }
         if let Some(cache) = &secrets.cache {
@@ -346,10 +318,6 @@ impl ScalewayFunction {
         }
         if let Some(fleet_key) = &secrets.fleet_key {
             secret.insert(vars::FLEET_KEY.to_string(), fleet_key.clone());
-        }
-        check_provider_env(secrets)?;
-        for (name, value) in &secrets.provider_env {
-            secret.insert(name.clone(), value.clone());
         }
         Ok(Settings {
             runtime: RUNTIME,
@@ -578,7 +546,6 @@ impl ScalewayFunction {
 #[async_trait]
 impl Host for ScalewayFunction {
     async fn plan(&self, secrets: &Secrets) -> Result<Vec<Step>> {
-        check_provider_env(secrets)?;
         check_dispatcher_env(secrets)?;
         let found = self.find().await?;
         let function_name = self.function_name();
@@ -643,7 +610,6 @@ impl Host for ScalewayFunction {
     }
 
     async fn apply(&self, steps: &[Step], secrets: &Secrets) -> Result<Outputs> {
-        check_provider_env(secrets)?;
         check_dispatcher_env(secrets)?;
         if let Some(step) = steps.iter().find(|s| {
             ![STEP_NAMESPACE, STEP_FUNCTION, STEP_CODE, STEP_CRON].contains(&s.id.as_str())
@@ -783,28 +749,13 @@ impl Host for ScalewayFunction {
     }
 }
 
-/// Refuses a provider credential that would shadow one of the function's own variables, before
-/// anything is read or written.
-fn check_provider_env(secrets: &Secrets) -> Result<()> {
-    match secrets
-        .provider_env
-        .keys()
-        .find(|name| !vars::provider_name_ok(name))
-    {
-        Some(name) => Err(Error::provider(format!(
-            "{HOST_NAME}: provider variable {name} is reserved or not an upper-case name"
-        ))),
-        None => Ok(()),
-    }
-}
-
-/// Refuses a plain dispatcher variable that would shadow one of the function's own variables or
-/// a provider credential, before anything is read or written.
+/// Refuses a plain dispatcher variable that would shadow one of the function's own variables,
+/// before anything is read or written.
 fn check_dispatcher_env(secrets: &Secrets) -> Result<()> {
     match secrets
         .dispatcher_env
         .keys()
-        .find(|name| !vars::dispatcher_name_ok(name) || secrets.provider_env.contains_key(*name))
+        .find(|name| !vars::dispatcher_name_ok(name))
     {
         Some(name) => Err(Error::provider(format!(
             "{HOST_NAME}: dispatcher variable {name} is reserved or not an upper-case name"
@@ -901,24 +852,19 @@ mod tests {
             ciburst_core::provision::keys::runner_token("rust-1.96"),
             format!("CIBURST_{}", vars::runner_token("rust-1.96"))
         );
-        assert_eq!(vars::spill_token("vm"), "RUNNER_SPILL_TOKEN_VM");
-        assert_eq!(
-            vars::spill_token("rust-1.96"),
-            "RUNNER_SPILL_TOKEN_RUST_1_96"
-        );
     }
 
     #[test]
-    fn provider_variables_keep_out_of_the_functions_own_names() {
-        for name in ["HCLOUD_TOKEN", "A", "X1_Y"] {
-            assert!(vars::provider_name_ok(name), "{name}");
+    fn dispatcher_variables_keep_out_of_the_functions_own_names() {
+        for name in ["CIBURST_AGENT_SHA256_X", "A", "X1_Y"] {
+            assert!(vars::dispatcher_name_ok(name), "{name}");
         }
         for name in [
             "",
-            "hcloud_token",
+            "lower_case",
             "1TOKEN",
             "_TOKEN",
-            "HCLOUD-TOKEN",
+            "WITH-DASH",
             "SCW_SECRET_KEY",
             vars::HOOK_TOKEN,
             vars::CACHE_ACCESS_KEY,
@@ -926,16 +872,10 @@ mod tests {
             vars::SECRET_KEY,
             vars::CONFIG,
             vars::CODE_DIGEST,
-            "CIBURST_DISPATCH_URL",
             &vars::runner_token("ci"),
-            &vars::spill_token("vm"),
         ] {
-            assert!(!vars::provider_name_ok(name), "{name}");
+            assert!(!vars::dispatcher_name_ok(name), "{name}");
         }
-        for name in [vars::runner_token("ci"), vars::spill_token("vm")] {
-            assert!(!vars::dispatcher_name_ok(&name), "{name}");
-        }
-        assert!(vars::provider_name_ok("RUNNER_SPILL"));
     }
 
     /// D50: a function deployed with 128 MB carries another description, so it plans

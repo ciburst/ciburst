@@ -27,13 +27,9 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 /// The contract config (S3 cache) with both pools as lanes.
+/// The contract config: the VM runner and the host's lanes `ci` and `build`.
 fn lanes() -> Arc<Config> {
-    let mut config = (*contract_config()).clone();
-    config
-        .provider
-        .extra
-        .insert("runtime".into(), json!("jobs"));
-    Arc::new(config)
+    contract_config()
 }
 
 fn provider(config: Arc<Config>, backend: &Arc<ScalewayFake>, log: Log) -> Scaleway {
@@ -210,7 +206,7 @@ async fn the_pinned_runner_is_the_default_source() {
 }
 
 #[tokio::test]
-async fn the_step_follows_the_bucket_whenever_a_pool_exists() {
+async fn the_step_follows_the_bucket() {
     let backend = Arc::new(ScalewayFake::new());
     let plan = |config: Arc<Config>| {
         let provider = provider(config, &backend, Log::silent());
@@ -228,24 +224,8 @@ async fn the_step_follows_the_bucket_whenever_a_pool_exists() {
             "vm:agent"
         ]
     );
-    let only_lanes = plan(lanes()).await;
-    assert_eq!(
-        ids(&only_lanes),
-        [
-            "project",
-            "key:dispatch",
-            "key:cache",
-            "bucket",
-            "runner-binary",
-            "definition:ci",
-            "definition:build"
-        ]
-    );
-    let mut no_pools = (*contract_config()).clone();
-    no_pools.pools.clear();
-    no_pools.default_pool = None;
-    let steps = plan(Arc::new(no_pools)).await;
-    assert!(!ids(&steps).contains(&"runner-binary"), "{steps:?}");
+    let ids_of = ids(&vms);
+    assert!(ids_of.contains(&"definition:7-ci") && ids_of.contains(&"definition:7-build"));
     let mut no_cache = (*lanes()).clone();
     no_cache.cache.kind = CacheType::None;
     let steps = plan(Arc::new(no_cache)).await;
@@ -308,7 +288,7 @@ async fn definitions_of_existing_deployments_plan_an_update() {
             .unwrap();
     }
     let steps = provider.plan(&[]).await.unwrap();
-    for id in ["definition:ci", "definition:build"] {
+    for id in ["definition:7-ci", "definition:7-build"] {
         let step = step(&steps, id);
         assert_eq!(
             (step.action, step.detail.as_deref()),
@@ -342,7 +322,7 @@ async fn a_new_runner_pin_is_a_new_object_and_updates_the_lanes() {
         .with_runner_source(newer_url, newer_sha.clone());
     let steps = bumped.plan(&[]).await.unwrap();
     assert_eq!(step(&steps, "runner-binary").action, Action::Create);
-    for id in ["definition:ci", "definition:build"] {
+    for id in ["definition:7-ci", "definition:7-build"] {
         assert_eq!(
             step(&steps, id).detail.as_deref(),
             Some("environment_variables")

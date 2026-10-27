@@ -74,6 +74,24 @@ impl FakeJobs {
         self.inner.lock().expect("fake jobs").runs.clone()
     }
 
+    /// Adds a definition named `name` in `project_id`, as another tool or an earlier version
+    /// would have made it; answers its id.
+    pub fn add_definition(&self, project_id: &str, name: &str) -> String {
+        let mut inner = self.inner.lock().expect("fake jobs");
+        inner.next += 1;
+        let n = inner.next;
+        let id = fake_uuid(5, n);
+        inner.definitions.push(json!({
+            "id": id, "name": name, "project_id": project_id,
+            "region": super::scaleway_fake::FAKE_REGION,
+            "cpu_limit": 1000, "memory_limit": 2048, "local_storage_capacity": 1024,
+            "image_uri": "example.invalid/x", "command": "", "description": "",
+            "environment_variables": {}, "job_timeout": null, "cron_schedule": null,
+            "created_at": fake_time(n), "updated_at": fake_time(n),
+        }));
+        id
+    }
+
     /// Caps `page_size` so that tests can force several pages.
     pub fn set_max_page_size(&self, size: usize) {
         self.inner.lock().expect("fake jobs").max_page_size = size.max(1);
@@ -105,6 +123,19 @@ fn valid_duration(value: &Value) -> bool {
     }
 }
 
+/// The longest job definition name the fake takes. Scaleway documents lowercase letters,
+/// digits and dashes and no length; the fake holds names to the DNS label length that
+/// `ciburst_core::config::MAX_DEFINITION_NAME` keeps them within.
+pub const MAX_NAME: usize = 63;
+
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_NAME
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 /// Checks and copies the writable definition fields of `body` into `definition`.
 fn write_fields(
     definition: &mut Value,
@@ -116,6 +147,13 @@ fn write_fields(
         if required(field) && body[field].as_str().is_none_or(str::is_empty) {
             return Err(format!("{field} required"));
         }
+    }
+    if let Some(name) = body["name"].as_str()
+        && !valid_name(name)
+    {
+        return Err(format!(
+            "name {name}: lowercase letters, digits and dashes, at most {MAX_NAME} characters"
+        ));
     }
     if create && body["project_id"].as_str().is_none_or(str::is_empty) {
         return Err("project_id required".into());

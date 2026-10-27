@@ -3,17 +3,13 @@
   "gitlab": { "url": "https://gitlab.com", "projectIds": [0] },
   "host": { "type": "scaleway-function", "region": "fr-par" },
   "provider": { "type": "scaleway", "region": "fr-par" },
-  "defaultPool": "vm",
-  "pools": [
-    {
-      "tag": "vm",
-      "runtime": "instances",
-      "image": "ubuntu:24.04",
-      "stages": [],
-      "slots": 2,
-      "instanceTypes": ["DEV1-M", "DEV1-L"],
-      "maxRuns": 4
-    }
-  ],
+  "vm": {
+    "tag": "vm",
+    "runtime": "instances",
+    "image": "ubuntu:24.04",
+    "slots": 2,
+    "instanceTypes": ["DEV1-M", "DEV1-L"],
+    "maxRuns": 4
+  },
   "cache": { "type": "s3", "expireDays": 30 }
 }

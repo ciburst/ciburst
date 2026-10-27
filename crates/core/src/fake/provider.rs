@@ -7,7 +7,7 @@ use rand::Rng;
 use rand::distr::Alphanumeric;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{CacheType, Config, INSTANCES_RUNTIME, Pool};
+use crate::config::{CacheType, Config, INSTANCES_RUNTIME, Pool, parse_lane_key};
 use crate::fleet::FleetStore;
 use crate::provision::keys;
 use crate::store::Store;
@@ -60,9 +60,6 @@ struct Vm {
     pool: String,
     state: VmState,
     free: u32,
-    /// Slots of the last report that poll with the spill runner (M6.2 rule R6).
-    #[serde(default)]
-    spill: u32,
     seen: Option<u64>,
     drain: Option<u64>,
     created_at: u64,
@@ -74,7 +71,6 @@ impl Vm {
             run_id: self.run_id.clone(),
             state: self.state,
             free: self.free,
-            spill: self.spill,
             seen: self.seen,
             created_at: self.created_at,
         }
@@ -142,9 +138,21 @@ impl FakeProvider {
     }
 
     fn is_vm_pool(&self, tag: &str) -> bool {
-        self.config
-            .pool_by_tag(tag)
-            .is_some_and(|pool| pool.runtime.as_deref() == Some(VM_RUNTIME))
+        tag == self.config.vm.tag && self.config.vm.runtime() == VM_RUNTIME
+    }
+
+    /// Whether `tag` is the key of a lane of another project than the host: the dispatcher
+    /// keeps those definitions on `/join` (M6.4 rule R5), so `apply` leaves them alone.
+    fn is_member_lane(&self, tag: &str) -> bool {
+        parse_lane_key(tag).is_some_and(|(project, _)| project != self.config.host_project())
+    }
+
+    /// The keys of the job definitions the fake keeps: `<project id>-<lane tag>`.
+    pub async fn definition_keys(&self) -> Vec<String> {
+        self.state()
+            .await
+            .map(|state| state.definitions.into_keys().collect())
+            .unwrap_or_default()
     }
 
     async fn state(&self) -> Result<State> {
@@ -257,7 +265,7 @@ impl Provider for FakeProvider {
                 ));
             }
         }
-        for pool in &self.config.pools {
+        for pool in &self.config.pools() {
             let action = match state.definitions.get(&pool.tag) {
                 None => Action::Create,
                 Some(current) if *current == Definition::from(pool) => Action::Noop,
@@ -270,7 +278,7 @@ impl Provider for FakeProvider {
             ));
         }
         for tag in state.definitions.keys() {
-            if self.config.pool_by_tag(tag).is_none() {
+            if self.config.pool_by_tag(tag).is_none() && !self.is_member_lane(tag) {
                 steps.push(Step::new(
                     format!("definition:{tag}"),
                     Action::Delete,
@@ -329,7 +337,7 @@ impl Provider for FakeProvider {
                             .ok_or_else(|| Error::provider(format!("unknown pool {tag}")))?;
                         state
                             .definitions
-                            .insert(tag.to_string(), Definition::from(pool));
+                            .insert(tag.to_string(), Definition::from(&pool));
                     }
                 }
             }
@@ -377,7 +385,6 @@ impl Provider for FakeProvider {
                 pool: run.pool.clone(),
                 state: VmState::Starting,
                 free: request.pool.slots.saturating_sub(request.taken),
-                spill: 0,
                 seen: None,
                 drain: None,
                 created_at,
@@ -431,7 +438,6 @@ impl Provider for FakeProvider {
         let vm = vm_mut(&mut state, run_id)?;
         vm.state = report.state;
         vm.free = report.free;
-        vm.spill = report.spill;
         vm.seen = Some(now);
         vm.drain = match report.state {
             VmState::Draining => vm.drain.or(Some(now)),
@@ -464,6 +470,31 @@ impl Provider for FakeProvider {
 
     async fn fleet(&self, _secrets: &crate::types::Secrets) -> Result<Option<Arc<dyn FleetStore>>> {
         Ok(self.fleet.clone())
+    }
+
+    /// The definitions of `project`'s lanes become `lanes`; the project's others go. Ids are
+    /// `def-<key>`. A lane of another project is refused, as the real provider names it.
+    async fn sync_lanes(&self, project: u64, lanes: &[Pool]) -> Result<BTreeMap<String, String>> {
+        let mut state = self.state().await?;
+        let mut ids = BTreeMap::new();
+        for lane in lanes {
+            let Some((_, tag)) = parse_lane_key(&lane.tag).filter(|(p, _)| *p == project) else {
+                return Err(Error::provider(format!(
+                    "lane {} is not a lane of project {project}",
+                    lane.tag
+                )));
+            };
+            state
+                .definitions
+                .insert(lane.tag.clone(), Definition::from(lane));
+            ids.insert(tag.to_string(), format!("def-{}", lane.tag));
+        }
+        state.definitions.retain(|key, _| {
+            parse_lane_key(key).is_none_or(|(owner, _)| owner != project)
+                || lanes.iter().any(|lane| lane.tag == *key)
+        });
+        self.save(&state).await?;
+        Ok(ids)
     }
 }
 
@@ -525,11 +556,8 @@ mod tests {
                   "name": "demo",
                   "gitlab": { "url": "https://gitlab.example", "projectIds": [7] },
                   "host": { "type": "fake" }, "provider": { "type": "fake" },
-                  "defaultPool": "vm",
-                  "pools": [
-                    { "tag": "vm", "image": "img/node", "runtime": "instances", "slots": 2 },
-                    { "tag": "jobs", "image": "img/node", "runtime": "jobs", "stages": ["build"] }
-                  ],
+                  "vm": { "image": "img/node", "slots": 2 },
+                  "lanes": [ { "tag": "jobs", "image": "img/node", "jobs": ["build"] } ],
                   "cache": { "type": "s3" }
                 }"#,
             )
@@ -556,7 +584,7 @@ mod tests {
             env.insert(keys::VM_SECRET.to_string(), "vm-secret".to_string());
         }
         StartRequest {
-            pool: config.pool_by_tag(tag).unwrap().clone(),
+            pool: config.pool_by_tag(tag).unwrap(),
             env,
             labels: BTreeMap::new(),
             taken: 1,
@@ -568,7 +596,6 @@ mod tests {
             state,
             free,
             slots: 2,
-            spill: 0,
         }
     }
 
@@ -579,11 +606,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_job_pools_have_no_capacity() {
+    async fn lanes_have_no_capacity() {
         let (provider, _) = setup().await;
-        assert_eq!(provider.capacity("jobs").await.unwrap(), None);
+        assert_eq!(provider.capacity("7-jobs").await.unwrap(), None);
         assert_eq!(provider.capacity("unknown").await.unwrap(), None);
-        let run = provider.start(request("jobs", false)).await.unwrap();
+        let run = provider.start(request("7-jobs", false)).await.unwrap();
         assert!(provider.claim(&run).await.is_err());
         assert!(
             provider
@@ -592,6 +619,55 @@ mod tests {
                 .is_err()
         );
         assert!(provider.sweep(T0 + 10 * 86_400).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_lanes_keeps_one_projects_definitions_and_apply_keeps_members() {
+        let (provider, _) = setup().await;
+        let config = config();
+        let lane = |project: u64, tag: &str| {
+            let mut lane = config.lanes[0].clone();
+            lane.tag = tag.to_string();
+            lane.pool(project)
+        };
+        let ids = provider
+            .sync_lanes(8, &[lane(8, "node"), lane(8, "rust")])
+            .await
+            .unwrap();
+        assert_eq!(
+            ids,
+            BTreeMap::from([
+                ("node".to_string(), "def-8-node".to_string()),
+                ("rust".to_string(), "def-8-rust".to_string()),
+            ])
+        );
+        provider.sync_lanes(9, &[lane(9, "node")]).await.unwrap();
+        provider.sync_lanes(8, &[lane(8, "rust")]).await.unwrap();
+        let keys = |state: State| state.definitions.into_keys().collect::<Vec<_>>();
+        assert_eq!(
+            keys(provider.state().await.unwrap()),
+            ["7-jobs", "8-rust", "9-node", "vm"]
+        );
+        let steps = provider.plan(&[]).await.unwrap();
+        assert!(steps.iter().all(|s| s.is_noop()), "{steps:?}");
+        assert!(provider.sync_lanes(8, &[lane(9, "x")]).await.is_err());
+        provider.sync_lanes(8, &[]).await.unwrap();
+        assert_eq!(
+            keys(provider.state().await.unwrap()),
+            ["7-jobs", "9-node", "vm"]
+        );
+        let run = provider.start(request("vm", true)).await.unwrap();
+        assert!(run.starts_with("fake-"));
+        let member = StartRequest {
+            pool: lane(9, "node"),
+            ..request("7-jobs", false)
+        };
+        assert!(provider.start(member).await.is_ok());
+        let gone = StartRequest {
+            pool: lane(8, "node"),
+            ..request("7-jobs", false)
+        };
+        assert!(provider.start(gone).await.is_err(), "deleted with its lane");
     }
 
     #[tokio::test]
@@ -609,7 +685,6 @@ mod tests {
                 run_id: run.clone(),
                 state: VmState::Starting,
                 free: 1,
-                spill: 0,
                 seen: None,
                 created_at: T0,
             }

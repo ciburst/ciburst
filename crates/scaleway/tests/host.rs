@@ -22,16 +22,18 @@ const FUNCTION: &str = "demo-dispatch";
 const CRON: &str = "demo-sweep";
 const PROJECT: &str = "11111111-1111-4111-8111-111111111111";
 
-fn config(pools: &str) -> Arc<Config> {
+/// The VM runner `ci` and the host's `lanes`; the provider type leaves the VM start lookups
+/// out, which the Functions fake cannot answer.
+fn config(lanes: &str) -> Arc<Config> {
     Arc::new(
         parse_config(&format!(
             r#"{{
               "name": "demo",
               "gitlab": {{ "url": "https://gitlab.example", "projectIds": [7] }},
               "host": {{ "type": "scaleway-function", "region": "fr-par" }},
-              "provider": {{ "type": "scaleway-jobs", "region": "fr-par" }},
-              "defaultPool": "ci",
-              "pools": [{pools}],
+              "provider": {{ "type": "fake", "region": "fr-par" }},
+              "vm": {{ "tag": "ci", "image": "img/node" }},
+              "lanes": [{lanes}],
               "cache": {{ "type": "s3" }}
             }}"#
         ))
@@ -40,15 +42,11 @@ fn config(pools: &str) -> Arc<Config> {
 }
 
 fn two_pools() -> Arc<Config> {
-    config(
-        r#"{ "tag": "ci", "image": "img/node" },
-           { "tag": "build-x", "image": "img/kaniko", "stages": ["build"] }"#,
-    )
+    config(r#"{ "tag": "build-x", "image": "img/kaniko", "jobs": ["image"] }"#)
 }
 
 fn secrets() -> Secrets {
     Secrets {
-        spill_tokens: Default::default(),
         hook_token: Some("hook-secret".into()),
         runner_tokens: BTreeMap::from([
             ("ci".to_string(), "glrt-ci".to_string()),
@@ -64,7 +62,6 @@ fn secrets() -> Secrets {
         }),
         vm_secret: Some("vm-secret".into()),
         sweep_token: Some("sweep-secret".into()),
-        provider_env: BTreeMap::new(),
         dispatcher_env: BTreeMap::new(),
         fleet_key: Some("fleet-secret".into()),
     }
@@ -282,10 +279,11 @@ async fn a_fleet_routing_change_leaves_the_function_alone() {
 
     let mut routing = (*two_pools()).clone();
     routing.ignore_jobs = vec!["prettier".into()];
-    routing.default_pool = Some("build-x".into());
-    routing.pools[0].jobs = vec!["lint-*".into()];
-    routing.pools[1].stages = vec!["build".into(), "test".into()];
-    routing.pools[1].max_runs = 9;
+    routing.lanes[0].jobs = vec!["lint-*".into(), "image".into()];
+    routing.lanes[0].max_runs = 9;
+    routing.vm.max_runs = 9;
+    routing.vm.slots = 3;
+    routing.vm.max_queue_s = Some(30);
     let routed = host(Arc::new(routing.clone()), &fake);
     let plan = routed.plan(&secrets()).await.unwrap();
     assert!(plan.iter().all(Step::is_noop), "{plan:?}");
@@ -300,13 +298,13 @@ async fn a_fleet_routing_change_leaves_the_function_alone() {
     );
 
     let mut shape = routing;
-    shape.pools[1].image = "img/buildkit".into();
+    shape.lanes[0].image = "img/buildkit".into();
     let reshaped = host(Arc::new(shape), &fake);
     let plan = reshaped.plan(&secrets()).await.unwrap();
     assert_eq!(
         plan[1].action,
         Action::Update,
-        "a pool's image is not routing"
+        "a lane's image is not routing"
     );
 }
 
@@ -365,7 +363,7 @@ async fn a_removed_pool_removes_its_secret() {
         .apply(&first.plan(&secrets()).await.unwrap(), &secrets())
         .await
         .unwrap();
-    let one_pool = host(config(r#"{ "tag": "ci", "image": "img/node" }"#), &fake);
+    let one_pool = host(config(""), &fake);
     let plan = one_pool.plan(&secrets()).await.unwrap();
     assert_eq!(plan[1].action, Action::Update);
     one_pool.apply(&plan, &secrets()).await.unwrap();
@@ -382,174 +380,6 @@ async fn a_removed_pool_removes_its_secret() {
             .iter()
             .all(Step::is_noop)
     );
-}
-
-/// M6.2 rule R6: the spill runner's token of a pool is the secret `RUNNER_SPILL_TOKEN_<TAG>`; a
-/// changed or removed token updates the function, one of a tag outside the config is left out.
-#[tokio::test]
-async fn spill_tokens_are_secret_variables_by_pool_tag() {
-    let fake = Arc::new(FakeFunctions::new());
-    let host = host(two_pools(), &fake);
-    let mut spill = secrets();
-    spill
-        .spill_tokens
-        .insert("build-x".into(), "glrt-spill".into());
-    spill.spill_tokens.insert("gone".into(), "glrt-gone".into());
-    host.apply(&host.plan(&spill).await.unwrap(), &spill)
-        .await
-        .unwrap();
-    assert_eq!(
-        fake.secret(FUNCTION, "RUNNER_SPILL_TOKEN_BUILD_X")
-            .as_deref(),
-        Some("glrt-spill")
-    );
-    let keys = fake.secret_keys(FUNCTION);
-    assert!(!keys.contains(&"RUNNER_SPILL_TOKEN_CI".to_string()));
-    assert!(!keys.iter().any(|k| k.contains("GONE")), "{keys:?}");
-    let function = fake.function(FUNCTION).unwrap();
-    assert!(!function.to_string().contains("glrt-spill"));
-    assert!(host.plan(&spill).await.unwrap().iter().all(Step::is_noop));
-
-    let mut rotated = spill.clone();
-    rotated
-        .spill_tokens
-        .insert("build-x".into(), "glrt-spill-2".into());
-    let plan = host.plan(&rotated).await.unwrap();
-    assert_eq!(
-        actions(&plan),
-        [
-            ("namespace", Action::Noop),
-            ("function", Action::Update),
-            ("code", Action::Noop),
-            ("cron", Action::Noop)
-        ]
-    );
-    assert!(!format!("{plan:?}").contains("glrt-spill"));
-    host.apply(&plan, &rotated).await.unwrap();
-    assert_eq!(
-        fake.secret(FUNCTION, "RUNNER_SPILL_TOKEN_BUILD_X")
-            .as_deref(),
-        Some("glrt-spill-2")
-    );
-
-    let plan = host.plan(&secrets()).await.unwrap();
-    assert_eq!(plan[1].action, Action::Update);
-    host.apply(&plan, &secrets()).await.unwrap();
-    assert!(
-        !fake
-            .secret_keys(FUNCTION)
-            .contains(&"RUNNER_SPILL_TOKEN_BUILD_X".to_string())
-    );
-    assert!(
-        host.plan(&secrets())
-            .await
-            .unwrap()
-            .iter()
-            .all(Step::is_noop)
-    );
-}
-
-#[tokio::test]
-async fn provider_credentials_are_secret_variables_that_drift_like_the_others() {
-    let fake = Arc::new(FakeFunctions::new());
-    let host = host(two_pools(), &fake);
-    let mut with_token = secrets();
-    with_token
-        .provider_env
-        .insert("HCLOUD_TOKEN".into(), "hcloud-secret".into());
-    host.apply(&host.plan(&with_token).await.unwrap(), &with_token)
-        .await
-        .unwrap();
-    assert_eq!(
-        fake.secret(FUNCTION, "HCLOUD_TOKEN").as_deref(),
-        Some("hcloud-secret")
-    );
-    let function = fake.function(FUNCTION).unwrap();
-    assert!(
-        function["environment_variables"]
-            .get("HCLOUD_TOKEN")
-            .is_none()
-    );
-    assert!(!function.to_string().contains("hcloud-secret"));
-    assert!(
-        host.plan(&with_token)
-            .await
-            .unwrap()
-            .iter()
-            .all(Step::is_noop)
-    );
-
-    let mut rotated = with_token.clone();
-    rotated
-        .provider_env
-        .insert("HCLOUD_TOKEN".into(), "hcloud-rotated".into());
-    let plan = host.plan(&rotated).await.unwrap();
-    assert_eq!(
-        actions(&plan),
-        [
-            ("namespace", Action::Noop),
-            ("function", Action::Update),
-            ("code", Action::Noop),
-            ("cron", Action::Noop)
-        ]
-    );
-    assert!(!format!("{plan:?}").contains("hcloud-rotated"));
-    host.apply(&plan, &rotated).await.unwrap();
-    assert_eq!(
-        fake.secret(FUNCTION, "HCLOUD_TOKEN").as_deref(),
-        Some("hcloud-rotated")
-    );
-    assert!(host.plan(&rotated).await.unwrap().iter().all(Step::is_noop));
-
-    let plan = host.plan(&secrets()).await.unwrap();
-    assert_eq!(plan[1].action, Action::Update);
-    host.apply(&plan, &secrets()).await.unwrap();
-    assert!(
-        !fake
-            .secret_keys(FUNCTION)
-            .contains(&"HCLOUD_TOKEN".to_string())
-    );
-    assert!(
-        host.plan(&secrets())
-            .await
-            .unwrap()
-            .iter()
-            .all(Step::is_noop)
-    );
-}
-
-#[tokio::test]
-async fn provider_credentials_cannot_take_the_functions_own_names() {
-    let fake = Arc::new(FakeFunctions::new());
-    let host = host(two_pools(), &fake);
-    for name in [
-        "HOOK_TOKEN",
-        "CACHE_S3_SECRET_KEY",
-        "RUNNER_TOKEN_CI",
-        "RUNNER_SPILL_TOKEN_CI",
-        "CIBURST_DISPATCH_KEY",
-        "SCW_SECRET_KEY",
-        "hcloud_token",
-    ] {
-        let mut bad = secrets();
-        bad.provider_env.insert(name.into(), "value".into());
-        let error = host.plan(&bad).await.unwrap_err().to_string();
-        assert_eq!(
-            error,
-            format!(
-                "scaleway-function: provider variable {name} is reserved or not an upper-case name"
-            )
-        );
-        let steps = [Step::new(
-            "namespace",
-            Action::Create,
-            "function namespace demo",
-        )];
-        let error = host.apply(&steps, &bad).await.unwrap_err().to_string();
-        assert!(error.contains(name), "{error}");
-    }
-    assert_eq!(fake.namespace_count(), 0, "refused before any write");
-    assert_eq!(fake.function_count(), 0);
 }
 
 #[tokio::test]
@@ -623,14 +453,10 @@ async fn dispatcher_variables_cannot_take_the_functions_own_names() {
         vars::VM_IMAGES,
         "HOOK_TOKEN",
         "RUNNER_TOKEN_CI",
-        "RUNNER_SPILL_TOKEN_VM",
         "SCW_DEFAULT_PROJECT_ID",
-        "HCLOUD_TOKEN",
         "lower",
     ] {
         let mut bad = secrets();
-        bad.provider_env
-            .insert("HCLOUD_TOKEN".into(), "hcloud".into());
         bad.dispatcher_env.insert(name.into(), "value".into());
         let error = host.plan(&bad).await.unwrap_err().to_string();
         assert_eq!(
@@ -674,11 +500,8 @@ async fn vm_pools_hand_their_security_group_and_images_to_the_function() {
               "gitlab": { "url": "https://gitlab.example", "projectIds": [7] },
               "host": { "type": "scaleway-function", "region": "fr-par" },
               "provider": { "type": "scaleway", "region": "fr-par" },
-              "defaultPool": "ci",
-              "pools": [
-                { "tag": "ci", "image": "img/docker", "instanceTypes": ["DEV1-M", "PLAY2-NANO"] },
-                { "tag": "build-x", "image": "img/docker", "instanceTypes": ["DEV1-L", "DEV1-M"] }
-              ],
+              "vm": { "tag": "ci", "image": "img/docker", "instanceTypes": ["DEV1-M", "PLAY2-NANO", "DEV1-L"] },
+              "lanes": [ { "tag": "build-x", "image": "img/docker", "jobs": ["image"] } ],
               "cache": { "type": "s3" }
             }"#,
         )
@@ -941,8 +764,6 @@ fn the_embedded_zip_is_the_function_package() {
         "vendor/scaleway/Cargo.toml",
         "vendor/scaleway/src/lib.rs",
         "vendor/scaleway/src/host.rs",
-        "vendor/hetzner/Cargo.toml",
-        "vendor/hetzner/src/lib.rs",
     ] {
         assert!(
             names.iter().any(|n| n == required),
@@ -974,7 +795,7 @@ fn the_embedded_zip_is_the_function_package() {
         .collect();
     assert_eq!(
         vendored,
-        BTreeSet::from(["core", "hetzner", "scaleway"]),
+        BTreeSet::from(["core", "scaleway"]),
         "every path dependency of the function, and nothing else"
     );
 
@@ -991,7 +812,6 @@ fn the_embedded_zip_is_the_function_package() {
     assert!(root.contains("name = \"ciburst-dispatch-scaleway\""));
     assert!(root.contains("path = \"vendor/core\""));
     assert!(root.contains("path = \"vendor/scaleway\""));
-    assert!(root.contains("path = \"vendor/hetzner\""));
     assert!(!root.contains("../"));
     assert!(!root.contains("build.rs"));
     assert!(!root.contains("members"));
@@ -1008,10 +828,7 @@ fn the_embedded_zip_is_the_function_package() {
     assert!(!scaleway.contains("zip"));
     let core = read("vendor/core/Cargo.toml");
     assert!(!core.contains("[dev-dependencies]"));
-    let hetzner = read("vendor/hetzner/Cargo.toml");
-    assert!(hetzner.contains("path = \"../core\""));
-    assert!(!hetzner.contains("[dev-dependencies]"));
-    for manifest in [&root, &scaleway, &core, &hetzner] {
+    for manifest in [&root, &scaleway, &core] {
         assert!(!manifest.contains(".workspace"), "{manifest}");
         assert!(!manifest.contains("workspace = true"), "{manifest}");
     }

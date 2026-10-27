@@ -1,10 +1,11 @@
-//! Serverless Jobs `serverless-jobs/v1alpha1`: job definitions per pool, runs, start and stop.
-//! A definition is a lane (D45, M6 rule R5): the pool's image runs `lane-bootstrap.sh`, which
-//! its environment carries, and fetches the runner from the cache bucket.
+//! Serverless Jobs `serverless-jobs/v1alpha1`: one job definition per lane of a project, runs,
+//! start and stop. A definition `<name>-<project id>-<tag>` is a lane (D45, D60, M6 rule R5):
+//! the lane's image runs `lane-bootstrap.sh`, which its environment carries, and fetches the
+//! runner from the cache bucket.
 
 use std::collections::BTreeMap;
 
-use ciburst_core::config::{CacheType, Config, Pool};
+use ciburst_core::config::{CacheType, Config, Pool, parse_lane_key};
 use ciburst_core::lane;
 use ciburst_core::provision::keys;
 use ciburst_core::types::{Action, Run, RunState, StartRequest};
@@ -42,8 +43,9 @@ pub fn bucket_name(config: &Config, project_id: &str) -> String {
     format!("{}-cache-{project_id}", config.name)
 }
 
-/// The definition's environment: pool, GitLab, wait timeout, the bootstrap with the runner it
-/// downloads and checks (M6 rule R5), and the cache location with an S3 cache.
+/// The definition's environment: the lane's key and project (D60), GitLab, wait timeout, the
+/// bootstrap with the runner it downloads and checks (M6 rule R5), and the cache location with
+/// an S3 cache.
 pub fn definition_env(
     config: &Config,
     pool: &Pool,
@@ -71,6 +73,9 @@ pub fn definition_env(
             runner_sha256.to_string(),
         ),
     ]);
+    if let Some(project) = pool.project {
+        env.insert("CIBURST_PROJECT".to_string(), project.to_string());
+    }
     if config.cache.kind == CacheType::S3 {
         for (key, value) in [
             ("CACHE_TYPE", "s3".to_string()),
@@ -103,7 +108,7 @@ pub fn desired_definition(
         "command": lane::COMMAND,
         "project_id": project_id,
         "environment_variables": definition_env(config, pool, region, project_id, runner_sha256),
-        "description": format!("ciburst pool {}", pool.tag),
+        "description": format!("ciburst lane {}", pool.tag),
         "job_timeout": format!("{}s", pool.timeout_s),
     })
 }
@@ -293,10 +298,10 @@ impl Scaleway {
         let pool = self
             .config
             .pool_by_tag(tag)
-            .ok_or_else(|| Error::provider(format!("{PROVIDER_NAME}: unknown pool {tag}")))?;
+            .ok_or_else(|| Error::provider(format!("{PROVIDER_NAME}: unknown lane {tag}")))?;
         let body = desired_definition(
             &self.config,
-            pool,
+            &pool,
             self.client.region(),
             project_id,
             self.runner_sha256(),
@@ -344,19 +349,32 @@ impl Scaleway {
         start(&self.client, &definition_id, &env).await
     }
 
-    pub(super) async fn job_runs(&self, project_id: &str, tags: &[&str]) -> Result<Vec<Run>> {
-        if tags.is_empty() {
+    /// Whether `tag` is the key of a lane of another project than the host's, whose definition
+    /// follows that member's `/join` (M6.4 rule R5).
+    pub(super) fn is_member_lane(&self, tag: &str) -> bool {
+        parse_lane_key(tag).is_some_and(|(project, _)| project != self.config.host_project())
+    }
+
+    /// The runs of the lanes `tags`; `None` takes every lane of every project.
+    pub(super) async fn job_runs(
+        &self,
+        project_id: &str,
+        tags: Option<&[String]>,
+    ) -> Result<Vec<Run>> {
+        if tags.is_some_and(<[String]>::is_empty) {
             return Ok(Vec::new());
         }
         let definitions = list_definitions(&self.client, project_id).await?;
         let mut runs = Vec::new();
-        for tag in tags {
-            let name = self.definition_name(tag);
-            let Some(definition_id) = definitions
-                .iter()
-                .find(|d| d["name"].as_str() == Some(name.as_str()))
-                .and_then(|d| d["id"].as_str())
-            else {
+        for definition in &definitions {
+            let Some(tag) = self.definition_tag(definition) else {
+                continue;
+            };
+            let wanted = match tags {
+                Some(tags) => tags.iter().any(|t| t == tag),
+                None => parse_lane_key(tag).is_some(),
+            };
+            let Some(definition_id) = definition["id"].as_str().filter(|_| wanted) else {
                 continue;
             };
             for run in list_runs(&self.client, project_id, definition_id).await? {
@@ -370,6 +388,88 @@ impl Scaleway {
             }
         }
         Ok(runs)
+    }
+
+    /// D60, M6.4 rule R5: the definitions of project `project`'s lanes become `lanes`, created
+    /// or updated, and the project's other definitions go. Answers each definition's id by lane
+    /// tag. Runs with the dispatch key, whose policy holds `ServerlessJobsFullAccess`.
+    pub(super) async fn sync_lane_definitions(
+        &self,
+        project: u64,
+        lanes: &[Pool],
+    ) -> Result<BTreeMap<String, String>> {
+        let mut tags = Vec::new();
+        for lane in lanes {
+            match parse_lane_key(&lane.tag) {
+                Some((owner, tag)) if owner == project && lane.project == Some(project) => {
+                    tags.push(tag)
+                }
+                _ => {
+                    return Err(Error::provider(format!(
+                        "{PROVIDER_NAME}: lane {} is not a lane of project {project}",
+                        lane.tag
+                    )));
+                }
+            }
+        }
+        let project_id = self
+            .client
+            .find_project(self.name())
+            .await?
+            .ok_or_else(|| {
+                Error::provider(format!(
+                    "{PROVIDER_NAME}: project {} does not exist",
+                    self.name()
+                ))
+            })?;
+        let definitions = list_definitions(&self.client, &project_id).await?;
+        let mut ids = BTreeMap::new();
+        for (lane, tag) in lanes.iter().zip(tags) {
+            let name = self.definition_name(&lane.tag);
+            let body = desired_definition(
+                &self.config,
+                lane,
+                self.client.region(),
+                &project_id,
+                self.runner_sha256(),
+            );
+            let current = definitions
+                .iter()
+                .find(|d| d["name"].as_str() == Some(name.as_str()));
+            let id = match current.and_then(|d| d["id"].as_str().map(|id| (d, id))) {
+                Some((current, id)) => {
+                    if !differences(&body, current).is_empty() {
+                        update_definition(&self.client, id, &body).await?;
+                        self.log
+                            .info("updated job definition", &[("name", &name), ("id", id)]);
+                    }
+                    id.to_string()
+                }
+                None => {
+                    let id = create_definition(&self.client, &body).await?;
+                    self.log
+                        .info("created job definition", &[("name", &name), ("id", &id)]);
+                    id
+                }
+            };
+            ids.insert(tag.to_string(), id);
+        }
+        for definition in &definitions {
+            let Some(key) = self.definition_tag(definition) else {
+                continue;
+            };
+            let owned = parse_lane_key(key).is_some_and(|(owner, _)| owner == project);
+            if owned
+                && !lanes.iter().any(|lane| lane.tag == key)
+                && let Some(id) = definition["id"].as_str()
+            {
+                delete_definition(&self.client, id).await?;
+                let name = definition["name"].as_str().unwrap_or_default();
+                self.log
+                    .info("deleted job definition", &[("name", name), ("id", id)]);
+            }
+        }
+        Ok(ids)
     }
 }
 
@@ -425,9 +525,9 @@ mod tests {
     #[test]
     fn builds_the_lane_definition_of_rule_r5() {
         let config = contract_config();
-        let pool = &config.pools[0];
+        let pool = &config.lanes[0].pool(7);
         let body = desired_definition(&config, pool, "fr-par", "p-1", SHA);
-        assert_eq!(body["name"], "contract-ci");
+        assert_eq!(body["name"], "contract-7-ci");
         assert_eq!(body["cpu_limit"], 2000);
         assert_eq!(body["memory_limit"], 4096);
         assert_eq!(body["local_storage_capacity"], 10240);
@@ -443,7 +543,8 @@ mod tests {
         assert_eq!(
             rest,
             json!({
-                "CIBURST_POOL": "ci",
+                "CIBURST_POOL": "7-ci",
+                "CIBURST_PROJECT": "7",
                 "CI_SERVER_URL": "https://gitlab.example",
                 "RUNNER_WAIT_TIMEOUT": "60",
                 "CIBURST_RUNNER_URL": format!("https://contract-cache-p-1.s3.fr-par.scw.cloud/ciburst/runner/{SHA}"),
@@ -466,7 +567,7 @@ mod tests {
     #[test]
     fn a_definition_without_the_lane_drifts_in_command_and_environment() {
         let config = contract_config();
-        let pool = &config.pools[0];
+        let pool = &config.lanes[0].pool(7);
         let body = desired_definition(&config, pool, "fr-par", "p-1", SHA);
         let mut before = body.clone();
         before["command"] = Value::Null;

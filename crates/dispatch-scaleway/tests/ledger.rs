@@ -30,7 +30,7 @@ const NOW: u64 = 1_800_000_000;
 const HOST: &str = "demo-dispatch.functions.fnc.fr-par.scw.cloud";
 const INTENT: &str = "ciburst/intents/vm/1800000000-00000000000000000042";
 
-/// A VM pool on `runtime`; every config with a pool has an S3 cache (M6 rule R1).
+/// The VM runner on `runtime`; every config has an S3 cache (M6 rule R1).
 fn config(runtime: &str) -> String {
     format!(
         r#"{{
@@ -38,8 +38,7 @@ fn config(runtime: &str) -> String {
           "gitlab": {{ "url": "https://gitlab.example", "projectIds": [7] }},
           "host": {{ "type": "scaleway-function" }},
           "provider": {{ "type": "scaleway" }},
-          "defaultPool": "vm",
-          "pools": [ {{ "tag": "vm", "image": "img/docker", "slots": 2, "runtime": "{runtime}" }} ],
+          "vm": {{ "image": "img/docker", "slots": 2, "runtime": "{runtime}" }},
           "cache": {{ "type": "s3" }}
         }}"#
     )
@@ -195,7 +194,7 @@ async fn no_ledger_without_both_cache_keys_or_an_s3_cache() {
         assert!(backends.ledger.is_none() && backends.records.is_none());
         assert!(backends.schedule.is_none());
     }
-    // A config with pools always has an S3 cache (M6 rule R1); the function still builds no
+    // A config always has an S3 cache (M6 rule R1); the function still builds no
     // ledger from cache keys when the cache is not S3.
     let mut no_cache = env(&vars);
     assert!(no_cache.secrets.cache.is_some());
@@ -208,7 +207,7 @@ async fn no_ledger_without_both_cache_keys_or_an_s3_cache() {
 }
 
 /// The queue-first schedule (M6.2 rules R2 to R4) beside the intents, under the cache key IAM
-/// scoped to the deployment's project, in the Hetzner composite too.
+/// scoped to the deployment's project.
 #[tokio::test]
 async fn the_schedule_lives_beside_the_ledger_under_the_cache_key() {
     let (backend, vars) = deployed("instances").await;
@@ -253,14 +252,6 @@ async fn the_schedule_lives_beside_the_ledger_under_the_cache_key() {
             .schedule
             .is_some()
     );
-
-    let mut with_hetzner = vars.clone();
-    let mut config: Value = serde_json::from_str(&vars[vars::CONFIG]).unwrap();
-    config["providers"] = json!({ "hetzner": {} });
-    with_hetzner.insert(vars::CONFIG.to_string(), config.to_string());
-    with_hetzner.insert("HCLOUD_TOKEN".to_string(), "hcloud".to_string());
-    let backends = crate::env(&with_hetzner).backends_on(backend.clone(), Log::silent());
-    assert!(backends.schedule.is_some() && backends.records.is_some());
 }
 
 /// The warm start records (M6.1 rule R5) beside the intents, under the cache key IAM scoped to
@@ -349,7 +340,6 @@ async fn pipeline_events_keep_their_records_in_the_cache_bucket() {
 
     let (status, body) = hook(&backend, &env, "Job Hook", &job_event(41)).await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(records.seen_jobs("9").await.unwrap(), ["41"]);
 
     let (status, body) = hook(
         &backend,
@@ -472,13 +462,12 @@ async fn vm_start_calls(backend: &Arc<ScalewayFake>, env: &Env) -> (Vec<String>,
     )
 }
 
-/// M7 hardening rule R3, measured on the fake: a pending job that starts a VM makes ten
+/// M7 hardening rule R3, measured on the fake: a pending job that starts a VM makes nine
 /// Scaleway calls through a function without `CIBURST_VM_SECURITY_GROUP` and
 /// `CIBURST_VM_IMAGES`: the capacity read, both lookups, create, user data and power on, the
-/// burst intent's write and read, and the reads of its pipeline's closed record (D56) and warm
-/// start record (M6.1 rule R5). The second start makes no lookup; it finds the first VM alive,
-/// so it also reads the queue and the running jobs of the pool before it starts (M6.2 rule
-/// R2), ten calls again.
+/// burst intent's write and read, and the read of its pipeline's closed record (D56). The
+/// second start makes no lookup; it finds the first VM alive, so it also reads the queue and
+/// the running jobs of the VM runner before it starts (M6.2 rule R2), nine calls again.
 #[tokio::test]
 async fn the_function_starts_a_vm_without_lookups_on_the_resolved_variables() {
     let (backend, mut vars) = deployed("instances").await;
@@ -492,7 +481,7 @@ async fn the_function_starts_a_vm_without_lookups_on_the_resolved_variables() {
     assert_eq!(looked_up.len(), 6, "{looked_up:#?}");
     assert_eq!(looked_up[0], format!("{zone}/servers"), "capacity");
     assert_eq!(looked_up[1..3], lookups);
-    assert_eq!(total, 10);
+    assert_eq!(total, 9);
 
     let config = Arc::new(parse_config(&vars[vars::CONFIG]).unwrap());
     let provider = Scaleway::new(config, backend.client(), Log::silent());
@@ -509,5 +498,5 @@ async fn the_function_starts_a_vm_without_lookups_on_the_resolved_variables() {
         direct.iter().all(|call| !lookups.contains(call)),
         "{direct:#?}"
     );
-    assert_eq!(total, 10);
+    assert_eq!(total, 9);
 }

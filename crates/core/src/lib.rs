@@ -4,7 +4,6 @@
 
 pub mod check;
 pub mod cloud_init;
-pub mod composite;
 pub mod config;
 pub mod dispatch;
 pub mod error;

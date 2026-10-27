@@ -5,10 +5,11 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::super::{DispatchResponse, Dispatcher};
-use super::{FLEET_CACHE, FleetCache, PATH_FLEET, PATH_JOIN, PATH_LEAVE};
+use super::{FLEET_CACHE, FleetCache, JOIN_BUDGET, PATH_FLEET, PATH_JOIN, PATH_LEAVE};
+use crate::config::Pool;
 use crate::config::{Config, parse_config};
 use crate::fake::FakeProvider;
-use crate::fleet::{FleetStore, Member, MemoryFleetStore};
+use crate::fleet::{FleetStore, Member, MemberLane, MemoryFleetStore};
 use crate::invite::{self, TTL_S};
 use crate::log::Log;
 use crate::store::MemoryStore;
@@ -24,24 +25,22 @@ const HOOK: &str = "hook-secret";
 const VM_SECRET: &str = "vm-secret";
 const URL: &str = "https://dispatch.example";
 
-fn config_text(default_pool: &str, project_ids: &str) -> String {
+/// The host's config: the VM runner and the host's lane `jobs` with the patterns `jobs`.
+fn config_text(jobs: &str, project_ids: &str) -> String {
     format!(
         r#"{{
           "name": "fleet",
           "gitlab": {{ "url": "https://gitlab.example", "projectIds": {project_ids} }},
           "host": {{ "type": "fake" }}, "provider": {{ "type": "fake" }},
-          "defaultPool": "{default_pool}",
-          "pools": [
-            {{ "tag": "vm", "image": "img/node", "runtime": "instances", "slots": 2, "maxRuns": 4 }},
-            {{ "tag": "jobs", "image": "img/kaniko", "stages": ["build"], "runtime": "jobs" }}
-          ],
+          "vm": {{ "image": "img/node", "slots": 2, "maxRuns": 4 }},
+          "lanes": [ {{ "tag": "jobs", "image": "img/kaniko", "jobs": {jobs} }} ],
           "cache": {{ "type": "s3" }}
         }}"#
     )
 }
 
 fn config(project_ids: &str) -> Arc<Config> {
-    Arc::new(parse_config(&config_text("vm", project_ids)).unwrap())
+    Arc::new(parse_config(&config_text(r#"["build"]"#, project_ids)).unwrap())
 }
 
 fn secrets() -> Secrets {
@@ -69,13 +68,15 @@ fn member(project_id: u64, runners: &[(&str, &str)]) -> Member {
             .map(|(tag, token)| (tag.to_string(), token.to_string()))
             .collect(),
         joined_at: NOW - 100,
+        ..Default::default()
     }
 }
 
-/// The fake provider; records each start request.
+/// The fake provider; records each start request and may delay `sync_lanes`.
 struct Capture {
     inner: FakeProvider,
     started: Mutex<Vec<StartRequest>>,
+    sync_delay: Mutex<std::time::Duration>,
 }
 
 #[async_trait]
@@ -110,6 +111,11 @@ impl Provider for Capture {
     }
     async fn report(&self, run_id: &str, report: &VmReport, now: u64) -> Result<()> {
         self.inner.report(run_id, report, now).await
+    }
+    async fn sync_lanes(&self, project: u64, lanes: &[Pool]) -> Result<BTreeMap<String, String>> {
+        let delay = *self.sync_delay.lock().unwrap();
+        tokio::time::sleep(delay).await;
+        self.inner.sync_lanes(project, lanes).await
     }
 }
 
@@ -175,6 +181,7 @@ async fn setup(project_ids: &str, fleet: bool) -> Setup {
         provider: Arc::new(Capture {
             inner,
             started: Mutex::new(Vec::new()),
+            sync_delay: Mutex::new(std::time::Duration::ZERO),
         }),
         store,
         cache: Arc::new(FleetCache::new()),
@@ -217,10 +224,11 @@ impl Setup {
             .await
     }
 
-    async fn event(&self, token: &str, project: u64, stage: &str, job: u64) -> DispatchResponse {
+    /// A pending event of job `job` of `project` named `name`; lanes take jobs by name.
+    async fn event(&self, token: &str, project: u64, name: &str, job: u64) -> DispatchResponse {
         let body = json!({
-            "object_kind": "build", "build_id": job, "build_stage": stage,
-            "build_name": format!("job-{job}"), "build_status": "pending",
+            "object_kind": "build", "build_id": job, "build_stage": "test",
+            "build_name": name, "build_status": "pending",
             "pipeline_id": 9, "project_id": project
         });
         self.request(
@@ -244,6 +252,30 @@ impl Setup {
     fn started(&self) -> Vec<StartRequest> {
         self.provider.started.lock().unwrap().clone()
     }
+
+    async fn join(&self, project: u64, body: Value, now: u64) -> DispatchResponse {
+        self.request(
+            "POST",
+            PATH_JOIN,
+            &[(invite::HEADER, &code_for(project))],
+            body.to_string().as_bytes(),
+            now,
+        )
+        .await
+    }
+}
+
+/// A join body with the VM runner token `vm` and `lanes` as (tag, image, patterns).
+fn join_body(vm: &str, lanes: &[(&str, &str, &[&str])]) -> Value {
+    let lane_runners: BTreeMap<String, String> = lanes
+        .iter()
+        .map(|(tag, _, _)| (tag.to_string(), format!("{vm}-{tag}")))
+        .collect();
+    let lanes: Vec<Value> = lanes
+        .iter()
+        .map(|(tag, image, jobs)| json!({ "tag": tag, "image": image, "jobs": jobs }))
+        .collect();
+    json!({ "runners": { "vm": vm }, "lanes": lanes, "laneRunners": lane_runners })
 }
 
 fn code_for(project: u64) -> String {
@@ -330,15 +362,15 @@ async fn a_config_change_takes_effect_within_the_cache_time() {
     );
     s.store
         .inner
-        .put_config(&config_text("jobs", "[7]"))
+        .put_config(&config_text(r#"["build", "deploy"]"#, "[7]"))
         .await
         .unwrap();
     tokio::time::advance(FLEET_CACHE - std::time::Duration::from_secs(1)).await;
     assert_eq!(s.event(HOOK, 7, "deploy", 2).await.body["pool"], "vm");
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
     let after = s.event(HOOK, 7, "deploy", 3).await;
-    assert_eq!(after.body["pool"], "jobs", "{}", after.body);
-    assert_eq!(s.started().last().unwrap().pool.tag, "jobs");
+    assert_eq!(after.body["pool"], "7-jobs", "{}", after.body);
+    assert_eq!(s.started().last().unwrap().pool.tag, "7-jobs");
 }
 
 #[tokio::test(start_paused = true)]
@@ -359,20 +391,19 @@ async fn a_failed_read_keeps_the_last_state() {
     *s.store.failing.lock().unwrap() = false;
     s.store
         .inner
-        .put_config(&config_text("jobs", "[7]"))
+        .put_config(&config_text(r#"["build", "deploy"]"#, "[7]"))
         .await
         .unwrap();
-    s.put(member(8, &[("vm", "glrt-8"), ("jobs", "glrt-8-jobs")]))
-        .await;
+    s.put(member(8, &[("vm", "glrt-8")])).await;
     let read = s.event(HOOK, 7, "deploy", 2).await;
     assert_eq!(
-        read.body["pool"], "jobs",
+        read.body["pool"], "7-jobs",
         "a failed read is retried at once"
     );
 
     *s.store.failing.lock().unwrap() = true;
     tokio::time::advance(FLEET_CACHE).await;
-    assert_eq!(s.event(HOOK, 7, "deploy", 3).await.body["pool"], "jobs");
+    assert_eq!(s.event(HOOK, 7, "deploy", 3).await.body["pool"], "7-jobs");
     let secret8 = invite::hook_secret(HOOK, 8);
     assert_eq!(
         s.event(&secret8, 8, "test", 4).await.body["result"],
@@ -382,7 +413,7 @@ async fn a_failed_read_keeps_the_last_state() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_member_joins_with_a_code_and_leaves() {
+async fn a_member_joins_with_its_lanes_and_leaves() {
     let s = setup("[7]", true).await;
     let code = code_for(8);
     let fleet = s
@@ -393,22 +424,19 @@ async fn a_member_joins_with_a_code_and_leaves() {
         fleet.body,
         json!({
             "result": "fleet", "name": "fleet", "ms": 0,
-            "pools": [
-                { "tag": "vm", "runtime": "instances", "tags": ["vm", "jobs"] },
-                { "tag": "jobs", "runtime": "jobs", "tags": ["jobs"] }
-            ],
+            "vm": { "tag": "vm", "runtime": "instances" },
+            "pools": [ { "tag": "vm", "runtime": "instances", "tags": ["vm"] } ],
             "hookSecret": invite::hook_secret(HOOK, 8),
         })
     );
 
-    let body = br#"{"runners":{"vm":"glrt-8","jobs":"glrt-8-jobs"}}"#;
-    let join = s
-        .request("POST", PATH_JOIN, &[(invite::HEADER, &code)], body, NOW)
-        .await;
+    let mut body = join_body("glrt-8", &[("jobs", "img/node", &["build", "unit-*"])]);
+    body["ignoreJobs"] = json!(["pages"]);
+    let join = s.join(8, body, NOW).await;
     assert_eq!(join.status, 200, "{}", join.body);
     assert_eq!(
         join.body,
-        json!({ "result": "joined", "fleet": "fleet", "ms": 0 })
+        json!({ "result": "joined", "fleet": "fleet", "lanes": ["jobs"], "ms": 0 })
     );
     let stored = s.store.inner.members().await.unwrap();
     assert_eq!(
@@ -416,49 +444,78 @@ async fn a_member_joins_with_a_code_and_leaves() {
         [Member {
             project_id: 8,
             hook_secret: invite::hook_secret(HOOK, 8),
-            runners: BTreeMap::from([
-                ("jobs".to_string(), "glrt-8-jobs".to_string()),
-                ("vm".to_string(), "glrt-8".to_string()),
-            ]),
+            runners: BTreeMap::from([("vm".to_string(), "glrt-8".to_string())]),
+            lanes: vec![MemberLane {
+                tag: "jobs".into(),
+                image: "img/node".into(),
+                jobs: vec!["build".into(), "unit-*".into()],
+                max_runs: 10,
+                definition_id: "def-8-jobs".into(),
+                runner_token: "glrt-8-jobs".into(),
+            }],
+            ignore_jobs: vec!["pages".into()],
             joined_at: NOW,
         }]
     );
-    assert!(
-        s.lines()
-            .iter()
-            .any(|l| l.starts_with("info joined") && l.contains("project=\"8\""))
-    );
+    assert!(s.lines().iter().any(|l| l.starts_with("info joined")
+        && l.contains(r#"project="8""#)
+        && l.contains(r#"lanes="jobs""#)));
     let secret = invite::hook_secret(HOOK, 8);
-    let lane = s.event(&secret, 8, "build", 1).await;
+    let lane = s.event(&secret, 8, "unit-a", 1).await;
     assert_eq!(
         lane.body["result"], "started",
         "at once, without a cache wait"
     );
+    assert_eq!(lane.body["pool"], "8-jobs");
     let started = s.started();
     assert_eq!(started[0].env["RUNNER_TOKEN"], "glrt-8-jobs");
+    assert_eq!(started[0].pool.image, "img/node");
+    let ignored = s.event(&secret, 8, "pages", 2).await;
+    assert_eq!(ignored.body["reason"], "ignore_jobs");
+    let host_pages = s.event(HOOK, 7, "pages", 3).await;
+    assert_eq!(
+        host_pages.body["pool"], "vm",
+        "the member's ignoreJobs are its own"
+    );
 
-    let again = s
-        .request(
-            "POST",
-            PATH_JOIN,
-            &[(invite::HEADER, &code)],
-            br#"{"runners":{"vm":"glrt-8b"}}"#,
-            NOW + 5,
-        )
-        .await;
-    assert_eq!(again.body["result"], "joined");
+    // M6.4 rule R5: a rejoin updates a changed lane and deletes a removed one.
+    let changed = join_body(
+        "glrt-8b",
+        &[
+            ("rust", "img/rust", &["clippy"]),
+            ("jobs", "img/node2", &["build"]),
+        ],
+    );
+    assert_eq!(s.join(8, changed, NOW + 5).await.body["result"], "joined");
     let stored = s.store.inner.members().await.unwrap();
     assert_eq!(stored.len(), 1, "a second join replaces the record");
+    assert_eq!(stored[0].lanes.len(), 2);
+    assert!(stored[0].ignore_jobs.is_empty());
+    let rerun = s.event(&secret, 8, "build", 4).await;
+    assert_eq!(rerun.body["pool"], "8-jobs");
+    assert_eq!(s.started().last().unwrap().pool.image, "img/node2");
     assert_eq!(
-        stored[0].runners,
-        BTreeMap::from([("vm".into(), "glrt-8b".into())])
+        s.started().last().unwrap().env["RUNNER_TOKEN"],
+        "glrt-8b-jobs"
     );
-    let no_lane = s.event(&secret, 8, "build", 2).await;
-    assert_eq!(
-        no_lane.body,
-        json!({ "result": "ignored", "reason": "no_runner", "pool": "jobs", "ms": 0 })
-    );
+    let unit = s.event(&secret, 8, "unit-a", 5).await;
+    assert_eq!(unit.body["pool"], "vm", "no lane takes it any more");
+    let only_vm = join_body("glrt-8c", &[]);
+    assert_eq!(s.join(8, only_vm, NOW + 6).await.body["result"], "joined");
+    let defs = s.provider.inner.definition_keys().await;
+    assert_eq!(defs, ["7-jobs", "vm"], "the member's definitions are gone");
+    assert_eq!(s.event(&secret, 8, "build", 6).await.body["pool"], "vm");
 
+    assert_eq!(
+        s.join(
+            8,
+            join_body("glrt-8", &[("jobs", "img/node", &["build"])]),
+            NOW + 7
+        )
+        .await
+        .body["result"],
+        "joined"
+    );
     let expired = invite::issue(HOOK, URL, 8, NOW - TTL_S);
     let leave = s
         .request("POST", PATH_LEAVE, &[(invite::HEADER, &expired)], b"", NOW)
@@ -469,12 +526,82 @@ async fn a_member_joins_with_a_code_and_leaves() {
         "an expired code still leaves"
     );
     assert!(s.store.inner.members().await.unwrap().is_empty());
-    assert_eq!(s.event(&secret, 8, "test", 3).await.status, 401);
+    assert_eq!(s.provider.inner.definition_keys().await, ["7-jobs", "vm"]);
+    assert_eq!(s.event(&secret, 8, "test", 7).await.status, 401);
     assert!(s.lines().iter().any(|l| l.starts_with("info left")));
 }
 
+/// D60: two projects with the same lane tag and patterns route only to their own
+/// definitions; a job of one project that only the other's lane matches runs on the VM
+/// runner.
 #[tokio::test(start_paused = true)]
-async fn bad_codes_unknown_pools_and_the_host_are_refused() {
+async fn lanes_route_only_the_jobs_of_their_own_project() {
+    let s = setup("[7]", true).await;
+    let same = join_body("glrt-8", &[("jobs", "img/kaniko", &["build"])]);
+    assert_eq!(s.join(8, same, NOW).await.body["result"], "joined");
+    let other = join_body("glrt-9", &[("node", "node:24", &["lint"])]);
+    assert_eq!(s.join(9, other, NOW).await.body["result"], "joined");
+
+    let host = s.event(HOOK, 7, "build", 1).await;
+    assert_eq!(host.body["pool"], "7-jobs", "{}", host.body);
+    let member = s.event(&invite::hook_secret(HOOK, 8), 8, "build", 2).await;
+    assert_eq!(member.body["pool"], "8-jobs", "{}", member.body);
+    let started = s.started();
+    assert_eq!(
+        (
+            started[0].pool.tag.as_str(),
+            started[0].env["RUNNER_TOKEN"].as_str()
+        ),
+        ("7-jobs", "glrt-jobs")
+    );
+    assert_eq!(
+        (
+            started[1].pool.tag.as_str(),
+            started[1].env["RUNNER_TOKEN"].as_str()
+        ),
+        ("8-jobs", "glrt-8-jobs")
+    );
+    for (token, project, job) in [
+        (HOOK.to_string(), 7, 3),
+        (invite::hook_secret(HOOK, 8), 8, 4),
+    ] {
+        let lint = s.event(&token, project, "lint", job).await;
+        assert_eq!(lint.body["pool"], "vm", "only project 9's lane takes lint");
+    }
+    let nine = s.event(&invite::hook_secret(HOOK, 9), 9, "build", 5).await;
+    assert_eq!(
+        nine.body["pool"], "vm",
+        "the host's and 8's lanes are not 9's"
+    );
+    let lint = s.event(&invite::hook_secret(HOOK, 9), 9, "lint", 6).await;
+    assert_eq!(lint.body["pool"], "9-node");
+    assert_eq!(
+        s.started().last().unwrap().env["RUNNER_TOKEN"],
+        "glrt-9-node"
+    );
+}
+
+/// M6.4 rule R5: a step of `/join` that does not finish within the budget answers 504 naming
+/// it, and stores nothing.
+#[tokio::test(start_paused = true)]
+async fn a_join_that_cannot_finish_in_time_names_the_step() {
+    let s = setup("[7]", true).await;
+    *s.provider.sync_delay.lock().unwrap() = JOIN_BUDGET + std::time::Duration::from_secs(1);
+    let body = join_body("glrt-8", &[("jobs", "img/node", &["build"])]);
+    let join = s.join(8, body, NOW).await;
+    assert_eq!(join.status, 504, "{}", join.body);
+    assert_eq!(join.body["result"], "timeout");
+    assert_eq!(join.body["step"], "definitions");
+    assert!(s.store.inner.members().await.unwrap().is_empty());
+    assert!(
+        s.lines()
+            .iter()
+            .any(|l| l.starts_with("error join_failed") && l.contains(r#"step="definitions""#))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn bad_codes_unknown_runners_bad_lanes_and_the_host_are_refused() {
     let s = setup("[7]", true).await;
     let runners = br#"{"runners":{"vm":"glrt-8"}}"#;
     let expired = invite::issue(HOOK, URL, 8, NOW - TTL_S);
@@ -510,8 +637,29 @@ async fn bad_codes_unknown_pools_and_the_host_are_refused() {
         )
         .await;
     assert_eq!(unknown.status, 400);
-    assert_eq!(unknown.body["result"], "unknown_pools");
-    assert_eq!(unknown.body["pools"], json!(["gpu"]));
+    assert_eq!(unknown.body["result"], "unknown_runners");
+    assert_eq!(unknown.body["runners"], json!(["gpu"]));
+    let mut bad_lanes = join_body(
+        "glrt-8",
+        &[("vm", "img/node", &["a"]), ("big", "img/node", &[])],
+    );
+    bad_lanes["lanes"][1]["vcpu"] = json!(7);
+    bad_lanes["laneRunners"]
+        .as_object_mut()
+        .unwrap()
+        .remove("big");
+    let invalid = s.join(8, bad_lanes, NOW).await;
+    assert_eq!(invalid.status, 400);
+    assert_eq!(invalid.body["result"], "invalid_lanes");
+    assert_eq!(
+        invalid.body["errors"],
+        json!([
+            "lanes[0].tag: vm is the VM runner's tag",
+            "lanes[1].jobs: at least one job name pattern",
+            "lanes[1].vcpu: 7 above fake maximum 6",
+            "laneRunners.big: lanes[1] has no runner token",
+        ])
+    );
     for body in [&b"{}"[..], b"{\"runners\":{}}", b"nope"] {
         let bad = s
             .request("POST", PATH_JOIN, &[(invite::HEADER, &code)], body, NOW)
@@ -554,7 +702,6 @@ async fn vm_reports_answer_the_member_runners_of_their_pool() {
         state: VmState::Idle,
         free: 2,
         slots: 2,
-        spill: 0,
     })
     .unwrap();
     let token = vm::token(VM_SECRET, &run);
@@ -591,17 +738,20 @@ async fn vm_reports_answer_the_member_runners_of_their_pool() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn further_config_projects_use_the_host_runners_until_they_join() {
+async fn further_config_projects_use_the_host_vm_runner_until_they_join() {
     let s = setup("[7, 11]", true).await;
-    let lane = s.event(HOOK, 11, "build", 1).await;
-    assert_eq!(lane.body["result"], "started");
-    assert_eq!(s.started()[0].env["RUNNER_TOKEN"], "glrt-jobs");
-    s.put(member(11, &[("jobs", "glrt-11-jobs")])).await;
+    let host_lane = s.event(HOOK, 11, "build", 1).await;
+    assert_eq!(
+        host_lane.body["pool"], "vm",
+        "the host's lanes take the host's jobs only"
+    );
+    assert_eq!(s.started()[0].env["RUNNER_TOKEN"], "glrt-vm");
+    s.put(member(11, &[("vm", "glrt-11")])).await;
     tokio::time::advance(FLEET_CACHE).await;
     assert_eq!(s.event(HOOK, 11, "build", 2).await.status, 401);
     let own = s
         .event(&invite::hook_secret(HOOK, 11), 11, "build", 3)
         .await;
     assert_eq!(own.body["result"], "started");
-    assert_eq!(s.started()[1].env["RUNNER_TOKEN"], "glrt-11-jobs");
+    assert_eq!(own.body["pool"], "vm");
 }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use ciburst::{Env, agent_path};
 use ciburst_core::check::LintJob;
-use ciburst_core::config::{Config, parse_config};
+use ciburst_core::config::{Config, Route, parse_config};
 use ciburst_core::gitlab::Gitlab;
 use ciburst_core::http::HttpClient;
 use ciburst_core::log::Log;
@@ -15,11 +15,8 @@ const FAKE_CONFIG: &str = r#"{
   "gitlab": { "url": "https://gitlab.com", "projectIds": [1] },
   "host": { "type": "fake" },
   "provider": { "type": "fake" },
-  "defaultPool": "ci",
-  "pools": [
-    { "tag": "ci", "image": "example.invalid/node:24", "stages": ["lint", "test"] },
-    { "tag": "build", "image": "example.invalid/node:24", "stages": ["build"], "maxRuns": 2 }
-  ],
+  "vm": { "tag": "ci", "image": "example.invalid/node:24" },
+  "lanes": [ { "tag": "build", "image": "example.invalid/node:24", "jobs": ["build"], "maxRuns": 2 } ],
   "cache": { "type": "s3" }
 }"#;
 
@@ -28,8 +25,7 @@ const SCALEWAY_CONFIG: &str = r#"{
   "gitlab": { "url": "https://gitlab.com", "projectIds": [1] },
   "host": { "type": "scaleway-function", "region": "fr-par" },
   "provider": { "type": "scaleway", "region": "fr-par" },
-  "defaultPool": "vm",
-  "pools": [{ "tag": "vm", "image": "ubuntu:24.04", "runtime": "instances" }],
+  "vm": { "tag": "vm", "image": "ubuntu:24.04", "runtime": "instances" },
   "cache": { "type": "s3" }
 }"#;
 
@@ -84,7 +80,7 @@ async fn dry_run_is_idempotent_and_destroy_asks_for_the_name() {
     let (code, out) = ciburst(dir.path(), &["plan"]).await;
     assert_eq!(code, 0, "{out}");
     assert!(out.contains("create  project demo"), "{out}");
-    assert!(out.contains("create  job definition demo-build"), "{out}");
+    assert!(out.contains("create  job definition demo-1-build"), "{out}");
     assert!(out.contains("update  fleet config"), "{out}");
     assert!(out.contains("create  member 1"), "{out}");
     assert!(
@@ -116,7 +112,11 @@ async fn dry_run_is_idempotent_and_destroy_asks_for_the_name() {
         out.contains("dispatcher: https://demo-dispatch.fake.invalid/"),
         "{out}"
     );
-    assert!(out.contains("pool build: 0 live of 2"), "{out}");
+    assert!(out.contains("vm runner ci: 0 live of 4"), "{out}");
+    assert!(
+        out.contains("lane build of project 1 (example.invalid/node:24): 0 live of 2"),
+        "{out}"
+    );
     assert!(out.contains("\nmember 1 joined "), "{out}");
 
     let (code, out) = ciburst(dir.path(), &["destroy"]).await;
@@ -135,7 +135,7 @@ async fn dry_run_is_idempotent_and_destroy_asks_for_the_name() {
 }
 
 #[tokio::test]
-async fn the_dry_run_config_shows_the_default_vm_pool() {
+async fn the_dry_run_config_shows_the_default_vm_runner() {
     let dir = tempfile::tempdir().unwrap();
     let config = repo_file("test/config.fake.json").display().to_string();
     let local = dir.path().display().to_string();
@@ -160,10 +160,8 @@ async fn the_dry_run_config_shows_the_default_vm_pool() {
     let config =
         parse_config(&std::fs::read_to_string(repo_file("test/config.fake.json")).unwrap())
             .unwrap();
-    assert_eq!(
-        config.pools,
-        Config::ci_defaults(1, "https://gitlab.com").pools
-    );
+    assert_eq!(config.vm, Config::ci_defaults(1, "https://gitlab.com").vm);
+    assert!(config.lanes.is_empty());
 }
 
 #[test]
@@ -196,12 +194,15 @@ async fn reports_unknown_modules_and_bad_config() {
 
     std::fs::write(
         dir.path().join("config.json"),
-        FAKE_CONFIG.replace(r#""defaultPool": "ci""#, r#""defaultPool": "nope""#),
+        FAKE_CONFIG.replace(r#""lanes""#, r#""defaultPool": "ci", "lanes""#),
     )
     .unwrap();
     let (code, out) = ciburst(dir.path(), &["plan"]).await;
     assert_eq!(code, 1);
-    assert!(out.contains("defaultPool: nope is not a pool"), "{out}");
+    assert!(
+        out.contains("defaultPool: removed: a job that no lane and no ignoreJobs entry takes runs on the VM runner (vm)"),
+        "{out}"
+    );
 
     std::fs::write(
         dir.path().join("config.json"),
@@ -216,13 +217,16 @@ async fn reports_unknown_modules_and_bad_config() {
         dir.path().join("config.json"),
         FAKE_CONFIG.replace(
             r#""cache": { "type": "s3" }"#,
-            r#""providers": { "vm": {} }"#,
+            r#""cache": { "type": "s3" }, "providers": { "hetzner": {} }"#,
         ),
     )
     .unwrap();
     let (code, out) = ciburst(dir.path(), &["plan"]).await;
     assert_eq!(code, 1);
-    assert!(out.contains("providers.vm: reserved name"), "{out}");
+    assert!(
+        out.contains("providers: removed: Scaleway is the only provider (D65)"),
+        "{out}"
+    );
 }
 
 #[tokio::test]
@@ -234,7 +238,9 @@ async fn help_and_usage_errors() {
         out.contains("GitLab runners that exist only while jobs run"),
         "{out}"
     );
-    assert!(out.contains("hetzner.env"), "{out}");
+    assert!(!out.contains("hetzner"), "{out}");
+    assert!(out.contains("VM runner"), "{out}");
+    assert!(!out.contains("pool"), "{out}");
     assert!(out.contains("--ci"), "{out}");
     assert!(out.contains("--agent"), "{out}");
     let (code, out) = run(env(None), &["rotate", "--help"]).await;
@@ -271,7 +277,10 @@ async fn check_needs_only_the_config_and_gitlab() {
     )
     .await;
     assert_eq!(code, 0, "{out}");
-    assert_eq!(out, "project 1: every job matches the stage map\n");
+    assert_eq!(
+        out,
+        "project 1: every job matches its lanes and the VM runner\n"
+    );
     assert!(fake.calls().iter().all(|c| c.path == "/projects/1/ci/lint"));
 }
 
@@ -355,11 +364,11 @@ async fn check_suggest_prints_lanes_for_docker_free_jobs() {
         out,
         concat!(
             "project 1: lane node-24 for node:24-bookworm-slim\n",
-            r#"  { "tag": "node-24", "runtime": "jobs", "image": "node:24-bookworm-slim", "jobs": ["lint"], "vcpu": 2, "memoryMiB": 4096 }"#,
+            r#"  { "tag": "node-24", "image": "node:24-bookworm-slim", "jobs": ["lint"], "vcpu": 2, "memoryMiB": 4096 }"#,
             "\n",
             "  job lint: tags: [node-24]\n",
             "project 1: lane rust-1 for rust:1.96.0-bookworm\n",
-            r#"  { "tag": "rust-1", "runtime": "jobs", "image": "rust:1.96.0-bookworm", "jobs": ["cargo-test"], "vcpu": 2, "memoryMiB": 4096 }"#,
+            r#"  { "tag": "rust-1", "image": "rust:1.96.0-bookworm", "jobs": ["cargo-test"], "vcpu": 2, "memoryMiB": 4096 }"#,
             "\n",
             "  job cargo-test: tags: [rust-1]\n",
         )
@@ -372,34 +381,34 @@ async fn check_suggest_prints_lanes_for_docker_free_jobs() {
         .filter_map(|line| line.strip_prefix("  {").map(|_| line.trim()))
         .collect();
     let with_lanes = SCALEWAY_CONFIG.replace(
-        r#""runtime": "instances" }]"#,
-        &format!(r#""runtime": "instances" }}, {}]"#, entries.join(", ")),
+        r#""cache""#,
+        &format!(r#""lanes": [{}], "cache""#, entries.join(", ")),
     );
     let parsed = parse_config(&with_lanes).unwrap();
-    assert_eq!(parsed.pools.len(), 3);
+    assert_eq!(parsed.lanes.len(), 2);
+    assert!(matches!(parsed.route("lint"), Route::Lane(lane) if lane.tag == "node-24"));
     assert_eq!(
-        parsed.pool_for("lint", Some("test")).unwrap().tag,
-        "node-24"
-    );
-    assert_eq!(
-        (parsed.pools[2].vcpu, parsed.pools[2].memory_mib),
+        (parsed.lanes[1].vcpu, parsed.lanes[1].memory_mib),
         (2, 4096)
     );
     std::fs::write(&config, &with_lanes).unwrap();
     fake.set_jobs(1, jobs("node-24", "rust-1"));
     let (code, out) = run(env(Some(fake.clone())), &args[..5]).await;
     assert_eq!(code, 0, "{out}");
-    assert_eq!(out, "project 1: every job matches the stage map\n");
+    assert_eq!(
+        out,
+        "project 1: every job matches its lanes and the VM runner\n"
+    );
     let (code, out) = run(env(Some(fake.clone())), &args).await;
     assert_eq!(code, 0, "{out}");
-    assert_eq!(out, "project 1: no Docker-free job runs on a VM pool\n");
+    assert_eq!(out, "project 1: no Docker-free job runs on the VM runner\n");
 
     fake.set_jobs(1, jobs("vm", "rust-1"));
     let (code, out) = run(env(Some(fake.clone())), &args[..5]).await;
     assert_eq!(code, 1, "{out}");
     assert_eq!(
         out,
-        "project 1: job lint (stage test): the job name maps to pool node-24 but the job is tagged vm\n"
+        "project 1: job lint (stage test): lane node-24 takes the job by name but the job is tagged vm\n"
     );
     fake.set_lint_errors(
         1,
@@ -471,7 +480,7 @@ unit-smoke:
         out,
         concat!(
             "project 1: lane node-24 for node:24-bookworm-slim\n",
-            r#"  { "tag": "node-24", "runtime": "jobs", "image": "node:24-bookworm-slim", "jobs": ["e2e*", "unit 1/2", "unit 2/2"], "vcpu": 2, "memoryMiB": 4096 }"#,
+            r#"  { "tag": "node-24", "image": "node:24-bookworm-slim", "jobs": ["e2e*", "unit 1/2", "unit 2/2"], "vcpu": 2, "memoryMiB": 4096 }"#,
             "\n",
             "  job e2e: tags: [node-24]\n",
             "  job unit: tags: [node-24]\n",
@@ -483,14 +492,17 @@ unit-smoke:
     assert_eq!(code, 1, "{out}");
     assert_eq!(
         out,
-        "project 1: job unit-smoke (stage test): runs on other runners (tags saas-linux-small-amd64) but ignoreJobs misses it: its pending events start VMs\n"
+        "project 1: job unit-smoke (stage test): runs on other runners (tags saas-linux-small-amd64) but ignoreJobs misses it: its pending events start runs\n"
     );
 
     let ignoring = SCALEWAY_CONFIG.replacen('{', r#"{ "ignoreJobs": ["unit-smoke"],"#, 1);
     std::fs::write(&config, ignoring).unwrap();
     let (code, out) = run(env(Some(fake.clone())), &args[..5]).await;
     assert_eq!(code, 0, "{out}");
-    assert_eq!(out, "project 1: every job matches the stage map\n");
+    assert_eq!(
+        out,
+        "project 1: every job matches its lanes and the VM runner\n"
+    );
     let (code, out) = run(env(Some(fake.clone())), &args).await;
     assert_eq!(code, 0, "{out}");
     assert!(!out.contains("ignoreJobs"), "{out}");
@@ -559,8 +571,8 @@ async fn status_lists_the_deliveries_and_check_a_disabled_hook() {
         format!(
             concat!(
                 "dispatcher: https://demo-dispatch.fake.invalid/\n",
-                "pool ci: 0 live of 10\n",
-                "pool build: 0 live of 2\n",
+                "vm runner ci: 0 live of 4\n",
+                "lane build of project 1 (example.invalid/node:24): 0 live of 2\n",
                 "hook {hook}: executable\n",
                 "delivery 2026-10-25T12:00:01Z e2e: [ios] 200 started ci 5120\n",
                 "delivery 2026-10-25T12:00:02Z pipeline 901 200 ignored - -\n",
@@ -587,7 +599,10 @@ async fn status_lists_the_deliveries_and_check_a_disabled_hook() {
     let check = ["--config", &config, "--local", &local, "check"];
     let (code, out) = run(env(Some(fake.clone())), &check).await;
     assert_eq!(code, 0, "{out}");
-    assert_eq!(out, "project 1: every job matches the stage map\n");
+    assert_eq!(
+        out,
+        "project 1: every job matches its lanes and the VM runner\n"
+    );
     fake.disable_hook(hook, "temporarily_disabled", Some("2026-10-25T12:10:00Z"));
     let (code, out) = run(env(Some(fake.clone())), &check).await;
     assert_eq!(code, 1, "{out}");
@@ -595,7 +610,7 @@ async fn status_lists_the_deliveries_and_check_a_disabled_hook() {
         out,
         concat!(
             "project 1: webhook temporarily_disabled until 2026-10-25T12:10:00Z: run ciburst-setup to enable it again\n",
-            "project 1: every job matches the stage map\n",
+            "project 1: every job matches its lanes and the VM runner\n",
         )
     );
     let (code, out) = run(env(Some(fake.clone())), &status).await;
@@ -710,24 +725,6 @@ async fn missing_files_and_variables_are_named() {
         format!(
             "{} not found; it holds GITLAB_TOKEN",
             local.join("gitlab.env").display()
-        )
-    );
-
-    std::fs::write(
-        &config,
-        FAKE_CONFIG.replace(
-            r#""cache": { "type": "s3" }"#,
-            r#""cache": { "type": "s3" }, "providers": { "hetzner": {} }"#,
-        ),
-    )
-    .unwrap();
-    let (code, out) = run(env(None), &plan).await;
-    assert_eq!(code, 1);
-    assert_eq!(
-        out,
-        format!(
-            "{} not found; it holds HCLOUD_TOKEN",
-            local.join("hetzner.env").display()
         )
     );
 }

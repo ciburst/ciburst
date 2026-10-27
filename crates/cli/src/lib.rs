@@ -8,9 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ciburst_core::check::{SUGGESTED_MEMORY_MIB, SUGGESTED_VCPU, Suggestion};
-use ciburst_core::composite::Composite;
 use ciburst_core::config::{
-    Config, JOBS_RUNTIME, check_capabilities, load_config, merge_config, read_config_file,
+    Config, ProjectConfig, check_capabilities, load_config, merge_config, read_config_file,
 };
 use ciburst_core::fake::{FakeHost, FakeProvider};
 use ciburst_core::fleet::StoreFleet;
@@ -26,7 +25,6 @@ use ciburst_core::store::{FileStore, MemoryStore, Store};
 use ciburst_core::time::rfc3339;
 use ciburst_core::types::{Host, Outputs, Provider, Rotation};
 use ciburst_core::{Error, Result};
-use ciburst_hetzner::Hetzner;
 use ciburst_scaleway::client::{Credentials, DEFAULT_REGION, ScalewayClient};
 use ciburst_scaleway::host::{HOST_NAME as SCALEWAY_HOST, ScalewayFunction};
 use ciburst_scaleway::provider::Scaleway;
@@ -48,7 +46,6 @@ pub mod ci_vars {
     pub const SCW_ORGANIZATION_ID: &str = "CIBURST_SCW_ORGANIZATION_ID";
     pub const SCW_PROJECT_ID: &str = "CIBURST_SCW_PROJECT_ID";
     pub const GITLAB_TOKEN: &str = "CIBURST_GITLAB_TOKEN";
-    pub const HCLOUD_TOKEN: &str = "CIBURST_HCLOUD_TOKEN";
     pub const PROJECT_ID: &str = "CI_PROJECT_ID";
     pub const SERVER_URL: &str = "CI_SERVER_URL";
     pub const REF_PROTECTED: &str = "CI_COMMIT_REF_PROTECTED";
@@ -65,7 +62,7 @@ struct Cli {
     /// pipeline defaults]
     #[arg(long, global = true)]
     config: Option<PathBuf>,
-    /// Directory with scaleway.env, gitlab.env, hetzner.env, outputs.env and state.json
+    /// Directory with scaleway.env, gitlab.env, outputs.env and state.json
     #[arg(long, default_value = ".local", global = true)]
     local: PathBuf,
     /// Plan or apply without touching GitLab
@@ -95,15 +92,15 @@ enum Command {
         #[arg(long)]
         yes: Option<String>,
     },
-    /// Live runs per pool
+    /// Live runs of the VM runner and of each project's lanes, the members and the webhooks
     Status,
-    /// Compare every project's pipeline with the routing of the pools
+    /// Compare every project's pipeline with its own lanes and ignoreJobs
     Check {
         /// Branch, tag or commit to lint instead of the default branch
         #[arg(long = "ref")]
         content_ref: Option<String>,
-        /// Print lanes for the Docker-free jobs that run on a VM pool, with the tags each job
-        /// needs, and ignoreJobs for the jobs of other runners
+        /// Print lanes for each project's Docker-free jobs that run on the VM runner, with the
+        /// tags each job needs, and ignoreJobs for the jobs of other runners
         #[arg(long)]
         suggest: bool,
     },
@@ -302,39 +299,27 @@ impl Modules {
         })
     }
 
-    /// The projects `check` looks at: the config's, then the members that joined the fleet
-    /// (M6.3 rule R7). Without the provider's credentials only the config's.
-    async fn fleet_projects(&mut self) -> Result<Vec<u64>> {
-        let mut projects = self.config.gitlab.project_ids.clone();
+    /// The projects `check` looks at, each with its own lanes and `ignoreJobs` (M6.4 rule
+    /// R8): the config's, then the members that joined the fleet (M6.3 rule R7). Without the
+    /// provider's credentials only the config's.
+    async fn fleet_projects(&mut self) -> Result<Vec<(u64, ProjectConfig)>> {
+        let mut projects = provision::config_projects(&self.config);
         let Ok(provider) = self.provider().await else {
             return Ok(projects);
         };
         let secrets = secrets_from_outputs(&self.config, &self.stored_outputs().await?);
         if let Some(fleet) = provider.fleet(&secrets).await? {
-            let mut joined: Vec<u64> = fleet
+            let mut joined: Vec<(u64, ProjectConfig)> = fleet
                 .members()
                 .await?
                 .into_iter()
-                .map(|m| m.project_id)
-                .filter(|id| !projects.contains(id))
+                .filter(|m| !projects.iter().any(|(id, _)| *id == m.project_id))
+                .map(|m| (m.project_id, m.project_config()))
                 .collect();
-            joined.sort_unstable();
+            joined.sort_unstable_by_key(|(id, _)| *id);
             projects.extend(joined);
         }
         Ok(projects)
-    }
-
-    async fn hetzner_token(&self) -> Result<String> {
-        match &self.mode {
-            Mode::Ci { .. } => self.input(ci_vars::HCLOUD_TOKEN),
-            Mode::Local(local) => Ok(env_file(
-                &local.join("hetzner.env"),
-                &[ciburst_hetzner::TOKEN_VAR],
-            )
-            .await?
-            .remove(ciburst_hetzner::TOKEN_VAR)
-            .unwrap_or_default()),
-        }
     }
 
     fn store(&self, slot: &str) -> Arc<dyn Store> {
@@ -357,43 +342,9 @@ impl Modules {
         )
     }
 
-    /// The config's provider, wrapped in a [`Composite`] with the added providers of
-    /// `providers` (spec D35).
+    /// The config's provider; Scaleway is the only real one (D65).
     async fn provider(&mut self) -> Result<Arc<dyn Provider>> {
-        let main = self.main_provider().await?;
-        let mut extras: Vec<(String, Arc<dyn Provider>)> = Vec::new();
-        let config = self.config.clone();
-        for runtime in config.providers.keys() {
-            match runtime.as_str() {
-                ciburst_hetzner::RUNTIME => {
-                    let token = self.hetzner_token().await?;
-                    extras.push((
-                        runtime.clone(),
-                        Arc::new(Hetzner::new(
-                            self.config.clone(),
-                            token,
-                            self.http()?,
-                            self.log.clone(),
-                        )),
-                    ));
-                }
-                other => {
-                    return Err(Error::other(format!(
-                        "providers.{other}: no provider named {other}; available: {}",
-                        ciburst_hetzner::RUNTIME
-                    )));
-                }
-            }
-        }
-        if extras.is_empty() {
-            return Ok(main);
-        }
-        Ok(Arc::new(Composite::new(
-            self.config.clone(),
-            main,
-            extras,
-            self.log.clone(),
-        )))
+        self.main_provider().await
     }
 
     async fn main_provider(&mut self) -> Result<Arc<dyn Provider>> {
@@ -496,7 +447,6 @@ fn workstation_name(key: &str) -> Option<&'static str> {
         "CIBURST_SCW_ORGANIZATION_ID" => "SCW_DEFAULT_ORGANIZATION_ID",
         "CIBURST_SCW_PROJECT_ID" => "SCW_DEFAULT_PROJECT_ID",
         "CIBURST_GITLAB_TOKEN" => "GITLAB_TOKEN",
-        "CIBURST_HCLOUD_TOKEN" => "HCLOUD_TOKEN",
         _ => return None,
     })
 }
@@ -736,11 +686,18 @@ async fn write_status(out: &mut dyn Write, provisioner: &Provisioner) -> Result<
         status.url.as_deref().unwrap_or("not deployed")
     )?;
     for pool in &status.pools {
-        writeln!(
-            out,
-            "pool {}: {} live of {}",
-            pool.tag, pool.live, pool.max_runs
-        )?;
+        match pool.project {
+            None => writeln!(
+                out,
+                "vm runner {}: {} live of {}",
+                pool.tag, pool.live, pool.max_runs
+            )?,
+            Some(project) => writeln!(
+                out,
+                "lane {} of project {project} ({}): {} live of {}",
+                pool.tag, pool.image, pool.live, pool.max_runs
+            )?,
+        }
     }
     for member in &status.members {
         writeln!(
@@ -828,7 +785,7 @@ fn write_check(out: &mut dyn Write, report: &[ProjectReport]) -> Result<i32> {
         if project.problems.is_empty() {
             writeln!(
                 out,
-                "project {}: every job matches the stage map",
+                "project {}: every job matches its lanes and the VM runner",
                 project.project_id
             )?;
             continue;
@@ -845,7 +802,8 @@ fn write_check(out: &mut dyn Write, report: &[ProjectReport]) -> Result<i32> {
     Ok(if failed { 1 } else { 0 })
 }
 
-/// `check --suggest` (D46): per image a pool entry for `ciburst.json` and the tags of its jobs,
+/// `check --suggest` (D46): per image a lane for the project's `ciburst.json` and the tags of
+/// its jobs,
 /// then the `ignoreJobs` key for the jobs of other runners (M6.1 rule R8). Exits 0 unless a
 /// pipeline is invalid.
 fn write_suggestions(out: &mut dyn Write, report: &[ProjectReport]) -> Result<i32> {
@@ -866,7 +824,10 @@ fn write_suggestions(out: &mut dyn Write, report: &[ProjectReport]) -> Result<i3
             continue;
         }
         if project.suggestions.is_empty() {
-            writeln!(out, "project {id}: no Docker-free job runs on a VM pool")?;
+            writeln!(
+                out,
+                "project {id}: no Docker-free job runs on the VM runner"
+            )?;
         }
         for lane in &project.suggestions {
             writeln!(out, "project {id}: lane {} for {}", lane.tag, lane.image)?;
@@ -901,6 +862,18 @@ async fn member(cli: &Cli, env: Env, out: &mut dyn Write) -> Result<i32> {
     };
     let code = input(fleet::JOIN_VAR)?;
     let token = input(ci_vars::GITLAB_TOKEN)?;
+    // M6.4 rule R5: the member's own lanes and ignoreJobs; without the file it has none.
+    let project_file = match &cli.config {
+        Some(path) => Some(read_config_file(path).await?),
+        None => {
+            let path = PathBuf::from("ciburst.json");
+            if tokio::fs::try_exists(&path).await? {
+                Some(read_config_file(&path).await?)
+            } else {
+                None
+            }
+        }
+    };
     let http: Arc<dyn HttpClient> = match env.http {
         Some(http) => http,
         None => Arc::new(ReqwestClient::new()?),
@@ -916,6 +889,7 @@ async fn member(cli: &Cli, env: Env, out: &mut dyn Write) -> Result<i32> {
                 &env.log,
                 project_id,
                 &code,
+                project_file.as_deref(),
                 now,
             )
             .await
@@ -944,14 +918,13 @@ fn ignore_entry(names: &[String]) -> String {
     format!(r#""ignoreJobs": [{}]"#, names.join(", "))
 }
 
-/// A suggested lane as one line of the `pools` array of `ciburst.json`.
+/// A suggested lane as one line of the `lanes` array of the project's `ciburst.json`.
 fn lane_entry(lane: &Suggestion) -> String {
     let quote = |text: &str| Value::from(text).to_string();
     let jobs: Vec<String> = lane.jobs.iter().map(|job| quote(job)).collect();
     format!(
-        r#"{{ "tag": {}, "runtime": {}, "image": {}, "jobs": [{}], "vcpu": {SUGGESTED_VCPU}, "memoryMiB": {SUGGESTED_MEMORY_MIB} }}"#,
+        r#"{{ "tag": {}, "image": {}, "jobs": [{}], "vcpu": {SUGGESTED_VCPU}, "memoryMiB": {SUGGESTED_MEMORY_MIB} }}"#,
         quote(&lane.tag),
-        quote(JOBS_RUNTIME),
         quote(&lane.image),
         jobs.join(", "),
     )

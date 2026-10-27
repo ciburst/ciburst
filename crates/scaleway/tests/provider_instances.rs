@@ -33,9 +33,12 @@ const RUNNER_TOKEN: &str = "glrt-vm-runner-token";
 const CACHE_SECRET: &str = "cache-secret-key-value";
 const DISPATCH_URL: &str = "https://dispatch.example";
 
-/// The contract config (S3 cache) on the default runtime.
+/// The contract config (S3 cache) with the VM runner tagged `ci` and the host's lane `build`
+/// (key `7-build`).
 fn config(change: impl FnOnce(&mut Config)) -> Arc<Config> {
     let mut config = (*contract_config()).clone();
+    config.vm.tag = "ci".into();
+    config.lanes.retain(|lane| lane.tag != "ci");
     change(&mut config);
     Arc::new(config)
 }
@@ -149,7 +152,7 @@ fn parse(user_data: &str) -> Yaml {
 }
 
 #[tokio::test]
-async fn first_plan_lists_the_agent_and_security_group_and_no_job_definition() {
+async fn first_plan_lists_the_agent_the_security_group_and_the_lane() {
     let backend = Arc::new(ScalewayFake::new());
     let provider = provider(plain(), &backend, Log::silent());
     let steps = provider.plan(&[]).await.unwrap();
@@ -163,6 +166,7 @@ async fn first_plan_lists_the_agent_and_security_group_and_no_job_definition() {
             ("runner-binary".to_string(), Action::Create),
             ("vm:agent".to_string(), Action::Create),
             ("vm:security-group".to_string(), Action::Create),
+            ("definition:7-build".to_string(), Action::Create),
         ]
     );
     assert_eq!(
@@ -191,7 +195,7 @@ async fn first_plan_lists_the_agent_and_security_group_and_no_job_definition() {
     assert_eq!(group["stateful"], true);
     assert_eq!(group["project_default"], false);
     assert_eq!(group["zone"], "fr-par-1");
-    assert!(backend.jobs.definitions().is_empty());
+    assert_eq!(backend.jobs.definitions().len(), 1, "the lane build");
     let again = provider.plan(&[]).await.unwrap();
     assert!(again.iter().all(Step::is_noop), "{again:?}");
     assert_eq!(again.len(), steps.len());
@@ -391,7 +395,7 @@ async fn start_creates_the_server_of_rule_four_then_user_data_then_poweron() {
 
 #[tokio::test]
 async fn a_server_starts_with_the_slots_the_dispatcher_already_took() {
-    let config = config(|c| c.pools[0].slots = 3);
+    let config = config(|c| c.vm.slots = 3);
     let (backend, provider, _) = provisioned(config.clone(), Log::silent()).await;
     let free = |id: &str| {
         tags(&backend.instance.server(id).unwrap())
@@ -421,107 +425,11 @@ async fn a_server_starts_with_the_slots_the_dispatcher_already_took() {
     }
 }
 
-/// M6.2 rule R6: the spill runner's token of the start env reaches `vm.env`, and nothing else:
-/// no tag, no log line.
-#[tokio::test]
-async fn the_spill_token_reaches_vm_env_only() {
-    const SPILL: &str = "glrt-spill-runner-token";
-    let (log, lines) = Log::memory();
-    let (backend, provider, _) = provisioned(plain(), log).await;
-    let config = plain();
-    let plain_id = provider.start(request(&config, "ci")).await.unwrap();
-    let user_data = backend.instance.user_data(&plain_id, "cloud-init").unwrap();
-    assert!(!vm_env(&parse(&user_data)).contains_key("RUNNER_SPILL_TOKEN"));
-
-    let mut start = request(&config, "ci");
-    start
-        .env
-        .insert("RUNNER_SPILL_TOKEN".to_string(), SPILL.to_string());
-    let id = provider.start(start).await.unwrap();
-    let user_data = backend.instance.user_data(&id, "cloud-init").unwrap();
-    let vm_env = vm_env(&parse(&user_data));
-    assert_eq!(vm_env["RUNNER_SPILL_TOKEN"], SPILL);
-    assert_eq!(vm_env["RUNNER_TOKEN"], RUNNER_TOKEN);
-    let report = VmReport {
-        state: VmState::Idle,
-        free: 2,
-        slots: 2,
-        spill: 2,
-    };
-    provider
-        .report(&id, &report, FAKE_CLOCK + 30)
-        .await
-        .unwrap();
-    let everything = format!(
-        "{}\n{:?}\n{:?}",
-        tags(&backend.instance.server(&id).unwrap()).join(","),
-        backend.instance.calls(),
-        lines.lock().unwrap()
-    );
-    assert!(!everything.contains(SPILL), "the spill token leaked");
-}
-
-/// M6.2 rule R6: a report writes its spill count into the server's tags, the capacity reads it
-/// back, a claim keeps it, and a report without spill removes it.
-#[tokio::test]
-async fn capacity_reads_the_spill_of_the_last_report() {
-    let config = config(|c| c.pools[0].slots = 2);
-    let (backend, provider, _) = provisioned(config.clone(), Log::silent()).await;
-    let id = provider.start(request(&config, "ci")).await.unwrap();
-    let started = tags(&backend.instance.server(&id).unwrap());
-    assert!(!started.iter().any(|t| t.starts_with("ciburst-spill")));
-    let spill = || provider.capacity("ci");
-    assert_eq!(spill().await.unwrap().unwrap()[0].spill, 0);
-
-    let mut report = VmReport {
-        state: VmState::Idle,
-        free: 2,
-        slots: 2,
-        spill: 2,
-    };
-    provider
-        .report(&id, &report, FAKE_CLOCK + 15)
-        .await
-        .unwrap();
-    let vm = &spill().await.unwrap().unwrap()[0];
-    assert_eq!((vm.free, vm.spill), (2, 2));
-    provider.claim(&id).await.unwrap();
-    let vm = &spill().await.unwrap().unwrap()[0];
-    assert_eq!((vm.free, vm.spill), (1, 2));
-    report.spill = 1;
-    provider
-        .report(&id, &report, FAKE_CLOCK + 30)
-        .await
-        .unwrap();
-    provider
-        .report(&id, &report, FAKE_CLOCK + 45)
-        .await
-        .unwrap();
-    let spilling = tags(&backend.instance.server(&id).unwrap());
-    assert_eq!(
-        spilling
-            .iter()
-            .filter(|t| t.starts_with("ciburst-spill:"))
-            .collect::<Vec<_>>(),
-        ["ciburst-spill:1"]
-    );
-    assert_eq!(spilling.len(), started.len() + 2, "seen and spill");
-    report.spill = 0;
-    provider
-        .report(&id, &report, FAKE_CLOCK + 60)
-        .await
-        .unwrap();
-    assert_eq!(spill().await.unwrap().unwrap()[0].spill, 0);
-    let after = tags(&backend.instance.server(&id).unwrap());
-    assert!(!after.iter().any(|t| t.starts_with("ciburst-spill")));
-    assert_eq!(after.len(), started.len() + 1, "seen");
-}
-
 #[tokio::test]
 async fn start_falls_back_to_the_next_type_when_out_of_stock() {
     let config = config(|c| {
-        c.pools[0].instance_types = strings(&["DEV1-M", "DEV1-L"]);
-        c.pools[0].slots = 3;
+        c.vm.instance_types = strings(&["DEV1-M", "DEV1-L"]);
+        c.vm.slots = 3;
     });
     let (log, lines) = Log::memory();
     let (backend, provider, _) = provisioned(config.clone(), log).await;
@@ -542,7 +450,7 @@ async fn start_falls_back_to_the_next_type_when_out_of_stock() {
 
 #[tokio::test]
 async fn start_falls_back_when_over_quota_and_names_every_failure() {
-    let config = config(|c| c.pools[0].instance_types = strings(&["DEV1-M", "DEV1-L"]));
+    let config = config(|c| c.vm.instance_types = strings(&["DEV1-M", "DEV1-L"]));
     let (backend, provider, _) = provisioned(config.clone(), Log::silent()).await;
     backend.instance.set_over_quota("DEV1-M");
     let id = provider.start(request(&config, "ci")).await.unwrap();
@@ -587,7 +495,7 @@ async fn the_default_types_fall_back_to_dev1_l() {
 
 #[tokio::test]
 async fn out_of_stock_at_poweron_removes_the_server_and_tries_the_next_type() {
-    let config = config(|c| c.pools[0].instance_types = strings(&["DEV1-M", "DEV1-L"]));
+    let config = config(|c| c.vm.instance_types = strings(&["DEV1-M", "DEV1-L"]));
     let (backend, provider, _) = provisioned(config.clone(), Log::silent()).await;
     backend.instance.set_poweron_out_of_stock("DEV1-M");
     let id = provider.start(request(&config, "ci")).await.unwrap();
@@ -688,12 +596,11 @@ async fn the_dispatcher_starts_vms_on_the_agent_of_its_environment_without_a_reg
 
 #[tokio::test]
 async fn capacity_reads_the_pool_servers_and_ignores_other_deployments() {
-    let config = config(|c| c.pools[0].slots = 2);
+    let config = config(|c| c.vm.slots = 2);
     let (backend, provider, project_id) = provisioned(config.clone(), Log::silent()).await;
     let first = provider.start(request(&config, "ci")).await.unwrap();
     backend.instance.set_clock(FAKE_CLOCK + 60);
     let second = provider.start(request(&config, "ci")).await.unwrap();
-    let build = provider.start(request(&config, "build")).await.unwrap();
     let stopped = provider.start(request(&config, "ci")).await.unwrap();
     backend.instance.set_state(&stopped, "stopped");
     backend.instance.add_server(
@@ -710,7 +617,6 @@ async fn capacity_reads_the_pool_servers_and_ignores_other_deployments() {
         state: VmState::Busy,
         free: 1,
         slots: 2,
-        spill: 0,
     };
     provider
         .report(&first, &report, FAKE_CLOCK + 120)
@@ -730,27 +636,25 @@ async fn capacity_reads_the_pool_servers_and_ignores_other_deployments() {
     assert_eq!(ci[1].free, 1);
     assert_eq!(ci[1].seen, None);
     assert_eq!(ci[1].created_at, FAKE_CLOCK + 60);
-    let build_capacity = provider.capacity("build").await.unwrap().unwrap();
-    assert_eq!(
-        build_capacity
-            .iter()
-            .map(|c| c.run_id.as_str())
-            .collect::<Vec<_>>(),
-        [build.as_str()]
-    );
+    assert_eq!(provider.capacity("7-build").await.unwrap(), None, "a lane");
 }
 
 #[tokio::test]
-async fn jobs_pools_have_no_capacity() {
-    let mixed = config(|c| c.pools[1].runtime = Some("jobs".into()));
+async fn lanes_have_no_capacity() {
+    let mixed = plain();
     let (_, provider, _) = provisioned(mixed, Log::silent()).await;
-    assert_eq!(provider.capacity("build").await.unwrap(), None);
+    assert_eq!(provider.capacity("7-build").await.unwrap(), None);
+    assert_eq!(
+        provider.capacity("8-build").await.unwrap(),
+        None,
+        "a member's lane"
+    );
     assert_eq!(provider.capacity("ci").await.unwrap(), Some(Vec::new()));
 }
 
 #[tokio::test]
 async fn claim_lowers_free_slots_down_to_zero() {
-    let config = config(|c| c.pools[0].slots = 2);
+    let config = config(|c| c.vm.slots = 2);
     let (backend, provider, _) = provisioned(config.clone(), Log::silent()).await;
     let id = provider.start(request(&config, "ci")).await.unwrap();
     let before = tags(&backend.instance.server(&id).unwrap());
@@ -788,7 +692,6 @@ async fn report_rewrites_the_state_tags_and_keeps_every_other_tag() {
         state: VmState::Draining,
         free: 1,
         slots: 1,
-        spill: 0,
     };
     provider.report(&id, &draining, 1_000).await.unwrap();
     provider.report(&id, &draining, 1_060).await.unwrap();
@@ -814,7 +717,6 @@ async fn report_rewrites_the_state_tags_and_keeps_every_other_tag() {
         state: VmState::Idle,
         free: 1,
         slots: 1,
-        spill: 0,
     };
     provider.report(&id, &idle, 1_100).await.unwrap();
     let after = tags(&backend.instance.server(&id).unwrap());
@@ -835,7 +737,6 @@ async fn claim_report_and_stop_refuse_servers_of_others() {
         state: VmState::Idle,
         free: 1,
         slots: 1,
-        spill: 0,
     };
     let message = format!("scaleway: server {foreign} does not belong to contract");
     assert_eq!(
@@ -882,7 +783,7 @@ async fn list_shows_servers_as_runs_and_stop_terminates() {
         provider.list(None).await.unwrap()[0].state,
         RunState::Running
     );
-    assert!(provider.list(Some("build")).await.unwrap().is_empty());
+    assert!(provider.list(Some("7-build")).await.unwrap().is_empty());
 
     provider.stop(&id).await.unwrap();
     let terminate = backend.instance.calls().into_iter().last().unwrap();
@@ -894,9 +795,14 @@ async fn list_shows_servers_as_runs_and_stop_terminates() {
         backend.instance.volumes().is_empty(),
         "local volume deleted"
     );
-    assert_eq!(
-        provider.stop("missing").await.unwrap_err().to_string(),
-        "scaleway: server missing not found"
+    assert!(
+        provider
+            .stop("missing")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("404 job run not found"),
+        "neither a server nor a job run"
     );
 }
 
@@ -921,16 +827,16 @@ async fn stop_deletes_a_server_that_never_powered_on() {
 }
 
 #[tokio::test]
-async fn mixed_pools_keep_jobs_on_serverless_jobs() {
-    let mixed = config(|c| c.pools[1].runtime = Some("jobs".into()));
+async fn lanes_run_on_serverless_jobs_beside_the_vm_runner() {
+    let mixed = plain();
     let (backend, provider, _) = provisioned(mixed.clone(), Log::silent()).await;
     let steps = provider.plan(&[]).await.unwrap();
     let ids: Vec<&str> = steps.iter().map(|s| s.id.as_str()).collect();
     assert!(ids.contains(&"vm:security-group"));
-    assert!(ids.contains(&"definition:build"));
+    assert!(ids.contains(&"definition:7-build"));
     assert!(!ids.contains(&"definition:ci"));
 
-    let job = provider.start(request(&mixed, "build")).await.unwrap();
+    let job = provider.start(request(&mixed, "7-build")).await.unwrap();
     let start = backend
         .jobs
         .calls()
@@ -1056,65 +962,65 @@ async fn sweep_applies_each_rule_at_its_boundary() {
 }
 
 #[tokio::test]
-async fn unknown_runtimes_fail_plan_naming_the_pool() {
+async fn an_unknown_vm_runtime_fails_plan() {
     let backend = Arc::new(ScalewayFake::new());
-    let bad_pool = config(|c| c.pools[1].runtime = Some("vm".into()));
-    let error = provider(bad_pool, &backend, Log::silent())
+    let bad = config(|c| c.vm.runtime = Some("lambda".into()));
+    let error = provider(bad, &backend, Log::silent())
         .plan(&[])
         .await
         .unwrap_err()
         .to_string();
     assert_eq!(
         error,
-        "scaleway: pool build: runtime vm is not instances or jobs"
-    );
-    let bad_default = config(|c| {
-        c.provider.extra.insert("runtime".into(), json!("lambda"));
-    });
-    let error = provider(bad_default, &backend, Log::silent())
-        .plan(&[])
-        .await
-        .unwrap_err()
-        .to_string();
-    assert_eq!(
-        error,
-        "scaleway: provider.runtime \"lambda\" is not instances or jobs"
+        "scaleway: pool ci: runtime lambda is not instances or jobs"
     );
     assert!(backend.writes().is_empty());
 }
 
+/// D60: `apply` keeps the host's lane definitions `<name>-<host>-<tag>`, deletes the
+/// definitions of earlier configs without a project, and leaves the definitions of members'
+/// lanes to their `/join`.
 #[tokio::test]
-async fn switching_runtimes_moves_between_definitions_and_the_security_group() {
-    let jobs_config = config(|c| {
-        c.provider.extra.insert("runtime".into(), json!("jobs"));
-    });
-    let (backend, jobs, _) = provisioned(jobs_config, Log::silent()).await;
-    assert_eq!(backend.jobs.definitions().len(), 2);
-    assert!(backend.instance.security_groups().is_empty());
-
-    let instances = provider(plain(), &backend, Log::silent());
-    let steps = instances.plan(&[]).await.unwrap();
-    let find = |steps: &[Step], id: &str| steps.iter().find(|s| s.id == id).map(|s| s.action);
-    assert_eq!(find(&steps, "vm:security-group"), Some(Action::Create));
-    assert_eq!(find(&steps, "definition:ci"), Some(Action::Delete));
-    assert_eq!(find(&steps, "definition:build"), Some(Action::Delete));
-    instances.apply(&steps).await.unwrap();
-    assert!(backend.jobs.definitions().is_empty());
-    assert_eq!(backend.instance.security_groups().len(), 1);
-
-    let steps = jobs.plan(&[]).await.unwrap();
-    assert_eq!(find(&steps, "vm:security-group"), Some(Action::Delete));
-    assert_eq!(find(&steps, "definition:ci"), Some(Action::Create));
-    jobs.apply(&steps).await.unwrap();
-    assert!(backend.instance.security_groups().is_empty());
-    assert_eq!(backend.jobs.definitions().len(), 2);
-    let again = jobs.plan(&[]).await.unwrap();
-    assert!(again.iter().all(Step::is_noop), "{again:?}");
-    assert_eq!(find(&again, "vm:security-group"), None);
+async fn apply_owns_the_host_lanes_and_leaves_member_lanes_alone() {
+    let (backend, provider, project_id) = provisioned(plain(), Log::silent()).await;
+    let names = || -> Vec<String> {
+        let mut names: Vec<String> = backend
+            .jobs
+            .definitions()
+            .iter()
+            .map(|d| d["name"].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(names(), ["contract-7-build"]);
+    for name in ["contract-build", "contract-8-node"] {
+        backend.jobs.add_definition(&project_id, name);
+    }
+    let steps = provider.plan(&[]).await.unwrap();
+    let definitions: Vec<(&str, Action)> = steps
+        .iter()
+        .filter(|s| s.id.starts_with("definition:"))
+        .map(|s| (s.id.as_str(), s.action))
+        .collect();
+    assert_eq!(
+        definitions,
+        [
+            ("definition:7-build", Action::Noop),
+            ("definition:build", Action::Delete),
+        ]
+    );
+    provider.apply(&steps).await.unwrap();
+    assert_eq!(names(), ["contract-7-build", "contract-8-node"]);
+    provider.destroy().await.unwrap();
+    assert!(
+        names().is_empty(),
+        "destroy deletes every member's definitions too"
+    );
 }
 
 #[tokio::test]
-async fn the_type_scaleway_jobs_keeps_serverless_jobs_unless_told_otherwise() {
+async fn the_type_scaleway_jobs_reads_as_scaleway() {
     let backend = Arc::new(ScalewayFake::new());
     let legacy = config(|c| c.provider.kind = "scaleway-jobs".into());
     let legacy = provider(legacy, &backend, Log::silent());
@@ -1125,30 +1031,10 @@ async fn the_type_scaleway_jobs_keeps_serverless_jobs_unless_told_otherwise() {
         .into_iter()
         .map(|s| s.id)
         .collect();
-    assert!(ids.contains(&"definition:ci".to_string()), "{ids:?}");
-    assert!(!ids.contains(&"vm:security-group".to_string()), "{ids:?}");
+    assert!(ids.contains(&"vm:security-group".to_string()), "{ids:?}");
+    assert!(!ids.contains(&"definition:ci".to_string()), "{ids:?}");
     let caps = legacy.capabilities();
     assert_eq!(caps.name, "scaleway");
-    assert!(!caps.docker_daemon);
-    assert_eq!(caps.billing, Billing::PerSecond);
-
-    let explicit = config(|c| {
-        c.provider.kind = "scaleway-jobs".into();
-        c.provider
-            .extra
-            .insert("runtime".into(), json!("instances"));
-    });
-    let ids: Vec<String> = provider(explicit, &backend, Log::silent())
-        .plan(&[])
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|s| s.id)
-        .collect();
-    assert!(ids.contains(&"vm:security-group".to_string()), "{ids:?}");
-
-    let current = config(|c| c.provider.kind = "scaleway".into());
-    let caps = provider(current, &backend, Log::silent()).capabilities();
     assert!(caps.docker_daemon);
     assert_eq!(caps.billing, Billing::PerHour);
 }
@@ -1172,8 +1058,7 @@ async fn plan_warns_when_the_zone_has_no_quota_for_the_pool_types() {
         .expect("warning");
     assert!(warning.contains("zone fr-par-1 has no quota for DEV1-M, DEV1-L"));
     assert!(warning.contains("quota in nl-ams-1, pl-waw-1"));
-    let jobs_too = config(|c| c.pools[1].runtime = Some("jobs".into()));
-    let error = provider(jobs_too, &backend, Log::silent())
+    let error = provider(plain(), &backend, Log::silent())
         .preflight()
         .await
         .unwrap_err()
@@ -1183,12 +1068,6 @@ async fn plan_warns_when_the_zone_has_no_quota_for_the_pool_types() {
         "scaleway: pool ci: zone fr-par-1 has no quota for DEV1-M, DEV1-L: set provider.zone \
          (quota in nl-ams-1, pl-waw-1) or ask Scaleway support to raise it"
     );
-    let error = provider(plain(), &backend, Log::silent())
-        .preflight()
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("pool ci: zone") && error.contains("; pool build: zone"));
     assert!(backend.writes().is_empty(), "preflight writes nothing");
 
     backend
@@ -1310,7 +1189,7 @@ async fn destroy_removes_servers_and_the_security_group() {
     let (log, lines) = Log::memory();
     let (backend, provider, project_id) = provisioned(plain(), log).await;
     let running = provider.start(request(&plain(), "ci")).await.unwrap();
-    let stopped = provider.start(request(&plain(), "build")).await.unwrap();
+    let stopped = provider.start(request(&plain(), "ci")).await.unwrap();
     backend.instance.set_state(&stopped, "stopped");
     let foreign =
         backend

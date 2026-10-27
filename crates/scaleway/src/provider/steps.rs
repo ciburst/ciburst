@@ -76,14 +76,13 @@ impl Scaleway {
     }
 
     pub(super) async fn plan_steps(&self, rotate: &[Rotation]) -> Result<Vec<Step>> {
-        self.default_runtime()?;
         let runtimes = self.own_runtimes()?;
         let needs_agent = self.needs_agent()?;
         if !self.cache_on() {
             for tag in self.vm_pools()? {
                 self.log.warn(
                     "vm pools cannot start",
-                    &[("pool", tag), ("reason", NO_CACHE)],
+                    &[("pool", &tag), ("reason", NO_CACHE)],
                 );
             }
         }
@@ -211,9 +210,11 @@ impl Scaleway {
             let Some(tag) = self.definition_tag(definition) else {
                 continue;
             };
-            let kept = runtimes
-                .iter()
-                .any(|(pool, runtime)| pool.tag == tag && *runtime == Runtime::Jobs);
+            // A member's lanes follow its `/join` (M6.4 rule R5), not this config.
+            let kept = self.is_member_lane(tag)
+                || runtimes
+                    .iter()
+                    .any(|(pool, runtime)| pool.tag == tag && *runtime == Runtime::Jobs);
             if !kept {
                 steps.push(Step::new(
                     format!("definition:{tag}"),

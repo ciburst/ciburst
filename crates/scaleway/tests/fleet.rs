@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use ciburst_core::fleet::{FleetStore, Member};
+use ciburst_core::fleet::{FleetStore, Member, MemberLane};
 use ciburst_core::types::KeyPair;
 use ciburst_scaleway::fleet::{
     CONFIG_KEY, FleetKey, MEMBER_PREFIX, ScalewayFleetStore, base64_decode, member_key,
@@ -67,6 +67,7 @@ fn member(project_id: u64, hook: &str) -> Member {
             ("vm".to_string(), TOKEN.to_string()),
         ]),
         joined_at: 1_800_000_000,
+        ..Default::default()
     }
 }
 
@@ -154,6 +155,53 @@ async fn members_are_sealed_at_rest_and_read_back() {
     store.put_member(&member(7, HOOK)).await.unwrap();
     let again: Value = serde_json::from_slice(&object(&fake, &member_key(7))).unwrap();
     assert_ne!(again["hookSecret"], stored["hookSecret"]);
+}
+
+/// M6.4 rule R6: a member's lanes keep their routing fields in clear text and their runner
+/// token sealed; a record written before M6.4 reads as a member without lanes.
+#[tokio::test]
+async fn member_lanes_seal_their_runner_token_and_old_records_have_none() {
+    let (fake, store) = store().await;
+    let mut with_lanes = member(8, HOOK);
+    with_lanes.runners = BTreeMap::from([("vm".to_string(), TOKEN.to_string())]);
+    with_lanes.lanes = vec![MemberLane {
+        tag: "node".into(),
+        image: "node:24".into(),
+        jobs: vec!["lint".into()],
+        max_runs: 3,
+        definition_id: "def-1".into(),
+        runner_token: "glrt-lane-token-of-member".into(),
+    }];
+    with_lanes.ignore_jobs = vec!["pages".into()];
+    store.put_member(&with_lanes).await.unwrap();
+    let text = String::from_utf8(object(&fake, &member_key(8))).unwrap();
+    assert!(!text.contains("glrt-lane-token-of-member"), "{text}");
+    let stored: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(stored["lanes"][0]["tag"], "node");
+    assert_eq!(stored["lanes"][0]["jobs"], serde_json::json!(["lint"]));
+    assert_eq!(stored["lanes"][0]["maxRuns"], 3);
+    assert_eq!(stored["ignoreJobs"], serde_json::json!(["pages"]));
+    assert_eq!(store.members().await.unwrap(), [with_lanes.clone()]);
+
+    // The sealed token is bound to its member and lane: moved to another lane, it fails.
+    let mut moved = stored.clone();
+    moved["lanes"][0]["tag"] = "rust".into();
+    owner(&fake)
+        .put_object(BUCKET, &member_key(8), serde_json::to_vec(&moved).unwrap())
+        .await
+        .unwrap();
+    assert!(store.members().await.is_err());
+
+    let mut old = stored;
+    old.as_object_mut().unwrap().remove("lanes");
+    old.as_object_mut().unwrap().remove("ignoreJobs");
+    owner(&fake)
+        .put_object(BUCKET, &member_key(8), serde_json::to_vec(&old).unwrap())
+        .await
+        .unwrap();
+    let read = store.members().await.unwrap();
+    assert!(read[0].lanes.is_empty() && read[0].ignore_jobs.is_empty());
+    assert_eq!(read[0].runners, with_lanes.runners);
 }
 
 /// The S3 fake with a round trip of 100 ms that counts the requests in flight.

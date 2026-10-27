@@ -22,6 +22,8 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
 const POOL: &str = "glrt-runner-secret";
+/// The token of a spill runner a VM started before D62 still has in `vm.env`; the agent
+/// ignores it.
 const SPILL: &str = "glrt-spill-secret";
 const MEMBER_A: &str = "glrt-member-a-secret";
 const MEMBER_B: &str = "glrt-member-b-secret";
@@ -43,14 +45,13 @@ struct Server {
 }
 
 impl Server {
-    fn set_answer(&self, spill: bool, members: &[(u64, &str)]) {
+    fn set_answer(&self, members: &[(u64, &str)]) {
         let runners: Vec<serde_json::Value> = members
             .iter()
             .map(|(project, token)| serde_json::json!({"projectId": project, "token": token}))
             .collect();
         *self.answer.lock().unwrap() = serde_json::json!({
             "result": "reported",
-            "spill": spill,
             "nextReportS": 10,
             "runners": runners,
             "ms": 1,
@@ -258,7 +259,7 @@ fn one_runner_process_serves_every_entry_and_reloads_its_config() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     let server = Arc::new(Server::default());
-    server.set_answer(false, &[(42, MEMBER_A)]);
+    server.set_answer(&[(42, MEMBER_A)]);
     let serving = Arc::clone(&server);
     std::thread::spawn(move || serve(listener, serving));
 
@@ -317,31 +318,22 @@ fn one_runner_process_serves_every_entry_and_reloads_its_config() {
     let body: serde_json::Value = serde_json::from_str(&report.body).unwrap();
     assert_eq!(
         body,
-        serde_json::json!({"state": "idle", "free": 2, "slots": 2, "spill": 0})
+        serde_json::json!({"state": "idle", "free": 2, "slots": 2})
     );
 
-    // A second member and spill: the next report's answer rewrites the file, the same process
-    // reloads it and polls with all four tokens.
-    server.set_answer(true, &[(42, MEMBER_A), (77, MEMBER_B)]);
+    // A second member: the next report's answer rewrites the file, the same process reloads it
+    // and polls with all three tokens.
+    server.set_answer(&[(42, MEMBER_A), (77, MEMBER_B)]);
     let changed = Instant::now();
-    wait_for("job requests of the added runners", 60, || {
+    wait_for("job requests of the added runner", 60, || {
         let requests = server.requests(changed);
-        (requests.contains_key(MEMBER_B) && requests.contains_key(SPILL)).then_some(())
+        requests.contains_key(MEMBER_B).then_some(())
     });
     let config = fs::read_to_string(&config_path).unwrap();
-    assert_eq!(config.matches("[[runners]]").count(), 4, "{config}");
-    wait_for("the spill report", 30, || {
-        server
-            .reports()
-            .iter()
-            .any(|report| {
-                serde_json::from_str::<serde_json::Value>(&report.body).unwrap()["spill"] == 1
-            })
-            .then_some(())
-    });
+    assert_eq!(config.matches("[[runners]]").count(), 3, "{config}");
 
     // Removed entries stop polling within a few seconds of the rewrite.
-    server.set_answer(false, &[(77, MEMBER_B)]);
+    server.set_answer(&[(77, MEMBER_B)]);
     wait_for("the config with two runners again", 30, || {
         (agent_log()
             .lines()
@@ -395,10 +387,8 @@ fn one_runner_process_serves_every_entry_and_reloads_its_config() {
     for line in [
         r#"info agent started run="run-e2e" pool="vm" slots="2" timeout_s="3600""#,
         r#"info config written runners="2""#,
-        r#"info config written runners="4""#,
+        r#"info config written runners="3""#,
         r#"info state from="starting" to="idle" free="2""#,
-        r#"info spill allowed="true""#,
-        r#"info spill allowed="false""#,
         r#"warn runner exited code="0""#,
     ] {
         assert!(log.lines().any(|l| l == line), "{line} not in:\n{log}");

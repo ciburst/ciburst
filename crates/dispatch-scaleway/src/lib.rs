@@ -17,7 +17,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use ciburst_core::cloud_init::is_sha256;
-use ciburst_core::composite::Composite;
 use ciburst_core::config::{CacheType, Config, parse_config};
 use ciburst_core::dispatch::{Dispatcher, FleetCache};
 use ciburst_core::fleet::FleetStore;
@@ -25,7 +24,6 @@ use ciburst_core::http::{HttpClient, ReqwestClient};
 use ciburst_core::ledger::{GROUP_WAIT_S, Ledger, PipelineRecords, Schedule};
 use ciburst_core::log::Log;
 use ciburst_core::types::{KeyPair, Provider, Secrets};
-use ciburst_hetzner::Hetzner;
 use ciburst_scaleway::client::{Credentials, ScalewayClient};
 use ciburst_scaleway::fleet::{FleetKey, ScalewayFleetStore};
 use ciburst_scaleway::host::vars;
@@ -47,8 +45,6 @@ pub struct Env {
     pub region: String,
     /// Optional override of the callback URL VMs use; by default the webhook's Host header.
     pub dispatch_url: Option<String>,
-    /// `HCLOUD_TOKEN`, required when the config adds the `hetzner` provider.
-    pub hetzner_token: Option<String>,
     /// `CIBURST_AGENT_SHA256`, the agent new VMs download from the cache bucket (D38); a VM
     /// start without it fails naming the variable.
     pub agent_sha256: Option<String>,
@@ -143,17 +139,9 @@ impl Env {
 
         let config = parse_config(&required(vars::CONFIG)?)
             .map_err(|_| EnvError::Invalid(vars::CONFIG.to_string()))?;
-        let config_has_hetzner = config.providers.contains_key(ciburst_hetzner::RUNTIME);
         let mut runner_tokens = BTreeMap::new();
-        let mut spill_tokens = BTreeMap::new();
-        for pool in &config.pools {
-            runner_tokens.insert(pool.tag.clone(), required(&vars::runner_token(&pool.tag))?);
-            // The host sets it for a VM pool with a spill runner only (M6.2 rule R6).
-            if config.is_vm_pool(pool)
-                && let Some(token) = optional(&vars::spill_token(&pool.tag))
-            {
-                spill_tokens.insert(pool.tag.clone(), token);
-            }
+        for tag in ciburst_core::provision::keys::runner_tags(&config) {
+            runner_tokens.insert(tag.clone(), required(&vars::runner_token(&tag))?);
         }
         let cache = match (
             optional(vars::CACHE_ACCESS_KEY),
@@ -166,14 +154,12 @@ impl Env {
             _ => None,
         };
         let secrets = Secrets {
-            spill_tokens,
             hook_token: Some(required(vars::HOOK_TOKEN)?),
             runner_tokens,
             dispatch: None,
             cache,
             vm_secret: optional(vars::VM_SECRET),
             sweep_token: optional(vars::SWEEP_TOKEN),
-            provider_env: BTreeMap::new(),
             dispatcher_env: BTreeMap::new(),
             fleet_key: None,
         };
@@ -204,11 +190,6 @@ impl Env {
             credentials,
             region: required(vars::REGION)?,
             dispatch_url: optional("CIBURST_DISPATCH_URL"),
-            hetzner_token: if config_has_hetzner {
-                Some(required(ciburst_hetzner::TOKEN_VAR)?)
-            } else {
-                None
-            },
             agent_sha256,
             vm_start,
             group_wait: Duration::from_secs(GROUP_WAIT_S),
@@ -228,43 +209,19 @@ impl Env {
         Ok(self.backends_on(http, log))
     }
 
-    /// The `Scaleway` provider, in a [`Composite`] with Hetzner when the config adds it
-    /// (spec D35), the ledger, the records and the schedule, all on `http`.
+    /// The `Scaleway` provider, the ledger, the records and the schedule, all on `http`.
     pub fn backends_on(&self, http: Arc<dyn HttpClient>, log: Log) -> Backends {
         let client = ScalewayClient::new(http.clone(), self.credentials.clone(), &self.region);
-        let main: Arc<dyn Provider> = Arc::new(
-            Scaleway::new(self.config.clone(), Arc::new(client), log.clone())
+        let provider: Arc<dyn Provider> = Arc::new(
+            Scaleway::new(self.config.clone(), Arc::new(client), log)
                 .with_agent_sha256(self.agent_sha256.clone())
                 .with_vm_start(self.vm_start.clone()),
         );
-        let ledger = self.ledger_on(http.clone());
-        let records = self.records_on(http.clone());
-        let schedule = self.schedule_on(http.clone());
-        let fleet = self.fleet_on(http.clone());
-        let Some(token) = &self.hetzner_token else {
-            return Backends::new(main)
-                .with_ledger(ledger)
-                .with_records(records)
-                .with_schedule(schedule)
-                .with_fleet(fleet);
-        };
-        let hetzner: Arc<dyn Provider> = Arc::new(Hetzner::new(
-            self.config.clone(),
-            token.clone(),
-            http,
-            log.clone(),
-        ));
-        let composite = Composite::new(
-            self.config.clone(),
-            main,
-            vec![(ciburst_hetzner::RUNTIME.to_string(), hetzner)],
-            log,
-        );
-        Backends::new(Arc::new(composite))
-            .with_ledger(ledger)
-            .with_records(records)
-            .with_schedule(schedule)
-            .with_fleet(fleet)
+        Backends::new(provider)
+            .with_ledger(self.ledger_on(http.clone()))
+            .with_records(self.records_on(http.clone()))
+            .with_schedule(self.schedule_on(http.clone()))
+            .with_fleet(self.fleet_on(http))
     }
 
     /// The fleet state in the ledger's bucket, under the same key and condition, sealed with
@@ -486,12 +443,11 @@ mod tests {
       "name": "demo",
       "gitlab": { "url": "https://gitlab.example", "projectIds": [7] },
       "host": { "type": "scaleway-function" },
-      "provider": { "type": "scaleway-jobs" },
-      "defaultPool": "ci",
-      "pools": [
-        { "tag": "ci", "image": "img/node" },
-        { "tag": "build-x", "image": "img/kaniko", "stages": ["build"] },
-        { "tag": "vm", "image": "img/docker", "stages": ["vm"], "runtime": "instances", "slots": 2 }
+      "provider": { "type": "scaleway" },
+      "vm": { "image": "img/docker", "slots": 2 },
+      "lanes": [
+        { "tag": "ci", "image": "img/node", "jobs": ["test"] },
+        { "tag": "build-x", "image": "img/kaniko", "jobs": ["build"] }
       ],
       "cache": { "type": "s3" }
     }"#;
@@ -610,7 +566,7 @@ mod tests {
 
     fn event(status: &str, stage: &str) -> Vec<u8> {
         json!({
-            "object_kind": "build", "build_id": 42, "build_stage": stage,
+            "object_kind": "build", "build_id": 42, "build_name": stage, "build_stage": stage,
             "build_status": status, "pipeline_id": 9, "project_id": 7
         })
         .to_string()
@@ -716,6 +672,7 @@ mod tests {
             hook_secret: "hook-7".into(),
             runners: BTreeMap::from([("vm".to_string(), "glrt-7".to_string())]),
             joined_at: NOW,
+            ..Default::default()
         };
         setup.put_member(&member).await.unwrap();
 
@@ -723,29 +680,6 @@ mod tests {
         let fleet = backends.fleet.expect("fleet store");
         assert_eq!(fleet.config().await.unwrap().as_deref(), Some(CONFIG));
         assert_eq!(fleet.members().await.unwrap(), [member]);
-    }
-
-    /// M6.2 rule R6: `RUNNER_SPILL_TOKEN_<TAG>` of a VM pool, optional, as the host sets it.
-    #[test]
-    fn reads_the_spill_tokens_of_vm_pools() {
-        assert!(
-            env_from(&vars_map())
-                .unwrap()
-                .secrets
-                .spill_tokens
-                .is_empty()
-        );
-        let mut spill = vars_map();
-        spill.insert(vars::spill_token("vm"), "glrt-spill".to_string());
-        spill.insert(vars::spill_token("build-x"), "glrt-lane".to_string());
-        let env = env_from(&spill).unwrap();
-        assert_eq!(
-            env.secrets.spill_tokens,
-            BTreeMap::from([("vm".to_string(), "glrt-spill".to_string())]),
-            "a lane has no spill runner"
-        );
-        spill.insert(vars::spill_token("vm"), String::new());
-        assert!(env_from(&spill).unwrap().secrets.spill_tokens.is_empty());
     }
 
     #[test]
@@ -870,8 +804,8 @@ mod tests {
         assert_eq!(status, 200);
         let body = parse(&body);
         assert_eq!(body["result"], "started");
-        assert_eq!(body["pool"], "build-x");
-        let runs = provider.list(Some("build-x")).await.unwrap();
+        assert_eq!(body["pool"], "7-build-x");
+        let runs = provider.list(Some("7-build-x")).await.unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].labels["job"], "42");
         let lines = lines.lock().unwrap();
@@ -1047,7 +981,7 @@ mod tests {
             assert_eq!(content_type.as_deref(), Some("application/json"));
             assert_eq!(
                 parse(&body),
-                json!({ "result": "reported", "spill": false, "nextReportS": 600 })
+                json!({ "result": "reported", "nextReportS": 600 })
             );
         }
         let vms = provider.capacity("vm").await.unwrap().unwrap();
@@ -1125,7 +1059,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_job_pools_keep_counting_runs() {
+    async fn lanes_keep_counting_runs() {
         let env = env_from(&vars_map()).unwrap();
         let provider = fake_provider(&env).await;
         let (status, _, body) = http(
@@ -1139,7 +1073,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, 200);
-        assert_eq!(parse(&body)["pool"], "build-x");
-        assert_eq!(provider.capacity("build-x").await.unwrap(), None);
+        assert_eq!(parse(&body)["pool"], "7-build-x");
+        assert_eq!(provider.capacity("7-build-x").await.unwrap(), None);
     }
 }

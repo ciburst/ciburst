@@ -1,6 +1,5 @@
 //! The runner process, state reports and the drain protocol of spec section 6.1; the member
-//! runners of M6.3 rule R5 and the spill runner of M6.2 rules R6 and R7 as entries of the
-//! runner's `config.toml`.
+//! runners of M6.3 rule R5 as entries of the runner's `config.toml`.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -58,7 +57,6 @@ pub fn busy(docker_ps: &str) -> u32 {
 fn no_answer() -> VmReportAnswer {
     VmReportAnswer {
         runners: Vec::new(),
-        spill: false,
         next_report_s: vm::HEARTBEAT_S,
     }
 }
@@ -196,7 +194,6 @@ impl Agent {
                         state: VmState::Draining,
                         free: 0,
                         slots: self.config.slots,
-                        spill: self.spill(),
                     };
                     // The grace starts only once the dispatcher stopped counting this VM.
                     if self.send_report(&report).await {
@@ -231,17 +228,6 @@ impl Agent {
         })
     }
 
-    /// 1 while `config.toml` holds the spill runner's entry.
-    fn spill(&self) -> u32 {
-        u32::from(self.written.as_ref().is_some_and(|written| written.spill))
-    }
-
-    /// The spill entry belongs in `config.toml` while the last answer allows spill and the VM
-    /// is not draining (M6.2 rule R6, D54).
-    fn spill_wanted(&self) -> bool {
-        self.answer.spill && self.config.spill_token.is_some() && !self.phase.draining()
-    }
-
     fn current_report(&self) -> Option<VmReport> {
         let state = match self.phase {
             Phase::Starting if self.busy? > 0 => VmState::Busy,
@@ -253,7 +239,6 @@ impl Agent {
             state,
             free: self.free_in(self.phase)?,
             slots: self.config.slots,
-            spill: self.spill(),
         })
     }
 
@@ -291,7 +276,7 @@ impl Agent {
                 let answer = response.json::<VmReportAnswer>().unwrap_or_else(|error| {
                     self.log
                         .warn("report answer unreadable", &[("error", &error.to_string())]);
-                    // A garbled answer stops spill but drops no member's runner.
+                    // A garbled answer drops no member's runner.
                     VmReportAnswer {
                         runners: self.answer.runners.clone(),
                         ..no_answer()
@@ -325,10 +310,6 @@ impl Agent {
     }
 
     fn take_answer(&mut self, answer: VmReportAnswer) {
-        if answer.spill != self.answer.spill {
-            self.log
-                .info("spill", &[("allowed", &answer.spill.to_string())]);
-        }
         self.answer = answer;
     }
 
@@ -368,7 +349,7 @@ impl Agent {
     /// Writes `config.toml` when the wanted runners differ from the file's; the runner reloads
     /// it within about a second (`docs/RUNBOOK.md`, M6.3 phase 0).
     fn write_config(&mut self) {
-        let rendered = render(&self.config, &self.answer.runners, self.spill_wanted());
+        let rendered = render(&self.config, &self.answer.runners);
         if self
             .written
             .as_ref()
@@ -494,10 +475,9 @@ mod tests {
     use crate::config::{Config, parse};
     use crate::system::{Clock, Docker, Files, Process, Uptime};
 
-    const SECRETS: [&str; 7] = [
+    const SECRETS: [&str; 6] = [
         "vm-token-secret",
         "glrt-runner-secret",
-        "glrt-spill-secret",
         "glrt-member-a",
         "glrt-member-b",
         "cache-secret-key",
@@ -723,19 +703,18 @@ mod tests {
         json!({"result": "reported", "ms": 3})
     }
 
-    fn spill_answer(spill: bool, next_report_s: u64) -> Value {
-        json!({"result": "reported", "spill": spill, "nextReportS": next_report_s, "ms": 3})
+    fn next_answer(next_report_s: u64) -> Value {
+        json!({"result": "reported", "nextReportS": next_report_s, "ms": 3})
     }
 
     /// An M6.3 answer with member runners as (project id, token).
-    fn member_answer(spill: bool, next_report_s: u64, members: &[(u64, &str)]) -> Value {
+    fn member_answer(next_report_s: u64, members: &[(u64, &str)]) -> Value {
         let runners: Vec<Value> = members
             .iter()
             .map(|(project, token)| json!({"projectId": project, "token": token}))
             .collect();
         json!({
             "result": "reported",
-            "spill": spill,
             "nextReportS": next_report_s,
             "runners": runners,
             "ms": 3,
@@ -846,15 +825,8 @@ mod tests {
         }
 
         /// Accepted and failed `/vm` reports as (time, state, free).
+        /// Accepted and failed `/vm` reports as (time, state, free).
         fn reports(&self) -> Vec<(u64, String, u64)> {
-            self.reports_with_spill()
-                .into_iter()
-                .map(|(at, state, free, _)| (at, state, free))
-                .collect()
-        }
-
-        /// Accepted and failed `/vm` reports as (time, state, free, spill).
-        fn reports_with_spill(&self) -> Vec<(u64, String, u64, u64)> {
             self.sent
                 .lock()
                 .unwrap()
@@ -866,7 +838,6 @@ mod tests {
                         sent.at,
                         body["state"].as_str().unwrap().to_string(),
                         body["free"].as_u64().unwrap(),
-                        body["spill"].as_u64().unwrap(),
                     )
                 })
                 .collect()
@@ -932,10 +903,6 @@ mod tests {
         (at, state.to_string(), free)
     }
 
-    fn spilled(at: u64, state: &str, free: u64, spill: u64) -> (u64, String, u64, u64) {
-        (at, state.to_string(), free, spill)
-    }
-
     fn names(at: u64, names: &[&str]) -> (u64, Vec<String>) {
         (at, names.iter().map(|name| name.to_string()).collect())
     }
@@ -972,7 +939,7 @@ mod tests {
         assert_eq!(h.run_until(0).await, None);
         assert_eq!(h.configs(), [names(0, &["pool"])]);
         let written = h.files.lock().unwrap().writes[0].2.clone();
-        assert_eq!(written, render(&h.config, &[], false).content);
+        assert_eq!(written, render(&h.config, &[]).content);
         let spawns = h.process.lock().unwrap().spawns.clone();
         assert_eq!(spawns, [(0, runner_command(&h.config).args)]);
         assert_eq!(h.reports(), [report(0, "idle", 2)]);
@@ -981,7 +948,7 @@ mod tests {
         assert_eq!(sent.token, h.config.token);
         assert_eq!(
             sent.body.unwrap(),
-            json!({"state": "idle", "free": 2, "slots": 2, "spill": 0})
+            json!({"state": "idle", "free": 2, "slots": 2})
         );
         h.assert_lines(&[
             r#"info config written runners="1""#,
@@ -1310,9 +1277,9 @@ mod tests {
     async fn member_runners_follow_the_answer_and_the_file_changes_only_with_them() {
         let mut h = harness(2, 0);
         h.answer(|now| match now {
-            0..20 => member_answer(false, 15, &[(42, "glrt-member-a")]),
-            20..40 => member_answer(false, 15, &[(77, "glrt-member-b"), (42, "glrt-member-a")]),
-            _ => member_answer(false, 15, &[(77, "glrt-member-b")]),
+            0..20 => member_answer(15, &[(42, "glrt-member-a")]),
+            20..40 => member_answer(15, &[(77, "glrt-member-b"), (42, "glrt-member-a")]),
+            _ => member_answer(15, &[(77, "glrt-member-b")]),
         });
         assert_eq!(h.run_until(120).await, None);
         assert_eq!(
@@ -1337,98 +1304,23 @@ mod tests {
         ]);
         assert_eq!(h.count(r#"info config written runners="2""#), 2);
         assert!(
-            h.reports_with_spill()
+            h.reports()
                 .iter()
-                .all(|(_, state, free, spill)| state == "idle" && *free == 2 && *spill == 0)
+                .all(|(_, state, free)| state == "idle" && *free == 2)
         );
     }
 
     #[tokio::test]
-    async fn an_unreadable_answer_keeps_the_members_and_stops_spill() {
+    async fn an_unreadable_answer_keeps_the_members() {
         let mut h = harness(2, 0);
         h.answer(|now| match now {
-            0..10 => member_answer(true, 15, &[(42, "glrt-member-a")]),
+            0..10 => member_answer(15, &[(42, "glrt-member-a")]),
             _ => Value::Null,
         });
         assert_eq!(h.run_until(30).await, None);
         assert_eq!(
             h.configs(),
-            [
-                names(0, &["pool"]),
-                names(0, &["pool", "member-42", "spill"]),
-                names(20, &["pool", "member-42"]),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn spill_adds_and_removes_the_spill_entry() {
-        let mut h = harness(2, 0);
-        h.job("101", 0, 1000, 2);
-        h.answer(|now| spill_answer(now < 20, 15));
-        assert_eq!(h.run_until(40).await, None);
-        assert_eq!(
-            h.configs(),
-            [
-                names(0, &["pool"]),
-                names(0, &["pool", "spill"]),
-                names(20, &["pool"]),
-            ]
-        );
-        assert_eq!(
-            h.reports_with_spill(),
-            [
-                spilled(0, "busy", 1, 0),
-                spilled(5, "busy", 1, 1),
-                spilled(20, "busy", 1, 1),
-                spilled(25, "busy", 1, 0),
-                spilled(40, "busy", 1, 0),
-            ]
-        );
-        let sent = h.sent.lock().unwrap()[1].clone();
-        assert_eq!(
-            sent.body.unwrap(),
-            json!({"state": "busy", "free": 1, "slots": 2, "spill": 1})
-        );
-        // A busy runner keeps its job: no SIGQUIT, no restart.
-        assert_eq!(h.spawns(), [0]);
-        assert!(h.quits().is_empty());
-        h.assert_lines(&[
-            r#"info spill allowed="true""#,
-            r#"info config written runners="2""#,
-            r#"info spill allowed="false""#,
-        ]);
-    }
-
-    #[tokio::test]
-    async fn without_a_spill_token_no_spill_entry() {
-        let text = SAMPLE
-            .lines()
-            .filter(|line| !line.starts_with("RUNNER_SPILL_TOKEN="))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mut h = harness_from(&text, 0);
-        h.answer(|_| spill_answer(true, 15));
-        assert_eq!(h.run_until(60).await, None);
-        assert_eq!(h.configs(), [names(0, &["pool"])]);
-        assert_eq!(
-            h.reports_with_spill(),
-            [0, 15, 30, 45, 60].map(|at| spilled(at, "idle", 2, 0))
-        );
-    }
-
-    #[tokio::test]
-    async fn no_spill_before_the_first_answer() {
-        let mut h = harness(2, 0);
-        h.respond(|_, now| if now < 12 { 503 } else { 200 });
-        h.answer(|_| spill_answer(true, 600));
-        assert_eq!(h.run_until(10).await, None);
-        assert_eq!(h.reports().len(), 3);
-        assert_eq!(h.configs(), [names(0, &["pool"])]);
-        assert_eq!(h.run_until(15).await, None);
-        assert_eq!(
-            h.configs(),
-            [names(0, &["pool"]), names(15, &["pool", "spill"])]
+            [names(0, &["pool"]), names(0, &["pool", "member-42"])]
         );
     }
 
@@ -1441,7 +1333,7 @@ mod tests {
                 100..200 => 3,
                 _ => 5000,
             };
-            spill_answer(false, next)
+            next_answer(next)
         });
         assert_eq!(h.run_until(1000).await, None);
         let times: Vec<u64> = h.reports().into_iter().map(|(at, _, _)| at).collect();
@@ -1454,23 +1346,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_answer_without_the_new_fields_means_no_spill_and_ten_minutes() {
+    async fn an_answer_without_the_new_fields_means_ten_minutes() {
         let mut h = harness(2, 0);
         h.answer(|now| match now {
-            0..10 => spill_answer(true, 15),
+            0..10 => next_answer(15),
             10..600 => old_answer(),
             _ => Value::Null,
         });
         assert_eq!(h.run_until(1300).await, None);
         assert_eq!(
-            h.reports_with_spill(),
+            h.reports(),
             [
-                spilled(0, "idle", 2, 0),
-                spilled(5, "idle", 2, 1),
-                spilled(20, "idle", 2, 1),
-                spilled(25, "idle", 2, 0),
-                spilled(625, "idle", 2, 0),
-                spilled(1225, "idle", 2, 0),
+                report(0, "idle", 2),
+                report(15, "idle", 2),
+                report(615, "idle", 2),
+                report(1215, "idle", 2),
             ]
         );
         let unreadable = r#"warn report answer unreadable error="json: invalid type: null, expected struct VmReportAnswer at line 1 column 4""#;
@@ -1478,48 +1368,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_spill_entry_while_draining() {
+    async fn the_drain_keeps_the_members_and_the_grace() {
         let mut h = harness(2, 3290);
-        // A dispatcher answers a draining VM with spill false; this one does not.
-        h.answer(|now| spill_answer(now >= 10, 15));
-        assert_eq!(h.run_to_end().await, 0);
-        assert_eq!(h.configs(), [names(0, &["pool"])]);
-        assert_eq!(h.quits(), [40]);
-        assert_eq!(h.terminates(), [45]);
-        assert_eq!(
-            h.reports_with_spill(),
-            [
-                spilled(0, "idle", 2, 0),
-                spilled(10, "draining", 0, 0),
-                spilled(25, "draining", 0, 0),
-                spilled(40, "draining", 0, 0),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn the_drain_removes_the_spill_entry_and_keeps_the_grace() {
-        let mut h = harness(2, 3290);
-        h.answer(|_| member_answer(true, 15, &[(42, "glrt-member-a")]));
+        h.answer(|_| member_answer(15, &[(42, "glrt-member-a")]));
         assert_eq!(h.run_to_end().await, 0);
         assert_eq!(
             h.configs(),
-            [
-                names(0, &["pool"]),
-                names(0, &["pool", "member-42", "spill"]),
-                names(10, &["pool", "member-42"]),
-            ]
+            [names(0, &["pool"]), names(0, &["pool", "member-42"])]
         );
         assert_eq!(h.quits(), [40]);
         assert_eq!(h.terminates(), [45]);
         assert_eq!(
-            h.reports_with_spill(),
+            h.reports(),
             [
-                spilled(0, "idle", 2, 0),
-                spilled(5, "idle", 2, 1),
-                spilled(10, "draining", 0, 1),
-                spilled(15, "draining", 0, 0),
-                spilled(30, "draining", 0, 0),
+                report(0, "idle", 2),
+                report(10, "draining", 0),
+                report(25, "draining", 0),
+                report(40, "draining", 0),
             ]
         );
     }
@@ -1530,9 +1395,9 @@ mod tests {
         h.process.lock().unwrap().quit_delay = 100;
         h.answer(|now| {
             if now < 40 {
-                member_answer(false, 10, &[])
+                member_answer(10, &[])
             } else {
-                member_answer(false, 10, &[(42, "glrt-member-a")])
+                member_answer(10, &[(42, "glrt-member-a")])
             }
         });
         assert_eq!(h.run_to_end().await, 0);
@@ -1551,12 +1416,12 @@ mod tests {
                 200
             }
         });
-        h.answer(|_| member_answer(true, 15, &[(42, "glrt-member-a"), (77, "glrt-member-b")]));
+        h.answer(|_| member_answer(15, &[(42, "glrt-member-a"), (77, "glrt-member-b")]));
         assert_eq!(h.run_to_end().await, 0);
         assert!(
             h.configs()
                 .iter()
-                .any(|(_, names)| names.contains(&"spill".to_string()))
+                .any(|(_, names)| names.contains(&"member-77".to_string()))
         );
         let lines = h.lines();
         assert!(!lines.is_empty());

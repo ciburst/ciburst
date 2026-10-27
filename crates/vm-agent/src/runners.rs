@@ -1,6 +1,6 @@
 //! The `config.toml` of the VM's one `gitlab-runner run` (M6.3 rule R5, D59): `concurrent` is
-//! the VM's slots, one `[[runners]]` entry for the pool runner, one per member runner of the
-//! last report answer and, while spill is allowed, one for the spill runner (D54).
+//! the VM's slots, one `[[runners]]` entry for the VM runner and one per member runner of the
+//! last report answer.
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -18,18 +18,12 @@ pub struct RunnerConfig {
     pub content: String,
     /// `[[runners]]` entries.
     pub runners: usize,
-    /// Whether the spill runner's entry is among them.
-    pub spill: bool,
 }
 
-/// One entry per distinct token: the pool runner first, the members by project id, the spill
-/// runner last, so the same runners always render the same text.
-pub fn render(config: &Config, members: &[VmRunner], spill: bool) -> RunnerConfig {
-    let spill_token = config.spill_token.as_deref().filter(|_| spill);
+/// One entry per distinct token: the VM runner first, then the members by project id, so the
+/// same runners always render the same text.
+pub fn render(config: &Config, members: &[VmRunner]) -> RunnerConfig {
     let mut seen: BTreeSet<&str> = BTreeSet::from([config.runner_token.as_str()]);
-    if let Some(token) = spill_token {
-        seen.insert(token);
-    }
     let mut sorted: Vec<&VmRunner> = members.iter().collect();
     sorted.sort_by_key(|member| member.project_id);
 
@@ -38,9 +32,6 @@ pub fn render(config: &Config, members: &[VmRunner], spill: bool) -> RunnerConfi
         if !member.token.is_empty() && seen.insert(&member.token) {
             entries.push((format!("member-{}", member.project_id), &member.token));
         }
-    }
-    if let Some(token) = spill_token {
-        entries.push(("spill".to_string(), token));
     }
 
     let mut content = String::from("# Written by ciburst-vm-agent.\n");
@@ -52,7 +43,6 @@ pub fn render(config: &Config, members: &[VmRunner], spill: bool) -> RunnerConfi
     RunnerConfig {
         content,
         runners: entries.len(),
-        spill: spill_token.is_some(),
     }
 }
 
@@ -155,18 +145,17 @@ SecretKey = \"cache-secret-key\"
 
     #[test]
     fn without_members_only_the_pool_runner() {
-        let rendered = render(&sample(), &[], false);
+        let rendered = render(&sample(), &[]);
         assert_eq!(
             rendered.content,
             format!("{HEAD}{}", entry_text("pool", "glrt-runner-secret"))
         );
         assert_eq!(rendered.runners, 1);
-        assert!(!rendered.spill);
     }
 
     #[test]
     fn one_member_gets_its_own_entry() {
-        let rendered = render(&sample(), &[member(42, "glrt-member-42")], false);
+        let rendered = render(&sample(), &[member(42, "glrt-member-42")]);
         assert_eq!(
             rendered.content,
             format!(
@@ -185,7 +174,7 @@ SecretKey = \"cache-secret-key\"
             member(10, "glrt-member-10"),
             member(20, "glrt-member-20"),
         ];
-        let rendered = render(&sample(), &members, false);
+        let rendered = render(&sample(), &members);
         assert_eq!(
             rendered.content,
             format!(
@@ -199,51 +188,25 @@ SecretKey = \"cache-secret-key\"
         assert_eq!(rendered.runners, 4);
         let mut reversed = members.to_vec();
         reversed.reverse();
-        assert_eq!(render(&sample(), &reversed, false), rendered);
-    }
-
-    #[test]
-    fn the_spill_entry_comes_last_while_allowed() {
-        let members = [member(7, "glrt-member-7")];
-        let rendered = render(&sample(), &members, true);
-        assert_eq!(
-            rendered.content,
-            format!(
-                "{HEAD}{}{}{}",
-                entry_text("pool", "glrt-runner-secret"),
-                entry_text("member-7", "glrt-member-7"),
-                entry_text("spill", "glrt-spill-secret")
-            )
-        );
-        assert_eq!(rendered.runners, 3);
-        assert!(rendered.spill);
-
-        let mut config = sample();
-        config.spill_token = None;
-        let rendered = render(&config, &members, true);
-        assert_eq!(rendered.runners, 2);
-        assert!(!rendered.spill);
-        assert!(!rendered.content.contains("name = \"spill\""));
+        assert_eq!(render(&sample(), &reversed), rendered);
     }
 
     #[test]
     fn duplicate_and_empty_tokens_get_no_second_entry() {
         let members = [
             member(1, "glrt-runner-secret"),
-            member(2, "glrt-spill-secret"),
+            member(2, "glrt-member-2"),
             member(3, "glrt-member-3"),
             member(4, "glrt-member-3"),
             member(5, ""),
         ];
-        let rendered = render(&sample(), &members, true);
+        let rendered = render(&sample(), &members);
         assert_eq!(rendered.runners, 3);
         assert_eq!(rendered.content.matches("[[runners]]").count(), 3);
+        assert!(rendered.content.contains("name = \"member-2\""));
         assert!(rendered.content.contains("name = \"member-3\""));
         assert!(!rendered.content.contains("member-4"));
-        // Without spill, the spill runner's token may serve as a member's.
-        let rendered = render(&sample(), &members, false);
-        assert_eq!(rendered.runners, 3);
-        assert!(rendered.content.contains("name = \"member-2\""));
+        assert!(!rendered.content.contains("member-1"));
     }
 
     #[test]
@@ -251,7 +214,7 @@ SecretKey = \"cache-secret-key\"
         let mut config = sample();
         config.cache = None;
         config.slots = 3;
-        let rendered = render(&config, &[], false);
+        let rendered = render(&config, &[]);
         assert_eq!(
             rendered.content,
             "# Written by ciburst-vm-agent.\nconcurrent = 3\ncheck_interval = 3\n

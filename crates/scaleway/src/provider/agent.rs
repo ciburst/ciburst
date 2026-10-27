@@ -58,18 +58,13 @@ impl Scaleway {
         self
     }
 
-    /// The pools that run on VMs: own pools on Instances and pools of other providers, whose
-    /// VMs fetch the agent from this bucket too.
-    pub(super) fn vm_pools(&self) -> Result<Vec<&str>> {
-        let mut tags = Vec::new();
-        for pool in &self.config.pools {
-            let vm = self.config.extra_provider_of(pool).is_some()
-                || self.runtime(pool)? == Runtime::Instances;
-            if vm {
-                tags.push(pool.tag.as_str());
-            }
-        }
-        Ok(tags)
+    /// The tags of the run specs that run on VMs: the VM runner's.
+    pub(super) fn vm_pools(&self) -> Result<Vec<String>> {
+        Ok(self
+            .pools_on(Runtime::Instances)?
+            .into_iter()
+            .map(|pool| pool.tag)
+            .collect())
     }
 
     /// Whether a pool runs on VMs, so the cache bucket holds the agent.

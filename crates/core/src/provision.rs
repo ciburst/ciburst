@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use crate::check::{Problem, Suggestion};
 #[cfg(feature = "pipeline")]
 use crate::check::{check_jobs, suggest_ignore_jobs, suggest_lanes};
-use crate::config::{CacheType, Config, SPILL_SUFFIX};
+use crate::config::{CacheType, Config, ProjectConfig};
 use crate::fake::Clock;
 use crate::fleet::{FleetStore, Member};
 use crate::gitlab::{DELIVERIES, Delivery, Gitlab, Hook, Job, REENABLE_TRIGGER};
@@ -28,6 +28,10 @@ pub const REPLAY_MIN_AGE_S: u64 = 60;
 /// Detail of a runner step that only replaces the runner's tags (D47).
 const RETAG: &str = "set tags ";
 
+/// The description suffix of the spill runner of earlier deployments (D54), which `apply` and
+/// `destroy` delete (D62).
+const SPILL_SUFFIX: &str = "-spill";
+
 /// Output keys: `.local/outputs.env`, or project variables in pipeline mode.
 pub mod keys {
     use crate::config::Config;
@@ -42,8 +46,6 @@ pub mod keys {
     pub const DISPATCH_SECRET_KEY: &str = "CIBURST_DISPATCH_SECRET_KEY";
     pub const CACHE_ACCESS_KEY: &str = "CIBURST_CACHE_ACCESS_KEY";
     pub const CACHE_SECRET_KEY: &str = "CIBURST_CACHE_SECRET_KEY";
-    /// Outputs of added providers that the dispatcher needs as secret environment variables.
-    pub const PROVIDER_ENV: [&str; 1] = ["HCLOUD_TOKEN"];
     /// SHA-256 of the uploaded VM agent (M5 rule R3); plain dispatcher environment.
     pub const AGENT_SHA256: &str = "CIBURST_AGENT_SHA256";
     /// Outputs the dispatcher gets as plain environment variables.
@@ -51,8 +53,7 @@ pub mod keys {
     pub const PROJECT_ID: &str = "CIBURST_PROJECT_ID";
     pub const REGISTRY_ENDPOINT: &str = "CIBURST_REGISTRY_ENDPOINT";
 
-    /// Output keys that do not depend on the pools. `PROVIDER_ENV` is not among them: in
-    /// pipeline mode its values never leave memory.
+    /// Output keys that do not depend on the VM runner and the lanes.
     pub const FIXED: [&str; 12] = [
         HOOK_TOKEN,
         VM_SECRET,
@@ -80,35 +81,32 @@ pub mod keys {
             CACHE_SECRET_KEY,
         ]
         .contains(&key)
-            || PROVIDER_ENV.contains(&key)
             || key.starts_with("CIBURST_RUNNER_TOKEN_")
-            || key.starts_with("CIBURST_SPILL_RUNNER_TOKEN_")
     }
 
     /// Keys a provider answers from every `apply` call; they replace stored values.
     pub fn is_refreshed(key: &str) -> bool {
-        PROVIDER_ENV.contains(&key) || DISPATCHER_ENV.contains(&key)
+        DISPATCHER_ENV.contains(&key)
     }
 
-    /// Every output key of a deployment of `config`: the fixed ones, the runner keys of its
-    /// pools and the spill runner keys of its VM pools (M6.2 rule R6).
+    /// Every output key of a deployment of `config`: the fixed ones and the keys of the
+    /// runners of the VM runner and of the host project's lanes.
     pub fn output_keys(config: &Config) -> Vec<String> {
         FIXED
             .iter()
             .map(|key| key.to_string())
             .chain(
-                config
-                    .pools
-                    .iter()
-                    .flat_map(|pool| [runner_id(&pool.tag), runner_token(&pool.tag)]),
+                runner_tags(config)
+                    .into_iter()
+                    .flat_map(|tag| [runner_id(&tag), runner_token(&tag)]),
             )
-            .chain(
-                config
-                    .pools
-                    .iter()
-                    .filter(|pool| config.is_vm_pool(pool))
-                    .flat_map(|pool| [spill_runner_id(&pool.tag), spill_runner_token(&pool.tag)]),
-            )
+            .collect()
+    }
+
+    /// The tags of the host project's runners: the VM runner's, then its lanes'.
+    pub fn runner_tags(config: &Config) -> Vec<String> {
+        std::iter::once(config.vm.tag.clone())
+            .chain(config.lanes.iter().map(|lane| lane.tag.clone()))
             .collect()
     }
 
@@ -118,16 +116,6 @@ pub mod keys {
 
     pub fn runner_token(tag: &str) -> String {
         format!("CIBURST_RUNNER_TOKEN_{}", env_name(tag))
-    }
-
-    /// The id of the spill runner of VM pool `tag` (M6.2 rule R6).
-    pub fn spill_runner_id(tag: &str) -> String {
-        format!("CIBURST_SPILL_RUNNER_ID_{}", env_name(tag))
-    }
-
-    /// The token of the spill runner of VM pool `tag`, a secret (M6.2 rule R6).
-    pub fn spill_runner_token(tag: &str) -> String {
-        format!("CIBURST_SPILL_RUNNER_TOKEN_{}", env_name(tag))
     }
 
     fn env_name(tag: &str) -> String {
@@ -144,13 +132,12 @@ pub mod keys {
 }
 
 pub fn secrets_from_outputs(config: &Config, outputs: &Outputs) -> Secrets {
-    let runner_tokens = config
-        .pools
-        .iter()
-        .filter_map(|pool| {
+    let runner_tokens = keys::runner_tags(config)
+        .into_iter()
+        .filter_map(|tag| {
             outputs
-                .get(&keys::runner_token(&pool.tag))
-                .map(|token| (pool.tag.clone(), token.clone()))
+                .get(&keys::runner_token(&tag))
+                .map(|token| (tag, token.clone()))
         })
         .collect();
     let pair = |access: &str, secret: &str| {
@@ -164,22 +151,8 @@ pub fn secrets_from_outputs(config: &Config, outputs: &Outputs) -> Secrets {
         vm_secret: outputs.get(keys::VM_SECRET).cloned(),
         sweep_token: outputs.get(keys::SWEEP_TOKEN).cloned(),
         runner_tokens,
-        spill_tokens: config
-            .pools
-            .iter()
-            .filter(|pool| config.spill_tags(pool).is_some())
-            .filter_map(|pool| {
-                outputs
-                    .get(&keys::spill_runner_token(&pool.tag))
-                    .map(|token| (pool.tag.clone(), token.clone()))
-            })
-            .collect(),
         dispatch: pair(keys::DISPATCH_ACCESS_KEY, keys::DISPATCH_SECRET_KEY),
         cache: pair(keys::CACHE_ACCESS_KEY, keys::CACHE_SECRET_KEY),
-        provider_env: keys::PROVIDER_ENV
-            .iter()
-            .filter_map(|key| outputs.get(*key).map(|v| (key.to_string(), v.clone())))
-            .collect(),
         dispatcher_env: keys::DISPATCHER_ENV
             .iter()
             .filter_map(|key| outputs.get(*key).map(|v| (key.to_string(), v.clone())))
@@ -188,19 +161,26 @@ pub fn secrets_from_outputs(config: &Config, outputs: &Outputs) -> Secrets {
     }
 }
 
-/// A GitLab runner the config wants: a pool's own runner, or a VM pool's spill runner (M6.2
-/// rule R6). `name` follows `<config name>-` in the description and `runner:` in step ids.
+/// A GitLab runner the config wants: the VM runner's, enabled in every further project, or a
+/// host lane's, in the host project only (D60). `name` follows `<config name>-` in the
+/// description and `runner:` in step ids.
 struct RunnerSpec {
     name: String,
     tags: Vec<String>,
     id_key: String,
     token_key: String,
-    spill: bool,
+    enable: bool,
 }
 
+/// The VM runner or one project's lane in `ciburst status`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolStatus {
+    /// The project of a lane; `None` for the VM runner.
+    pub project: Option<u64>,
+    /// The VM runner's tag or the lane's tag.
     pub tag: String,
+    /// The lane's image; empty for the VM runner.
+    pub image: String,
     pub live: usize,
     pub max_runs: u32,
 }
@@ -208,6 +188,7 @@ pub struct PoolStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Status {
     pub url: Option<String>,
+    /// The VM runner, then each member's lanes, the host's first (M6.4 rule R8).
     pub pools: Vec<PoolStatus>,
     pub runs: Vec<Run>,
     /// The fleet's members, the host first (M6.3 rule R7); empty without fleet state.
@@ -220,7 +201,7 @@ pub struct ProjectReport {
     pub valid: bool,
     pub errors: Vec<String>,
     pub problems: Vec<Problem>,
-    /// Lanes for the Docker-free jobs on VM pools (D46).
+    /// Lanes for the Docker-free jobs on the VM runner (D46).
     pub suggestions: Vec<Suggestion>,
     /// Jobs of other runners that `ignoreJobs` misses (M6.1 rule R8).
     pub ignore: Vec<String>,
@@ -340,15 +321,24 @@ impl Provisioner {
         let hook = secrets.hook_token.clone().unwrap_or_default();
         let now = (self.clock)();
         let mut writes = Vec::new();
+        let vm_tag = &self.config.vm.tag;
+        let runners: std::collections::BTreeMap<String, String> = secrets
+            .runner_tokens
+            .iter()
+            .filter(|(tag, _)| *tag == vm_tag)
+            .map(|(tag, token)| (tag.clone(), token.clone()))
+            .collect();
         for (index, &project_id) in self.config.gitlab.project_ids.iter().enumerate() {
             let existing = members.iter().find(|m| m.project_id == project_id);
             // A further project that joined keeps its own record.
-            let joined = index > 0 && existing.is_some_and(|m| m.runners != secrets.runner_tokens);
+            let joined =
+                index > 0 && existing.is_some_and(|m| m.runners.get(vm_tag) != runners.get(vm_tag));
             let member = Member {
                 project_id,
                 hook_secret: hook.clone(),
-                runners: secrets.runner_tokens.clone(),
+                runners: runners.clone(),
                 joined_at: existing.map_or(now, |m| m.joined_at),
+                ..Member::default()
             };
             let action = match existing {
                 _ if joined => Action::Noop,
@@ -389,29 +379,20 @@ impl Provisioner {
         format!("{}-{name}", self.config.name)
     }
 
-    /// The runners the config wants, in config order: each pool's own runner, and after a VM
-    /// pool its spill runner when lanes spill onto it (M6.2 rule R6).
+    /// The runners the config wants: the VM runner's, carrying only its tag (D62), then one
+    /// per host lane with the lane's tag (D60).
     fn runner_specs(&self) -> Vec<RunnerSpec> {
-        let mut specs = Vec::new();
-        for pool in &self.config.pools {
-            specs.push(RunnerSpec {
-                name: pool.tag.clone(),
-                tags: self.config.runner_tags(pool),
-                id_key: keys::runner_id(&pool.tag),
-                token_key: keys::runner_token(&pool.tag),
-                spill: false,
-            });
-            if let Some(tags) = self.config.spill_tags(pool) {
-                specs.push(RunnerSpec {
-                    name: format!("{}{SPILL_SUFFIX}", pool.tag),
-                    tags,
-                    id_key: keys::spill_runner_id(&pool.tag),
-                    token_key: keys::spill_runner_token(&pool.tag),
-                    spill: true,
-                });
-            }
-        }
-        specs
+        keys::runner_tags(&self.config)
+            .into_iter()
+            .enumerate()
+            .map(|(index, tag)| RunnerSpec {
+                name: tag.clone(),
+                tags: vec![tag.clone()],
+                id_key: keys::runner_id(&tag),
+                token_key: keys::runner_token(&tag),
+                enable: index == 0,
+            })
+            .collect()
     }
 
     fn primary_project(&self) -> u64 {
@@ -438,9 +419,6 @@ impl Provisioner {
                 Action::Create,
                 format!("gitlab runner {description}"),
             );
-            if spec.spill {
-                step.detail = Some(format!("tags {}", spec.tags.join(", ")));
-            }
             if existing.is_some() && rotate {
                 step.action = Action::Update;
                 step.detail = Some("delete and recreate, new token".into());
@@ -475,13 +453,19 @@ impl Provisioner {
             for spec in &specs {
                 let description = self.runner_description(&spec.name);
                 let present = enabled.iter().any(|r| r.description == description);
+                // D60: a host lane's runner serves the host project only; an earlier
+                // deployment enabled it in every project.
+                let action = match (spec.enable, present) {
+                    (true, true) | (false, false) => Action::Noop,
+                    (true, false) => Action::Create,
+                    (false, true) => Action::Delete,
+                };
+                if !spec.enable && action == Action::Noop {
+                    continue;
+                }
                 steps.push(Step::new(
                     format!("runner-enable:{project_id}:{}", spec.name),
-                    if present {
-                        Action::Noop
-                    } else {
-                        Action::Create
-                    },
+                    action,
                     format!("gitlab runner {description} enabled in project {project_id}"),
                 ));
             }
@@ -490,8 +474,9 @@ impl Provisioner {
     }
 
     /// Names of runners this deployment created that the config no longer wants: described
-    /// `<name>-<x>` and carrying the tag `<x>`, or for a spill runner `<name>-<vm tag>-spill` the
-    /// tag `<vm tag>`, so another deployment's runners never match.
+    /// `<name>-<x>` and carrying the tag `<x>`, or for the spill runner of an earlier
+    /// deployment `<name>-<vm tag>-spill` the tag `<vm tag>`, so another deployment's runners
+    /// never match.
     async fn orphan_runners(
         &self,
         gitlab: &Gitlab,
@@ -620,8 +605,10 @@ impl Provisioner {
                 .await?;
             created.insert(spec.id_key.clone(), runner.id.to_string());
             created.insert(spec.token_key.clone(), runner.token.clone());
-            for &project_id in self.other_projects() {
-                gitlab.enable_runner(project_id, runner.id).await?;
+            if spec.enable {
+                for &project_id in self.other_projects() {
+                    gitlab.enable_runner(project_id, runner.id).await?;
+                }
             }
             self.log.info(
                 "runner",
@@ -645,6 +632,23 @@ impl Provisioner {
             let Some(spec) = specs.iter().find(|spec| spec.name == name) else {
                 continue;
             };
+            if step.action == Action::Delete {
+                let project_id: u64 = project.parse().map_err(|_| Error::other("bad step id"))?;
+                let description = self.runner_description(&spec.name);
+                if let Some(runner) = gitlab
+                    .list_runners(project_id)
+                    .await?
+                    .into_iter()
+                    .find(|r| r.description == description)
+                {
+                    gitlab.disable_runner(project_id, runner.id).await?;
+                    self.log.info(
+                        "runner_disabled",
+                        &[("project", project), ("runner", &spec.name)],
+                    );
+                }
+                continue;
+            }
             if created.contains_key(&spec.id_key) {
                 continue;
             }
@@ -720,10 +724,8 @@ impl Provisioner {
     /// `/terminate` fail, and the sweep ends it once silent, even mid-job.
     async fn refuse_vm_rotation_while_running(&self) -> Result<()> {
         let mut running = 0;
-        for pool in &self.config.pools {
-            if let Some(vms) = self.provider.capacity(&pool.tag).await? {
-                running += vms.len();
-            }
+        if let Some(vms) = self.provider.capacity(&self.config.vm.tag).await? {
+            running += vms.len();
         }
         if running > 0 {
             return Err(Error::other(format!(
@@ -894,7 +896,8 @@ impl Provisioner {
             }
         };
         let now = (self.clock)();
-        let tags: BTreeSet<&str> = self.config.pools.iter().map(|p| p.tag.as_str()).collect();
+        let runner_tags = keys::runner_tags(&self.config);
+        let tags: BTreeSet<&str> = runner_tags.iter().map(String::as_str).collect();
         for &project_id in &self.config.gitlab.project_ids {
             let project = project_id.to_string();
             let jobs = match gitlab.list_pending_jobs(project_id).await {
@@ -989,24 +992,26 @@ impl Provisioner {
                 }
             }
             let runners = gitlab.list_runners(self.primary_project()).await?;
-            // Every VM pool's spill runner, also one whose lanes left the config since.
-            let mut named: Vec<(String, String)> = Vec::new();
-            for pool in &self.config.pools {
-                named.push((pool.tag.clone(), keys::runner_id(&pool.tag)));
-                if self.config.is_vm_pool(pool) {
-                    named.push((
-                        format!("{}{SPILL_SUFFIX}", pool.tag),
-                        keys::spill_runner_id(&pool.tag),
-                    ));
-                }
-            }
+            // The host's runners, and the spill runner an earlier deployment may have left.
+            let mut named: Vec<(String, Option<String>)> = keys::runner_tags(&self.config)
+                .into_iter()
+                .map(|tag| {
+                    let id_key = keys::runner_id(&tag);
+                    (tag, Some(id_key))
+                })
+                .collect();
+            named.push((format!("{}{SPILL_SUFFIX}", self.config.vm.tag), None));
             for (name, id_key) in named {
                 let description = self.runner_description(&name);
                 let id = runners
                     .iter()
                     .find(|r| r.description == description)
                     .map(|r| r.id)
-                    .or_else(|| current.get(&id_key).and_then(|id| id.parse().ok()));
+                    .or_else(|| {
+                        id_key
+                            .and_then(|key| current.get(&key).cloned())
+                            .and_then(|id| id.parse().ok())
+                    });
                 if let Some(id) = id {
                     gitlab.delete_runner(id).await?;
                 }
@@ -1021,25 +1026,45 @@ impl Provisioner {
 
     pub async fn status(&self) -> Result<Status> {
         let runs = self.provider.list(None).await?;
-        let pools = self
-            .config
-            .pools
-            .iter()
-            .map(|pool| PoolStatus {
-                tag: pool.tag.clone(),
-                live: runs
-                    .iter()
-                    .filter(|run| run.pool == pool.tag && run.state.is_live())
-                    .count(),
-                max_runs: pool.max_runs,
-            })
-            .collect();
         let mut members = match self.stored_fleet().await? {
             Some(fleet) => fleet.members().await?,
             None => Vec::new(),
         };
         let host = self.primary_project();
         members.sort_by_key(|m| (m.project_id != host, m.project_id));
+        let live = |key: &str| {
+            runs.iter()
+                .filter(|run| run.pool == key && run.state.is_live())
+                .count()
+        };
+        let mut pools = vec![PoolStatus {
+            project: None,
+            tag: self.config.vm.tag.clone(),
+            image: String::new(),
+            live: live(&self.config.vm.tag),
+            max_runs: self.config.vm.max_runs,
+        }];
+        // M6.4 rule R8: the host's lanes from the config, every other member's from its record.
+        for lane in &self.config.lanes {
+            pools.push(PoolStatus {
+                project: Some(host),
+                tag: lane.tag.clone(),
+                image: lane.image.clone(),
+                live: live(&crate::config::lane_key(host, &lane.tag)),
+                max_runs: lane.max_runs,
+            });
+        }
+        for member in members.iter().filter(|m| m.project_id != host) {
+            for lane in &member.lanes {
+                pools.push(PoolStatus {
+                    project: Some(member.project_id),
+                    tag: lane.tag.clone(),
+                    image: lane.image.clone(),
+                    live: live(&crate::config::lane_key(member.project_id, &lane.tag)),
+                    max_runs: lane.max_runs,
+                });
+            }
+        }
         Ok(Status {
             url: self.host.url().await?,
             pools,
@@ -1103,7 +1128,11 @@ impl Provisioner {
             .as_ref()
             .ok_or_else(|| Error::other("check needs a GitLab token"))?;
         let url = self.host.url().await?;
-        let projects = self.projects().await?;
+        let mut projects = config_projects(&self.config);
+        for member in self.joined_members().await? {
+            let settings = member.project_config();
+            projects.push((member.project_id, settings));
+        }
         check_projects(&self.config, gitlab, &projects, content_ref, url.as_deref()).await
     }
 }
@@ -1129,9 +1158,29 @@ async fn dispatcher_hook(gitlab: &Gitlab, project_id: u64, url: &str) -> Result<
         .find(|hook| hook.url == url))
 }
 
-/// Lints every project's pipeline at `content_ref` (the default branch when `None`), compares
-/// its jobs with the routing of the config and proposes lanes (D46). With the dispatcher's
-/// `url` it also reads each project's hook to it (D51). Needs only the config and GitLab.
+/// The projects of `gitlab.projectIds`, each with its own settings (M6.4 rule R8): the host's
+/// lanes and `ignoreJobs`, none for the further projects, which use the host's VM runner.
+pub fn config_projects(config: &Config) -> Vec<(u64, ProjectConfig)> {
+    let host = config.host_project();
+    config
+        .gitlab
+        .project_ids
+        .iter()
+        .map(|&id| {
+            let settings = if id == host {
+                config.project()
+            } else {
+                ProjectConfig::default()
+            };
+            (id, settings)
+        })
+        .collect()
+}
+
+/// Lints the host project's pipeline at `content_ref` (the default branch when `None`),
+/// compares its jobs with its own lanes and `ignoreJobs` and proposes lanes (D46, M6.4 rule
+/// R8). With the dispatcher's `url` it also reads the project's hook to it (D51). Needs only
+/// the config and GitLab.
 #[cfg(feature = "pipeline")]
 pub async fn check(
     config: &Config,
@@ -1139,21 +1188,24 @@ pub async fn check(
     content_ref: Option<&str>,
     url: Option<&str>,
 ) -> Result<Vec<ProjectReport>> {
-    check_projects(config, gitlab, &config.gitlab.project_ids, content_ref, url).await
+    check_projects(config, gitlab, &config_projects(config), content_ref, url).await
 }
 
-/// [`check`] of `projects`, the config's and the fleet's members (M6.3 rule R7). A project
-/// outside the config that the token may not read is reported `unreadable`.
+/// [`check`] of `projects`, each with its own settings (M6.4 rule R8): the config's and the
+/// fleet's members (M6.3 rule R7). A project outside the config that the token may not read is
+/// reported `unreadable`.
 #[cfg(feature = "pipeline")]
 pub async fn check_projects(
     config: &Config,
     gitlab: &Gitlab,
-    projects: &[u64],
+    projects: &[(u64, ProjectConfig)],
     content_ref: Option<&str>,
     url: Option<&str>,
 ) -> Result<Vec<ProjectReport>> {
     let mut report = Vec::new();
-    for &project_id in projects {
+    let vm_tag = config.vm.tag.as_str();
+    for (project_id, settings) in projects {
+        let project_id = *project_id;
         let read = async {
             let hook = match url {
                 Some(url) => dispatcher_hook(gitlab, project_id, url).await?,
@@ -1185,9 +1237,9 @@ pub async fn check_projects(
                 None => Pipeline::default(),
             };
             (
-                check_jobs(config, &lint.jobs, &pipeline),
-                suggest_lanes(config, &lint.jobs, &pipeline),
-                suggest_ignore_jobs(config, &lint.jobs),
+                check_jobs(vm_tag, settings, &lint.jobs, &pipeline),
+                suggest_lanes(vm_tag, settings, &lint.jobs, &pipeline),
+                suggest_ignore_jobs(vm_tag, settings, &lint.jobs),
             )
         } else {
             (Vec::new(), Vec::new(), Vec::new())
@@ -1249,23 +1301,27 @@ mod tests {
     }
 
     #[test]
-    fn output_keys_cover_the_pools_and_leave_provider_env_out() {
+    fn output_keys_cover_the_vm_runner_and_the_lanes() {
         let config = Config::ci_defaults(5, "https://gitlab.example");
         let all = keys::output_keys(&config);
-        assert_eq!(all.len(), keys::FIXED.len() + 4);
+        assert_eq!(all.len(), keys::FIXED.len() + 2);
         assert!(all.contains(&keys::runner_token("vm")));
         assert!(all.contains(&keys::runner_id("vm")));
-        assert!(all.contains(&"CIBURST_SPILL_RUNNER_ID_VM".to_string()));
-        assert!(all.contains(&"CIBURST_SPILL_RUNNER_TOKEN_VM".to_string()));
         assert_eq!(
-            keys::spill_runner_token("node-24"),
-            "CIBURST_SPILL_RUNNER_TOKEN_NODE_24"
+            keys::runner_token("node-24"),
+            "CIBURST_RUNNER_TOKEN_NODE_24"
         );
-        assert!(keys::is_secret(&keys::spill_runner_token("vm")));
-        assert!(!keys::is_secret(&keys::spill_runner_id("vm")));
+        assert!(keys::is_secret(&keys::runner_token("vm")));
+        assert!(!keys::is_secret(&keys::runner_id("vm")));
+        let mut lanes = config.clone();
+        lanes.lanes = vec![
+            serde_json::from_value(json!({ "tag": "node", "image": "node:24", "jobs": ["a"] }))
+                .unwrap(),
+        ];
+        let all = keys::output_keys(&lanes);
+        assert_eq!(all.len(), keys::FIXED.len() + 4);
+        assert!(all.contains(&keys::runner_token("node")));
         assert!(all.contains(&keys::AGENT_SHA256.to_string()));
-        assert!(!all.iter().any(|k| keys::PROVIDER_ENV.contains(&k.as_str())));
-        assert!(keys::is_refreshed("HCLOUD_TOKEN"));
         assert!(keys::is_refreshed(keys::AGENT_SHA256));
         assert!(!keys::is_refreshed(keys::DISPATCH_SECRET_KEY));
     }

@@ -12,7 +12,6 @@ crate-type = ["lib"]
 [dependencies]
 axum.workspace = true
 ciburst-core = { path = "../core", version = "0.1.0" }
-ciburst-hetzner = { path = "../hetzner", version = "0.1.0" }
 ciburst-scaleway = { path = "../scaleway", version = "0.1.0" }
 http.workspace = true
 serde_json.workspace = true

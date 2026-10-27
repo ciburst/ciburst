@@ -447,6 +447,19 @@ impl Gitlab {
         .json()
     }
 
+    /// Disables a runner in a project other than its owner project
+    /// (`DELETE /projects/:id/runners/:runner_id`).
+    pub async fn disable_runner(&self, project_id: u64, runner_id: u64) -> Result<()> {
+        self.call(
+            "DELETE",
+            &format!("/projects/{project_id}/runners/{runner_id}"),
+            &[],
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn delete_runner(&self, runner_id: u64) -> Result<()> {
         self.call("DELETE", &format!("/runners/{runner_id}"), &[], None)
             .await?;

@@ -132,7 +132,7 @@ impl Scaleway {
             .await?;
         let mut images = BTreeMap::new();
         for pool in pools {
-            for commercial_type in instance_types(pool) {
+            for commercial_type in instance_types(&pool) {
                 if images.contains_key(&commercial_type) {
                     continue;
                 }

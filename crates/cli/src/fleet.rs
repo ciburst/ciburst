@@ -1,11 +1,13 @@
 //! M6.3 rules R3 and R4 on the command line: `invite` in the host, `join` and `leave` in a
-//! member's pipeline.
+//! member's pipeline. A member joins with its own lanes and `ignoreJobs` from its own
+//! `ciburst.json` (D60, D61, M6.4 rule R5).
 
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ciburst_core::config::{DEFAULT_VM_TAG, ProjectConfig, parse_project_config};
 use ciburst_core::dispatch::{PATH_FLEET, PATH_JOIN, PATH_LEAVE};
 use ciburst_core::gitlab::Gitlab;
 use ciburst_core::http::{HttpClient, Request, Response};
@@ -21,20 +23,26 @@ pub const JOIN_VAR: &str = "CIBURST_JOIN";
 /// The project, id or path, the host's `ciburst-invite` makes a code for.
 pub const INVITE_VAR: &str = "CIBURST_INVITE";
 
-/// The answer of `GET /fleet`.
+/// The answer of `GET /fleet`: the fleet's name, its VM runner and the member's webhook secret.
 #[derive(Debug, Deserialize)]
 struct FleetInfo {
     name: String,
-    pools: Vec<FleetPool>,
+    vm: Option<FleetVm>,
     #[serde(rename = "hookSecret")]
     hook_secret: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct FleetPool {
+struct FleetVm {
     tag: String,
-    #[serde(default)]
-    tags: Vec<String>,
+}
+
+impl FleetInfo {
+    fn vm_tag(&self) -> &str {
+        self.vm
+            .as_ref()
+            .map_or(DEFAULT_VM_TAG, |vm| vm.tag.as_str())
+    }
 }
 
 pub fn now() -> u64 {
@@ -145,8 +153,12 @@ async fn call(
     response.json()
 }
 
-/// `ciburst --ci join` (M6.3 rule R4): one runner per fleet pool in this project with the
-/// pool's tags, the webhook with the member's secret, then `/join` with the runner tokens.
+/// `ciburst --ci join` (M6.3 rule R4, M6.4 rule R5): the member's own `ciburst.json`
+/// (`project_file`; none means no lanes and no `ignoreJobs`) is validated first, then this
+/// project's earlier runners of the fleet go, one runner for the fleet's VM runner and one per
+/// lane are registered in this project, the webhook gets the member's secret, and `/join`
+/// receives the runner tokens, the lanes and `ignoreJobs`.
+#[allow(clippy::too_many_arguments)]
 pub async fn join(
     out: &mut dyn Write,
     gitlab: &Gitlab,
@@ -154,31 +166,35 @@ pub async fn join(
     log: &Log,
     project_id: u64,
     code: &str,
+    project_file: Option<&str>,
     now: u64,
 ) -> Result<i32> {
     let invite = member_invite(code, project_id, now, false)?;
     let fleet: FleetInfo =
         serde_json::from_value(call(http, "GET", &invite, PATH_FLEET, code, None).await?)?;
-    let existing = gitlab.list_runners(project_id).await?;
-    let mut runners = BTreeMap::new();
-    for pool in &fleet.pools {
-        let description = format!("{}-{}", fleet.name, pool.tag);
-        for runner in existing.iter().filter(|r| r.description == description) {
+    let vm_tag = fleet.vm_tag().to_string();
+    let settings = match project_file {
+        Some(text) => parse_project_config(text, &fleet.name, &vm_tag, project_id)?,
+        None => ProjectConfig::default(),
+    };
+    let prefix = format!("{}-", fleet.name);
+    for runner in gitlab.list_runners(project_id).await? {
+        if runner.description.starts_with(&prefix) {
             gitlab.delete_runner(runner.id).await?;
         }
-        let tags = if pool.tags.is_empty() {
-            vec![pool.tag.clone()]
-        } else {
-            pool.tags.clone()
-        };
+    }
+    let register = async |tag: &str| -> Result<String> {
+        let description = format!("{prefix}{tag}");
         let runner = gitlab
-            .create_runner(project_id, &tags, &description)
+            .create_runner(project_id, &[tag.to_string()], &description)
             .await?;
-        log.info(
-            "runner",
-            &[("pool", &pool.tag), ("id", &runner.id.to_string())],
-        );
-        runners.insert(pool.tag.clone(), runner.token);
+        log.info("runner", &[("tag", tag), ("id", &runner.id.to_string())]);
+        Ok(runner.token)
+    };
+    let runners = BTreeMap::from([(vm_tag.clone(), register(&vm_tag).await?)]);
+    let mut lane_runners = BTreeMap::new();
+    for lane in &settings.lanes {
+        lane_runners.insert(lane.tag.clone(), register(&lane.tag).await?);
     }
     let hooks = gitlab.list_hooks(project_id).await?;
     match hooks.iter().find(|h| same_url(&h.url, &invite.url)) {
@@ -194,25 +210,27 @@ pub async fn join(
         }
     }
     log.info("hook", &[("project", &project_id.to_string())]);
-    let answer = call(
-        http,
-        "POST",
-        &invite,
-        PATH_JOIN,
-        code,
-        Some(&json!({ "runners": runners })),
-    )
-    .await?;
+    let body = json!({
+        "runners": runners,
+        "lanes": settings.lanes,
+        "laneRunners": lane_runners,
+        "ignoreJobs": settings.ignore_jobs,
+    });
+    let answer = call(http, "POST", &invite, PATH_JOIN, code, Some(&body)).await?;
     let name = answer
         .get("fleet")
         .and_then(Value::as_str)
         .unwrap_or(&fleet.name);
+    for lane in &settings.lanes {
+        writeln!(out, "lane {} ({})", lane.tag, lane.image)?;
+    }
     writeln!(out, "joined fleet {name}")?;
     Ok(0)
 }
 
-/// `ciburst --ci leave` (M6.3 rule R4): `/leave`, then the member's runners and webhook go.
-/// An expired code still leaves.
+/// `ciburst --ci leave` (M6.3 rule R4, M6.4 rule R5): `/leave`, which deletes the member's
+/// lane definitions and record, then the member's runners and webhook go. An expired code
+/// still leaves.
 pub async fn leave(
     out: &mut dyn Write,
     gitlab: &Gitlab,

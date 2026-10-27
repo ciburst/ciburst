@@ -39,11 +39,8 @@ fn config() -> Arc<Config> {
                 "gitlab": { "url": "https://gitlab.example", "projectIds": [7, 8] },
                 "host": { "type": "fake" },
                 "provider": { "type": "fake" },
-                "defaultPool": "ci",
-                "pools": [
-                    { "tag": "ci", "image": "img/node", "stages": ["test"] },
-                    { "tag": "build", "image": "img/node", "stages": ["build"] }
-                ],
+                "vm": { "tag": "ci", "image": "img/node" },
+                "lanes": [ { "tag": "build", "image": "img/node", "jobs": ["image"] } ],
                 "cache": { "type": "s3" }
             })
             .to_string(),
@@ -373,7 +370,7 @@ async fn a_disabled_hook_is_enabled_before_the_replay() {
     assert!(reenabled < replayed, "{lines:?}");
 }
 
-/// M6.2 rule R6: lane jobs that no spill slot took wait for their lane's tag.
+/// Lane jobs wait for their lane's tag, which the host's lane runner carries.
 #[tokio::test]
 async fn jobs_waiting_for_a_lane_tag_are_replayed_too() {
     let mut s = Setup::new();
@@ -384,11 +381,8 @@ async fn jobs_waiting_for_a_lane_tag_are_replayed_too() {
                 "gitlab": { "url": "https://gitlab.example", "projectIds": [7] },
                 "host": { "type": "fake" },
                 "provider": { "type": "fake" },
-                "defaultPool": "vm",
-                "pools": [
-                    { "tag": "vm", "image": "ubuntu:24.04", "runtime": "instances" },
-                    { "tag": "node-24", "image": "node:24", "runtime": "jobs", "jobs": ["lint"] }
-                ],
+                "vm": { "image": "ubuntu:24.04" },
+                "lanes": [ { "tag": "node-24", "image": "node:24", "jobs": ["lint"] } ],
                 "cache": { "type": "s3" }
             })
             .to_string(),

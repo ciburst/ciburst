@@ -23,11 +23,8 @@ fn config(project_ids: &[u64]) -> Arc<Config> {
         "gitlab": { "url": "https://gitlab.example", "projectIds": project_ids },
         "host": { "type": "fake" },
         "provider": { "type": "fake" },
-        "defaultPool": "ci",
-        "pools": [
-            { "tag": "ci", "image": "img/node", "stages": ["test"] },
-            { "tag": "build", "image": "img/kaniko", "stages": ["build"] }
-        ],
+        "vm": { "tag": "ci", "image": "img/node" },
+        "lanes": [ { "tag": "build", "image": "img/kaniko", "jobs": ["image"] } ],
         "cache": { "type": "s3" }
     });
     Arc::new(parse_config(&raw.to_string()).unwrap())
@@ -93,7 +90,7 @@ async fn plans_everything_applies_then_plans_nothing() {
         "key:cache",
         "bucket",
         "definition:ci",
-        "definition:build",
+        "definition:7-build",
         "runner:ci",
         "runner:build",
         "dispatcher",
@@ -177,7 +174,7 @@ async fn secrets_reach_the_dispatcher_and_status_counts_runs() {
             status.pools[0].live,
             status.pools[0].max_runs
         ),
-        ("ci", 1, 10)
+        ("ci", 1, 4)
     );
     assert_eq!(
         (status.pools[1].tag.as_str(), status.pools[1].live),
@@ -255,12 +252,20 @@ async fn enables_runners_and_hooks_in_every_project() {
     assert_eq!(a["hook:8"], Action::Create);
     s.provisioner.apply(&[]).await.unwrap();
     assert_eq!(s.fake.runner_count(), 2);
-    assert!(
-        s.fake
-            .runner_projects()
-            .iter()
-            .all(|(_, projects)| projects.contains(&8))
+    let values = s.outputs.read().await.unwrap();
+    let projects: BTreeMap<u64, Vec<u64>> = s.fake.runner_projects().into_iter().collect();
+    let id = |tag: &str| -> u64 { values[&keys::runner_id(tag)].parse().unwrap() };
+    assert_eq!(
+        projects[&id("ci")],
+        [7, 8],
+        "the VM runner serves every project"
     );
+    assert_eq!(
+        projects[&id("build")],
+        [7],
+        "D60: a lane serves its project only"
+    );
+    assert!(!a.contains_key("runner-enable:8:build"));
     assert_eq!(s.fake.hooks().len(), 2);
     let again = s.provisioner.plan(&[]).await.unwrap();
     assert!(all(&again, Action::Noop), "{again:?}");
@@ -356,7 +361,7 @@ async fn works_without_gitlab() {
 }
 
 #[tokio::test]
-async fn checks_pipelines_against_the_stage_map() {
+async fn checks_each_project_against_its_own_lanes() {
     let s = setup(config(&[7, 8, 9]), true);
     let job = |name: &str, stage: &str, tags: &[&str]| LintJob {
         name: name.into(),
@@ -364,7 +369,7 @@ async fn checks_pipelines_against_the_stage_map() {
         tag_list: tags.iter().map(|t| t.to_string()).collect(),
     };
     s.fake.set_jobs(7, vec![job("unit", "test", &["ci"])]);
-    s.fake.set_jobs(8, vec![job("image", "build", &["ci"])]);
+    s.fake.set_jobs(8, vec![job("image", "build", &["build"])]);
     s.fake.set_lint_errors(9, vec!["invalid yaml".into()]);
     let report = s.provisioner.check(None).await.unwrap();
     let summary: Vec<(u64, bool, usize, usize)> = report
@@ -378,259 +383,102 @@ async fn checks_pipelines_against_the_stage_map() {
     assert_eq!(report[1].problems[0].job, "image");
 }
 
-fn lanes_config(rust_vm_first: bool) -> Arc<Config> {
+fn lanes_config() -> Arc<Config> {
     let raw = json!({
         "name": "demo",
         "gitlab": { "url": "https://gitlab.example", "projectIds": [7, 8] },
         "host": { "type": "fake" },
         "provider": { "type": "fake" },
-        "defaultPool": "vm",
-        "pools": [
-            { "tag": "vm", "image": "ubuntu:24.04", "runtime": "instances" },
-            { "tag": "node-24", "image": "node:24-bookworm-slim", "runtime": "jobs", "jobs": ["lint"] },
-            { "tag": "rust-1", "image": "rust:1.96.0-bookworm", "runtime": "jobs",
-              "jobs": ["clippy"], "vmFirst": rust_vm_first }
+        "vm": { "image": "ubuntu:24.04" },
+        "lanes": [
+            { "tag": "node-24", "image": "node:24-bookworm-slim", "jobs": ["lint"] },
+            { "tag": "rust-1", "image": "rust:1.96.0-bookworm", "jobs": ["clippy"] }
         ],
         "cache": { "type": "s3" }
     });
     Arc::new(parse_config(&raw.to_string()).unwrap())
 }
 
-/// [`lanes_config`] with `vmFirst` of both lanes given.
-fn spill_config(node_vm_first: bool, rust_vm_first: bool) -> Arc<Config> {
-    let mut config = (*lanes_config(rust_vm_first)).clone();
-    config.pools[1].vm_first = Some(node_vm_first);
-    config.spill_runner = true;
-    Arc::new(config)
-}
-
-/// D55: without `spillRunner` the VM pool's own runner carries the `vmFirst` lanes' tags, and a
-/// spill runner from before goes, so polling VM slots take lane jobs when no job event arrives.
+/// D60, D62: the VM runner carries only its own tag and is enabled in every project; each
+/// host lane gets a runner in the host project only. The lane tags an earlier deployment put
+/// on the VM runner, its spill runner and its lane runners enabled elsewhere go.
 #[tokio::test]
-async fn without_the_spill_runner_the_vm_runner_carries_the_lane_tags() {
-    let fake = Arc::new(FakeGitlab::new());
-    let store = Arc::new(MemoryStore::new());
-    let host_store = Arc::new(MemoryStore::new());
-    let outputs = Arc::new(MemoryOutputs::new());
-    let provisioner = |config: Arc<Config>| {
-        Provisioner::new(
-            config.clone(),
-            Arc::new(FakeProvider::new(config.clone(), store.clone())),
-            Arc::new(FakeHost::new(config.clone(), host_store.clone())),
-            Some(Arc::new(Gitlab::new(
-                &config.gitlab.url,
-                FAKE_TOKEN,
-                fake.clone(),
-            ))),
-            outputs.clone(),
-            Log::silent(),
-        )
-    };
-    provisioner(spill_config(true, false))
-        .apply(&[])
+async fn the_vm_runner_carries_only_its_tag_and_lane_runners_stay_in_the_host() {
+    let s = setup(lanes_config(), true);
+    s.provisioner.apply(&[]).await.unwrap();
+    let values = s.outputs.read().await.unwrap();
+    let id_of = |tag: &str| -> u64 { values[&keys::runner_id(tag)].parse().unwrap() };
+    let (vm, node, rust) = (id_of("vm"), id_of("node-24"), id_of("rust-1"));
+    assert_eq!(s.fake.runner_tags(vm).unwrap(), ["vm"]);
+    assert_eq!(s.fake.runner_tags(node).unwrap(), ["node-24"]);
+    assert_eq!(s.fake.runner_tags(rust).unwrap(), ["rust-1"]);
+    let projects: BTreeMap<u64, Vec<u64>> = s.fake.runner_projects().into_iter().collect();
+    assert_eq!(projects[&vm], [7, 8]);
+    assert_eq!(projects[&node], [7]);
+    assert_eq!(projects[&rust], [7]);
+    assert!(all(&s.provisioner.plan(&[]).await.unwrap(), Action::Noop));
+
+    // What an earlier deployment left: lane tags on the VM runner, a spill runner, a lane
+    // runner enabled in the further project.
+    let gitlab = Gitlab::new("https://gitlab.example", FAKE_TOKEN, s.fake.clone());
+    gitlab
+        .update_runner_tags(vm, &["vm".to_string(), "node-24".to_string()])
         .await
         .unwrap();
-    assert!(
-        outputs
-            .read()
-            .await
-            .unwrap()
-            .contains_key("CIBURST_SPILL_RUNNER_ID_VM")
-    );
-
-    let mut plain = (*spill_config(true, false)).clone();
-    plain.spill_runner = false;
-    let plain = Arc::new(plain);
-    let deployment = provisioner(plain.clone());
-    let plan = deployment.plan(&[]).await.unwrap();
-    let runners: Vec<(String, Action, Option<String>)> = plan
+    let spill = gitlab
+        .create_runner(
+            7,
+            &["vm".to_string(), "node-24".to_string()],
+            "demo-vm-spill",
+        )
+        .await
+        .unwrap();
+    gitlab.enable_runner(8, node).await.unwrap();
+    let plan = s.provisioner.plan(&[]).await.unwrap();
+    let steps: Vec<(String, Action, Option<String>)> = plan
         .iter()
-        .filter(|s| s.id.starts_with("runner:"))
+        .filter(|s| s.id.starts_with("runner"))
+        .filter(|s| !s.is_noop())
         .map(|s| (s.id.clone(), s.action, s.detail.clone()))
         .collect();
-    assert!(
-        runners.contains(&(
-            "runner:vm".to_string(),
-            Action::Update,
-            Some("set tags vm, node-24".to_string())
-        )),
-        "{runners:?}"
-    );
-    assert!(
-        runners.contains(&("runner:vm-spill".to_string(), Action::Delete, None)),
-        "{runners:?}"
-    );
-    deployment.apply(&[]).await.unwrap();
-    let values = outputs.read().await.unwrap();
-    let vm = values[&keys::runner_id("vm")].parse().unwrap();
-    assert_eq!(fake.runner_tags(vm).unwrap(), ["vm", "node-24"]);
-    assert_eq!(fake.runner_count(), 3, "vm, node-24, rust-1");
-    assert!(
-        secrets_from_outputs(&plain, &values)
-            .spill_tokens
-            .is_empty()
-    );
-}
-
-#[tokio::test]
-async fn a_vm_pool_with_vm_first_lanes_gets_a_spill_runner() {
-    let fake = Arc::new(FakeGitlab::new());
-    let store = Arc::new(MemoryStore::new());
-    let host_store = Arc::new(MemoryStore::new());
-    let outputs = Arc::new(MemoryOutputs::new());
-    let (log, lines) = Log::memory();
-    let provisioner = |config: Arc<Config>| {
-        Provisioner::new(
-            config.clone(),
-            Arc::new(FakeProvider::new(config.clone(), store.clone())),
-            Arc::new(FakeHost::new(config.clone(), host_store.clone())),
-            Some(Arc::new(Gitlab::new(
-                &config.gitlab.url,
-                FAKE_TOKEN,
-                fake.clone(),
-            ))),
-            outputs.clone(),
-            log.clone(),
-        )
-    };
-    let runner_steps = |steps: &[Step]| -> Vec<(String, Action, Option<String>)> {
-        steps
-            .iter()
-            .filter(|s| s.id.starts_with("runner:"))
-            .map(|s| (s.id.clone(), s.action, s.detail.clone()))
-            .collect()
-    };
-    let step = |id: &str, action: Action, detail: Option<&str>| {
-        (id.to_string(), action, detail.map(String::from))
-    };
-    let id_of = |values: &Outputs, key: &str| -> u64 { values[key].parse().unwrap() };
-    const SPILL_ID: &str = "CIBURST_SPILL_RUNNER_ID_VM";
-    const SPILL_TOKEN: &str = "CIBURST_SPILL_RUNNER_TOKEN_VM";
-
-    // M6.1 left the lane tags on the VM pool's runner.
-    let first = provisioner(spill_config(false, false));
-    first.apply(&[]).await.unwrap();
-    let values = outputs.read().await.unwrap();
-    assert!(
-        !values.contains_key(SPILL_ID),
-        "no lane spills, no spill runner"
-    );
-    assert_eq!(fake.runner_count(), 3);
-    let gitlab = Gitlab::new("https://gitlab.example", FAKE_TOKEN, fake.clone());
-    let vm_runner = id_of(&values, &keys::runner_id("vm"));
-    gitlab
-        .update_runner_tags(vm_runner, &["vm".to_string(), "node-24".to_string()])
-        .await
-        .unwrap();
-
-    let second = provisioner(spill_config(true, false));
-    let plan = second.plan(&[]).await.unwrap();
     assert_eq!(
-        runner_steps(&plan),
+        steps,
         [
-            step("runner:vm", Action::Update, Some("set tags vm")),
-            step("runner:vm-spill", Action::Create, Some("tags vm, node-24")),
-            step("runner:node-24", Action::Noop, None),
-            step("runner:rust-1", Action::Noop, None),
+            (
+                "runner:vm".to_string(),
+                Action::Update,
+                Some("set tags vm".to_string())
+            ),
+            ("runner:vm-spill".to_string(), Action::Delete, None),
+            ("runner-enable:8:node-24".to_string(), Action::Delete, None),
         ]
     );
     let text = format_plan(&plan);
-    for line in [
-        "update  gitlab runner demo-vm  (set tags vm)",
-        "create  gitlab runner demo-vm-spill  (tags vm, node-24)",
-        "create  gitlab runner demo-vm-spill enabled in project 8",
-    ] {
-        assert!(text.lines().any(|l| l == line), "{line} in\n{text}");
-    }
-    second.apply(&[]).await.unwrap();
-    let values = outputs.read().await.unwrap();
-    let spill = id_of(&values, SPILL_ID);
-    assert!(values[SPILL_TOKEN].starts_with("glrt-"));
-    assert!(keys::is_secret(SPILL_TOKEN));
-    assert_eq!(fake.runner_tags(vm_runner).unwrap(), ["vm"]);
-    assert_eq!(fake.runner_tags(spill).unwrap(), ["vm", "node-24"]);
     assert!(
-        fake.runner_projects()
-            .iter()
-            .any(|(id, projects)| *id == spill && projects == &[7, 8]),
-        "enabled in every project"
+        text.lines()
+            .any(|l| l == "delete  gitlab runner demo-node-24 enabled in project 8"),
+        "{text}"
     );
-    let secrets = secrets_from_outputs(&spill_config(true, false), &values);
+    s.provisioner.apply(&[]).await.unwrap();
+    assert_eq!(s.fake.runner_tags(vm).unwrap(), ["vm"]);
+    assert_eq!(s.fake.runner_tags(spill.id), None);
+    let projects: BTreeMap<u64, Vec<u64>> = s.fake.runner_projects().into_iter().collect();
+    assert_eq!(projects[&node], [7]);
+    assert_eq!(s.fake.runner_count(), 3, "vm, node-24, rust-1");
+    assert!(all(&s.provisioner.plan(&[]).await.unwrap(), Action::Noop));
+    let secrets = secrets_from_outputs(&s.config, &s.outputs.read().await.unwrap());
     assert_eq!(
-        secrets.spill_tokens,
-        BTreeMap::from([("vm".to_string(), values[SPILL_TOKEN].clone())])
-    );
-    assert!(
-        lines
-            .lock()
-            .unwrap()
-            .contains(&format!(r#"info runner pool="vm-spill" id="{spill}""#))
-    );
-    assert!(all(&second.plan(&[]).await.unwrap(), Action::Noop));
-
-    let third = provisioner(spill_config(true, true));
-    let plan = third.plan(&[]).await.unwrap();
-    assert_eq!(
-        runner_steps(&plan)[1],
-        step(
-            "runner:vm-spill",
-            Action::Update,
-            Some("set tags vm, node-24, rust-1")
-        )
-    );
-    third.apply(&[]).await.unwrap();
-    assert_eq!(
-        fake.runner_tags(spill).unwrap(),
-        ["vm", "node-24", "rust-1"]
-    );
-    assert_eq!(
-        outputs.read().await.unwrap()[SPILL_TOKEN],
-        values[SPILL_TOKEN]
+        secrets.runner_tokens.keys().collect::<Vec<_>>(),
+        ["node-24", "rust-1", "vm"]
     );
 
-    third.apply(&[Rotation::Runner]).await.unwrap();
-    let rotated = outputs.read().await.unwrap();
-    assert_ne!(id_of(&rotated, SPILL_ID), spill);
-    assert_ne!(rotated[SPILL_TOKEN], values[SPILL_TOKEN]);
-    assert_eq!(
-        fake.runner_tags(id_of(&rotated, SPILL_ID)).unwrap(),
-        ["vm", "node-24", "rust-1"],
-        "a recreated spill runner gets every tag"
-    );
-
-    let fourth = provisioner(spill_config(false, false));
-    let plan = fourth.plan(&[]).await.unwrap();
-    assert_eq!(
-        runner_steps(&plan).last().unwrap(),
-        &step("runner:vm-spill", Action::Delete, None)
-    );
-    fourth.apply(&[]).await.unwrap();
-    assert_eq!(fake.runner_count(), 3);
-    assert_eq!(fake.runner_tags(id_of(&rotated, SPILL_ID)), None);
-    assert!(
-        secrets_from_outputs(&spill_config(false, false), &outputs.read().await.unwrap())
-            .spill_tokens
-            .is_empty(),
-        "a stale token is not handed to the dispatcher"
-    );
-
-    let fifth = provisioner(spill_config(true, false));
-    fifth.apply(&[]).await.unwrap();
-    assert_eq!(fake.runner_count(), 4);
-    provisioner(spill_config(false, false))
-        .destroy()
-        .await
-        .unwrap();
-    assert_eq!(
-        fake.runner_count(),
-        0,
-        "destroy removes the spill runner of a config without lanes too"
-    );
+    s.provisioner.destroy().await.unwrap();
+    assert_eq!(s.fake.runner_count(), 0);
 }
 
 #[tokio::test]
 async fn checks_lane_jobs_and_suggests_lanes_from_the_merged_yaml() {
-    let s = setup(lanes_config(true), true);
+    let s = setup(lanes_config(), true);
     let job = |name: &str, tags: &[&str]| LintJob {
         name: name.into(),
         stage: Some("test".into()),
@@ -825,12 +673,9 @@ async fn the_hook_delivers_pipeline_events_that_warm_a_vm() {
         "gitlab": { "url": "https://gitlab.example", "projectIds": [7] },
         "host": { "type": "fake" },
         "provider": { "type": "fake" },
-        "defaultPool": "vm",
         "ignoreJobs": ["pages"],
-        "pools": [
-            { "tag": "vm", "image": "img/node", "runtime": "instances" },
-            { "tag": "node", "image": "img/node", "runtime": "jobs", "stages": ["lint"] }
-        ],
+        "vm": { "image": "img/node" },
+        "lanes": [ { "tag": "node", "image": "img/node", "jobs": ["eslint"] } ],
         "cache": { "type": "s3" }
     });
     let s = setup(Arc::new(parse_config(&raw.to_string()).unwrap()), true);
@@ -1074,7 +919,7 @@ async fn secrets_survive_a_later_failing_step() {
     ));
     let failing = Arc::new(FailingStep {
         inner: inner.clone(),
-        fail: "definition:build",
+        fail: "definition:7-build",
     });
     let outputs = Arc::new(MemoryOutputs::new());
     let host = Arc::new(FakeHost::new(config.clone(), Arc::new(MemoryStore::new())));
@@ -1101,12 +946,12 @@ async fn secrets_survive_a_later_failing_step() {
 }
 
 #[tokio::test]
-async fn a_removed_pool_deletes_its_runner() {
+async fn a_removed_lane_deletes_its_runner() {
     let s = setup(config(&[7]), true);
     s.provisioner.apply(&[]).await.unwrap();
     assert_eq!(s.fake.runner_count(), 2);
     let mut smaller = (*s.config).clone();
-    smaller.pools.retain(|p| p.tag != "build");
+    smaller.lanes.clear();
     let smaller = Arc::new(smaller);
     let provider = Arc::new(FakeProvider::new(
         smaller.clone(),
@@ -1134,7 +979,7 @@ async fn a_removed_pool_deletes_its_runner() {
 
     let mut prefix_config = (*s.config).clone();
     prefix_config.name = "de".into();
-    prefix_config.pools.retain(|p| p.tag == "ci");
+    prefix_config.lanes.clear();
     let prefix_config = Arc::new(prefix_config);
     let other = Provisioner::new(
         prefix_config.clone(),
@@ -1162,12 +1007,10 @@ async fn a_removed_pool_deletes_its_runner() {
 
 #[tokio::test]
 async fn the_vm_secret_is_not_rotated_while_a_vm_runs() {
-    let mut vm_config = (*config(&[7])).clone();
-    vm_config.pools[0].runtime = Some("instances".into());
-    let s = setup(Arc::new(vm_config), false);
+    let s = setup(config(&[7]), false);
     s.provisioner.apply(&[]).await.unwrap();
     let before = s.outputs.read().await.unwrap()[keys::VM_SECRET].clone();
-    let pool = s.config.pools[0].clone();
+    let pool = s.config.vm_pool();
     s.provider
         .start(ciburst_core::types::StartRequest {
             pool,
@@ -1370,13 +1213,12 @@ async fn without_an_s3_cache_no_cache_key_is_needed() {
 }
 
 #[tokio::test]
-async fn every_apply_call_refreshes_provider_and_dispatcher_env() {
+async fn every_apply_call_refreshes_the_dispatcher_env() {
     let s = setup(config(&[7]), false);
     let mut wrapped = Wrapped::new(s.provider.clone());
     wrapped.extra = |call| {
         Outputs::from([
             (keys::AGENT_SHA256.to_string(), format!("sha-{call}")),
-            ("HCLOUD_TOKEN".to_string(), format!("hcloud-{call}")),
             (keys::PROJECT_ID.to_string(), format!("project-{call}")),
         ])
     };
@@ -1390,7 +1232,6 @@ async fn every_apply_call_refreshes_provider_and_dispatcher_env() {
         format!("sha-{calls}"),
         "tail call"
     );
-    assert_eq!(first["HCLOUD_TOKEN"], format!("hcloud-{calls}"));
     let kept = format!("project-{}", calls - 1);
     assert_eq!(
         first[keys::PROJECT_ID],
@@ -1402,7 +1243,6 @@ async fn every_apply_call_refreshes_provider_and_dispatcher_env() {
     let second = s.outputs.read().await.unwrap();
     let calls = wrapped.calls.load(Ordering::SeqCst);
     assert_eq!(second[keys::AGENT_SHA256], format!("sha-{calls}"));
-    assert_eq!(second["HCLOUD_TOKEN"], format!("hcloud-{calls}"));
     assert_eq!(
         second[keys::PROJECT_ID],
         kept,
@@ -1412,10 +1252,6 @@ async fn every_apply_call_refreshes_provider_and_dispatcher_env() {
     assert_eq!(
         secrets.dispatcher_env[keys::AGENT_SHA256],
         format!("sha-{calls}")
-    );
-    assert_eq!(
-        secrets.provider_env["HCLOUD_TOKEN"],
-        format!("hcloud-{calls}")
     );
     assert!(
         s.host

@@ -184,7 +184,6 @@ impl OutputsStore for MemoryOutputs {
 /// never returns a hidden variable's value, so reads come from the job environment, where
 /// GitLab put the variables, overlaid by this run's writes. Variables are protected, raw and in
 /// scope [`OUTPUTS_SCOPE`]; created masked and hidden, or unmasked where GitLab refuses.
-/// `PROVIDER_ENV` values stay in memory.
 pub struct GitlabOutputs {
     gitlab: Arc<Gitlab>,
     project_id: u64,
@@ -288,11 +287,9 @@ impl OutputsStore for GitlabOutputs {
             if current.is_some() && !overwrite {
                 continue;
             }
-            if !keys::PROVIDER_ENV.contains(&key.as_str()) {
-                let exists = self.existing().await?.contains(key);
-                if !exists || current.as_ref() != Some(value) {
-                    self.store(key, value, exists).await?;
-                }
+            let exists = self.existing().await?.contains(key);
+            if !exists || current.as_ref() != Some(value) {
+                self.store(key, value, exists).await?;
             }
             self.values
                 .lock()
@@ -557,21 +554,6 @@ mod tests {
             );
             let empty = outputs_on(fake, &[]);
             assert!(empty.outputs.read().await.unwrap().is_empty());
-        }
-
-        #[tokio::test]
-        async fn provider_env_stays_in_memory() {
-            let s = setup(&[]);
-            s.outputs
-                .write(&one("HCLOUD_TOKEN", "hetzner-token-value"), true)
-                .await
-                .unwrap();
-            assert!(s.fake.variables(PROJECT).is_empty());
-            assert!(s.fake.calls().is_empty());
-            assert_eq!(
-                s.outputs.read().await.unwrap()["HCLOUD_TOKEN"],
-                "hetzner-token-value"
-            );
         }
 
         #[tokio::test]

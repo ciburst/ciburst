@@ -5,12 +5,7 @@ use crate::ledger::Queued;
 
 /// M6.2 rule R5: queued entries older than this count as gone, a lost job event.
 pub const QUEUED_MAX_AGE_S: u64 = 1800;
-/// M6.2 rule R8: a spilled lane job that no VM slot took within this many seconds gets a lane
-/// run.
-pub const SPILL_WAIT_S: u64 = 20;
-/// M6.2 rule R8: a VM's spill slots count only from a report this recent.
-pub const SPILL_FRESH_S: u64 = 30;
-/// M6.2 rule R7: the report interval while idle slots spill or VM jobs queue.
+/// M6.2 rule R7: the report interval while VM jobs queue.
 pub const REPORT_QUEUE_S: u64 = 15;
 /// M6.2 rule R7: the report interval of a busy VM.
 pub const REPORT_BUSY_S: u64 = 30;
@@ -124,10 +119,9 @@ fn job_key(job: &str) -> (u8, u64, &str) {
     }
 }
 
-/// M6.2 rule R7: 15 s while idle slots spill or VM jobs queue, 30 s while the VM is busy, 600 s
-/// otherwise.
-pub fn next_report_s(spill: bool, queued: bool, busy: bool) -> u64 {
-    if spill || queued {
+/// M6.2 rule R7: 15 s while VM jobs queue, 30 s while the VM is busy, 600 s otherwise.
+pub fn next_report_s(queued: bool, busy: bool) -> u64 {
+    if queued {
         REPORT_QUEUE_S
     } else if busy {
         REPORT_BUSY_S
@@ -347,10 +341,10 @@ mod tests {
     }
 
     #[test]
-    fn reports_come_every_15_s_while_spilling_or_queued() {
-        assert_eq!(next_report_s(true, false, false), 15);
-        assert_eq!(next_report_s(false, true, true), 15);
-        assert_eq!(next_report_s(false, false, true), 30);
-        assert_eq!(next_report_s(false, false, false), 600);
+    fn reports_come_every_15_s_while_vm_jobs_queue() {
+        assert_eq!(next_report_s(true, true), 15);
+        assert_eq!(next_report_s(true, false), 15);
+        assert_eq!(next_report_s(false, true), 30);
+        assert_eq!(next_report_s(false, false), 600);
     }
 }

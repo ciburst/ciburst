@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use ciburst_core::check::LintJob;
 use ciburst_core::config::{Config, parse_config};
 use ciburst_core::fake::{FakeHost, FakeProvider};
-use ciburst_core::fleet::{FleetStore, Member, MemoryFleetStore};
+use ciburst_core::fleet::{FleetStore, Member, MemberLane, MemoryFleetStore};
 use ciburst_core::gitlab::Gitlab;
 use ciburst_core::log::Log;
 use ciburst_core::plan::{MemoryOutputs, OutputsStore, format_plan};
@@ -25,11 +25,8 @@ fn config(project_ids: &[u64]) -> Arc<Config> {
         "gitlab": { "url": "https://gitlab.example", "projectIds": project_ids },
         "host": { "type": "fake" },
         "provider": { "type": "fake" },
-        "defaultPool": "ci",
-        "pools": [
-            { "tag": "ci", "image": "img/node", "stages": ["test"] },
-            { "tag": "build", "image": "img/kaniko", "stages": ["build"] }
-        ],
+        "vm": { "tag": "ci", "image": "img/node" },
+        "lanes": [ { "tag": "build", "image": "img/kaniko", "jobs": ["image"] } ],
         "cache": { "type": "s3" }
     });
     Arc::new(parse_config(&raw.to_string()).unwrap())
@@ -90,6 +87,7 @@ fn joined(project_id: u64) -> Member {
         hook_secret: format!("secret-{project_id}"),
         runners: BTreeMap::from([("ci".to_string(), format!("glrt-{project_id}"))]),
         joined_at: NOW - 60,
+        ..Default::default()
     }
 }
 
@@ -115,14 +113,12 @@ async fn apply_writes_the_config_and_the_host_member() {
         [Member {
             project_id: 7,
             hook_secret: outputs[keys::HOOK_TOKEN].clone(),
-            runners: BTreeMap::from([
-                (
-                    "build".to_string(),
-                    outputs[&keys::runner_token("build")].clone()
-                ),
-                ("ci".to_string(), outputs[&keys::runner_token("ci")].clone()),
-            ]),
+            runners: BTreeMap::from([(
+                "ci".to_string(),
+                outputs[&keys::runner_token("ci")].clone()
+            )]),
             joined_at: NOW,
+            ..Default::default()
         }]
     );
     let lines = s.lines.lock().unwrap().clone();
@@ -191,18 +187,38 @@ async fn status_lists_the_members_and_their_deliveries() {
     let s = setup(&[7]);
     s.provisioner.apply(&[]).await.unwrap();
     s.fleet.put_member(&joined(21)).await.unwrap();
-    s.fleet.put_member(&joined(8)).await.unwrap();
+    let mut eight = joined(8);
+    eight.lanes = vec![MemberLane {
+        tag: "build".into(),
+        image: "img/kaniko".into(),
+        jobs: vec!["image".into()],
+        max_runs: 3,
+        definition_id: "def".into(),
+        runner_token: "glrt-8-build".into(),
+    }];
+    s.fleet.put_member(&eight).await.unwrap();
     let url = "https://demo-dispatch.fake.invalid/";
-    let hook = s
-        .provisioner
-        .status()
-        .await
-        .unwrap()
+    let status = s.provisioner.status().await.unwrap();
+    let hook = status
         .members
         .iter()
         .map(|m| m.project_id)
         .collect::<Vec<_>>();
     assert_eq!(hook, [7, 8, 21], "the host first");
+    // M6.4 rule R8: the VM runner, then the lanes per member, the host's first.
+    let pools: Vec<(Option<u64>, &str, u32)> = status
+        .pools
+        .iter()
+        .map(|p| (p.project, p.tag.as_str(), p.max_runs))
+        .collect();
+    assert_eq!(
+        pools,
+        [
+            (None, "ci", 4),
+            (Some(7), "build", 10),
+            (Some(8), "build", 3)
+        ]
+    );
 
     let member_hook = Gitlab::new("https://gitlab.example", FAKE_TOKEN, s.fake.clone())
         .create_hook(8, url, "secret-8")
@@ -230,11 +246,21 @@ async fn status_lists_the_members_and_their_deliveries() {
     );
 }
 
+/// M6.4 rule R8: each member is checked against its own lanes, never the host's.
 #[tokio::test]
 async fn check_lints_every_member() {
     let s = setup(&[7]);
     s.provisioner.apply(&[]).await.unwrap();
-    s.fleet.put_member(&joined(8)).await.unwrap();
+    let mut eight = joined(8);
+    eight.lanes = vec![MemberLane {
+        tag: "node".into(),
+        image: "node:24".into(),
+        jobs: vec!["lint".into()],
+        max_runs: 2,
+        definition_id: "def".into(),
+        runner_token: "glrt-8-node".into(),
+    }];
+    s.fleet.put_member(&eight).await.unwrap();
     s.fleet.put_member(&joined(9)).await.unwrap();
     let job = |name: &str, stage: &str, tags: &[&str]| LintJob {
         name: name.into(),
@@ -242,7 +268,13 @@ async fn check_lints_every_member() {
         tag_list: tags.iter().map(|t| t.to_string()).collect(),
     };
     s.fake.set_jobs(7, vec![job("unit", "test", &["ci"])]);
-    s.fake.set_jobs(8, vec![job("image", "build", &["ci"])]);
+    s.fake.set_jobs(
+        8,
+        vec![
+            job("lint", "test", &["node"]),
+            job("image", "build", &["build"]),
+        ],
+    );
     s.fake.hide_project(9);
     let report = s.provisioner.check(None).await.unwrap();
     let summary: Vec<(u64, usize, bool)> = report
@@ -250,6 +282,10 @@ async fn check_lints_every_member() {
         .map(|r| (r.project_id, r.problems.len(), r.unreadable.is_some()))
         .collect();
     assert_eq!(summary, [(7, 0, false), (8, 1, false), (9, 0, true)]);
+    assert_eq!(
+        report[1].problems[0].job, "image",
+        "the host's lane is not 8's"
+    );
 
     s.fake.hide_project(7);
     assert!(

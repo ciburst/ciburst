@@ -58,7 +58,7 @@ impl Scaleway {
     /// failed lookup only logs and ends the check.
     pub(super) async fn quota_problems(
         &self,
-        runtimes: &[(&Pool, Runtime)],
+        runtimes: &[(Pool, Runtime)],
     ) -> Vec<(String, String)> {
         let mut limits: BTreeMap<String, Vec<(String, u64)>> = BTreeMap::new();
         let mut problems = Vec::new();
@@ -115,7 +115,7 @@ impl Scaleway {
     }
 
     /// Warns for each pool of [`Scaleway::quota_problems`].
-    pub(super) async fn warn_without_quota(&self, runtimes: &[(&Pool, Runtime)]) {
+    pub(super) async fn warn_without_quota(&self, runtimes: &[(Pool, Runtime)]) {
         for (tag, reason) in self.quota_problems(runtimes).await {
             self.log.warn(
                 "vm pools cannot start",

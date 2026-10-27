@@ -1,14 +1,14 @@
-//! Provider `scaleway`. A pool runs on Scaleway Instances (`instances`, the default: one VM per
-//! run with its own Docker daemon, spec section 6.1) or on Serverless Jobs (`jobs`: one job
-//! definition per pool, one job run per pending job, the lanes of D45). Shared resources:
+//! Provider `scaleway`, the only provider (D65). The VM runner runs on Scaleway Instances (one
+//! VM per run with its own Docker daemon, spec section 6.1); each project's lanes run on
+//! Serverless Jobs (one job definition `<name>-<project id>-<tag>` per lane, one job run per
+//! pending job, D45, D60). Shared resources:
 //! project, IAM applications and keys, cache bucket with lifecycle, the runner (M6 rule R6) and
 //! the VM agent (D38) in it, the optional registry namespace; per runtime the VM security group
 //! or the job definitions. Every resource is looked up by name or tag; nothing is stored
 //! locally.
 //!
-//! Pools whose runtime is a key of the config's `providers` belong to another provider (spec
-//! D35): this one plans, starts and lists nothing for them and answers their runs with the agent
-//! and runner URLs and cache location of [`Provider::shared_env`].
+//! The definitions of the host's lanes follow the config on `apply`; those of a member's lanes
+//! follow its `/join` through [`Provider::sync_lanes`], and `apply` leaves them alone.
 //!
 //! Modules: `steps` plans and applies the resources, `keys` the IAM keys, `bucket` the cache
 //! bucket, `runner` the runner in it, `agent` the VM agent in it, `registry` the registry
@@ -36,7 +36,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ciburst_core::config::{CacheType, Config, Pool};
+use ciburst_core::config::{CacheType, Config, Pool, parse_lane_key};
 use ciburst_core::log::Log;
 use ciburst_core::types::{
     Billing, Capabilities, Outputs, Provider, Rotation, Run, StartRequest, Step, VmCapacity,
@@ -54,7 +54,7 @@ pub use vm_start::{IMAGES_VAR, SECURITY_GROUP_VAR, VmImage, VmStart};
 
 pub const PROVIDER_NAME: &str = "scaleway";
 
-/// The provider type of M2, which only had Serverless Jobs.
+/// The provider type of M2, which only had Serverless Jobs; read as `scaleway`.
 pub const LEGACY_JOBS_TYPE: &str = "scaleway-jobs";
 
 /// Commercial types tried in order when a pool names none (rule 4 of M3). PLAY2 types have no
@@ -179,25 +179,11 @@ impl Scaleway {
             .unwrap_or(false)
     }
 
-    /// `provider.runtime`, the runtime of pools that name none: `instances` unless set. A config
-    /// still typed `scaleway-jobs` keeps its job definitions, so upgrading changes nothing.
-    fn default_runtime(&self) -> Result<Runtime> {
-        match self.config.provider.extra.get("runtime") {
-            None | Some(Value::Null) if self.config.provider.kind == LEGACY_JOBS_TYPE => {
-                Ok(Runtime::Jobs)
-            }
-            None | Some(Value::Null) => Ok(Runtime::Instances),
-            Some(value) => value.as_str().and_then(Runtime::parse).ok_or_else(|| {
-                Error::provider(format!(
-                    "{PROVIDER_NAME}: provider.runtime {value} is not instances or jobs"
-                ))
-            }),
-        }
-    }
-
+    /// The runtime of a run spec: `jobs` for a lane, `instances` for the VM runner.
     fn runtime(&self, pool: &Pool) -> Result<Runtime> {
         match &pool.runtime {
-            None => self.default_runtime(),
+            None if pool.project.is_some() => Ok(Runtime::Jobs),
+            None => Ok(Runtime::Instances),
             Some(value) => Runtime::parse(value).ok_or_else(|| {
                 Error::provider(format!(
                     "{PROVIDER_NAME}: pool {}: runtime {value} is not instances or jobs",
@@ -207,46 +193,33 @@ impl Scaleway {
         }
     }
 
-    /// The runtime of the pool `tag`; a pool gone from the config counts as the default.
-    fn runtime_of(&self, tag: &str) -> Result<Runtime> {
-        match self.config.pool_by_tag(tag) {
-            Some(pool) => self.runtime(pool),
-            None => self.default_runtime(),
+    /// The runtime of the runs tagged `tag`: `jobs` for a lane's key `<project id>-<tag>` (of
+    /// any project), else `instances`.
+    fn runtime_of(&self, tag: &str) -> Runtime {
+        if tag != self.config.vm.tag && parse_lane_key(tag).is_some() {
+            Runtime::Jobs
+        } else {
+            Runtime::Instances
         }
     }
 
-    /// The pools this provider serves: every pool not handed to another provider.
-    fn own_pools(&self) -> impl Iterator<Item = &Pool> {
-        self.config
-            .pools
-            .iter()
-            .filter(|pool| self.config.extra_provider_of(pool).is_none())
-    }
-
-    /// The own pools with their runtimes.
-    fn own_runtimes(&self) -> Result<Vec<(&Pool, Runtime)>> {
+    /// The run specs of the config: the VM runner and the host's lanes, with their runtimes.
+    fn own_runtimes(&self) -> Result<Vec<(Pool, Runtime)>> {
         let mut runtimes = Vec::new();
-        for pool in self.own_pools() {
-            runtimes.push((pool, self.runtime(pool)?));
+        for pool in self.config.pools() {
+            let runtime = self.runtime(&pool)?;
+            runtimes.push((pool, runtime));
         }
         Ok(runtimes)
     }
 
-    /// The other provider the pool `tag` belongs to, `None` for a pool of this one.
-    fn other_provider(&self, tag: &str) -> Option<&str> {
-        self.config
-            .pool_by_tag(tag)
-            .and_then(|pool| self.config.extra_provider_of(pool))
-    }
-
-    fn pools_on(&self, runtime: Runtime) -> Result<Vec<&Pool>> {
-        let mut pools = Vec::new();
-        for pool in self.own_pools() {
-            if self.runtime(pool)? == runtime {
-                pools.push(pool);
-            }
-        }
-        Ok(pools)
+    fn pools_on(&self, runtime: Runtime) -> Result<Vec<Pool>> {
+        Ok(self
+            .own_runtimes()?
+            .into_iter()
+            .filter(|(_, r)| *r == runtime)
+            .map(|(pool, _)| pool)
+            .collect())
     }
 
     /// Object Storage scoped to `project_id`: Scaleway creates and finds buckets in the API
@@ -379,7 +352,7 @@ impl Provider for Scaleway {
     }
 
     fn capabilities(&self) -> Capabilities {
-        let vm = self.default_runtime().unwrap_or(Runtime::Instances) == Runtime::Instances;
+        let vm = true;
         Capabilities {
             name: PROVIDER_NAME.into(),
             docker_daemon: vm,
@@ -417,12 +390,6 @@ impl Provider for Scaleway {
     }
 
     async fn start(&self, request: StartRequest) -> Result<String> {
-        if let Some(other) = self.config.extra_provider_of(&request.pool) {
-            return Err(Error::provider(format!(
-                "{PROVIDER_NAME}: pool {} belongs to provider {other}",
-                request.pool.tag
-            )));
-        }
         if request.env.get("RUNNER_TOKEN").is_none_or(|t| t.is_empty()) {
             return Err(Error::provider(format!(
                 "{PROVIDER_NAME}: RUNNER_TOKEN missing"
@@ -434,54 +401,36 @@ impl Provider for Scaleway {
         }
     }
 
-    /// A pool of another provider has no runs here. Servers left from a pool that moved to
-    /// another provider stay in `list(None)` and in the sweep: they run here until they end.
+    /// The runs of `pool`, the VM runner's tag or a lane's key; with `None` every VM and the
+    /// runs of every lane of every project.
     async fn list(&self, pool: Option<&str>) -> Result<Vec<Run>> {
-        if pool.is_some_and(|tag| self.other_provider(tag).is_some()) {
-            return Ok(Vec::new());
-        }
         let Some(project_id) = self.client.find_project(self.name()).await? else {
             return Ok(Vec::new());
         };
-        let (job_tags, vms): (Vec<&str>, Option<Option<&str>>) = match pool {
-            Some(tag) => match self.runtime_of(tag)? {
-                Runtime::Jobs => (vec![tag], None),
-                Runtime::Instances => (Vec::new(), Some(Some(tag))),
+        let (job_tags, vms): (Option<Vec<String>>, Option<Option<&str>>) = match pool {
+            Some(tag) => match self.runtime_of(tag) {
+                Runtime::Jobs => (Some(vec![tag.to_string()]), None),
+                Runtime::Instances => (Some(Vec::new()), Some(Some(tag))),
             },
-            None => (
-                self.pools_on(Runtime::Jobs)?
-                    .iter()
-                    .map(|p| p.tag.as_str())
-                    .collect(),
-                Some(None),
-            ),
+            None => (None, Some(None)),
         };
-        let mut runs = self.job_runs(&project_id, &job_tags).await?;
+        let mut runs = self.job_runs(&project_id, job_tags.as_deref()).await?;
         if let Some(pool) = vms {
             runs.extend(self.vm_runs(&project_id, pool).await?);
         }
         Ok(runs)
     }
 
-    /// A run id is a server id or a job run id; servers are looked up first, so a VM that
-    /// outlived its pool's switch to `jobs` still ends.
+    /// A run id is a server id or a job run id; servers are looked up first.
     async fn stop(&self, run_id: &str) -> Result<()> {
         if self.stop_server(run_id).await? {
             return Ok(());
-        }
-        if self.pools_on(Runtime::Jobs)?.is_empty() {
-            return Err(Error::provider(format!(
-                "{PROVIDER_NAME}: server {run_id} not found"
-            )));
         }
         jobs::stop(&self.client, run_id).await
     }
 
     async fn capacity(&self, pool: &str) -> Result<Option<Vec<VmCapacity>>> {
-        if self.other_provider(pool).is_some() {
-            return Ok(Some(Vec::new()));
-        }
-        if self.runtime_of(pool)? != Runtime::Instances {
+        if self.runtime_of(pool) != Runtime::Instances {
             return Ok(None);
         }
         self.vm_capacity(pool).await.map(Some)
@@ -501,5 +450,9 @@ impl Provider for Scaleway {
 
     async fn sweep(&self, now: u64) -> Result<Vec<String>> {
         self.sweep_servers(now).await
+    }
+
+    async fn sync_lanes(&self, project: u64, lanes: &[Pool]) -> Result<BTreeMap<String, String>> {
+        self.sync_lane_definitions(project, lanes).await
     }
 }

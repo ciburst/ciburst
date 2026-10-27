@@ -13,10 +13,10 @@ pub const CONTRACT_CONFIG: &str = r#"{
   "gitlab": { "url": "https://gitlab.example", "projectIds": [7] },
   "host": { "type": "fake" },
   "provider": { "type": "fake" },
-  "defaultPool": "ci",
-  "pools": [
-    { "tag": "ci", "image": "example.invalid/node:24", "stages": ["test"] },
-    { "tag": "build", "image": "example.invalid/node:24", "stages": ["build"], "maxRuns": 1 }
+  "vm": { "image": "example.invalid/node:24" },
+  "lanes": [
+    { "tag": "ci", "image": "example.invalid/node:24", "jobs": ["test-*"] },
+    { "tag": "build", "image": "example.invalid/node:24", "jobs": ["build-*"], "maxRuns": 1 }
   ],
   "cache": { "type": "s3", "expireDays": 14 }
 }"#;
@@ -25,11 +25,11 @@ pub fn contract_config() -> Arc<Config> {
     Arc::new(parse_config(CONTRACT_CONFIG).expect("contract config"))
 }
 
-/// The contract config with the `ci` pool changed and the `build` pool removed.
+/// The contract config with the lane `ci` changed and the lane `build` removed.
 pub fn changed_config() -> Arc<Config> {
     let mut config = (*contract_config()).clone();
-    config.pools.truncate(1);
-    config.pools[0].vcpu = 4;
+    config.lanes.truncate(1);
+    config.lanes[0].vcpu = 4;
     Arc::new(config)
 }
 
@@ -80,14 +80,14 @@ pub async fn run_provider_contract<F: ProviderFactory>(factory: &F) {
         let provider = factory.make(config.clone(), &backend);
         let first = provider.plan(&[]).await.expect("plan");
         assert!(
-            first.len() >= config.pools.len(),
-            "one step per pool at least"
+            first.len() >= config.lanes.len(),
+            "one step per lane at least"
         );
         assert!(
             first.iter().all(|s| s.action == Action::Create),
             "all create on empty backend: {first:?}"
         );
-        for pool in &config.pools {
+        for pool in &config.pools()[1..] {
             assert!(
                 first
                     .iter()
@@ -116,14 +116,14 @@ pub async fn run_provider_contract<F: ProviderFactory>(factory: &F) {
         assert!(
             steps
                 .iter()
-                .any(|s| s.id == "definition:ci" && s.action == Action::Update),
-            "update for the changed pool: {steps:?}"
+                .any(|s| s.id == "definition:7-ci" && s.action == Action::Update),
+            "update for the changed lane: {steps:?}"
         );
         assert!(
             steps
                 .iter()
-                .any(|s| s.id == "definition:build" && s.action == Action::Delete),
-            "delete for the removed pool: {steps:?}"
+                .any(|s| s.id == "definition:7-build" && s.action == Action::Delete),
+            "delete for the removed lane: {steps:?}"
         );
         again.apply(&steps).await.expect("apply changed");
         let after = again.plan(&[]).await.expect("plan after change");
@@ -151,12 +151,12 @@ pub async fn run_provider_contract<F: ProviderFactory>(factory: &F) {
         }
     }
 
-    // start refuses an unprovisioned pool and a missing token
+    // start refuses an unprovisioned lane and a missing token
     {
         let backend = factory.backend().await;
         let provider = factory.make(config.clone(), &backend);
         let request = StartRequest {
-            pool: config.pools[0].clone(),
+            pool: config.lanes[0].pool(7),
             env: env(),
             labels: labels(),
             taken: 1,
@@ -185,7 +185,7 @@ pub async fn run_provider_contract<F: ProviderFactory>(factory: &F) {
         provider.apply(&steps).await.expect("apply");
         let run_id = provider
             .start(StartRequest {
-                pool: config.pools[0].clone(),
+                pool: config.lanes[0].pool(7),
                 env: env(),
                 labels: labels(),
                 taken: 1,
@@ -193,7 +193,7 @@ pub async fn run_provider_contract<F: ProviderFactory>(factory: &F) {
             .await
             .expect("start");
         assert!(!run_id.is_empty());
-        let listed = provider.list(Some("ci")).await.expect("list");
+        let listed = provider.list(Some("7-ci")).await.expect("list");
         let run = listed
             .iter()
             .find(|r| r.run_id == run_id)
@@ -202,7 +202,7 @@ pub async fn run_provider_contract<F: ProviderFactory>(factory: &F) {
         assert_eq!(run.labels, labels());
         assert!(
             provider
-                .list(Some("build"))
+                .list(Some("7-build"))
                 .await
                 .expect("list build")
                 .is_empty()

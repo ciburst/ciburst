@@ -145,12 +145,17 @@ async fn names_a_missing_input() {
         r#"{ "provider": { "type": "fake" }, "host": { "type": "fake" },
              "providers": { "hetzner": {} } }"#,
     );
-    let mut vars = job_vars("true");
-    vars.insert("HCLOUD_TOKEN".into(), "a-local-token".into());
-    let run = ciburst(vars, fake.clone(), &["--config", &hetzner, "plan"]).await;
-    assert_eq!(
-        run.out,
-        "CIBURST_HCLOUD_TOKEN missing; the job has HCLOUD_TOKEN, but pipeline mode reads only CIBURST_* variables: rename it to CIBURST_HCLOUD_TOKEN"
+    let run = ciburst(
+        job_vars("true"),
+        fake.clone(),
+        &["--config", &hetzner, "plan"],
+    )
+    .await;
+    assert!(
+        run.out
+            .contains("providers: removed: Scaleway is the only provider (D65)"),
+        "{}",
+        run.out
     );
 
     let mut vars = job_vars("true");
@@ -232,7 +237,10 @@ async fn never_reads_scw_gitlab_token_or_local() {
     assert_eq!(run.code, 1, "the Scaleway fake answers 404: {}", run.out);
     let run = ciburst(vars, router.clone(), &[&args[..], &["check"]].concat()).await;
     assert_eq!(run.code, 0, "{}", run.out);
-    assert_eq!(run.out, "project 5: every job matches the stage map\n");
+    assert_eq!(
+        run.out,
+        "project 5: every job matches its lanes and the VM runner\n"
+    );
 
     let requests = router.requests.lock().unwrap();
     let scaleway: Vec<&Request> = requests
@@ -381,7 +389,7 @@ async fn the_check_job_reports_a_disabled_webhook() {
         run.out,
         concat!(
             "project 5: webhook disabled until never: run ciburst-setup to enable it again\n",
-            "project 5: every job matches the stage map\n",
+            "project 5: every job matches its lanes and the VM runner\n",
         )
     );
     gitlab

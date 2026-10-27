@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, Pool};
+use crate::config::{Lane, ProjectConfig, Route};
 use crate::pipeline::{JobSpec, Pipeline};
 
 const DEFAULT_STAGE: &str = "test";
@@ -32,11 +32,13 @@ pub struct Problem {
     pub job: String,
     pub stage: String,
     pub tags: Vec<String>,
-    pub pool: String,
+    /// The tag of the runner the job's name routes it to: a lane's or the VM runner's; empty
+    /// for a job in `ignoreJobs`.
+    pub runner: String,
     pub problem: String,
 }
 
-/// A lane for Docker-free jobs that run on a VM pool (D46).
+/// A lane for Docker-free jobs that run on the VM runner (D46).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Suggestion {
     pub tag: String,
@@ -49,73 +51,75 @@ pub struct Suggestion {
     pub tagged: Vec<String>,
 }
 
-/// The tags of `job` that name a pool.
-fn pool_tags<'a>(config: &Config, job: &'a LintJob) -> Vec<&'a str> {
+/// The tags of `job` that name a runner of the project: the VM runner's or one of its lanes'.
+fn own_tags<'a>(vm_tag: &str, project: &ProjectConfig, job: &'a LintJob) -> Vec<&'a str> {
     job.tag_list
         .iter()
         .map(String::as_str)
-        .filter(|tag| config.pool_by_tag(tag).is_some())
+        .filter(|tag| *tag == vm_tag || project.lane_by_tag(tag).is_some())
         .collect()
 }
 
-/// M6.1 rule R8: a job tagged only for other runners whose pending events still reach a pool,
-/// because `ignoreJobs` misses it.
-fn runs_elsewhere_unignored(config: &Config, job: &LintJob) -> bool {
-    let stage = job.stage.as_deref().unwrap_or(DEFAULT_STAGE);
+/// M6.1 rule R8: a job tagged only for other runners whose pending events still start a VM or
+/// a lane run, because the project's `ignoreJobs` misses it.
+fn runs_elsewhere_unignored(vm_tag: &str, project: &ProjectConfig, job: &LintJob) -> bool {
     !job.tag_list.is_empty()
-        && pool_tags(config, job).is_empty()
-        && config.pool_for(&job.name, Some(stage)).is_some()
+        && own_tags(vm_tag, project, job).is_empty()
+        && project.route(&job.name) != Route::Ignored
 }
 
-/// Compares the jobs of a linted pipeline with the routing of the config (D46): each job's
-/// tags, for a job routed to a lane what keeps it from running there, and `ignoreJobs` against
-/// the jobs of other runners (M6.1 rule R8).
-pub fn check_jobs(config: &Config, jobs: &[LintJob], pipeline: &Pipeline) -> Vec<Problem> {
+/// Compares the jobs of a linted pipeline with the project's own lanes and `ignoreJobs` (M6.4
+/// rule R8): a lane job without the lane's tag, with another image or with a Docker need; a VM
+/// job with a lane's tag; the jobs of other runners that `ignoreJobs` misses (M6.1 rule R8).
+pub fn check_jobs(
+    vm_tag: &str,
+    project: &ProjectConfig,
+    jobs: &[LintJob],
+    pipeline: &Pipeline,
+) -> Vec<Problem> {
     let mut problems = Vec::new();
     for job in jobs.iter().filter(|job| !is_own_job(&job.name)) {
         let stage = job.stage.as_deref().unwrap_or(DEFAULT_STAGE);
-        let pool = config.pool_for(&job.name, Some(stage));
-        let expected = pool.map(|p| p.tag.as_str());
-        let route = if config.pool_by_name(&job.name).is_some() {
-            "the job name".to_string()
-        } else {
-            format!("stage {stage}")
+        let route = project.route(&job.name);
+        let expected = match route {
+            Route::Ignored => "",
+            Route::Lane(lane) => lane.tag.as_str(),
+            Route::Vm => vm_tag,
         };
-        let chosen = pool_tags(config, job);
+        let chosen = own_tags(vm_tag, project, job);
         let mut found = Vec::new();
-        if config.ignores(&job.name) {
+        if route == Route::Ignored {
             if let Some(tag) = chosen.first() {
                 found.push(format!(
-                    "is in ignoreJobs but tagged for pool {tag}: no runner starts for it"
+                    "is in ignoreJobs but tagged {tag}: no runner starts for it"
                 ));
             }
-        } else if runs_elsewhere_unignored(config, job) {
+        } else if runs_elsewhere_unignored(vm_tag, project, job) {
             found.push(format!(
-                "runs on other runners (tags {}) but ignoreJobs misses it: its pending events start VMs",
+                "runs on other runners (tags {}) but ignoreJobs misses it: its pending events start runs",
                 job.tag_list.join(", ")
             ));
         } else if chosen.len() > 1 {
-            found.push(format!("tagged for several pools: {}", chosen.join(", ")));
-        } else if chosen.len() == 1 && Some(chosen[0]) != expected {
-            found.push(match expected {
-                Some(pool) => format!(
-                    "{route} maps to pool {pool} but the job is tagged {}",
-                    chosen[0]
+            found.push(format!("tagged for several runners: {}", chosen.join(", ")));
+        } else if chosen.len() == 1 && chosen[0] != expected {
+            found.push(match route {
+                Route::Lane(lane) => format!(
+                    "lane {} takes the job by name but the job is tagged {}",
+                    lane.tag, chosen[0]
                 ),
-                None => format!(
-                    "{route} maps to no pool but the job is tagged {}",
+                _ => format!(
+                    "tagged for lane {} but no jobs pattern of that lane matches the name: the VM runner gets its events",
                     chosen[0]
                 ),
             });
-        } else if job.tag_list.is_empty()
-            && let Some(pool) = expected
-        {
+        } else if job.tag_list.is_empty() {
             found.push(format!(
-                "untagged: add tags [{pool}] or a hosted runner tag"
+                "untagged: add tags [{expected}] or a hosted runner tag"
             ));
         }
         let here = job.tag_list.is_empty() || !chosen.is_empty();
-        if let Some(lane) = pool.filter(|pool| here && config.is_lane(pool))
+        if let Route::Lane(lane) = route
+            && here
             && let Some(spec) = pipeline.job(&job.name)
         {
             found.extend(lane_problems(lane, spec, pipeline));
@@ -125,7 +129,7 @@ pub fn check_jobs(config: &Config, jobs: &[LintJob], pipeline: &Pipeline) -> Vec
                 job: job.name.clone(),
                 stage: stage.to_string(),
                 tags: job.tag_list.clone(),
-                pool: expected.unwrap_or("").to_string(),
+                runner: expected.to_string(),
                 problem,
             });
         }
@@ -135,7 +139,7 @@ pub fn check_jobs(config: &Config, jobs: &[LintJob], pipeline: &Pipeline) -> Vec
 
 /// D46: what keeps a job from a lane, whose run has no Docker daemon and starts from the
 /// lane's image.
-fn lane_problems(lane: &Pool, job: &JobSpec, pipeline: &Pipeline) -> Vec<String> {
+fn lane_problems(lane: &Lane, job: &JobSpec, pipeline: &Pipeline) -> Vec<String> {
     let mut problems = Vec::new();
     if !job.services.is_empty() {
         problems.push(format!(
@@ -175,12 +179,17 @@ fn lane_problems(lane: &Pool, job: &JobSpec, pipeline: &Pipeline) -> Vec<String>
     problems
 }
 
-/// D46: lanes for the Docker-free jobs routed to a VM pool, one per image in the order the
-/// jobs come. A job that carries only tags of no pool runs elsewhere on purpose; a job
-/// without an image, or with one that names an unknown variable, gets no lane. The copies of
-/// a parallel or matrix job share one pattern `<name>*` unless another job's name starts with
-/// `<name>` (M7 rule R7).
-pub fn suggest_lanes(config: &Config, jobs: &[LintJob], pipeline: &Pipeline) -> Vec<Suggestion> {
+/// D46, M6.4 rule R8: lanes for the project's Docker-free jobs on the VM runner, one per image
+/// in the order the jobs come. A job that carries only tags of other runners runs elsewhere on
+/// purpose; a job without an image, or with one that names an unknown variable, gets no lane.
+/// The copies of a parallel or matrix job share one pattern `<name>*` unless another job's
+/// name starts with `<name>` (M7 rule R7).
+pub fn suggest_lanes(
+    vm_tag: &str,
+    project: &ProjectConfig,
+    jobs: &[LintJob],
+    pipeline: &Pipeline,
+) -> Vec<Suggestion> {
     let names: Vec<&str> = jobs
         .iter()
         .map(|job| job.name.as_str())
@@ -188,15 +197,8 @@ pub fn suggest_lanes(config: &Config, jobs: &[LintJob], pipeline: &Pipeline) -> 
         .collect();
     let mut suggestions: Vec<Suggestion> = Vec::new();
     for job in jobs.iter().filter(|job| !is_own_job(&job.name)) {
-        let stage = job.stage.as_deref().unwrap_or(DEFAULT_STAGE);
-        let on_vm = config
-            .pool_for(&job.name, Some(stage))
-            .is_some_and(|pool| config.is_vm_pool(pool));
-        let here = job.tag_list.is_empty()
-            || job
-                .tag_list
-                .iter()
-                .any(|tag| config.pool_by_tag(tag).is_some());
+        let on_vm = project.route(&job.name) == Route::Vm;
+        let here = job.tag_list.is_empty() || !own_tags(vm_tag, project, job).is_empty();
         let Some(spec) = pipeline.job(&job.name).filter(|_| on_vm && here) else {
             continue;
         };
@@ -233,7 +235,9 @@ pub fn suggest_lanes(config: &Config, jobs: &[LintJob], pipeline: &Pipeline) -> 
         }
         let base = lane_tag(&image);
         let taken = |tag: &str| {
-            config.pool_by_tag(tag).is_some() || suggestions.iter().any(|lane| lane.tag == tag)
+            tag == vm_tag
+                || project.lane_by_tag(tag).is_some()
+                || suggestions.iter().any(|lane| lane.tag == tag)
         };
         let mut tag = base.clone();
         let mut next = 2;
@@ -251,12 +255,12 @@ pub fn suggest_lanes(config: &Config, jobs: &[LintJob], pipeline: &Pipeline) -> 
     suggestions
 }
 
-/// M6.1 rule R8: the names for `ignoreJobs` of the jobs tagged only for other runners that
-/// `ignoreJobs` misses, in the order the jobs come.
-pub fn suggest_ignore_jobs(config: &Config, jobs: &[LintJob]) -> Vec<String> {
+/// M6.1 rule R8: the names for the project's `ignoreJobs` of the jobs tagged only for other
+/// runners that it misses, in the order the jobs come.
+pub fn suggest_ignore_jobs(vm_tag: &str, project: &ProjectConfig, jobs: &[LintJob]) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for job in jobs.iter().filter(|job| !is_own_job(&job.name)) {
-        if runs_elsewhere_unignored(config, job) && !names.contains(&job.name) {
+        if runs_elsewhere_unignored(vm_tag, project, job) && !names.contains(&job.name) {
             names.push(job.name.clone());
         }
     }
@@ -321,511 +325,4 @@ pub fn lane_tag(image: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::parse_config;
-    use serde_json::json;
-
-    fn config() -> Config {
-        parse_config(
-            r#"{
-              "name": "demo",
-              "gitlab": { "url": "https://gitlab.example", "projectIds": [1] },
-              "host": { "type": "fake" }, "provider": { "type": "fake" },
-              "defaultPool": "ci",
-              "pools": [
-                { "tag": "ci", "image": "img/node", "stages": ["lint", "test"] },
-                { "tag": "build", "image": "img/kaniko", "stages": ["build"] }
-              ],
-              "cache": { "type": "s3" }
-            }"#,
-        )
-        .unwrap()
-    }
-
-    fn job(name: &str, stage: Option<&str>, tags: &[&str]) -> LintJob {
-        LintJob {
-            name: name.into(),
-            stage: stage.map(String::from),
-            tag_list: tags.iter().map(|t| t.to_string()).collect(),
-        }
-    }
-
-    fn summary(problems: &[Problem]) -> Vec<(&str, &str, &str)> {
-        problems
-            .iter()
-            .map(|p| (p.job.as_str(), p.pool.as_str(), p.problem.as_str()))
-            .collect()
-    }
-
-    #[test]
-    fn without_a_default_pool_untagged_jobs_are_fine_and_pool_tags_need_a_stage() {
-        let mut config = config();
-        config.default_pool = None;
-        let problems = check_jobs(
-            &config,
-            &[
-                job("hosted", Some("deploy"), &[]),
-                job("unit", Some("test"), &["ci"]),
-                job("lost", Some("deploy"), &["ci"]),
-            ],
-            &Pipeline::default(),
-        );
-        assert_eq!(
-            summary(&problems),
-            vec![(
-                "lost",
-                "",
-                "stage deploy maps to no pool but the job is tagged ci"
-            )]
-        );
-    }
-
-    #[test]
-    fn skips_the_components_own_jobs() {
-        let problems = check_jobs(
-            &config(),
-            &[
-                job("ciburst-setup", Some(".pre"), &["saas-linux-small-amd64"]),
-                job("ciburst-check", Some(".pre"), &["ci"]),
-                job("ciburst-destroy", Some("build"), &[]),
-                job("ciburst", Some("build"), &["ci"]),
-            ],
-            &Pipeline::default(),
-        );
-        let names: Vec<&str> = problems.iter().map(|p| p.job.as_str()).collect();
-        assert_eq!(names, ["ciburst"]);
-        assert!(is_own_job("ciburst-setup"));
-        assert!(!is_own_job("ciburst"));
-        assert!(!is_own_job("my-ciburst-job"));
-    }
-
-    #[test]
-    fn accepts_matching_tags_and_ignored_foreign_ones() {
-        let mut config = config();
-        config.ignore_jobs = vec!["hosted-*".into()];
-        let jobs = [
-            job("unit", Some("test"), &["ci"]),
-            job("image", Some("build"), &["build"]),
-            job("deploy", Some("deploy"), &["ci"]),
-            job("hosted-a", Some("test"), &["saas-linux-small-amd64"]),
-            job("hosted-b", Some("test"), &[]),
-            job("implicit", None, &["ci"]),
-        ];
-        let problems = check_jobs(&config, &jobs, &Pipeline::default());
-        assert!(problems.is_empty(), "{problems:?}");
-        assert!(suggest_ignore_jobs(&config, &jobs).is_empty());
-    }
-
-    #[test]
-    fn ignore_jobs_must_cover_the_jobs_of_other_runners_and_only_them() {
-        let mut config = config();
-        config.ignore_jobs = vec!["pages".into(), "release*".into()];
-        let jobs = [
-            job("hosted", Some("test"), &["saas-linux-small-amd64"]),
-            job("macos", Some("build"), &["saas-macos-medium-m1", "macos"]),
-            job("hosted", Some("test"), &["saas-linux-small-amd64"]),
-            job("pages", Some("deploy"), &["saas-linux-small-amd64"]),
-            job("release-notes", Some("deploy"), &["ci"]),
-            job("release-tag", Some("deploy"), &["build", "ci"]),
-            job("release-plain", Some("deploy"), &[]),
-            job("ciburst-setup", Some(".pre"), &["saas-linux-small-amd64"]),
-        ];
-        let problems = check_jobs(&config, &jobs, &Pipeline::default());
-        assert_eq!(
-            summary(&problems),
-            vec![
-                (
-                    "hosted",
-                    "ci",
-                    "runs on other runners (tags saas-linux-small-amd64) but ignoreJobs misses it: its pending events start VMs"
-                ),
-                (
-                    "macos",
-                    "build",
-                    "runs on other runners (tags saas-macos-medium-m1, macos) but ignoreJobs misses it: its pending events start VMs"
-                ),
-                (
-                    "hosted",
-                    "ci",
-                    "runs on other runners (tags saas-linux-small-amd64) but ignoreJobs misses it: its pending events start VMs"
-                ),
-                (
-                    "release-notes",
-                    "",
-                    "is in ignoreJobs but tagged for pool ci: no runner starts for it"
-                ),
-                (
-                    "release-tag",
-                    "",
-                    "is in ignoreJobs but tagged for pool build: no runner starts for it"
-                ),
-            ]
-        );
-        assert_eq!(suggest_ignore_jobs(&config, &jobs), ["hosted", "macos"]);
-
-        config.default_pool = None;
-        let unmapped = [job("hosted", Some("deploy"), &["saas-linux-small-amd64"])];
-        assert!(
-            check_jobs(&config, &unmapped, &Pipeline::default()).is_empty(),
-            "a job no pool takes starts nothing"
-        );
-        assert!(suggest_ignore_jobs(&config, &unmapped).is_empty());
-    }
-
-    #[test]
-    fn a_job_of_other_runners_gets_no_lane_problems() {
-        let pipeline = pipeline(json!({
-            "lint": { "image": "docker:27", "script": ["docker build ."] }
-        }));
-        let problems = check_jobs(
-            &lane_config(),
-            &[job("lint", Some("test"), &["saas-linux-small-amd64"])],
-            &pipeline,
-        );
-        assert_eq!(
-            summary(&problems),
-            vec![(
-                "lint",
-                "node-24",
-                "runs on other runners (tags saas-linux-small-amd64) but ignoreJobs misses it: its pending events start VMs"
-            )]
-        );
-    }
-
-    #[test]
-    fn reports_mismatch_untagged_and_double() {
-        let problems = check_jobs(
-            &config(),
-            &[
-                job("wrong", Some("build"), &["ci"]),
-                job("naked", Some("test"), &[]),
-                job("both", Some("test"), &["ci", "build"]),
-                job("no-list", Some("lint"), &[]),
-            ],
-            &Pipeline::default(),
-        );
-        assert_eq!(
-            summary(&problems),
-            vec![
-                (
-                    "wrong",
-                    "build",
-                    "stage build maps to pool build but the job is tagged ci"
-                ),
-                (
-                    "naked",
-                    "ci",
-                    "untagged: add tags [ci] or a hosted runner tag"
-                ),
-                ("both", "ci", "tagged for several pools: ci, build"),
-                (
-                    "no-list",
-                    "ci",
-                    "untagged: add tags [ci] or a hosted runner tag"
-                ),
-            ]
-        );
-    }
-
-    fn lane_config() -> Config {
-        parse_config(
-            r#"{
-              "name": "demo",
-              "gitlab": { "url": "https://gitlab.example", "projectIds": [1] },
-              "host": { "type": "fake" }, "provider": { "type": "fake" },
-              "defaultPool": "vm",
-              "pools": [
-                { "tag": "vm", "image": "ubuntu:24.04", "runtime": "instances" },
-                { "tag": "node-24", "image": "node:24-bookworm-slim", "runtime": "jobs",
-                  "jobs": ["lint", "unit-*"] },
-                { "tag": "build", "image": "img/kaniko", "runtime": "jobs", "stages": ["build"] }
-              ],
-              "cache": { "type": "s3" }
-            }"#,
-        )
-        .unwrap()
-    }
-
-    fn pipeline(root: serde_json::Value) -> Pipeline {
-        Pipeline::from_value(&root).unwrap()
-    }
-
-    #[test]
-    fn routes_by_job_name_before_the_stage() {
-        let pipeline = pipeline(json!({
-            "lint": { "image": "node:24-bookworm-slim", "script": ["npm run lint"] },
-            "unit-a": { "image": "node:24-bookworm-slim", "script": ["npm test"] }
-        }));
-        let problems = check_jobs(
-            &lane_config(),
-            &[
-                job("lint", Some("test"), &["node-24"]),
-                job("unit-a", Some("build"), &["vm"]),
-                job("unit-b", Some("build"), &[]),
-                job("e2e", Some("build"), &["vm"]),
-            ],
-            &pipeline,
-        );
-        assert_eq!(
-            summary(&problems),
-            vec![
-                (
-                    "unit-a",
-                    "node-24",
-                    "the job name maps to pool node-24 but the job is tagged vm"
-                ),
-                (
-                    "unit-b",
-                    "node-24",
-                    "untagged: add tags [node-24] or a hosted runner tag"
-                ),
-                (
-                    "e2e",
-                    "build",
-                    "stage build maps to pool build but the job is tagged vm"
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_lane_job_needs_no_docker_and_the_lanes_image() {
-        let pipeline = pipeline(json!({
-            "variables": { "NODE": "24", "SLIM": { "value": "bookworm-slim" } },
-            "lint": { "image": "node:${NODE}-$SLIM", "script": ["npm run lint"] },
-            "unit-services": {
-                "image": "node:24-bookworm-slim",
-                "services": ["postgres:17", { "name": "redis:8" }],
-                "script": ["npm test"]
-            },
-            "unit-dind": { "image": "docker:27", "services": ["docker:dind"], "script": ["docker build ."] },
-            "unit-registry": { "image": "registry.example:5000/tools/docker-cli:1", "script": ["true"] },
-            "unit-script": {
-                "image": "node:24-bookworm-slim",
-                "before_script": ["  docker login -u x"],
-                "script": ["docker-compose up", "dockerd &", "echo docker run"]
-            },
-            "unit-other": { "image": "node:22-bookworm-slim", "script": ["npm test"] },
-            "unit-variable": { "image": "$CI_REGISTRY_IMAGE/node:24", "script": ["npm test"] },
-            "unit-none": { "script": ["npm test"] }
-        }));
-        let names = [
-            "lint",
-            "unit-services",
-            "unit-dind",
-            "unit-registry",
-            "unit-script",
-            "unit-other",
-            "unit-variable",
-            "unit-none",
-            "unit-unknown",
-        ];
-        let jobs: Vec<LintJob> = names
-            .iter()
-            .map(|name| job(name, Some("test"), &["node-24"]))
-            .collect();
-        let problems = check_jobs(&lane_config(), &jobs, &pipeline);
-        assert!(problems.iter().all(|p| p.pool == "node-24"));
-        let found: Vec<(&str, &str)> = problems
-            .iter()
-            .map(|p| (p.job.as_str(), p.problem.as_str()))
-            .collect();
-        assert_eq!(
-            found,
-            vec![
-                (
-                    "unit-services",
-                    "lane node-24 has no Docker daemon but the job has services: postgres:17, redis:8"
-                ),
-                (
-                    "unit-dind",
-                    "lane node-24 has no Docker daemon but the job has services: docker:dind"
-                ),
-                (
-                    "unit-dind",
-                    "lane node-24 has no Docker daemon but the job's image is docker:27"
-                ),
-                (
-                    "unit-dind",
-                    "lane node-24 has no Docker daemon but a script line runs docker: docker build ."
-                ),
-                (
-                    "unit-dind",
-                    "lane node-24 runs node:24-bookworm-slim but the job's image is docker:27"
-                ),
-                (
-                    "unit-registry",
-                    "lane node-24 has no Docker daemon but the job's image is registry.example:5000/tools/docker-cli:1"
-                ),
-                (
-                    "unit-registry",
-                    "lane node-24 runs node:24-bookworm-slim but the job's image is registry.example:5000/tools/docker-cli:1"
-                ),
-                (
-                    "unit-script",
-                    "lane node-24 has no Docker daemon but a script line runs docker: docker login -u x"
-                ),
-                (
-                    "unit-other",
-                    "lane node-24 runs node:24-bookworm-slim but the job's image is node:22-bookworm-slim"
-                ),
-                (
-                    "unit-variable",
-                    "image $CI_REGISTRY_IMAGE/node:24: variable CI_REGISTRY_IMAGE is not in the pipeline's top-level variables"
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn docker_images_are_named_docker() {
-        for (image, docker) in [
-            ("docker:27", true),
-            ("docker", true),
-            ("docker:27-dind", true),
-            ("docker.io/library/docker:27@sha256:abc", true),
-            ("registry.example:5000/group/docker", true),
-            ("docker.io/library/node:24", false),
-            ("registry.example:5000/docker/node:24", false),
-            ("node:24-docker", false),
-            ("gcr.io/kaniko-project/executor:debug", false),
-        ] {
-            assert_eq!(is_docker_image(image), docker, "{image}");
-        }
-    }
-
-    #[test]
-    fn lane_tags_are_the_name_and_major_version() {
-        for (image, tag) in [
-            ("rust:1.96.0-bookworm", "rust-1"),
-            ("node:24-bookworm-slim", "node-24"),
-            ("mcr.microsoft.com/playwright:v1.64.0-noble", "playwright-1"),
-            ("alpine:3.21", "alpine-3"),
-            ("alpine", "alpine"),
-            ("ubuntu:latest", "ubuntu"),
-            (
-                "registry.example:5000/Group/My_Tool:2024.1@sha256:abc",
-                "my-tool-2024",
-            ),
-            ("python:3.13@sha256:abc", "python-3"),
-            ("__", "lane"),
-        ] {
-            assert_eq!(lane_tag(image), tag, "{image}");
-        }
-        assert_eq!(lane_tag(&format!("{}:1", "a".repeat(80))).len(), 63);
-    }
-
-    #[test]
-    fn suggests_lanes_for_docker_free_jobs_on_a_vm_pool() {
-        let pipeline = pipeline(json!({
-            "variables": { "RUST": "1.96.0" },
-            ".node": { "image": "node:24-bookworm-slim" },
-            "eslint": { "extends": ".node", "script": ["npm run lint"] },
-            "vitest": { "extends": ".node", "script": ["npm test"] },
-            "cargo": { "image": "rust:${RUST}-bookworm", "script": ["cargo test"] },
-            "rust-alpine": { "image": "rust:1.96.0-alpine", "script": ["cargo test"] },
-            "with-db": { "image": "node:24-bookworm-slim", "services": ["postgres:17"], "script": ["npm test"] },
-            "image": { "image": "docker:27", "services": ["docker:dind"], "script": ["docker build ."] },
-            "login": { "image": "alpine:3.21", "script": ["docker login"] },
-            "unknown": { "image": "$NOPE", "script": ["x"] },
-            "bare": { "script": ["x"] },
-            "hosted": { "image": "alpine:3.21", "script": ["deploy"] },
-            "lint": { "image": "node:24-bookworm-slim", "script": ["already a lane"] },
-            "kaniko": { "image": "alpine:3.21", "script": ["build"] }
-        }));
-        let jobs = [
-            job("eslint", Some("test"), &["vm"]),
-            job("cargo", Some("test"), &["vm"]),
-            job("vitest", Some("test"), &[]),
-            job("rust-alpine", Some("test"), &["vm"]),
-            job("with-db", Some("test"), &["vm"]),
-            job("image", Some("test"), &["vm"]),
-            job("login", Some("test"), &["vm"]),
-            job("unknown", Some("test"), &["vm"]),
-            job("bare", Some("test"), &["vm"]),
-            job("hosted", Some("test"), &["saas-linux-small-amd64"]),
-            job("lint", Some("test"), &["node-24"]),
-            job("kaniko", Some("build"), &["build"]),
-            job("ciburst-check", Some(".pre"), &["vm"]),
-            job("missing", Some("test"), &["vm"]),
-        ];
-        let suggestions = suggest_lanes(&lane_config(), &jobs, &pipeline);
-        assert_eq!(
-            suggestions,
-            [
-                Suggestion {
-                    tag: "node-24-2".into(),
-                    image: "node:24-bookworm-slim".into(),
-                    jobs: vec!["eslint".into(), "vitest".into()],
-                    tagged: vec!["eslint".into(), "vitest".into()],
-                },
-                Suggestion {
-                    tag: "rust-1".into(),
-                    image: "rust:1.96.0-bookworm".into(),
-                    jobs: vec!["cargo".into()],
-                    tagged: vec!["cargo".into()],
-                },
-                Suggestion {
-                    tag: "rust-1-2".into(),
-                    image: "rust:1.96.0-alpine".into(),
-                    jobs: vec!["rust-alpine".into()],
-                    tagged: vec!["rust-alpine".into()],
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn parallel_and_matrix_jobs_get_one_pattern_and_one_tags_line() {
-        let pipeline = pipeline(json!({
-            "e2e": {
-                "image": "node:24-bookworm-slim",
-                "parallel": { "matrix": [{ "PLATFORM": ["android", "ios"] }] },
-                "script": ["npm run e2e"]
-            },
-            "unit": { "image": "node:24-bookworm-slim", "parallel": 3, "script": ["npm test"] },
-            "unit-smoke": { "image": "alpine:3.21", "script": ["true"] },
-            "lint": { "image": "node:24-bookworm-slim", "script": ["npm run lint"] }
-        }));
-        let jobs = [
-            job("e2e: [android]", Some("test"), &["vm"]),
-            job("e2e: [ios]", Some("test"), &["vm"]),
-            job("unit 1/3", Some("test"), &["vm"]),
-            job("unit 2/3", Some("test"), &["vm"]),
-            job("unit 3/3", Some("test"), &["vm"]),
-            job("unit-smoke", Some("test"), &["saas-linux-small-amd64"]),
-        ];
-        let suggestions = suggest_lanes(&lane_config(), &jobs, &pipeline);
-        assert_eq!(
-            suggestions,
-            [Suggestion {
-                tag: "node-24-2".into(),
-                image: "node:24-bookworm-slim".into(),
-                jobs: vec![
-                    "e2e*".into(),
-                    "unit 1/3".into(),
-                    "unit 2/3".into(),
-                    "unit 3/3".into()
-                ],
-                tagged: vec!["e2e".into(), "unit".into()],
-            }],
-            "unit-smoke starts with unit, so unit keeps its copies' names"
-        );
-        let mut config = lane_config();
-        config.pools[1].jobs = suggestions[0].jobs.clone();
-        for name in ["e2e: [android]", "e2e: [ios]", "unit 2/3"] {
-            assert_eq!(
-                config.pool_for(name, Some("test")).map(|p| p.tag.as_str()),
-                Some("node-24"),
-                "{name}"
-            );
-        }
-        assert_eq!(
-            config
-                .pool_for("unit-smoke", Some("test"))
-                .map(|p| p.tag.as_str()),
-            Some("vm")
-        );
-    }
-}
+mod tests;

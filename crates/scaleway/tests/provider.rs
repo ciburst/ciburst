@@ -15,7 +15,7 @@ use ciburst_scaleway::provider::s3::{S3, lifecycle_xml};
 use ciburst_scaleway::testing::scaleway_fake::{
     FAKE_ACCESS_KEY, FAKE_REGION, FAKE_SECRET_KEY, Failure, ScalewayFake,
 };
-use ciburst_scaleway::testing::{RUNNER_FIXTURE_URL, runner_fixture_sha256};
+use ciburst_scaleway::testing::{RUNNER_FIXTURE_URL, agent_fixture, runner_fixture_sha256};
 use serde_json::json;
 
 struct Factory;
@@ -33,20 +33,12 @@ impl ProviderFactory for Factory {
     }
 }
 
-/// The config with `provider.runtime: jobs`: the contract and these tests cover Serverless
-/// Jobs; `provider_instances.rs` covers the default runtime.
-fn jobs(config: Arc<Config>) -> Arc<Config> {
-    let mut config = (*config).clone();
-    config
-        .provider
-        .extra
-        .insert("runtime".into(), json!("jobs"));
-    Arc::new(config)
-}
-
+/// The provider with the agent fixture: these tests and the contract cover the lanes and the
+/// shared resources; `provider_instances.rs` covers the VM runner.
 fn provider(config: Arc<Config>, backend: &Arc<ScalewayFake>, log: Log) -> Scaleway {
-    Scaleway::new(jobs(config), backend.client(), log)
+    Scaleway::new(config, backend.client(), log)
         .with_s3_access_key(FAKE_ACCESS_KEY)
+        .with_agent(Some(agent_fixture()))
         .with_runner_source(RUNNER_FIXTURE_URL, runner_fixture_sha256())
 }
 
@@ -57,7 +49,8 @@ fn with_credentials(
     log: Log,
 ) -> Scaleway {
     let client = ScalewayClient::new(backend.clone(), credentials, FAKE_REGION);
-    Scaleway::new(jobs(config), Arc::new(client), log)
+    Scaleway::new(config, Arc::new(client), log)
+        .with_agent(Some(agent_fixture()))
         .with_runner_source(RUNNER_FIXTURE_URL, runner_fixture_sha256())
 }
 
@@ -93,7 +86,7 @@ fn labels() -> BTreeMap<String, String> {
 
 fn start_request(tag: usize) -> StartRequest {
     StartRequest {
-        pool: contract_config().pools[tag].clone(),
+        pool: contract_config().lanes[tag].pool(7),
         env: BTreeMap::from([("RUNNER_TOKEN".to_string(), "glrt-test".to_string())]),
         labels: labels(),
         taken: 1,
@@ -120,8 +113,10 @@ async fn first_plan_lists_every_resource_in_order() {
             ("key:cache".to_string(), Action::Create),
             ("bucket".to_string(), Action::Create),
             ("runner-binary".to_string(), Action::Create),
-            ("definition:ci".to_string(), Action::Create),
-            ("definition:build".to_string(), Action::Create),
+            ("vm:agent".to_string(), Action::Create),
+            ("vm:security-group".to_string(), Action::Create),
+            ("definition:7-ci".to_string(), Action::Create),
+            ("definition:7-build".to_string(), Action::Create),
         ]
     );
     assert!(backend.writes().is_empty(), "plan writes nothing");
@@ -194,7 +189,7 @@ async fn apply_creates_the_resources_of_the_spec() {
     let definitions = backend.jobs.definitions();
     assert_eq!(definitions.len(), 2);
     let ci = &definitions[0];
-    assert_eq!(ci["name"], "contract-ci");
+    assert_eq!(ci["name"], "contract-7-ci");
     assert_eq!(ci["project_id"], *project_id);
     assert_eq!(ci["cpu_limit"], 2000);
     assert_eq!(ci["memory_limit"], 4096);
@@ -215,7 +210,10 @@ async fn second_apply_is_noop_and_returns_no_secret() {
     let steps = provider.plan(&[]).await.unwrap();
     assert!(steps.iter().all(Step::is_noop), "{steps:?}");
     let outputs = provider.apply(&steps).await.unwrap();
-    assert_eq!(outputs.keys().collect::<Vec<_>>(), ["CIBURST_PROJECT_ID"]);
+    assert_eq!(
+        outputs.keys().collect::<Vec<_>>(),
+        ["CIBURST_AGENT_SHA256", "CIBURST_PROJECT_ID"]
+    );
     assert_eq!(backend.writes().len(), writes, "no write after noop");
 }
 
@@ -255,12 +253,12 @@ async fn changed_pool_updates_and_removed_pool_deletes() {
     let (backend, _, _) = provisioned(Log::silent()).await;
     let changed = provider(changed_config(), &backend, Log::silent());
     let steps = changed.plan(&[]).await.unwrap();
-    let ci = steps.iter().find(|s| s.id == "definition:ci").unwrap();
+    let ci = steps.iter().find(|s| s.id == "definition:7-ci").unwrap();
     assert_eq!(ci.action, Action::Update);
     assert_eq!(ci.detail.as_deref(), Some("cpu_limit"));
-    let build = steps.iter().find(|s| s.id == "definition:build").unwrap();
+    let build = steps.iter().find(|s| s.id == "definition:7-build").unwrap();
     assert_eq!(build.action, Action::Delete);
-    assert_eq!(build.resource, "job definition contract-build");
+    assert_eq!(build.resource, "job definition contract-7-build");
     changed.apply(&steps).await.unwrap();
     let definitions = backend.jobs.definitions();
     assert_eq!(definitions.len(), 1);
@@ -295,7 +293,7 @@ async fn turning_the_cache_off_deletes_its_key_and_bucket() {
     let find = |id: &str| steps.iter().find(|s| s.id == id).map(|s| s.action);
     assert_eq!(find("key:cache"), Some(Action::Delete));
     assert_eq!(find("bucket"), Some(Action::Delete));
-    assert_eq!(find("definition:ci"), Some(Action::Update));
+    assert_eq!(find("definition:7-ci"), Some(Action::Update));
     let outputs = off.apply(&steps).await.unwrap();
     assert!(!outputs.contains_key("CIBURST_CACHE_SECRET_KEY"));
     assert!(backend.s3.buckets().is_empty());
@@ -362,10 +360,10 @@ async fn start_passes_env_and_labels_and_list_reads_them_back() {
             "CIBURST_STAGE": "test",
         }}))
     );
-    let runs = provider.list(Some("ci")).await.unwrap();
+    let runs = provider.list(Some("7-ci")).await.unwrap();
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].run_id, run_id);
-    assert_eq!(runs[0].pool, "ci");
+    assert_eq!(runs[0].pool, "7-ci");
     assert_eq!(runs[0].state, RunState::Queued);
     assert_eq!(runs[0].labels, labels());
     assert!(!runs[0].created_at.is_empty());
@@ -392,8 +390,8 @@ async fn list_reads_every_page_of_every_pool() {
         provider.start(start_request(0)).await.unwrap();
     }
     provider.start(start_request(1)).await.unwrap();
-    assert_eq!(provider.list(Some("ci")).await.unwrap().len(), 5);
-    assert_eq!(provider.list(Some("build")).await.unwrap().len(), 1);
+    assert_eq!(provider.list(Some("7-ci")).await.unwrap().len(), 5);
+    assert_eq!(provider.list(Some("7-build")).await.unwrap().len(), 1);
     assert_eq!(provider.list(None).await.unwrap().len(), 6);
     assert!(provider.list(Some("unknown")).await.unwrap().is_empty());
 }
@@ -530,7 +528,7 @@ async fn api_errors_carry_method_path_status_and_message() {
 async fn s3_errors_carry_the_s3_code() {
     let (backend, _, outputs) = provisioned(Log::silent()).await;
     let project_id = &outputs["CIBURST_PROJECT_ID"];
-    let wrong = Scaleway::new(jobs(contract_config()), backend.client(), Log::silent())
+    let wrong = Scaleway::new(contract_config(), backend.client(), Log::silent())
         .with_s3_access_key("SCWWRONGACCESSKEY000");
     let error = wrong.plan(&[]).await.unwrap_err().to_string();
     assert_eq!(
@@ -553,7 +551,7 @@ async fn s3_errors_carry_the_s3_code() {
         error,
         "scaleway: the cache bucket needs the access key of SCW_SECRET_KEY"
     );
-    let no_cache = Scaleway::new(jobs(cache_off()), backend.client(), Log::silent());
+    let no_cache = Scaleway::new(cache_off(), backend.client(), Log::silent());
     assert!(no_cache.plan(&[]).await.is_ok(), "no S3 without the cache");
 }
 
@@ -596,7 +594,7 @@ async fn logs_name_resources_and_never_a_secret() {
     assert!(
         lines
             .iter()
-            .any(|l| l.starts_with("info created job definition name=\"contract-ci\""))
+            .any(|l| l.starts_with("info created job definition name=\"contract-7-ci\""))
     );
     assert!(
         lines

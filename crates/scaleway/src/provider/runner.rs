@@ -68,10 +68,10 @@ impl Scaleway {
         &self.runner.sha256
     }
 
-    /// Whether the cache bucket holds the runner: whenever a pool exists. Without an S3 cache
-    /// there is no bucket, which config validation refuses for a config with pools.
+    /// Whether the cache bucket holds the runner: always with an S3 cache, which config
+    /// validation requires, because the VM runner and every lane download it.
     pub(super) fn needs_runner(&self) -> bool {
-        self.cache_on() && !self.config.pools.is_empty()
+        self.cache_on()
     }
 
     /// `noop` when the object exists, else `create`.

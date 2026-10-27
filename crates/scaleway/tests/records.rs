@@ -411,13 +411,12 @@ async fn the_ledger_reads_past_the_records() {
       "gitlab": { "url": "https://gitlab.example", "projectIds": [7] },
       "host": { "type": "scaleway-function" },
       "provider": { "type": "scaleway" },
-      "defaultPool": "_pipelines",
-      "pools": [ { "tag": "_pipelines", "image": "img/docker", "runtime": "instances" } ],
+      "vm": { "tag": "_pipelines", "image": "img/docker" },
       "cache": { "type": "s3" }
     }"#;
     let error = parse_config(config).unwrap_err().to_string();
     assert!(
-        error.contains("pools[0].tag: lowercase letters, digits and hyphens"),
+        error.contains("vm.tag: lowercase letters, digits and hyphens"),
         "{error}"
     );
 }

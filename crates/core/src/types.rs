@@ -119,9 +119,6 @@ pub struct KeyPair {
 pub struct Secrets {
     pub hook_token: Option<String>,
     pub runner_tokens: BTreeMap<String, String>,
-    /// Token of each VM pool's spill runner, by VM pool tag (M6.2 rule R6).
-    #[serde(default)]
-    pub spill_tokens: BTreeMap<String, String>,
     pub dispatch: Option<KeyPair>,
     pub cache: Option<KeyPair>,
     /// Signs VM capability tokens (`crate::vm::token`); never leaves the dispatcher.
@@ -130,10 +127,6 @@ pub struct Secrets {
     /// Authenticates the cron trigger's sweep, so the hook token never sits in the cron's args.
     #[serde(default)]
     pub sweep_token: Option<String>,
-    /// Credentials of added providers the dispatcher needs, by variable name (`HCLOUD_TOKEN`);
-    /// the host stores them as secret environment variables.
-    #[serde(default)]
-    pub provider_env: BTreeMap<String, String>,
     /// Plain (not secret) environment of the dispatcher, by variable name
     /// (`CIBURST_AGENT_SHA256`); the host stores them as ordinary environment variables.
     #[serde(default)]
@@ -205,7 +198,7 @@ pub struct StartRequest {
 pub trait Provider: Send + Sync {
     fn capabilities(&self) -> Capabilities;
 
-    /// The capabilities that apply to `pool`; a composite answers with the member serving it.
+    /// The capabilities that apply to `pool`; by default those of the provider.
     fn capabilities_for(&self, _pool: &Pool) -> Capabilities {
         self.capabilities()
     }
@@ -248,6 +241,14 @@ pub trait Provider: Send + Sync {
     /// Ends runs that stopped behaving (spec section 6.1, sweep) and returns their ids.
     async fn sweep(&self, _now: u64) -> Result<Vec<String>> {
         Ok(Vec::new())
+    }
+
+    /// D60, M6.4 rule R5: makes the job definitions of project `project`'s lanes match
+    /// `lanes`, run specs of [`crate::config::Lane::pool`], creating and updating them, and
+    /// deletes the project's other lane definitions. Answers each definition's id by lane
+    /// tag. The dispatcher calls it on `/join` and `/leave` with the dispatch key.
+    async fn sync_lanes(&self, _project: u64, _lanes: &[Pool]) -> Result<BTreeMap<String, String>> {
+        Err(crate::Error::provider("this provider runs no lanes"))
     }
 
     /// The deployment's fleet state (M6.3 rule R1), opened with the secrets of `apply`;
@@ -295,18 +296,12 @@ pub struct VmReport {
     pub state: VmState,
     pub free: u32,
     pub slots: u32,
-    /// Slots polling with the spill runner, which also takes lane jobs (M6.2 rule R6); agents
-    /// before M6.2 leave it out.
-    #[serde(default)]
-    pub spill: u32,
 }
 
-/// The dispatcher's answer to a [`VmReport`] besides `result` and `ms` (M6.2 rule R7): whether
-/// idle slots poll with the spill runner, and the seconds until the next report.
+/// The dispatcher's answer to a [`VmReport`] besides `result` and `ms`: the seconds until the
+/// next report and the member runners.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmReportAnswer {
-    #[serde(default)]
-    pub spill: bool,
     #[serde(rename = "nextReportS", default = "default_next_report_s")]
     pub next_report_s: u64,
     /// The runners of every member for the VM's pool (M6.3 rule R5); the agent runs one
@@ -333,8 +328,6 @@ pub struct VmCapacity {
     pub run_id: String,
     pub state: VmState,
     pub free: u32,
-    /// Slots of the last report that poll with the spill runner (M6.2).
-    pub spill: u32,
     /// Unix seconds of the last report, `None` before the first one.
     pub seen: Option<u64>,
     /// Unix seconds of creation.

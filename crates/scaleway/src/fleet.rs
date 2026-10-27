@@ -26,7 +26,7 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use async_trait::async_trait;
 use ciburst_core::config::Config;
-use ciburst_core::fleet::{FleetStore, Member};
+use ciburst_core::fleet::{FleetStore, Member, MemberLane};
 use ciburst_core::http::HttpClient;
 use ciburst_core::types::KeyPair;
 use ciburst_core::{Error, Result};
@@ -181,6 +181,10 @@ fn runner_aad(key: &str, tag: &str) -> String {
     format!("{key}#runners/{tag}")
 }
 
+fn lane_aad(key: &str, tag: &str) -> String {
+    format!("{key}#lanes/{tag}")
+}
+
 #[derive(Serialize, Deserialize)]
 struct StoredConfig {
     config: String,
@@ -196,6 +200,12 @@ struct StoredMember {
     #[serde(rename = "hookSecret")]
     hook_secret: String,
     runners: BTreeMap<String, String>,
+    /// The member's lanes with sealed runner tokens (M6.4 rule R6); a record before M6.4 has
+    /// none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    lanes: Vec<MemberLane>,
+    #[serde(default, rename = "ignoreJobs", skip_serializing_if = "Vec::is_empty")]
+    ignore_jobs: Vec<String>,
     #[serde(rename = "joinedAt")]
     joined_at: u64,
 }
@@ -250,11 +260,25 @@ impl ScalewayFleetStore {
             .iter()
             .map(|(tag, token)| Ok((tag.clone(), self.key.seal(&runner_aad(&key, tag), token)?)))
             .collect::<Result<_>>()?;
+        let lanes = member
+            .lanes
+            .iter()
+            .map(|lane| {
+                Ok(MemberLane {
+                    runner_token: self
+                        .key
+                        .seal(&lane_aad(&key, &lane.tag), &lane.runner_token)?,
+                    ..lane.clone()
+                })
+            })
+            .collect::<Result<_>>()?;
         Ok(StoredMember {
             project_id: member.project_id,
             cipher: CIPHER.to_string(),
             hook_secret: self.key.seal(&hook_aad(&key), &member.hook_secret)?,
             runners,
+            lanes,
+            ignore_jobs: member.ignore_jobs.clone(),
             joined_at: member.joined_at,
         })
     }
@@ -276,10 +300,24 @@ impl ScalewayFleetStore {
             .iter()
             .map(|(tag, token)| Ok((tag.clone(), self.key.open(&runner_aad(key, tag), token)?)))
             .collect::<Result<_>>()?;
+        let lanes = stored
+            .lanes
+            .iter()
+            .map(|lane| {
+                Ok(MemberLane {
+                    runner_token: self
+                        .key
+                        .open(&lane_aad(key, &lane.tag), &lane.runner_token)?,
+                    ..lane.clone()
+                })
+            })
+            .collect::<Result<_>>()?;
         Ok(Member {
             project_id: stored.project_id,
             hook_secret: self.key.open(&hook_aad(key), &stored.hook_secret)?,
             runners,
+            lanes,
+            ignore_jobs: stored.ignore_jobs,
             joined_at: stored.joined_at,
         })
     }

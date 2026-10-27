@@ -8,21 +8,89 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
+use crate::config::{
+    DEFAULT_MEMORY_MIB, DEFAULT_STORAGE_MIB, DEFAULT_TIMEOUT_S, DEFAULT_VCPU,
+    DEFAULT_WAIT_TIMEOUT_S, Lane, Pool, ProjectConfig,
+};
 use crate::store::Store;
 
 /// A project the fleet serves (M6.3 rule R2). The host is the first member.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Member {
     #[serde(rename = "projectId")]
     pub project_id: u64,
     /// The `X-Gitlab-Token` of the member's webhook.
     #[serde(rename = "hookSecret")]
     pub hook_secret: String,
-    /// The token of each runner the member registered, by pool tag.
+    /// The token of the member's VM runner, by the VM runner's tag. A record of an earlier
+    /// fleet may hold tokens of the host's lanes too, which nothing reads any more.
     pub runners: BTreeMap<String, String>,
+    /// The member's own lanes (D60); a record without them has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lanes: Vec<MemberLane>,
+    /// The member's own `ignoreJobs` (D61).
+    #[serde(default, rename = "ignoreJobs", skip_serializing_if = "Vec::is_empty")]
+    pub ignore_jobs: Vec<String>,
     /// Unix seconds of the join.
     #[serde(rename = "joinedAt")]
     pub joined_at: u64,
+}
+
+/// One lane of a member as its record keeps it (M6.4 rule R6): what routing reads in clear
+/// text, the job definition the dispatcher made for it, and the token of the lane's runner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberLane {
+    pub tag: String,
+    /// The lane's image, for `ciburst status`.
+    #[serde(default)]
+    pub image: String,
+    pub jobs: Vec<String>,
+    #[serde(rename = "maxRuns")]
+    pub max_runs: u32,
+    /// The id of the job definition `<name>-<project id>-<tag>`.
+    #[serde(rename = "definitionId")]
+    pub definition_id: String,
+    /// The token of the lane's runner in the member's project; sealed at rest.
+    #[serde(rename = "runnerToken")]
+    pub runner_token: String,
+}
+
+impl Member {
+    /// The route of job `name` of this member (D60, D61).
+    pub fn route(&self, name: &str) -> crate::config::Route<'_, MemberLane> {
+        crate::config::route(name, &self.ignore_jobs, &self.lanes, |lane| &lane.jobs)
+    }
+
+    /// The member's project settings as far as its record keeps them, for `ciburst check`.
+    pub fn project_config(&self) -> ProjectConfig {
+        ProjectConfig {
+            lanes: self.lanes.iter().map(MemberLane::lane).collect(),
+            ignore_jobs: self.ignore_jobs.clone(),
+        }
+    }
+}
+
+impl MemberLane {
+    /// The lane as far as the record keeps it; sizes the record leaves out take the defaults.
+    pub fn lane(&self) -> Lane {
+        Lane {
+            tag: self.tag.clone(),
+            image: self.image.clone(),
+            jobs: self.jobs.clone(),
+            vcpu: DEFAULT_VCPU,
+            memory_mib: DEFAULT_MEMORY_MIB,
+            storage_mib: DEFAULT_STORAGE_MIB,
+            timeout_s: DEFAULT_TIMEOUT_S,
+            wait_timeout_s: DEFAULT_WAIT_TIMEOUT_S,
+            max_runs: self.max_runs,
+        }
+    }
+
+    /// The run spec of this lane of project `project`: the start of a lane run needs its key
+    /// and `maxRuns` only.
+    pub fn pool(&self, project: u64) -> Pool {
+        self.lane().pool(project)
+    }
 }
 
 /// Where a fleet keeps its state. A store that persists members encrypts their secrets at rest
@@ -166,6 +234,7 @@ mod tests {
             hook_secret: "s".into(),
             runners: [("vm".to_string(), "glrt-9".to_string())].into(),
             joined_at: 3,
+            ..Default::default()
         };
         fleet.put_member(&member).await.unwrap();
         let again = StoreFleet::new(slot);
@@ -174,6 +243,48 @@ mod tests {
         again.delete_member(9).await.unwrap();
         again.delete_member(9).await.unwrap();
         assert!(fleet.members().await.unwrap().is_empty());
+    }
+
+    /// M6.4: a record written before lanes per project reads as a member without lanes and
+    /// without `ignoreJobs`; the lane tokens it kept under `runners` route nothing.
+    #[test]
+    fn an_old_record_reads_as_a_member_without_lanes() {
+        let old = serde_json::json!({
+            "projectId": 9,
+            "hookSecret": "s",
+            "runners": { "vm": "glrt-vm", "node-24": "glrt-node" },
+            "joinedAt": 3
+        });
+        let member: Member = serde_json::from_value(old).unwrap();
+        assert!(member.lanes.is_empty() && member.ignore_jobs.is_empty());
+        assert_eq!(member.route("lint"), crate::config::Route::Vm);
+        let back = serde_json::to_value(&member).unwrap();
+        assert!(back.get("lanes").is_none() && back.get("ignoreJobs").is_none());
+    }
+
+    #[test]
+    fn a_member_routes_by_its_own_lanes_and_ignore_jobs() {
+        let member = Member {
+            project_id: 9,
+            lanes: vec![MemberLane {
+                tag: "node".into(),
+                image: "node:24".into(),
+                jobs: vec!["lint".into(), "unit-*".into()],
+                max_runs: 3,
+                definition_id: "def".into(),
+                runner_token: "glrt-node".into(),
+            }],
+            ignore_jobs: vec!["pages".into()],
+            ..Default::default()
+        };
+        assert!(matches!(member.route("unit-a"), crate::config::Route::Lane(l) if l.tag == "node"));
+        assert_eq!(member.route("pages"), crate::config::Route::Ignored);
+        assert_eq!(member.route("e2e"), crate::config::Route::Vm);
+        let pool = member.lanes[0].pool(9);
+        assert_eq!((pool.tag.as_str(), pool.max_runs), ("9-node", 3));
+        let settings = member.project_config();
+        assert_eq!(settings.lanes[0].image, "node:24");
+        assert_eq!(settings.ignore_jobs, ["pages"]);
     }
 
     #[tokio::test]
@@ -187,6 +298,7 @@ mod tests {
             hook_secret: secret.into(),
             runners: [("vm".to_string(), "glrt-a".to_string())].into(),
             joined_at: 1,
+            ..Default::default()
         };
         store.put_member(&member(7, "a")).await.unwrap();
         store.put_member(&member(8, "b")).await.unwrap();

@@ -853,6 +853,27 @@ impl FakeGitlab {
                 }
                 json(200, runner.to_json())
             }
+            // GitLab refuses to disable a runner in its owner project (403) and answers 404
+            // for a runner not enabled in the project.
+            ("DELETE", ["projects", p, "runners", r]) => {
+                let project = id(p).unwrap_or(0);
+                let runner_id = id(r).unwrap_or(0);
+                match inner
+                    .runners
+                    .iter_mut()
+                    .find(|x| x.id == runner_id && x.projects.contains(&project))
+                {
+                    None => json(404, json!({ "message": "404 Runner Not Found" })),
+                    Some(runner) if runner.projects.first() == Some(&project) => json(
+                        403,
+                        json!({ "message": "403 Forbidden - Only one project associated with the runner. Please remove the runner instead" }),
+                    ),
+                    Some(runner) => {
+                        runner.projects.retain(|x| *x != project);
+                        Response::empty(204)
+                    }
+                }
+            }
             ("DELETE", ["runners", r]) => {
                 let runner_id = id(r).unwrap_or(0);
                 let before = inner.runners.len();
