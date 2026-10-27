@@ -357,7 +357,7 @@ async fn a_config_change_takes_effect_within_the_cache_time() {
     let s = setup("[7]", true).await;
     let before = s.event(HOOK, 7, "deploy", 1).await;
     assert_eq!(
-        before.body["pool"], "vm",
+        before.body["runner"], "vm",
         "the env config without a stored one"
     );
     s.store
@@ -366,10 +366,10 @@ async fn a_config_change_takes_effect_within_the_cache_time() {
         .await
         .unwrap();
     tokio::time::advance(FLEET_CACHE - std::time::Duration::from_secs(1)).await;
-    assert_eq!(s.event(HOOK, 7, "deploy", 2).await.body["pool"], "vm");
+    assert_eq!(s.event(HOOK, 7, "deploy", 2).await.body["runner"], "vm");
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
     let after = s.event(HOOK, 7, "deploy", 3).await;
-    assert_eq!(after.body["pool"], "7-jobs", "{}", after.body);
+    assert_eq!(after.body["runner"], "jobs", "{}", after.body);
     assert_eq!(s.started().last().unwrap().pool.tag, "7-jobs");
 }
 
@@ -378,7 +378,7 @@ async fn a_failed_read_keeps_the_last_state() {
     let s = setup("[7]", true).await;
     *s.store.failing.lock().unwrap() = true;
     let first = s.event(HOOK, 7, "deploy", 1).await;
-    assert_eq!(first.body["pool"], "vm", "the env config");
+    assert_eq!(first.body["runner"], "vm", "the env config");
     let lines = s.lines();
     assert!(
         lines
@@ -397,13 +397,13 @@ async fn a_failed_read_keeps_the_last_state() {
     s.put(member(8, &[("vm", "glrt-8")])).await;
     let read = s.event(HOOK, 7, "deploy", 2).await;
     assert_eq!(
-        read.body["pool"], "7-jobs",
+        read.body["runner"], "jobs",
         "a failed read is retried at once"
     );
 
     *s.store.failing.lock().unwrap() = true;
     tokio::time::advance(FLEET_CACHE).await;
-    assert_eq!(s.event(HOOK, 7, "deploy", 3).await.body["pool"], "7-jobs");
+    assert_eq!(s.event(HOOK, 7, "deploy", 3).await.body["runner"], "jobs");
     let secret8 = invite::hook_secret(HOOK, 8);
     assert_eq!(
         s.event(&secret8, 8, "test", 4).await.body["result"],
@@ -425,7 +425,6 @@ async fn a_member_joins_with_its_lanes_and_leaves() {
         json!({
             "result": "fleet", "name": "fleet", "ms": 0,
             "vm": { "tag": "vm", "runtime": "instances" },
-            "pools": [ { "tag": "vm", "runtime": "instances", "tags": ["vm"] } ],
             "hookSecret": invite::hook_secret(HOOK, 8),
         })
     );
@@ -466,7 +465,7 @@ async fn a_member_joins_with_its_lanes_and_leaves() {
         lane.body["result"], "started",
         "at once, without a cache wait"
     );
-    assert_eq!(lane.body["pool"], "8-jobs");
+    assert_eq!(lane.body["runner"], "jobs");
     let started = s.started();
     assert_eq!(started[0].env["RUNNER_TOKEN"], "glrt-8-jobs");
     assert_eq!(started[0].pool.image, "img/node");
@@ -474,7 +473,7 @@ async fn a_member_joins_with_its_lanes_and_leaves() {
     assert_eq!(ignored.body["reason"], "ignore_jobs");
     let host_pages = s.event(HOOK, 7, "pages", 3).await;
     assert_eq!(
-        host_pages.body["pool"], "vm",
+        host_pages.body["runner"], "vm",
         "the member's ignoreJobs are its own"
     );
 
@@ -492,19 +491,19 @@ async fn a_member_joins_with_its_lanes_and_leaves() {
     assert_eq!(stored[0].lanes.len(), 2);
     assert!(stored[0].ignore_jobs.is_empty());
     let rerun = s.event(&secret, 8, "build", 4).await;
-    assert_eq!(rerun.body["pool"], "8-jobs");
+    assert_eq!(rerun.body["runner"], "jobs");
     assert_eq!(s.started().last().unwrap().pool.image, "img/node2");
     assert_eq!(
         s.started().last().unwrap().env["RUNNER_TOKEN"],
         "glrt-8b-jobs"
     );
     let unit = s.event(&secret, 8, "unit-a", 5).await;
-    assert_eq!(unit.body["pool"], "vm", "no lane takes it any more");
+    assert_eq!(unit.body["runner"], "vm", "no lane takes it any more");
     let only_vm = join_body("glrt-8c", &[]);
     assert_eq!(s.join(8, only_vm, NOW + 6).await.body["result"], "joined");
     let defs = s.provider.inner.definition_keys().await;
     assert_eq!(defs, ["7-jobs", "vm"], "the member's definitions are gone");
-    assert_eq!(s.event(&secret, 8, "build", 6).await.body["pool"], "vm");
+    assert_eq!(s.event(&secret, 8, "build", 6).await.body["runner"], "vm");
 
     assert_eq!(
         s.join(
@@ -543,9 +542,9 @@ async fn lanes_route_only_the_jobs_of_their_own_project() {
     assert_eq!(s.join(9, other, NOW).await.body["result"], "joined");
 
     let host = s.event(HOOK, 7, "build", 1).await;
-    assert_eq!(host.body["pool"], "7-jobs", "{}", host.body);
+    assert_eq!(host.body["runner"], "jobs", "{}", host.body);
     let member = s.event(&invite::hook_secret(HOOK, 8), 8, "build", 2).await;
-    assert_eq!(member.body["pool"], "8-jobs", "{}", member.body);
+    assert_eq!(member.body["runner"], "jobs", "{}", member.body);
     let started = s.started();
     assert_eq!(
         (
@@ -566,15 +565,18 @@ async fn lanes_route_only_the_jobs_of_their_own_project() {
         (invite::hook_secret(HOOK, 8), 8, 4),
     ] {
         let lint = s.event(&token, project, "lint", job).await;
-        assert_eq!(lint.body["pool"], "vm", "only project 9's lane takes lint");
+        assert_eq!(
+            lint.body["runner"], "vm",
+            "only project 9's lane takes lint"
+        );
     }
     let nine = s.event(&invite::hook_secret(HOOK, 9), 9, "build", 5).await;
     assert_eq!(
-        nine.body["pool"], "vm",
+        nine.body["runner"], "vm",
         "the host's and 8's lanes are not 9's"
     );
     let lint = s.event(&invite::hook_secret(HOOK, 9), 9, "lint", 6).await;
-    assert_eq!(lint.body["pool"], "9-node");
+    assert_eq!(lint.body["runner"], "node");
     assert_eq!(
         s.started().last().unwrap().env["RUNNER_TOKEN"],
         "glrt-9-node"
@@ -742,7 +744,7 @@ async fn further_config_projects_use_the_host_vm_runner_until_they_join() {
     let s = setup("[7, 11]", true).await;
     let host_lane = s.event(HOOK, 11, "build", 1).await;
     assert_eq!(
-        host_lane.body["pool"], "vm",
+        host_lane.body["runner"], "vm",
         "the host's lanes take the host's jobs only"
     );
     assert_eq!(s.started()[0].env["RUNNER_TOKEN"], "glrt-vm");
@@ -753,5 +755,5 @@ async fn further_config_projects_use_the_host_vm_runner_until_they_join() {
         .event(&invite::hook_secret(HOOK, 11), 11, "build", 3)
         .await;
     assert_eq!(own.body["result"], "started");
-    assert_eq!(own.body["pool"], "vm");
+    assert_eq!(own.body["runner"], "vm");
 }

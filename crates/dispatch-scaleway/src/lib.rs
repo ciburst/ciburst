@@ -551,7 +551,7 @@ mod tests {
         assert_eq!(status, 200);
         let body = parse(&body);
         assert_eq!(body["result"], "started", "{body}");
-        assert_eq!(body["pool"], "vm");
+        assert_eq!(body["runner"], "vm");
         let run = body["runId"].as_str().unwrap().to_string();
         let token = ciburst_core::vm::token(VM_SECRET, &run);
         (run, token)
@@ -804,7 +804,7 @@ mod tests {
         assert_eq!(status, 200);
         let body = parse(&body);
         assert_eq!(body["result"], "started");
-        assert_eq!(body["pool"], "7-build-x");
+        assert_eq!(body["runner"], "build-x");
         let runs = provider.list(Some("7-build-x")).await.unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].labels["job"], "42");
@@ -1073,7 +1073,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, 200);
-        assert_eq!(parse(&body)["pool"], "7-build-x");
+        assert_eq!(parse(&body)["runner"], "build-x");
         assert_eq!(provider.capacity("7-build-x").await.unwrap(), None);
     }
 }

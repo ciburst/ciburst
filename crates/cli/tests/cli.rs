@@ -546,7 +546,7 @@ async fn status_lists_the_deliveries_and_check_a_disabled_hook() {
         delivery(
             1,
             serde_json::json!({ "object_kind": "build", "build_name": "e2e: [ios]" }),
-            r#"{"result":"started","pool":"ci","runId":"fake-1","ms":5120}"#,
+            r#"{"result":"started","runner":"ci","kind":"vm","runId":"fake-1","ms":5120}"#,
         ),
     );
     fake.add_hook_event(

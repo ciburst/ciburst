@@ -567,7 +567,7 @@ impl Provisioner {
                 gitlab.delete_runner(runner.id).await?;
                 self.log.info(
                     "runner_deleted",
-                    &[("pool", name), ("id", &runner.id.to_string())],
+                    &[("runner", name), ("id", &runner.id.to_string())],
                 );
             }
         }
@@ -590,7 +590,7 @@ impl Provisioner {
                 self.log.info(
                     "runner_tags",
                     &[
-                        ("pool", &spec.name),
+                        ("runner", &spec.name),
                         ("id", &existing.id.to_string()),
                         ("tags", &spec.tags.join(",")),
                     ],
@@ -612,7 +612,7 @@ impl Provisioner {
             }
             self.log.info(
                 "runner",
-                &[("pool", &spec.name), ("id", &runner.id.to_string())],
+                &[("runner", &spec.name), ("id", &runner.id.to_string())],
             );
         }
         if !created.is_empty() {
@@ -665,7 +665,7 @@ impl Provisioner {
                     "runner_enable_skipped",
                     &[
                         ("project", project),
-                        ("pool", name),
+                        ("runner", name),
                         ("reason", "runner id unknown"),
                     ],
                 ),

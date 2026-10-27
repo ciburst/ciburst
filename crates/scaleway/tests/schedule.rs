@@ -561,7 +561,7 @@ async fn bad_input_sends_nothing_and_bucket_errors_name_the_cause() {
     );
     assert_eq!(
         schedule.queued("VM").await.unwrap_err().to_string(),
-        "scaleway schedule: pool \"VM\" is not a pool tag"
+        "scaleway schedule: vm runner \"VM\" is not a runner tag"
     );
 
     let elsewhere = ScalewaySchedule::new(fake.clone(), "fr-par", "missing-bucket", &cache_key());

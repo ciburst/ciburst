@@ -119,7 +119,7 @@ pub fn run_env(
             .runner_tokens
             .get(pool.runner_tag())
             .cloned()
-            .ok_or_else(|| Error::other(format!("no runner token for {}", pool.tag)))?,
+            .ok_or_else(|| Error::other(format!("no runner token for {}", pool.describe())))?,
     };
     let mut env = BTreeMap::from([("RUNNER_TOKEN".to_string(), token)]);
     if config.cache.kind == CacheType::S3 {
@@ -135,7 +135,7 @@ pub fn run_env(
             .vm_secret
             .as_ref()
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| Error::other(format!("no VM secret for pool {}", pool.tag)))?;
+            .ok_or_else(|| Error::other(format!("no VM secret for {}", pool.describe())))?;
         env.insert(keys::VM_SECRET.to_string(), secret.clone());
     }
     Ok(env)
@@ -371,7 +371,10 @@ impl Dispatcher {
                 let pool = config.vm_pool();
                 // spec 8.5: only the project's own VM runner takes the job.
                 if self.runner_of(project_id, &pool.tag) == RunnerOf::Missing {
-                    return ignored("no_runner", json!({ "pool": pool.tag }));
+                    return ignored(
+                        "no_runner",
+                        json!({ "runner": pool.runner_tag(), "kind": pool.kind() }),
+                    );
                 }
                 pool
             }
@@ -404,7 +407,7 @@ impl Dispatcher {
             return ignored("pipeline_closed", json!({ "pipeline": pipeline }));
         }
         let callback = self.callback(headers);
-        fields.push(("pool", &pool.tag));
+        fields.push(("runner", pool.runner_tag()));
         match self
             .schedule(&pool, name, labels.clone(), now, callback.as_deref(), at)
             .await
@@ -413,27 +416,43 @@ impl Dispatcher {
                 let eta = wait_s.map_or_else(|| "null".to_string(), |s| s.to_string());
                 fields.push(("eta_s", &eta));
                 self.info(at, "queued", &fields);
-                reply(200, "queued", json!({ "pool": pool.tag, "etaS": wait_s }))
+                reply(
+                    200,
+                    "queued",
+                    json!({ "runner": pool.runner_tag(), "kind": pool.kind(), "etaS": wait_s }),
+                )
             }
             Ok(Decision::Claimed { run_id, free }) => {
                 let free = free.to_string();
                 fields.push(("run", &run_id));
                 fields.push(("free", &free));
                 self.info(at, "claimed", &fields);
-                reply(200, "claimed", json!({ "pool": pool.tag, "runId": run_id }))
+                reply(
+                    200,
+                    "claimed",
+                    json!({ "runner": pool.runner_tag(), "kind": pool.kind(), "runId": run_id }),
+                )
             }
             Ok(Decision::AtCapacity(live)) => {
                 let live = live.to_string();
                 fields.push(("live", &live));
                 self.info(at, "at_capacity", &fields);
-                reply(200, "at_capacity", json!({ "pool": pool.tag }))
+                reply(
+                    200,
+                    "at_capacity",
+                    json!({ "runner": pool.runner_tag(), "kind": pool.kind() }),
+                )
             }
             Ok(Decision::Started { run_id, taken }) => {
                 let taken = taken.to_string();
                 fields.push(("run", &run_id));
                 fields.push(("taken", &taken));
                 self.info(at, "started", &fields);
-                reply(200, "started", json!({ "pool": pool.tag, "runId": run_id }))
+                reply(
+                    200,
+                    "started",
+                    json!({ "runner": pool.runner_tag(), "kind": pool.kind(), "runId": run_id }),
+                )
             }
             Ok(Decision::Grouped { leader }) => {
                 fields.push(("leader", &leader));
@@ -441,12 +460,16 @@ impl Dispatcher {
                 reply(
                     200,
                     "grouped",
-                    json!({ "pool": pool.tag, "leader": leader }),
+                    json!({ "runner": pool.runner_tag(), "kind": pool.kind(), "leader": leader }),
                 )
             }
             Ok(Decision::Duplicate) => {
                 self.info(at, "duplicate", &fields);
-                reply(200, "duplicate", json!({ "pool": pool.tag }))
+                reply(
+                    200,
+                    "duplicate",
+                    json!({ "runner": pool.runner_tag(), "kind": pool.kind() }),
+                )
             }
             Err(error) => {
                 let message = error.to_string();
@@ -635,7 +658,11 @@ impl Dispatcher {
                     self.warn(
                         at,
                         "ledger_failed",
-                        &[("pool", &pool.tag), ("job", job), ("error", &message)],
+                        &[
+                            ("runner", pool.runner_tag()),
+                            ("job", job),
+                            ("error", &message),
+                        ],
                     );
                 }
             }
@@ -756,7 +783,11 @@ impl Dispatcher {
                     self.error(
                         at,
                         "start_failed",
-                        &[("pool", &pool.tag), ("job", &job), ("error", &message)],
+                        &[
+                            ("runner", pool.runner_tag()),
+                            ("job", &job),
+                            ("error", &message),
+                        ],
                     );
                     break;
                 }
@@ -772,7 +803,7 @@ impl Dispatcher {
                 at,
                 "queue_started",
                 &[
-                    ("pool", &pool.tag),
+                    ("runner", pool.runner_tag()),
                     ("job", &job),
                     ("vms", &vms),
                     ("needing", &needing),
@@ -849,7 +880,7 @@ impl Dispatcher {
             return ignored("status", json!({ "status": status }));
         }
         let duration = duration.map(|d| d.to_string());
-        fields.extend([("pool", pool.tag.as_str()), ("status", status)]);
+        fields.extend([("runner", pool.runner_tag()), ("status", status)]);
         if let Some(duration) = &duration {
             fields.push(("duration_s", duration));
         }
@@ -857,7 +888,7 @@ impl Dispatcher {
         reply(
             200,
             "tracked",
-            json!({ "status": status, "pool": pool.tag }),
+            json!({ "status": status, "runner": pool.runner_tag(), "kind": pool.kind() }),
         )
     }
 
@@ -897,21 +928,21 @@ impl Dispatcher {
     }
 
     /// spec 6.4: a schedule error never fails an answer; the caller goes on as without one.
-    fn schedule_failed(&self, at: Arrival, op: &str, pool: &str, error: &Error) {
+    fn schedule_failed(&self, at: Arrival, op: &str, runner: &str, error: &Error) {
         let message = error.to_string();
         self.warn(
             at,
             "schedule_failed",
-            &[("op", op), ("pool", pool), ("error", &message)],
+            &[("op", op), ("runner", runner), ("error", &message)],
         );
     }
 
-    fn capacity_failed(&self, at: Arrival, pool: &str, error: &Error) {
+    fn capacity_failed(&self, at: Arrival, runner: &str, error: &Error) {
         let message = error.to_string();
         self.warn(
             at,
             "capacity_failed",
-            &[("pool", pool), ("error", &message)],
+            &[("runner", runner), ("error", &message)],
         );
     }
 
@@ -1021,7 +1052,7 @@ impl Dispatcher {
             .warm(&names, &vm_jobs, enabled, callback.as_deref(), now, at)
             .await
         {
-            Ok(pools) => reply(200, "warm", json!({ "pipeline": id, "pools": pools })),
+            Ok(runners) => reply(200, "warm", json!({ "pipeline": id, "runners": runners })),
             Err(response) => response,
         }
     }
@@ -1134,13 +1165,13 @@ impl Dispatcher {
             };
             let count_text = count.to_string();
             let mut fields = names.to_vec();
-            fields.extend([("pool", pool.tag.as_str()), ("action", action)]);
+            fields.extend([("runner", pool.runner_tag()), ("action", action)]);
             if let Some(run_id) = &run_id {
                 fields.push(("run", run_id));
             }
             fields.push(("vm_jobs", &count_text));
             self.info(at, "warm", &fields);
-            let mut answer = json!({ "pool": pool.tag, "action": action, "vmJobs": count });
+            let mut answer = json!({ "runner": pool.runner_tag(), "kind": pool.kind(), "action": action, "vmJobs": count });
             if let Some(run_id) = run_id {
                 answer["runId"] = run_id.into();
             }
@@ -1178,7 +1209,11 @@ impl Dispatcher {
         self.warn(
             at,
             "ledger_failed",
-            &[("pool", &pool.tag), ("job", job), ("error", &message)],
+            &[
+                ("runner", pool.runner_tag()),
+                ("job", job),
+                ("error", &message),
+            ],
         );
     }
 
@@ -1192,7 +1227,7 @@ impl Dispatcher {
     ) -> DispatchResponse {
         let message = error.to_string();
         let mut fields = names.to_vec();
-        fields.extend([("pool", pool.tag.as_str()), ("error", message.as_str())]);
+        fields.extend([("runner", pool.runner_tag()), ("error", message.as_str())]);
         self.error(at, "start_failed", &fields);
         reply(500, "error", json!({}))
     }
@@ -1251,7 +1286,9 @@ impl Dispatcher {
                             .find(|lane| lane.tag == pool.runner_tag())
                     })
                     .map(|lane| lane.runner_token)
-                    .ok_or_else(|| Error::other(format!("no runner token for {}", pool.tag)))?,
+                    .ok_or_else(|| {
+                        Error::other(format!("no runner token for {}", pool.describe()))
+                    })?,
             ),
             _ => None,
         };
@@ -1276,7 +1313,11 @@ impl Dispatcher {
                 self.warn(
                     at,
                     "start_retry",
-                    &[("pool", &pool.tag), ("job", &job), ("error", &message)],
+                    &[
+                        ("runner", pool.runner_tag()),
+                        ("job", &job),
+                        ("error", &message),
+                    ],
                 );
                 tokio::time::sleep(START_RETRY_PAUSE).await;
                 self.provider.start(request).await?
@@ -2015,7 +2056,7 @@ mod tests {
             .await;
         assert_eq!(response.status, 200, "{}", response.body);
         assert_eq!(response.body["result"], "started");
-        assert_eq!(response.body["pool"], "7-build");
+        assert_eq!(response.body["runner"], "build");
         assert!(
             response.body["runId"]
                 .as_str()
@@ -2035,7 +2076,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.starts_with("info started") && l.contains("pool=\"7-build\""))
+                .any(|l| l.starts_with("info started") && l.contains("runner=\"build\""))
         );
         assert!(!lines.iter().any(|l| l.contains("glrt-")));
     }
@@ -2049,7 +2090,7 @@ mod tests {
         body["build_name"] = "deploy".into();
         let response = d.handle(&headers, body.to_string().as_bytes()).await;
         assert_eq!(response.body["result"], "started", "{}", response.body);
-        assert_eq!(response.body["pool"], "vm");
+        assert_eq!(response.body["runner"], "vm");
         assert_eq!(
             recording.started.lock().unwrap()[0].env["RUNNER_TOKEN"],
             "glrt-vm"
@@ -2067,7 +2108,7 @@ mod tests {
             .handle(&headers("hook-secret"), &event("build", "pending", 7, 2))
             .await;
         assert_eq!(second.body["result"], "at_capacity");
-        assert_eq!(second.body["pool"], "7-build");
+        assert_eq!(second.body["runner"], "build");
         recording
             .inner
             .stop(first.body["runId"].as_str().unwrap())
@@ -2119,7 +2160,7 @@ mod tests {
             run_env(&no_cache, &partial, &pool, true, None)
                 .unwrap_err()
                 .to_string()
-                .contains("no VM secret for pool 7-ci")
+                .contains("no VM secret for lane ci of project 7")
         );
         partial.vm_secret = Some("vm-secret".into());
         let one_job = run_env(&no_cache, &partial, &pool, false, None).unwrap();
@@ -2589,7 +2630,7 @@ mod tests {
         let s = vm_setup(vm_secrets()).await;
         let first = s.pending_at("test", 1, T0).await;
         assert_eq!(first.body["result"], "started", "{}", first.body);
-        assert_eq!(first.body["pool"], "vm");
+        assert_eq!(first.body["runner"], "vm");
         let second = s.pending_at("test", 2, T0).await;
         assert_eq!(
             second.body["result"], "started",
@@ -2599,7 +2640,7 @@ mod tests {
         assert_eq!(third.status, 200);
         assert_eq!(
             third.body,
-            json!({ "result": "at_capacity", "pool": "vm", "ms": 0 })
+            json!({ "result": "at_capacity", "runner": "vm", "kind": "vm", "ms": 0 })
         );
 
         s.report(&run_of(&first), VmState::Draining, 2).await;
@@ -2640,7 +2681,7 @@ mod tests {
         assert_eq!(claimed.status, 200);
         assert_eq!(
             claimed.body,
-            json!({ "result": "claimed", "pool": "vm", "runId": b, "ms": 0 })
+            json!({ "result": "claimed", "runner": "vm", "kind": "vm", "runId": b, "ms": 0 })
         );
         let free: BTreeMap<String, u32> = s
             .vms()
@@ -2670,7 +2711,7 @@ mod tests {
         let s = vm_setup_with(vm_secrets(), Some(ledger.clone())).await;
         let response = s.pending("build", 1).await;
         assert_eq!(response.body["result"], "started");
-        assert_eq!(response.body["pool"], "7-jobs");
+        assert_eq!(response.body["runner"], "jobs");
         assert_eq!(s.taken(), [1]);
         assert!(ledger.all().is_empty(), "lanes skip the ledger");
         let started = s.recording.started.lock().unwrap();
@@ -2994,7 +3035,7 @@ mod tests {
     }
 
     fn grouped(leader: &str) -> Value {
-        json!({ "result": "grouped", "pool": "vm", "leader": leader, "ms": 0 })
+        json!({ "result": "grouped", "runner": "vm", "kind": "vm", "leader": leader, "ms": 0 })
     }
 
     #[tokio::test(start_paused = true)]
@@ -3015,7 +3056,7 @@ mod tests {
         );
         assert_eq!(
             s.pending_at("test", 14, T0).await.body,
-            json!({ "result": "at_capacity", "pool": "vm", "ms": 0 }),
+            json!({ "result": "at_capacity", "runner": "vm", "kind": "vm", "ms": 0 }),
             "rank 4 is group 2 and maxRuns is 2"
         );
         assert_eq!(s.pending_at("test", 15, T0).await.body, grouped("14"));
@@ -3031,7 +3072,7 @@ mod tests {
         assert!(lines.iter().any(|l| l.starts_with("info grouped")
             && l.contains("job=\"11\"")
             && l.contains("leader=\"10\"")
-            && l.contains("pool=\"vm\"")));
+            && l.contains("runner=\"vm\"")));
         assert!(
             lines
                 .iter()
@@ -3049,7 +3090,7 @@ mod tests {
         assert_eq!(again.status, 200);
         assert_eq!(
             again.body,
-            json!({ "result": "duplicate", "pool": "vm", "ms": 0 })
+            json!({ "result": "duplicate", "runner": "vm", "kind": "vm", "ms": 0 })
         );
         assert_eq!(s.taken(), [1]);
         assert!(
@@ -3177,7 +3218,7 @@ mod tests {
                 .collect();
             assert_eq!(failed.len(), 3, "{fault:?}");
             assert!(
-                failed[0].starts_with(r#"warn ledger_failed pool="vm" job="1" error="#),
+                failed[0].starts_with(r#"warn ledger_failed runner="vm" job="1" error="#),
                 "{failed:?}"
             );
         }
@@ -3210,7 +3251,7 @@ mod tests {
         let waited = GROUP_WAIT_S * 1000;
         assert_eq!(
             a.body,
-            json!({ "result": "grouped", "pool": "vm", "leader": "30", "ms": waited }),
+            json!({ "result": "grouped", "runner": "vm", "kind": "vm", "leader": "30", "ms": waited }),
             "ms counts the group wait"
         );
         assert_eq!(b.body["result"], "started", "{}", b.body);
@@ -3292,7 +3333,7 @@ mod tests {
         idle_vm(&s, 1, 2).await;
         let lane = s.named_at("lint", 2, T0 + 60).await;
         assert_eq!(lane.body["result"], "started", "{}", lane.body);
-        assert_eq!(lane.body["pool"], "7-node-24");
+        assert_eq!(lane.body["runner"], "node-24");
         assert_eq!(s.vms().await[0].free, 2);
         assert!(s.recording.claimed.lock().unwrap().is_empty());
         assert_eq!(
@@ -3310,7 +3351,7 @@ mod tests {
         let s = setup_of(lane_config(), lane_secrets(), Some(ledger.clone())).await;
         let first = s.named_at("lint", 1, T0).await;
         assert_eq!(first.body["result"], "started", "{}", first.body);
-        assert_eq!(first.body["pool"], "7-node-24");
+        assert_eq!(first.body["runner"], "node-24");
         assert!(run_of(&first).starts_with("fake-"));
         idle_vm(&s, 2, 2).await;
         let in_window = s.named_at("unit-api", 3, T0 + GROUP_WINDOW_S).await;
@@ -3318,7 +3359,7 @@ mod tests {
             in_window.body["result"], "started",
             "a VM inside the window offers no slot"
         );
-        assert_eq!(in_window.body["pool"], "7-node-24");
+        assert_eq!(in_window.body["runner"], "node-24");
         assert_eq!(s.started_pools(), ["7-node-24", "vm", "7-node-24"]);
         assert!(s.recording.claimed.lock().unwrap().is_empty());
         assert_eq!(ledger.all().len(), 1, "lanes never use the ledger");
@@ -3328,7 +3369,7 @@ mod tests {
         assert!(
             s.lines()
                 .iter()
-                .any(|l| l.starts_with("info started") && l.contains(r#"pool="7-node-24""#))
+                .any(|l| l.starts_with("info started") && l.contains(r#"runner="node-24""#))
         );
     }
 
@@ -3338,7 +3379,7 @@ mod tests {
         idle_vm(&s, 1, 2).await;
         let response = s.named_at("clippy", 2, T0 + 60).await;
         assert_eq!(response.body["result"], "started", "{}", response.body);
-        assert_eq!(response.body["pool"], "7-rust-1");
+        assert_eq!(response.body["runner"], "rust-1");
         assert_eq!(s.vms().await[0].free, 2);
         assert!(s.recording.claimed.lock().unwrap().is_empty());
         assert_eq!(*s.recording.asked.lock().unwrap(), ["vm", "7-rust-1"]);
@@ -3355,10 +3396,10 @@ mod tests {
         assert_eq!(third.status, 200);
         assert_eq!(
             third.body,
-            json!({ "result": "at_capacity", "pool": "7-node-24", "ms": 0 })
+            json!({ "result": "at_capacity", "runner": "node-24", "kind": "lane", "ms": 0 })
         );
         assert!(s.lines().iter().any(|l| l.starts_with("info at_capacity")
-            && l.contains(r#"pool="7-node-24""#)
+            && l.contains(r#"runner="node-24""#)
             && l.contains(r#"live="2""#)));
         assert!(ledger.all().is_empty());
     }
@@ -3496,7 +3537,7 @@ mod tests {
         let lines = s.lines();
         assert_eq!(
             lines[0],
-            r#"warn start_retry pool="vm" job="1" error="scaleway: 503" ms="0""#
+            r#"warn start_retry runner="vm" job="1" error="scaleway: 503" ms="0""#
         );
         assert!(lines[1].starts_with("info started"), "{lines:?}");
         assert_eq!(ms_of(&lines[1]), Some(300));
@@ -3513,7 +3554,7 @@ mod tests {
         assert_eq!(answer["body"], json!({ "result": "error", "ms": 300 }));
         assert_eq!(s.recording.start_calls(), 2);
         assert!(
-            s.lines()[1].starts_with(r#"error start_failed job="1" pipeline="9" project="7" stage="test" pool="vm" error="scaleway: 429""#),
+            s.lines()[1].starts_with(r#"error start_failed job="1" pipeline="9" project="7" stage="test" runner="vm" error="scaleway: 429""#),
             "{:?}",
             s.lines()
         );
@@ -3557,7 +3598,7 @@ mod tests {
         s.recording.fail_starts([Error::retryable("scaleway: 503")]);
         let response = s.named_at("lint", 1, T0).await;
         assert_eq!(response.body["result"], "started", "{}", response.body);
-        assert_eq!(response.body["pool"], "7-node-24");
+        assert_eq!(response.body["runner"], "node-24");
         assert_eq!(response.body["ms"], 300);
         assert_eq!(s.recording.start_calls(), 2);
         assert_eq!(s.started_pools(), ["7-node-24"]);
@@ -3866,7 +3907,7 @@ mod tests {
         ];
         let warm = s.pipeline_at(9, "pending", &builds, now).await;
         assert_eq!(warm.status, 200, "{}", warm.body);
-        let run = warm.body["pools"][0]["runId"]
+        let run = warm.body["runners"][0]["runId"]
             .as_str()
             .unwrap_or_default()
             .to_string();
@@ -3874,7 +3915,7 @@ mod tests {
             warm.body,
             json!({
                 "result": "warm", "pipeline": 9, "ms": 0,
-                "pools": [{ "pool": "vm", "action": "started", "runId": run, "vmJobs": 3 }]
+                "runners": [{ "runner": "vm", "kind": "vm", "action": "started", "runId": run, "vmJobs": 3 }]
             })
         );
         assert_eq!(s.taken(), [0], "every slot of the warm VM is free");
@@ -3896,7 +3937,7 @@ mod tests {
         );
         assert_eq!(records.recorded("9"), vm_jobs(&[("vm", &["2", "3", "8"])]));
         assert!(s.lines().contains(&format!(
-            r#"info warm pipeline="9" project="7" pool="vm" action="started" run="{run}" vm_jobs="3" ms="0""#
+            r#"info warm pipeline="9" project="7" runner="vm" action="started" run="{run}" vm_jobs="3" ms="0""#
         )));
 
         let unit = s.job_at("unit", "test", 2, 9, now + 1).await;
@@ -3917,7 +3958,7 @@ mod tests {
         let e2e = s.job_at("e2e", "deploy", 3, 9, now + 60).await;
         assert_eq!(
             e2e.body,
-            json!({ "result": "claimed", "pool": "vm", "runId": run, "ms": 0 }),
+            json!({ "result": "claimed", "runner": "vm", "kind": "vm", "runId": run, "ms": 0 }),
             "a stage 2 VM job claims the warm VM"
         );
         assert_eq!(s.taken(), [0], "one VM for the pipeline");
@@ -3935,7 +3976,7 @@ mod tests {
     }
 
     fn warm_pools(response: &DispatchResponse) -> Value {
-        response.body["pools"].clone()
+        response.body["runners"].clone()
     }
 
     #[tokio::test(start_paused = true)]
@@ -3958,12 +3999,12 @@ mod tests {
             warm.body,
             json!({
                 "result": "warm", "pipeline": 9, "ms": 0,
-                "pools": [{ "pool": "vm", "action": "capacity", "vmJobs": 1 }]
+                "runners": [{ "runner": "vm", "kind": "vm", "action": "capacity", "vmJobs": 1 }]
             }),
             "a job event of the window ranks before the warm intent"
         );
         assert!(s.lines().contains(
-            &r#"info warm pipeline="9" project="7" pool="vm" action="capacity" vm_jobs="1" ms="0""#
+            &r#"info warm pipeline="9" project="7" runner="vm" action="capacity" vm_jobs="1" ms="0""#
                 .to_string()
         ));
         assert_eq!(
@@ -3980,7 +4021,7 @@ mod tests {
             .await;
         assert_eq!(
             warm_pools(&warm),
-            json!([{ "pool": "vm", "action": "capacity", "vmJobs": 1 }]),
+            json!([{ "runner": "vm", "kind": "vm", "action": "capacity", "vmJobs": 1 }]),
             "a claim candidate"
         );
         assert_eq!(
@@ -4010,7 +4051,7 @@ mod tests {
             .await;
         assert_eq!(
             warm_pools(&full),
-            json!([{ "pool": "vm", "action": "at_capacity", "vmJobs": 1 }])
+            json!([{ "runner": "vm", "kind": "vm", "action": "at_capacity", "vmJobs": 1 }])
         );
         assert_eq!(s.taken(), [1, 1]);
 
@@ -4036,7 +4077,7 @@ mod tests {
             .await;
         assert_eq!(
             warm_pools(&response),
-            json!([{ "pool": "vm", "action": "disabled", "vmJobs": 1 }])
+            json!([{ "runner": "vm", "kind": "vm", "action": "disabled", "vmJobs": 1 }])
         );
         assert_eq!(
             records.recorded("11"),
@@ -4052,7 +4093,7 @@ mod tests {
             response.body,
             json!({
                 "result": "warm", "pipeline": 12, "ms": 0,
-                "pools": [{ "pool": "vm", "action": "disabled", "vmJobs": 1 }]
+                "runners": [{ "runner": "vm", "kind": "vm", "action": "disabled", "vmJobs": 1 }]
             }),
             "without records"
         );
@@ -4241,12 +4282,12 @@ mod tests {
             };
             assert_eq!(
                 warm_pools(&warm),
-                json!([{ "pool": "vm", "action": action, "vmJobs": 1 }]),
+                json!([{ "runner": "vm", "kind": "vm", "action": action, "vmJobs": 1 }]),
                 "{op:?}"
             );
             let lint = s.job_at("lint", "test", 11, 20, now).await;
             assert_eq!(lint.body["result"], "started", "{op:?} {}", lint.body);
-            assert_eq!(lint.body["pool"], "7-node-24", "{op:?}");
+            assert_eq!(lint.body["runner"], "node-24", "{op:?}");
             let e2e = s.job_at("e2e", "test", 13, 20, now).await;
             assert_eq!(e2e.body["result"], "claimed", "{op:?} {}", e2e.body);
             let closed = s.pipeline_at(20, "failed", &builds, now).await;
@@ -4283,7 +4324,7 @@ mod tests {
         assert_eq!(failed.status, 500);
         assert_eq!(failed.body, json!({ "result": "error", "ms": 0 }));
         assert!(s.lines().contains(
-            &r#"error start_failed pipeline="9" project="7" pool="vm" error="scaleway: 400" ms="0""#
+            &r#"error start_failed pipeline="9" project="7" runner="vm" error="scaleway: 400" ms="0""#
                 .to_string()
         ));
 
@@ -4291,7 +4332,7 @@ mod tests {
         let retried = s
             .pipeline_at(10, "pending", &[build(2, "unit", "test")], T0)
             .await;
-        assert_eq!(retried.body["pools"][0]["action"], "started");
+        assert_eq!(retried.body["runners"][0]["action"], "started");
         assert_eq!(retried.body["ms"], 300);
         assert_eq!(s.recording.start_calls(), 3);
     }
@@ -4317,7 +4358,7 @@ mod tests {
                 s.job_at("unit", "test", 2, 9, job_at),
                 s.job_at("e2e", "test", 3, 9, job_at),
             );
-            assert_eq!(warm.body["pools"][0]["action"], expected, "{job_at}");
+            assert_eq!(warm.body["runners"][0]["action"], expected, "{job_at}");
             let results = [unit.body["result"].clone(), e2e.body["result"].clone()];
             let vms = s.vms().await;
             assert_eq!(vms.len(), 1, "{job_at}: {results:?}");
@@ -4465,14 +4506,14 @@ mod tests {
         assert_eq!(running.status, 200);
         assert_eq!(
             running.body,
-            json!({ "result": "tracked", "status": "running", "pool": "vm", "ms": 0 })
+            json!({ "result": "tracked", "status": "running", "runner": "vm", "kind": "vm", "ms": 0 })
         );
         assert!(s.lines().contains(
-            &r#"info tracked job="5" pipeline="9" project="7" stage="test" pool="vm" status="running" ms="0""#
+            &r#"info tracked job="5" pipeline="9" project="7" stage="test" runner="vm" status="running" ms="0""#
                 .to_string()
         ));
         let lint = s.event_at("lint", 6, 9, "running", json!({}), T0 + 1).await;
-        assert_eq!(lint.body["pool"], "7-node-24", "a lane job under its lane");
+        assert_eq!(lint.body["runner"], "node-24", "a lane job under its lane");
         let odd = json!({ "build_started_at": "yesterday" });
         s.event_at("image", 7, 9, "running", odd, T0 + 2).await;
         let running_of = |pool: &'static str| {
@@ -4498,10 +4539,10 @@ mod tests {
         let done = s.finished("image", 5, "success", 61.6, T0 + 32).await;
         assert_eq!(
             done.body,
-            json!({ "result": "tracked", "status": "success", "pool": "vm", "ms": 0 })
+            json!({ "result": "tracked", "status": "success", "runner": "vm", "kind": "vm", "ms": 0 })
         );
         assert!(s.lines().contains(
-            &r#"info tracked job="5" pipeline="9" project="7" stage="test" pool="vm" status="success" duration_s="62" ms="0""#
+            &r#"info tracked job="5" pipeline="9" project="7" stage="test" runner="vm" status="success" duration_s="62" ms="0""#
                 .to_string()
         ));
         assert_eq!(schedule.typical("vm", "image").await.unwrap(), Some(62));
@@ -4537,10 +4578,10 @@ mod tests {
         assert_eq!(deploy.status, 200);
         assert_eq!(
             deploy.body,
-            json!({ "result": "queued", "pool": "vm", "etaS": 2, "ms": 0 })
+            json!({ "result": "queued", "runner": "vm", "kind": "vm", "etaS": 2, "ms": 0 })
         );
         assert!(s.lines().contains(
-            &r#"info queued job="3" pipeline="9" project="7" stage="test" pool="vm" eta_s="2" ms="0""#
+            &r#"info queued job="3" pipeline="9" project="7" stage="test" runner="vm" eta_s="2" ms="0""#
                 .to_string()
         ));
         assert_eq!(
@@ -4566,7 +4607,7 @@ mod tests {
         );
         assert_eq!(
             s.running("deploy", 3, T0 + 63).await.body,
-            json!({ "result": "tracked", "status": "running", "pool": "vm", "ms": 0 })
+            json!({ "result": "tracked", "status": "running", "runner": "vm", "kind": "vm", "ms": 0 })
         );
         assert!(schedule.queued("vm").await.unwrap().is_empty());
         assert_eq!(s.started_pools(), ["vm"], "one VM");
@@ -4611,7 +4652,7 @@ mod tests {
         let deploy = s.pending_job("deploy", 3, T0 + 60).await;
         assert_eq!(
             deploy.body,
-            json!({ "result": "queued", "pool": "vm", "etaS": 0, "ms": 0 })
+            json!({ "result": "queued", "runner": "vm", "kind": "vm", "etaS": 0, "ms": 0 })
         );
         let again = s.pending_job("deploy", 3, T0 + 100).await;
         assert_eq!(again.body["result"], "queued");
@@ -4649,7 +4690,7 @@ mod tests {
             .map(|v| v.run_id.clone())
             .find(|r| *r != vm);
         assert!(s.lines().contains(&format!(
-            r#"info queue_started pool="vm" job="queue:3" vms="1" needing="1" runs="{}" ms="0""#,
+            r#"info queue_started runner="vm" job="queue:3" vms="1" needing="1" runs="{}" ms="0""#,
             run.unwrap()
         )));
         s.report_at(&vm, VmState::Busy, 0, T0 + 170).await;
@@ -4702,10 +4743,10 @@ mod tests {
         let third = s.pending_job("deploy", 3, T0 + 62).await;
         assert_eq!(
             third.body,
-            json!({ "result": "queued", "pool": "vm", "etaS": null, "ms": 0 })
+            json!({ "result": "queued", "runner": "vm", "kind": "vm", "etaS": null, "ms": 0 })
         );
         assert!(s.lines().contains(
-            &r#"info queued job="3" pipeline="9" project="7" stage="test" pool="vm" eta_s="null" ms="0""#
+            &r#"info queued job="3" pipeline="9" project="7" stage="test" runner="vm" eta_s="null" ms="0""#
                 .to_string()
         ));
         assert_eq!(
@@ -4804,7 +4845,7 @@ mod tests {
         assert!(
             s.lines()
                 .iter()
-                .any(|l| l.starts_with(r#"info queue_started pool="vm" job="queue:91""#)),
+                .any(|l| l.starts_with(r#"info queue_started runner="vm" job="queue:91""#)),
             "30 minutes still count"
         );
         assert_eq!(
@@ -4908,7 +4949,7 @@ mod tests {
             let warnings = schedule_warnings(&s);
             assert!(
                 warnings.iter().any(|l| l.starts_with(&format!(
-                    r#"warn schedule_failed op="{op}" pool="vm" error="bucket refused""#
+                    r#"warn schedule_failed op="{op}" runner="vm" error="bucket refused""#
                 ))),
                 "{op}: {warnings:?}"
             );
@@ -4935,7 +4976,7 @@ mod tests {
         );
         assert_eq!(
             schedule_warnings(&s),
-            [r#"warn schedule_failed op="started" pool="vm" error="bucket refused" ms="0""#]
+            [r#"warn schedule_failed op="started" runner="vm" error="bucket refused" ms="0""#]
         );
 
         let (s, _) = queue_setup(
@@ -4980,7 +5021,11 @@ mod tests {
             build(4, "e2e-c", "test"),
         ];
         let warm = s.pipeline_at(9, "pending", &builds, T0).await;
-        assert_eq!(warm.body["pools"][0]["action"], "started", "{}", warm.body);
+        assert_eq!(
+            warm.body["runners"][0]["action"], "started",
+            "{}",
+            warm.body
+        );
         let mut answers = Vec::new();
         for (job, name) in [(2, "e2e-a"), (3, "e2e-b"), (4, "e2e-c")] {
             let response = s.event_at(name, job, 9, "pending", json!({}), T0 + 5).await;
@@ -5003,7 +5048,7 @@ mod tests {
         assert!(
             s.lines()
                 .iter()
-                .any(|l| l.starts_with(r#"info queue_started pool="vm" job="queue:4""#))
+                .any(|l| l.starts_with(r#"info queue_started runner="vm" job="queue:4""#))
         );
     }
 }

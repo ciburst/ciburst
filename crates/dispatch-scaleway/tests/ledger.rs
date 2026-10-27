@@ -323,7 +323,7 @@ async fn pipeline_events_keep_their_records_in_the_cache_bucket() {
     )
     .await;
     assert_eq!((status, &body["result"]), (200, &json!("warm")), "{body}");
-    assert_eq!(body["pools"][0]["action"], "started", "{body}");
+    assert_eq!(body["runners"][0]["action"], "started", "{body}");
     let record = intents(&backend, &vars)
         .into_iter()
         .find(|(key, _)| key == "ciburst/intents/_pipelines/9/vm-jobs.json")
@@ -353,7 +353,7 @@ async fn a_pending_vm_job_without_a_free_slot_starts_a_vm_with_one_slot_taken() 
     let (status, body) = pending_job(&backend, &env(&vars)).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["result"], "started", "{body}");
-    assert_eq!(body["pool"], "vm");
+    assert_eq!(body["runner"], "vm");
     let server = backend
         .instance
         .server(body["runId"].as_str().unwrap())

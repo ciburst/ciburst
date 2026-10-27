@@ -63,7 +63,7 @@ impl fmt::Debug for Config {
             .field("run_id", &self.run_id)
             .field("dispatch_url", &self.dispatch_url)
             .field("server_url", &self.server_url)
-            .field("pool", &self.pool)
+            .field("runner", &self.pool)
             .field("slots", &self.slots)
             .field("default_image", &self.default_image)
             .field("timeout_s", &self.timeout_s)

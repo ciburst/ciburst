@@ -118,8 +118,8 @@ impl Scaleway {
     pub(super) async fn warn_without_quota(&self, runtimes: &[(Pool, Runtime)]) {
         for (tag, reason) in self.quota_problems(runtimes).await {
             self.log.warn(
-                "vm pools cannot start",
-                &[("pool", &tag), ("reason", &reason)],
+                "vm runner cannot start",
+                &[("runner", &tag), ("reason", &reason)],
             );
         }
     }
@@ -161,18 +161,21 @@ impl Scaleway {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 Error::provider(format!(
-                    "{PROVIDER_NAME}: pool {tag}: {} missing",
+                    "{PROVIDER_NAME}: vm runner {tag}: {} missing",
                     keys::VM_SECRET
                 ))
             })?;
         let agent = self.start_agent()?.ok_or_else(|| {
             Error::provider(format!(
-                "{PROVIDER_NAME}: pool {tag}: {} missing",
+                "{PROVIDER_NAME}: vm runner {tag}: {} missing",
                 cloud_init::AGENT_SHA256_KEY
             ))
         })?;
-        let not_provisioned =
-            || Error::provider(format!("{PROVIDER_NAME}: pool {tag} is not provisioned"));
+        let not_provisioned = || {
+            Error::provider(format!(
+                "{PROVIDER_NAME}: vm runner {tag} is not provisioned"
+            ))
+        };
         let project_id = self
             .client
             .find_project(self.name())
@@ -307,7 +310,7 @@ impl Scaleway {
                     self.log.info(
                         "started server",
                         &[
-                            ("pool", tag),
+                            ("runner", tag),
                             ("name", &name),
                             ("id", &id),
                             ("type", commercial_type),
@@ -327,7 +330,7 @@ impl Scaleway {
             }
         }
         Err(Error::provider(format!(
-            "{PROVIDER_NAME}: pool {tag}: no instance type started ({})",
+            "{PROVIDER_NAME}: vm runner {tag}: no instance type started ({})",
             failures.join("; ")
         )))
     }
@@ -381,7 +384,7 @@ impl Scaleway {
     /// `warn start_lookup`: the start looks up what the function's environment lacks or what
     /// Scaleway refused (spec 6.6).
     fn start_lookup(&self, pool: &str, commercial_type: Option<&str>, reason: &str) {
-        let mut fields = vec![("pool", pool)];
+        let mut fields = vec![("runner", pool)];
         fields.extend(commercial_type.map(|t| ("type", t)));
         fields.push(("reason", reason));
         self.log.warn("start_lookup", &fields);
@@ -391,7 +394,7 @@ impl Scaleway {
         self.log.warn(
             "instance type skipped",
             &[
-                ("pool", pool),
+                ("runner", pool),
                 ("type", commercial_type),
                 ("reason", "no local image"),
             ],
@@ -403,7 +406,7 @@ impl Scaleway {
         self.log.warn(
             "instance type unavailable",
             &[
-                ("pool", pool),
+                ("runner", pool),
                 ("type", commercial_type),
                 ("error", &error.message),
             ],

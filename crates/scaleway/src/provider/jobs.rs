@@ -334,8 +334,12 @@ impl Scaleway {
 
     pub(super) async fn start_job(&self, request: StartRequest) -> Result<String> {
         let tag = &request.pool.tag;
-        let not_provisioned =
-            || Error::provider(format!("{PROVIDER_NAME}: pool {tag} is not provisioned"));
+        let not_provisioned = || {
+            Error::provider(format!(
+                "{PROVIDER_NAME}: {} is not provisioned",
+                request.pool.describe()
+            ))
+        };
         let project_id = self
             .client
             .find_project(self.name())

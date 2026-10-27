@@ -136,7 +136,7 @@ impl Agent {
             "agent started",
             &[
                 ("run", &self.config.run_id),
-                ("pool", &self.config.pool),
+                ("runner", &self.config.pool),
                 ("slots", &self.config.slots.to_string()),
                 ("timeout_s", &self.config.timeout_s.to_string()),
             ],
@@ -937,7 +937,7 @@ mod tests {
     async fn writes_the_config_then_starts_one_runner_and_reports_idle() {
         let mut h = harness(2, 0);
         assert_eq!(h.run_until(0).await, None);
-        assert_eq!(h.configs(), [names(0, &["pool"])]);
+        assert_eq!(h.configs(), [names(0, &["vm"])]);
         let written = h.files.lock().unwrap().writes[0].2.clone();
         assert_eq!(written, render(&h.config, &[]).content);
         let spawns = h.process.lock().unwrap().spawns.clone();
@@ -1259,7 +1259,7 @@ mod tests {
         h.files.lock().unwrap().failing = false;
         assert_eq!(h.run_until(10).await, None);
         assert_eq!(h.spawns(), [10]);
-        assert_eq!(h.configs(), [names(10, &["pool"])]);
+        assert_eq!(h.configs(), [names(10, &["vm"])]);
     }
 
     #[tokio::test]
@@ -1285,10 +1285,10 @@ mod tests {
         assert_eq!(
             h.configs(),
             [
-                names(0, &["pool"]),
-                names(0, &["pool", "member-42"]),
-                names(30, &["pool", "member-42", "member-77"]),
-                names(45, &["pool", "member-77"]),
+                names(0, &["vm"]),
+                names(0, &["vm", "member-42"]),
+                names(30, &["vm", "member-42", "member-77"]),
+                names(45, &["vm", "member-77"]),
             ]
         );
         let last = h.files.lock().unwrap().writes.last().unwrap().2.clone();
@@ -1320,7 +1320,7 @@ mod tests {
         assert_eq!(h.run_until(30).await, None);
         assert_eq!(
             h.configs(),
-            [names(0, &["pool"]), names(0, &["pool", "member-42"])]
+            [names(0, &["vm"]), names(0, &["vm", "member-42"])]
         );
     }
 
@@ -1374,7 +1374,7 @@ mod tests {
         assert_eq!(h.run_to_end().await, 0);
         assert_eq!(
             h.configs(),
-            [names(0, &["pool"]), names(0, &["pool", "member-42"])]
+            [names(0, &["vm"]), names(0, &["vm", "member-42"])]
         );
         assert_eq!(h.quits(), [40]);
         assert_eq!(h.terminates(), [45]);
@@ -1401,7 +1401,7 @@ mod tests {
             }
         });
         assert_eq!(h.run_to_end().await, 0);
-        assert_eq!(h.configs(), [names(0, &["pool"])]);
+        assert_eq!(h.configs(), [names(0, &["vm"])]);
         assert_eq!(h.terminates(), [140]);
     }
 

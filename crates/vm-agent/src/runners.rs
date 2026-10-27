@@ -27,7 +27,7 @@ pub fn render(config: &Config, members: &[VmRunner]) -> RunnerConfig {
     let mut sorted: Vec<&VmRunner> = members.iter().collect();
     sorted.sort_by_key(|member| member.project_id);
 
-    let mut entries: Vec<(String, &str)> = vec![("pool".to_string(), &config.runner_token)];
+    let mut entries: Vec<(String, &str)> = vec![("vm".to_string(), &config.runner_token)];
     for member in sorted {
         if !member.token.is_empty() && seen.insert(&member.token) {
             entries.push((format!("member-{}", member.project_id), &member.token));
@@ -148,7 +148,7 @@ SecretKey = \"cache-secret-key\"
         let rendered = render(&sample(), &[]);
         assert_eq!(
             rendered.content,
-            format!("{HEAD}{}", entry_text("pool", "glrt-runner-secret"))
+            format!("{HEAD}{}", entry_text("vm", "glrt-runner-secret"))
         );
         assert_eq!(rendered.runners, 1);
     }
@@ -160,7 +160,7 @@ SecretKey = \"cache-secret-key\"
             rendered.content,
             format!(
                 "{HEAD}{}{}",
-                entry_text("pool", "glrt-runner-secret"),
+                entry_text("vm", "glrt-runner-secret"),
                 entry_text("member-42", "glrt-member-42")
             )
         );
@@ -179,7 +179,7 @@ SecretKey = \"cache-secret-key\"
             rendered.content,
             format!(
                 "{HEAD}{}{}{}{}",
-                entry_text("pool", "glrt-runner-secret"),
+                entry_text("vm", "glrt-runner-secret"),
                 entry_text("member-10", "glrt-member-10"),
                 entry_text("member-20", "glrt-member-20"),
                 entry_text("member-30", "glrt-member-30")
@@ -219,7 +219,7 @@ SecretKey = \"cache-secret-key\"
             rendered.content,
             "# Written by ciburst-vm-agent.\nconcurrent = 3\ncheck_interval = 3\n
 [[runners]]
-name = \"pool\"
+name = \"vm\"
 url = \"https://gitlab.example.invalid\"
 token = \"glrt-runner-secret\"
 executor = \"docker\"

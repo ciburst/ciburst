@@ -81,8 +81,8 @@ impl Scaleway {
         if !self.cache_on() {
             for tag in self.vm_pools()? {
                 self.log.warn(
-                    "vm pools cannot start",
-                    &[("pool", &tag), ("reason", NO_CACHE)],
+                    "vm runner cannot start",
+                    &[("runner", &tag), ("reason", NO_CACHE)],
                 );
             }
         }
@@ -233,11 +233,11 @@ impl Scaleway {
             .quota_problems(&runtimes)
             .await
             .into_iter()
-            .map(|(tag, reason)| format!("pool {tag}: {reason}"))
+            .map(|(tag, reason)| format!("vm runner {tag}: {reason}"))
             .collect();
         if !self.cache_on() {
             for tag in self.vm_pools()? {
-                problems.push(format!("pool {tag}: {NO_CACHE}"));
+                problems.push(format!("vm runner {tag}: {NO_CACHE}"));
             }
         } else if self.needs_agent()? && !self.agent_available().await? {
             problems.push(NO_AGENT.to_string());

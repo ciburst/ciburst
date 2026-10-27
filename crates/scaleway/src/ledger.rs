@@ -78,7 +78,7 @@ pub fn is_pool(pool: &str) -> bool {
 /// `ciburst/intents/<pool>/`; a pool is a config tag ([`is_pool`]).
 pub fn pool_prefix(pool: &str) -> Result<String> {
     if !is_pool(pool) {
-        return Err(invalid(format!("pool {pool:?} is not a pool tag")));
+        return Err(invalid(format!("vm runner {pool:?} is not a runner tag")));
     }
     Ok(format!("{INTENT_PREFIX}{pool}/"))
 }
@@ -166,7 +166,7 @@ impl Ledger for ScalewayLedger {
             }
         }
         Err(invalid(format!(
-            "pool {pool}: more than {MAX_PAGES} pages of intents"
+            "vm runner {pool}: more than {MAX_PAGES} pages of intents"
         )))
     }
 }

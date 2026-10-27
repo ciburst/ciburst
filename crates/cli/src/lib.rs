@@ -745,7 +745,7 @@ async fn write_status(out: &mut dyn Write, provisioner: &Provisioner) -> Result<
             writeln!(
                 out,
                 "delivery {} {} {} {} {} {}",
-                d.time, d.subject, d.status, d.result, d.pool, d.ms
+                d.time, d.subject, d.status, d.result, d.runner, d.ms
             )?;
         }
     }

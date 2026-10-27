@@ -69,8 +69,8 @@ mod tests {
     fn formats_fields_as_json_strings() {
         assert_eq!(format("info", "started", &[]), "info started");
         assert_eq!(
-            format("info", "started", &[("pool", "ci"), ("run", "a\"b")]),
-            r#"info started pool="ci" run="a\"b""#
+            format("info", "started", &[("runner", "ci"), ("run", "a\"b")]),
+            r#"info started runner="ci" run="a\"b""#
         );
     }
 

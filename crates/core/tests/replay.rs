@@ -87,7 +87,7 @@ impl HttpClient for Recorder {
 fn started(_: &Request) -> Result<Response> {
     Ok(Response::json_body(
         200,
-        &json!({ "result": "started", "pool": "ci" }),
+        &json!({ "result": "started", "runner": "ci", "kind": "vm" }),
     ))
 }
 

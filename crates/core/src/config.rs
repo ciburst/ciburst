@@ -241,6 +241,19 @@ impl Pool {
         u64::from(self.max_queue_s.unwrap_or(DEFAULT_MAX_QUEUE_S))
     }
 
+    /// `lane` for a lane, `vm` for the VM runner: the `kind` of the dispatcher's answers.
+    pub fn kind(&self) -> &'static str {
+        if self.project.is_some() { "lane" } else { "vm" }
+    }
+
+    /// The runner in messages: `vm runner <tag>`, or `lane <tag> of project <id>`.
+    pub fn describe(&self) -> String {
+        match self.project {
+            Some(project) => format!("lane {} of project {project}", self.runner_tag()),
+            None => format!("vm runner {}", self.tag),
+        }
+    }
+
     /// The tag of the GitLab runner that takes this pool's jobs: the lane tag of a lane, else
     /// the tag.
     pub fn runner_tag(&self) -> &str {

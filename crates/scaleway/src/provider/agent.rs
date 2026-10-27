@@ -18,9 +18,9 @@ pub const AGENT_PREFIX: &str = "ciburst/agent/";
 /// Why no VM could start: neither a binary nor an uploaded agent.
 pub const NO_AGENT: &str =
     "no VM agent: pass --agent <path> or build one with scripts/agent-binary.sh";
-/// Why a VM pool could not start without an S3 cache.
+/// Why the VM runner could not start without an S3 cache.
 pub const NO_CACHE: &str =
-    "VM pools need cache.type s3: VMs fetch their agent from the cache bucket";
+    "the VM runner needs cache.type s3: VMs fetch their agent from the cache bucket";
 
 /// Listing pages read at most while looking for the newest agent.
 const MAX_LIST_PAGES: usize = 100;
@@ -147,7 +147,7 @@ impl Scaleway {
                 .with_detail("newest uploaded agent"),
             None => {
                 self.log
-                    .warn("vm pools cannot start", &[("reason", NO_AGENT)]);
+                    .warn("vm runner cannot start", &[("reason", NO_AGENT)]);
                 Step::new(
                     AGENT_STEP,
                     Action::Create,

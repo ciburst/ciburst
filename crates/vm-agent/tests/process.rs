@@ -300,9 +300,9 @@ fn one_runner_process_serves_every_entry_and_reloads_its_config() {
     };
     let agent_log = || fs::read_to_string(&log_path).unwrap_or_default();
 
-    // Two entries, one process: the pool runner and the member's.
+    // Two entries, one process: the VM runner and the member's.
     let start = Instant::now();
-    wait_for("job requests of the pool and the member", 60, || {
+    wait_for("job requests of the VM runner and the member", 60, || {
         let requests = server.requests(start);
         (requests.contains_key(POOL) && requests.contains_key(MEMBER_A)).then_some(())
     });
@@ -385,7 +385,7 @@ fn one_runner_process_serves_every_entry_and_reloads_its_config() {
 
     let log = agent_log();
     for line in [
-        r#"info agent started run="run-e2e" pool="vm" slots="2" timeout_s="3600""#,
+        r#"info agent started run="run-e2e" runner="vm" slots="2" timeout_s="3600""#,
         r#"info config written runners="2""#,
         r#"info config written runners="3""#,
         r#"info state from="starting" to="idle" free="2""#,

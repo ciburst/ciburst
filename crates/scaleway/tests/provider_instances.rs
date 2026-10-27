@@ -466,7 +466,7 @@ async fn start_falls_back_when_over_quota_and_names_every_failure() {
         .to_string();
     assert_eq!(
         error,
-        "scaleway: pool ci: no instance type started (DEV1-M: Quota exceeded for this resource.; DEV1-L: out of stock)"
+        "scaleway: vm runner ci: no instance type started (DEV1-M: Quota exceeded for this resource.; DEV1-L: out of stock)"
     );
     assert_eq!(backend.instance.servers().len(), 1);
 }
@@ -489,7 +489,7 @@ async fn the_default_types_fall_back_to_dev1_l() {
         .to_string();
     assert_eq!(
         error,
-        "scaleway: pool ci: no instance type started (DEV1-M: out of stock; DEV1-L: out of stock)"
+        "scaleway: vm runner ci: no instance type started (DEV1-M: out of stock; DEV1-L: out of stock)"
     );
 }
 
@@ -535,22 +535,22 @@ async fn start_refuses_what_a_vm_cannot_use() {
         .await
         .unwrap_err()
         .to_string();
-    assert_eq!(error, "scaleway: pool ci is not provisioned");
+    assert_eq!(error, "scaleway: vm runner ci is not provisioned");
 
     let (backend, provider, _) = provisioned(plain(), Log::silent()).await;
     for (key, message) in [
         ("RUNNER_TOKEN", "scaleway: RUNNER_TOKEN missing"),
         (
             "CIBURST_VM_SECRET",
-            "scaleway: pool ci: CIBURST_VM_SECRET missing",
+            "scaleway: vm runner ci: CIBURST_VM_SECRET missing",
         ),
         (
             "CIBURST_DISPATCH_URL",
-            "scaleway: pool ci: CIBURST_DISPATCH_URL missing",
+            "scaleway: vm runner ci: CIBURST_DISPATCH_URL missing",
         ),
         (
             "CACHE_S3_SECRET_KEY",
-            "scaleway: pool ci: CACHE_S3_SECRET_KEY missing",
+            "scaleway: vm runner ci: CACHE_S3_SECRET_KEY missing",
         ),
     ] {
         let mut start = request(&plain(), "ci");
@@ -565,7 +565,10 @@ async fn start_refuses_what_a_vm_cannot_use() {
         .await
         .unwrap_err()
         .to_string();
-    assert_eq!(error, "scaleway: pool ci: CIBURST_AGENT_SHA256 missing");
+    assert_eq!(
+        error,
+        "scaleway: vm runner ci: CIBURST_AGENT_SHA256 missing"
+    );
     assert!(backend.instance.servers().is_empty(), "nothing started");
 }
 
@@ -972,7 +975,7 @@ async fn an_unknown_vm_runtime_fails_plan() {
         .to_string();
     assert_eq!(
         error,
-        "scaleway: pool ci: runtime lambda is not instances or jobs"
+        "scaleway: vm runner ci: runtime lambda is not instances or jobs"
     );
     assert!(backend.writes().is_empty());
 }
@@ -1053,7 +1056,7 @@ async fn plan_warns_when_the_zone_has_no_quota_for_the_pool_types() {
         .lock()
         .unwrap()
         .iter()
-        .find(|l| l.starts_with("warn vm pools cannot start"))
+        .find(|l| l.starts_with("warn vm runner cannot start"))
         .cloned()
         .expect("warning");
     assert!(warning.contains("zone fr-par-1 has no quota for DEV1-M, DEV1-L"));
@@ -1065,7 +1068,7 @@ async fn plan_warns_when_the_zone_has_no_quota_for_the_pool_types() {
         .to_string();
     assert_eq!(
         error,
-        "scaleway: pool ci: zone fr-par-1 has no quota for DEV1-M, DEV1-L: set provider.zone \
+        "scaleway: vm runner ci: zone fr-par-1 has no quota for DEV1-M, DEV1-L: set provider.zone \
          (quota in nl-ams-1, pl-waw-1) or ask Scaleway support to raise it"
     );
     assert!(backend.writes().is_empty(), "preflight writes nothing");
@@ -1096,7 +1099,9 @@ async fn plan_warns_and_preflight_fails_without_an_agent() {
     assert_eq!(step.detail.as_deref(), Some(no_agent));
     assert_eq!(
         *lines.lock().unwrap(),
-        [format!(r#"warn vm pools cannot start reason="{no_agent}""#)]
+        [format!(
+            r#"warn vm runner cannot start reason="{no_agent}""#
+        )]
     );
     assert_eq!(
         without.preflight().await.unwrap_err().to_string(),
@@ -1391,8 +1396,8 @@ async fn a_start_on_the_resolved_values_makes_no_lookup() {
     assert_eq!(
         warnings(&lines.lock().unwrap()),
         [
-            r#"warn start_lookup pool="ci" reason="CIBURST_VM_SECURITY_GROUP unset""#,
-            r#"warn start_lookup pool="ci" type="DEV1-M" reason="CIBURST_VM_IMAGES unset""#,
+            r#"warn start_lookup runner="ci" reason="CIBURST_VM_SECURITY_GROUP unset""#,
+            r#"warn start_lookup runner="ci" type="DEV1-M" reason="CIBURST_VM_IMAGES unset""#,
         ]
     );
 
@@ -1448,7 +1453,7 @@ async fn a_type_missing_from_the_images_is_looked_up_alone() {
     );
     assert_eq!(
         warnings(&lines.lock().unwrap()),
-        [r#"warn start_lookup pool="ci" type="DEV1-M" reason="not in CIBURST_VM_IMAGES""#]
+        [r#"warn start_lookup runner="ci" type="DEV1-M" reason="not in CIBURST_VM_IMAGES""#]
     );
 }
 
@@ -1486,7 +1491,7 @@ async fn a_refused_image_is_looked_up_and_the_create_repeated() {
     assert_eq!(
         warnings(&lines.lock().unwrap()),
         [
-            r#"warn start_lookup pool="ci" type="DEV1-M" reason="create refused: 400 image not found""#
+            r#"warn start_lookup runner="ci" type="DEV1-M" reason="create refused: 400 image not found""#
         ]
     );
 }
@@ -1524,7 +1529,7 @@ async fn a_refused_security_group_is_looked_up_and_the_create_repeated() {
     assert_eq!(
         warnings(&lines.lock().unwrap()),
         [
-            r#"warn start_lookup pool="ci" type="DEV1-M" reason="create refused: 404 security group not found""#
+            r#"warn start_lookup runner="ci" type="DEV1-M" reason="create refused: 404 security group not found""#
         ]
     );
 }

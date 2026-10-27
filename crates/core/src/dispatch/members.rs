@@ -348,11 +348,6 @@ impl Dispatcher {
             json!({
                 "name": config.name,
                 "vm": vm,
-                "pools": [{
-                    "tag": config.vm.tag,
-                    "runtime": config.vm.runtime(),
-                    "tags": [config.vm.tag],
-                }],
                 "hookSecret": invite::hook_secret(hook, invite.project),
             }),
         )

@@ -99,7 +99,7 @@ pub struct HookEvent {
     pub response_body: Value,
 }
 
-/// One delivery as `ciburst status` prints it (D52). `result`, `pool` and `ms` come from the
+/// One delivery as `ciburst status` prints it (D52). `result`, `runner` and `ms` come from the
 /// dispatcher's answer: `-` where the answer lacks the key, `?` where the body is unreadable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Delivery {
@@ -110,9 +110,9 @@ pub struct Delivery {
     pub subject: String,
     pub status: String,
     pub result: String,
-    /// The answer's `pool`; for the warm step every pool and its action, `vm:started` (spec
-    /// 6.5).
-    pub pool: String,
+    /// The answer's `runner`; for the warm step every runner and its action, `vm:started`
+    /// (spec 6.5). Answers before the field was named `runner` carry `pool` and `pools`.
+    pub runner: String,
     pub ms: String,
 }
 
@@ -145,23 +145,35 @@ impl HookEvent {
             None => "?".to_string(),
             Some(answer) => text_of(answer.get(key)).unwrap_or_else(|| "-".into()),
         };
-        let pool = match answer.as_ref().and_then(|a| a.get("pools")) {
-            Some(Value::Array(pools)) if !pools.is_empty() => pools
+        let warm = answer
+            .as_ref()
+            .and_then(|a| a.get("runners").or_else(|| a.get("pools")));
+        let runner = match warm {
+            Some(Value::Array(runners)) if !runners.is_empty() => runners
                 .iter()
-                .map(|pool| {
-                    let text = |key: &str| text_of(pool.get(key)).unwrap_or_else(|| "?".into());
-                    format!("{}:{}", text("pool"), text("action"))
+                .map(|entry| {
+                    let tag = text_of(entry.get("runner").or_else(|| entry.get("pool")));
+                    let action = text_of(entry.get("action"));
+                    let unknown = || "?".to_string();
+                    format!(
+                        "{}:{}",
+                        tag.unwrap_or_else(unknown),
+                        action.unwrap_or_else(unknown)
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join(","),
-            _ => field("pool"),
+            _ => match &answer {
+                Some(a) if a.get("runner").is_none() && a.get("pool").is_some() => field("pool"),
+                _ => field("runner"),
+            },
         };
         Delivery {
             time,
             subject,
             status,
             result: field("result"),
-            pool,
+            runner,
             ms: field("ms"),
         }
     }
@@ -1145,13 +1157,13 @@ mod tests {
     }
 
     #[test]
-    fn a_warm_delivery_shows_each_pool_and_its_action() {
+    fn a_warm_delivery_shows_each_runner_and_its_action() {
         let pipeline = json!({ "object_kind": "pipeline", "object_attributes": { "id": 31 } });
         let warm = json!({
             "result": "warm", "pipeline": 31, "ms": 2410,
-            "pools": [
-                { "pool": "vm", "action": "started", "runId": "r", "vmJobs": 3 },
-                { "pool": "big", "action": "capacity", "vmJobs": 1 },
+            "runners": [
+                { "runner": "vm", "kind": "vm", "action": "started", "runId": "r", "vmJobs": 3 },
+                { "runner": "big", "kind": "vm", "action": "capacity", "vmJobs": 1 },
                 { "action": "disabled" }
             ]
         });
@@ -1159,19 +1171,30 @@ mod tests {
             let event: HookEvent =
                 serde_json::from_value(event(1, pipeline.clone(), json!("200"), response)).unwrap();
             let d = event.delivery();
-            format!("{} {} {} {}", d.subject, d.result, d.pool, d.ms)
+            format!("{} {} {} {}", d.subject, d.result, d.runner, d.ms)
         };
         assert_eq!(
             line(Value::String(warm.to_string())),
             "pipeline 31 warm vm:started,big:capacity,?:disabled 2410"
         );
         assert_eq!(
-            line(json!({ "result": "closed", "pipeline": 31, "pools": [], "ms": 4 })),
+            line(json!({ "result": "closed", "pipeline": 31, "runners": [], "ms": 4 })),
             "pipeline 31 closed - 4"
         );
         assert_eq!(
             line(json!({ "result": "duplicate", "pipeline": 31, "ms": 90 })),
             "pipeline 31 duplicate - 90"
+        );
+        // Answers of earlier dispatchers, still among the hook's recent events.
+        assert_eq!(
+            line(
+                json!({ "result": "warm", "pools": [{ "pool": "vm", "action": "started" }], "ms": 7 })
+            ),
+            "pipeline 31 warm vm:started 7"
+        );
+        assert_eq!(
+            line(json!({ "result": "at_capacity", "pool": "7-node", "ms": 3 })),
+            "pipeline 31 at_capacity 7-node 3"
         );
     }
 
@@ -1190,13 +1213,13 @@ mod tests {
                 1,
                 job.clone(),
                 json!("200"),
-                json!(r#"{"result":"started","pool":"vm","runId":"r","ms":5120}"#),
+                json!(r#"{"result":"started","runner":"vm","kind":"vm","runId":"r","ms":5120}"#),
             ),
             (
                 2,
                 Value::String(job.to_string()),
                 json!(200),
-                json!({ "result": "claimed", "pool": "vm", "lane": "node-24", "ms": 812 }),
+                json!({ "result": "started", "runner": "node-24", "kind": "lane", "ms": 812 }),
             ),
             (
                 3,
@@ -1228,7 +1251,7 @@ mod tests {
                 let d = event.delivery();
                 format!(
                     "{} {} {} {} {} {}",
-                    d.time, d.subject, d.status, d.result, d.pool, d.ms
+                    d.time, d.subject, d.status, d.result, d.runner, d.ms
                 )
             })
             .collect();
@@ -1236,7 +1259,7 @@ mod tests {
             lines,
             [
                 "2026-10-25T12:00:01Z e2e: [ios] 200 started vm 5120",
-                "2026-10-25T12:00:02Z e2e: [ios] 200 claimed vm 812",
+                "2026-10-25T12:00:02Z e2e: [ios] 200 started node-24 812",
                 "2026-10-25T12:00:03Z pipeline 901 200 ignored - -",
                 "2026-10-25T12:00:04Z push 401 ? ? ?",
                 "2026-10-25T12:00:05Z ? internal error ? ? ?",

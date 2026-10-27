@@ -211,7 +211,7 @@ async fn a_read_follows_at_most_max_pages() {
     let error = ledger.since("vm", NOW).await.unwrap_err().to_string();
     assert_eq!(
         error,
-        format!("scaleway ledger: pool vm: more than {MAX_PAGES} pages of intents")
+        format!("scaleway ledger: vm runner vm: more than {MAX_PAGES} pages of intents")
     );
 }
 

@@ -126,7 +126,7 @@ fn invalid(what: String) -> Error {
 /// `<base><pool>/`; a pool is a config tag.
 fn pool_prefix(base: &str, pool: &str) -> Result<String> {
     if !is_pool(pool) {
-        return Err(invalid(format!("pool {pool:?} is not a pool tag")));
+        return Err(invalid(format!("vm runner {pool:?} is not a runner tag")));
     }
     Ok(format!("{base}{pool}/"))
 }

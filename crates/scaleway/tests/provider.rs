@@ -477,7 +477,7 @@ async fn start_refuses_without_token_or_definition() {
     let mut request = start_request(0);
     request.pool.tag = "gone".into();
     let error = provider.start(request).await.unwrap_err().to_string();
-    assert_eq!(error, "scaleway: pool gone is not provisioned");
+    assert_eq!(error, "scaleway: lane gone of project 7 is not provisioned");
 }
 
 /// spec 6.6 for lanes: 429 and 503 may pass on a repeat for every call, another

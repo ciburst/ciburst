@@ -58,6 +58,7 @@ Each row states the current state. The date is that of the decision.
 | D63 | 2026-10-27 | One VM runner per fleet (owner: "we have a generic serverless runner and a vm runner"): the config key `vm`; a job that no lane of its project and no `ignoreJobs` entry takes runs on the VM runner. |
 | D64 | 2026-10-27 | The docs describe the current state only (owner: "Reorganize the project documentation completely"): the decision log holds the decisions in force, each superseded one keeps one row with the reason it was dropped, and the spec holds every binding rule. |
 | D65 | 2026-10-27 | Scaleway is the only provider (owner: "you can also remove the hetzner plug for now"). The `Provider` and `Host` ports stay, so a provider can return (`docs/PROVIDERS.md`). |
+| D66 | 2026-10-27 | No pools in what a user sees (owner: "We do not have pools"). The dispatcher's answers name the runner a job went to as `runner` (its GitLab tag) and `kind` (`vm` or `lane`), the warm answer lists `runners`, log lines carry `runner=`, messages say `vm runner <tag>` or `lane <tag> of project <id>`, the VM's runner entry is named `vm`, and `GET /fleet` no longer sends `pools`. Names that only ciburst's own parts exchange stay: `CIBURST_POOL` in `vm.env` and in a lane definition, and the server tag `pool:<tag>`, which running VMs and definitions already carry. |
 
 ### 0.2 Dropped
 
@@ -124,7 +125,7 @@ Not applicable: UI, offline mode, languages other than English, legal pages. Aut
 | Agent object, runner object | `ciburst-vm-agent` and `gitlab-runner` in the cache bucket, each named by its SHA-256 |
 | Dispatcher | The webhook handler; host: where it runs; provider: where runs execute |
 | Job definition | Scaleway's template for a Serverless Job |
-| `Pool` | Internal Rust type for what one run needs, the VM runner or one lane; the log field `pool=` and the answer field `"pool"` name the VM runner's tag or a lane's key `<project id>-<lane tag>` |
+| `Pool` | Internal Rust type for what one run needs, the VM runner or one lane; answers name it as `runner` (the GitLab runner's tag) and `kind` (`vm` or `lane`), logs as `runner=` (D66) |
 
 ## 4. Personas and journeys
 
@@ -264,7 +265,7 @@ The tags are the only shared VM state; the function stays stateless.
 
 Facts from `gitlab-runner` v18.11.4 (`commands/multi.go`, `common/consts.go`) and a measurement on a real runner (`docs/RUNBOOK.md`, Measured): a runner receives a job only by requesting one, about every 3 s while idle; one `gitlab-runner run` runs at most `concurrent` jobs over all its `[[runners]]` entries and gives parallel jobs of one runner distinct concurrency ids, so their volumes stay apart; it reloads a changed `config.toml` within about 2 s; `SIGQUIT` stops further requests, lets the running jobs finish, then exits; a runner whose requests fail waits 300 s between requests, and `SIGQUIT` does not shorten that wait.
 
-The agent (`crates/vm-agent`) runs one `gitlab-runner run --config <state dir>/config.toml` (state dir `CIBURST_STATE_DIR`, default `/var/lib/ciburst`). It writes the file with `concurrent = slots`, `check_interval = 3` and one Docker executor entry per distinct token: `pool` (the host's VM runner, `RUNNER_TOKEN`), then `member-<project id>` for each runner in the last report answer's `runners` (section 8.5). Every entry runs privileged with `vm.image` as default image, the volumes `/cache` and `/certs/client` (Docker-in-Docker with TLS needs the latter) and the S3 cache settings with `FF_USE_FASTZIP=true` and `CACHE_COMPRESSION_LEVEL=fastest` (D44). The agent rewrites the file atomically only when its content changes; the runner starts once the file exists, again after an unexpected exit, and `free` is 0 while no runner process runs. Busy slots are the distinct `com.gitlab.gitlab-runner.job.id` labels over `docker ps`, read every 5 s.
+The agent (`crates/vm-agent`) runs one `gitlab-runner run --config <state dir>/config.toml` (state dir `CIBURST_STATE_DIR`, default `/var/lib/ciburst`). It writes the file with `concurrent = slots`, `check_interval = 3` and one Docker executor entry per distinct token: `vm` (the host's VM runner, `RUNNER_TOKEN`), then `member-<project id>` for each runner in the last report answer's `runners` (section 8.5). Every entry runs privileged with `vm.image` as default image, the volumes `/cache` and `/certs/client` (Docker-in-Docker with TLS needs the latter) and the S3 cache settings with `FF_USE_FASTZIP=true` and `CACHE_COMPRESSION_LEVEL=fastest` (D44). The agent rewrites the file atomically only when its content changes; the runner starts once the file exists, again after an unexpected exit, and `free` is 0 while no runner process runs. Busy slots are the distinct `com.gitlab.gitlab-runner.job.id` labels over `docker ps`, read every 5 s.
 
 Reports: the agent posts `{state, free, slots}` to the dispatcher's `/vm` (headers `X-Ciburst-Run` and `X-Ciburst-Token`) on every change and at the latest after the last answer's `nextReportS`, clamped to 10 to 600 s, 600 s before the first answer; a failed report is retried every 5 s. The answer is `200 {"result":"reported","nextReportS":<s>,"runners":[{"projectId":<id>,"token":<token>}]}`: `nextReportS` is 15 while VM jobs queue, 30 while the VM is busy, else 600; `runners` lists the members' own VM runners and is left out when empty. Each report also re-evaluates the queue (section 6.4).
 
@@ -320,7 +321,7 @@ A pending VM job without a claim candidate while a VM of the VM runner is live (
 
 The project hooks deliver pipeline events (`pipeline_events: true`). A pipeline event is checked for token and member as a job event, then by `object_attributes.status`:
 
-- `pending` or `running`: the warm step. Builds count when their `status` is `created`, `pending`, `waiting_for_resource`, `preparing` or `scheduled`, their `when` is neither `manual` nor `on_failure`, `manual` is false, and the name is not `ciburst-*`; a counted build that the project's routing sends to the VM runner is a VM job. Without VM jobs: `ignored`, reason `no_vm_jobs`. The record `ciburst/intents/_pipelines/<pipeline>/vm-jobs.json` (`{"<vm tag>": [<job ids>]}`) is written once; an existing one answers `duplicate` with `pipeline`. Then the VM runner's action: `disabled` with `vm.warmStart` false or without records; `capacity` when a claim candidate exists, or when, after the 2 s burst wait, an intent ranks before the warm intent `<unix s>-warm-<pipeline id, 20 digits>`; `at_capacity` at `maxRuns` live VMs; else one VM starts with every slot free (`started`, `runId`), whose ledger position lets the next `slots` VM jobs of the window ride on it. The answer is `warm` with `pipeline` and `pools`, a list with one entry `{pool, action, vmJobs, runId}`; log `warm`. A failed start logs `start_failed` and answers 500.
+- `pending` or `running`: the warm step. Builds count when their `status` is `created`, `pending`, `waiting_for_resource`, `preparing` or `scheduled`, their `when` is neither `manual` nor `on_failure`, `manual` is false, and the name is not `ciburst-*`; a counted build that the project's routing sends to the VM runner is a VM job. Without VM jobs: `ignored`, reason `no_vm_jobs`. The record `ciburst/intents/_pipelines/<pipeline>/vm-jobs.json` (`{"<vm tag>": [<job ids>]}`) is written once; an existing one answers `duplicate` with `pipeline`. Then the VM runner's action: `disabled` with `vm.warmStart` false or without records; `capacity` when a claim candidate exists, or when, after the 2 s burst wait, an intent ranks before the warm intent `<unix s>-warm-<pipeline id, 20 digits>`; `at_capacity` at `maxRuns` live VMs; else one VM starts with every slot free (`started`, `runId`), whose ledger position lets the next `slots` VM jobs of the window ride on it. The answer is `warm` with `pipeline` and `runners`, a list with one entry `{runner, kind, action, vmJobs, runId}`; log `warm`. A failed start logs `start_failed` and answers 500.
 - `success`, `failed`, `canceled`, `skipped`: deletes the pipeline's records and writes `ciburst/intents/_closed/<pipeline>` with the time and the ids of its builds with status `manual` (D56); answer `closed` with `pipeline`.
 - Any other status: `ignored`, reason `status`.
 
@@ -364,7 +365,7 @@ Live runs and `maxRuns` count per definition, so per project and lane. ciburst s
 
 ### 7.2 Lane runs
 
-A pending lane job counts the live runs of its definition (`queued`, `scheduled`, `running`); below `maxRuns` it starts one run (`started` with `runId`), else it answers `at_capacity`. The answer's `pool` is the lane key `<P>-<tag>`. Lanes never use the burst ledger or the queue.
+A pending lane job counts the live runs of its definition (`queued`, `scheduled`, `running`); below `maxRuns` it starts one run (`started` with `runId`), else it answers `at_capacity`. The answer's `runner` is the lane's tag, its `kind` `lane`. Lanes never use the burst ledger or the queue.
 
 The run starts with the overrides `RUNNER_TOKEN` (the lane's runner: the host's from the function's secrets, a member's from its record), `CACHE_S3_ACCESS_KEY`, `CACHE_S3_SECRET_KEY` and the labels as `CIBURST_PROJECT`, `CIBURST_PIPELINE`, `CIBURST_JOB`, `CIBURST_STAGE`; never `CIBURST_VM_SECRET`. It takes jobs with the lane's tag until `waitTimeoutS` idle seconds pass, which are billed.
 
@@ -402,7 +403,7 @@ The dispatcher reads both at once and keeps them for at most 30 s (`FLEET_CACHE`
 
 Each is authenticated by the code in the header `X-Ciburst-Join`, which must be authentic and, except for `/leave`, not expired; a forged or expired code answers `401` and logs `warn join_refused` with the reason. A code for the host answers `400 {"result":"refused","reason":"host"}`.
 
-- `GET /fleet`: `200 {"result":"fleet","name":<fleet>,"vm":{"tag":<vm tag>,"runtime":"instances"},"pools":[{"tag":<vm tag>,"runtime":"instances","tags":[<vm tag>]}],"hookSecret":<the member's webhook secret>}`. `pools` lists the VM runner alone, for clients that read the earlier shape.
+- `GET /fleet`: `200 {"result":"fleet","name":<fleet>,"vm":{"tag":<vm tag>,"runtime":"instances"},"hookSecret":<the member's webhook secret>}`.
 - `POST /join`, body `{"runners":{<vm tag>:<token>},"lanes":[<lanes>],"laneRunners":{<lane tag>:<token>},"ignoreJobs":[<patterns>]}`. Answers: `400 bad_request` without a VM runner token; `400 unknown_runners` with `runners` for a runner tag other than the VM runner's; `400 invalid_lanes` with `errors` for lanes or `ignoreJobs` that fail the validation of section 5.4 or the provider's limits, a lane without its runner token, or a runner token without its lane; `503 no_fleet` without fleet state. Then two steps within `JOIN_BUDGET` (25 s, inside the function's 30 s): `definitions` (the member's definitions become its lanes, others deleted, `Provider::sync_lanes`) and `record` (the member record, replacing an earlier one). A step that fails answers `500 {"result":"error","step":<step>}`, one that does not finish `504 {"result":"timeout","step":<step>}`; both log `error join_failed` with the step. Success: `200 {"result":"joined","fleet":<name>,"lanes":[<tags>]}`, log `joined`.
 - `POST /leave`: the steps `definitions` (deletes the member's definitions) and `record` (deletes the record), with the same failure answers (`leave_failed`); success `200 {"result":"left","fleet":<name>}`.
 
@@ -467,7 +468,7 @@ Start: `POST job-definitions/<id>/start` with the overrides of section 7.2. List
 
 ### 9.3 Preflight
 
-`apply` calls `Provider::preflight` before any change (D42): it fails when the zone has no Instance quota for any of `vm.instanceTypes` (the message names zones with quota), when the cache is not S3, or when no agent object is available. `plan` warns `vm pools cannot start` with the reason.
+`apply` calls `Provider::preflight` before any change (D42): it fails when the zone has no Instance quota for any of `vm.instanceTypes` (the message names zones with quota), when the cache is not S3, or when no agent object is available. `plan` warns `vm runner cannot start` with the reason.
 
 ### 9.4 Host `scaleway-function`
 
@@ -579,7 +580,7 @@ Lanes are the project's `ciburst.json` and its jobs' tags, not part of the compo
 
 ### 13.1 `ciburst status`
 
-Prints `dispatcher: <url>`, `vm runner <tag>: <n> live of <maxRuns>`, per lane `lane <tag> of project <id> (<image>): <n> live of <maxRuns>` (the host's lanes from the config, the members' from their records), `member <id> joined <time>` per member, then up to 20 runs as `run <id> <vm tag or lane key> <state> <created_at> job=<id>` with the states `Queued`, `Running`, `Done`, `Failed`. With a GitLab token (D52) it adds per project `hook <id>: <alert_status>` and the hook's 20 newest deliveries as `delivery <time> <job, pipeline <id> or event kind> <http status> <result> <pool> <ms>`, oldest first, `-` where the answer lacks the key, `?` for an unreadable body; a member project the token cannot read prints `hook not readable with this token`.
+Prints `dispatcher: <url>`, `vm runner <tag>: <n> live of <maxRuns>`, per lane `lane <tag> of project <id> (<image>): <n> live of <maxRuns>` (the host's lanes from the config, the members' from their records), `member <id> joined <time>` per member, then up to 20 runs as `run <id> <vm tag or lane key> <state> <created_at> job=<id>` with the states `Queued`, `Running`, `Done`, `Failed`. With a GitLab token (D52) it adds per project `hook <id>: <alert_status>` and the hook's 20 newest deliveries as `delivery <time> <job, pipeline <id> or event kind> <http status> <result> <runner> <ms>`, oldest first (a warm answer as `<runner>:<action>` per runner; answers of earlier dispatchers by their `pool`), `-` where the answer lacks the key, `?` for an unreadable body; a member project the token cannot read prints `hook not readable with this token`.
 
 ### 13.2 `ciburst check`
 

@@ -334,7 +334,7 @@ impl Provider for FakeProvider {
                         let pool = self
                             .config
                             .pool_by_tag(tag)
-                            .ok_or_else(|| Error::provider(format!("unknown pool {tag}")))?;
+                            .ok_or_else(|| Error::provider(format!("unknown lane {tag}")))?;
                         state
                             .definitions
                             .insert(tag.to_string(), Definition::from(&pool));
@@ -354,8 +354,8 @@ impl Provider for FakeProvider {
         let mut state = self.state().await?;
         if !state.definitions.contains_key(&request.pool.tag) {
             return Err(Error::provider(format!(
-                "pool {} is not provisioned",
-                request.pool.tag
+                "{} is not provisioned",
+                request.pool.describe()
             )));
         }
         if request.env.get("RUNNER_TOKEN").is_none_or(|t| t.is_empty()) {

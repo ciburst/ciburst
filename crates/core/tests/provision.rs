@@ -715,8 +715,8 @@ async fn the_hook_delivers_pipeline_events_that_warm_a_vm() {
     assert_eq!(response.status, 200, "{}", response.body);
     assert_eq!(response.body["result"], "warm");
     assert_eq!(response.body["pipeline"], 31);
-    assert_eq!(response.body["pools"][0]["action"], "started");
-    assert_eq!(response.body["pools"][0]["vmJobs"], 2);
+    assert_eq!(response.body["runners"][0]["action"], "started");
+    assert_eq!(response.body["runners"][0]["vmJobs"], 2);
     let jobs = records.recorded("31").unwrap();
     assert_eq!(jobs["vm"], ["12", "16"]);
     let vms = s.provider.capacity("vm").await.unwrap().unwrap();
@@ -828,7 +828,7 @@ async fn deliveries_come_from_the_hook_to_the_dispatcher() {
                 "created_at": "2026-10-25T12:00:00Z",
                 "request_data": { "object_kind": "build", "build_name": format!("unit {id}/25") },
                 "response_status": "200",
-                "response_body": json!({ "result": "started", "pool": "ci", "ms": id * 10 }).to_string(),
+                "response_body": json!({ "result": "started", "runner": "ci", "kind": "vm", "ms": id * 10 }).to_string(),
             }),
         );
     }

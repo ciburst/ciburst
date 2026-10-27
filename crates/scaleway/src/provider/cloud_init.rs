@@ -31,7 +31,10 @@ pub fn base_env(
             .filter(|v| !v.is_empty())
             .cloned()
             .ok_or_else(|| {
-                Error::provider(format!("{PROVIDER_NAME}: pool {}: {key} missing", pool.tag))
+                Error::provider(format!(
+                    "{PROVIDER_NAME}: {}: {key} missing",
+                    pool.describe()
+                ))
             })
     };
     let mut env = BTreeMap::from([
@@ -119,7 +122,7 @@ mod tests {
             let error = base_env(&config, pool, "fr-par", "p-1", &partial)
                 .unwrap_err()
                 .to_string();
-            assert_eq!(error, format!("scaleway: pool vm: {key} missing"));
+            assert_eq!(error, format!("scaleway: vm runner vm: {key} missing"));
         }
     }
 

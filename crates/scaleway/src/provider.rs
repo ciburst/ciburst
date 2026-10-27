@@ -186,8 +186,8 @@ impl Scaleway {
             None => Ok(Runtime::Instances),
             Some(value) => Runtime::parse(value).ok_or_else(|| {
                 Error::provider(format!(
-                    "{PROVIDER_NAME}: pool {}: runtime {value} is not instances or jobs",
-                    pool.tag
+                    "{PROVIDER_NAME}: {}: runtime {value} is not instances or jobs",
+                    pool.describe()
                 ))
             }),
         }

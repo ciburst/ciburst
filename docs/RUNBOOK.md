@@ -98,9 +98,9 @@ Where to look when a job waits:
 | 200 | `ignored`, reason `project` | a project that is not a member |
 | 200 | `ignored`, reason `own_job` | a job named `ciburst-*`, the component's own jobs |
 | 200 | `ignored`, reason `ignore_jobs` | a job named in its project's `ignoreJobs`, which runs on other runners |
-| 200 | `ignored`, reason `no_runner` (`pool`) | a VM job of a member that registered no VM runner |
+| 200 | `ignored`, reason `no_runner` (`runner`, `kind`) | a VM job of a member that registered no VM runner |
 | 200 | `ignored`, reason `pipeline_closed` (`pipeline`) | a pending event GitLab delivered after its pipeline had ended, for a job that existed before the end and was not manual (D56); nothing starts |
-| 200 | `warm` (`pipeline`, `pools[]` with `pool`, `action`, `vmJobs`, `runId`) | a pipeline event with VM jobs: `started` (a warm VM boots with every slot free), `capacity` (a VM with a free slot exists or one is starting), `at_capacity`, `disabled` (`warmStart` false) |
+| 200 | `warm` (`pipeline`, `runners[]` with `runner`, `kind`, `action`, `vmJobs`, `runId`) | a pipeline event with VM jobs: `started` (a warm VM boots with every slot free), `capacity` (a VM with a free slot exists or one is starting), `at_capacity`, `disabled` (`warmStart` false) |
 | 200 | `ignored`, reason `no_vm_jobs` | a pipeline event whose open jobs all run in lanes or elsewhere |
 | 200 | `duplicate` (`pipeline`) | a pipeline event for a pipeline whose record exists; nothing started |
 | 200 | `closed` (`pipeline`) | a pipeline event with a final status; the pipeline's records are deleted |
@@ -109,7 +109,7 @@ Where to look when a job waits:
 | 401 | no body | wrong or missing webhook secret, hook, VM or sweep token |
 | 500 | `error` | the provider failed (start, report, terminate, sweep) or the function's environment is incomplete; the body carries nothing more |
 
-Every answer with a body carries `ms`, the dispatcher's elapsed milliseconds; GitLab.com counts an answer after 10 s as a failed delivery and disables the webhook after four failures in a row (section Webhook health). Every 200 answer of a job event except `ignored` also names the `pool`: the VM runner's tag, or for a lane its key `<project id>-<lane tag>`. A `grouped` job depends on its leader's delivery: `started` (the VM boots), `queued` or `at_capacity` (the group waits for a slot) or 500 (the group waits for the next VM). Lane jobs never answer `grouped`, `duplicate` or `queued`: lanes use neither the burst ledger nor the queue. The fleet endpoints answer as in section Fleet members.
+Every answer with a body carries `ms`, the dispatcher's elapsed milliseconds; GitLab.com counts an answer after 10 s as a failed delivery and disables the webhook after four failures in a row (section Webhook health). Every 200 answer of a job event except `ignored` also names the `runner` and its `kind`: the VM runner's tag with `vm`, or the lane's tag with `lane`. Example: `{"result":"started","runner":"node24","kind":"lane","runId":"<run id>","ms":1840}`. A `grouped` job depends on its leader's delivery: `started` (the VM boots), `queued` or `at_capacity` (the group waits for a slot) or 500 (the group waits for the next VM). Lane jobs never answer `grouped`, `duplicate` or `queued`: lanes use neither the burst ledger nor the queue. The fleet endpoints answer as in section Fleet members.
 
 ## Fleet members
 
@@ -129,7 +129,7 @@ Join a project:
 3. In the member, `CIBURST_JOIN` (the code) and `CIBURST_GITLAB_TOKEN`, both protected, masked and hidden, scope `ciburst`; then `ciburst-join`.
    Check: the log shows `info runner tag="<vm tag>"`, `info runner tag="<lane tag>"` per lane, `info hook`, then `lane <tag> (<image>)` per lane and `joined fleet <name>`; the member's Runners page lists `<name>-<vm tag>` and `<name>-<lane tag>`; the console lists the job definitions `<name>-<project id>-<lane tag>`.
 4. A member pipeline.
-   Check: the deliveries answer with `pool` `<vm tag>` for VM jobs and `<project id>-<lane tag>` for lane jobs; `ciburst status` in the host lists `lane <tag> of project <id> (<image>)`.
+   Check: the deliveries answer with `runner` `<vm tag>` and `kind` `vm` for VM jobs, `<lane tag>` and `lane` for lane jobs; `ciburst status` in the host lists `lane <tag> of project <id> (<image>)`.
 
 Change a member's lanes or `ignoreJobs`: edit its `ciburst.json`, then `ciburst-join` again (a new code from the host when the old one expired). `/join` updates changed definitions and deletes those of removed lanes; `ciburst-join` replaces the member's runners.
 
@@ -178,9 +178,9 @@ Every line reads `<level> <message> key="value" ...` and never holds a secret.
 
 | Source | Where | Lines |
 |---|---|---|
-| Dispatcher | the function's stderr, which Cockpit does not show (2026-10-24): read the answers on the webhook's recent events instead | `info` `claimed`, `started`, `grouped`, `duplicate`, `at_capacity`, `queued` (`eta_s`), `tracked` (`status`, `duration_s`), `stale`, `warm`, `closed` with `project`, `pipeline`, `job`, `stage`, `pool`, `run`; `queue_started` (`vms`, `needing`), `reported` (`state`, `free`, `next_report_s`), `joined` (`lanes`), `left`; `warn` `claim_failed`, `ledger_failed`, `schedule_failed` (`op`), `records_failed` (`op`), `capacity_failed`, `fleet_failed` (`op`), `join_refused` (`route`, `reason`), `start_retry` (a 429 or 503 of the provider, retried once after 300 ms within 5 s), `start_lookup` (a VM start looked up its image or security group: a type not in `CIBURST_VM_IMAGES`, or a create refused for a removed image; the next `ciburst apply` resolves them again), `unauthorized`; every line ends with `ms`; `error` `start_failed`, `report_failed`, `terminate_failed`, `sweep_failed`, `join_failed` and `leave_failed` (`step`), and `env` naming a missing variable |
-| CLI | stderr; in pipeline mode the job log | one line per action; `plan` warns `vm pools cannot start reason="..."`; `apply` logs `runner`, `runner_tags`, `runner_deleted`, `runner_disabled`, `hook`, `hook_reenabled`, `fleet_config`, `member`, `replayed` per replayed job, `replay_failed` and `output_unmasked`; `ciburst-join` logs `runner` and `hook`, `ciburst-leave` `hook_deleted` and `runner_deleted` |
-| Deliveries | `ciburst status` with a GitLab token: each webhook's 20 newest deliveries, oldest first | `delivery <time> <job name, pipeline <id> or event kind> <http status> <result> <pool> <ms>`; `-` where the answer lacks the key, `?` for an unreadable body |
+| Dispatcher | the function's stderr, which Cockpit does not show (2026-10-24): read the answers on the webhook's recent events instead | `info` `claimed`, `started`, `grouped`, `duplicate`, `at_capacity`, `queued` (`eta_s`), `tracked` (`status`, `duration_s`), `stale`, `warm`, `closed` with `project`, `pipeline`, `job`, `stage`, `runner`, `run`; `queue_started` (`vms`, `needing`), `reported` (`state`, `free`, `next_report_s`), `joined` (`lanes`), `left`; `warn` `claim_failed`, `ledger_failed`, `schedule_failed` (`op`), `records_failed` (`op`), `capacity_failed`, `fleet_failed` (`op`), `join_refused` (`route`, `reason`), `start_retry` (a 429 or 503 of the provider, retried once after 300 ms within 5 s), `start_lookup` (a VM start looked up its image or security group: a type not in `CIBURST_VM_IMAGES`, or a create refused for a removed image; the next `ciburst apply` resolves them again), `unauthorized`; every line ends with `ms`; `error` `start_failed`, `report_failed`, `terminate_failed`, `sweep_failed`, `join_failed` and `leave_failed` (`step`), and `env` naming a missing variable |
+| CLI | stderr; in pipeline mode the job log | one line per action; `plan` warns `vm runner cannot start reason="..."`; `apply` logs `runner`, `runner_tags`, `runner_deleted`, `runner_disabled`, `hook`, `hook_reenabled`, `fleet_config`, `member`, `replayed` per replayed job, `replay_failed` and `output_unmasked`; `ciburst-join` logs `runner` and `hook`, `ciburst-leave` `hook_deleted` and `runner_deleted` |
+| Deliveries | `ciburst status` with a GitLab token: each webhook's 20 newest deliveries, oldest first | `delivery <time> <job name, pipeline <id> or event kind> <http status> <result> <runner> <ms>`; `-` where the answer lacks the key, `?` for an unreadable body |
 | Lane run | the job run's stdout and stderr on Serverless Jobs; `ciburst status` lists the run and its state | `ciburst-lane: <reason>` before the bootstrap exits 64 (section Failure modes), then `gitlab-runner`'s own lines |
 | VM agent | the VM's journal, `journalctl -u ciburst-vm-agent`, through the provider's console view only | `agent started`, `state from=... to=...` (`starting`, `idle`, `busy`, `draining`, `quitting`), `config written runners=<n>`, `runner started pid=...`, `runner exited code=...` (a warning when not draining; the agent starts it again), `runner start failed`, `config write failed`, `docker ps failed`, `report failed`, `report answer unreadable`, `terminate accepted`, `terminate failed`, `terminate gave up` |
 
@@ -275,7 +275,7 @@ Add lanes to a project:
    ```
    Check: `ciburst check` reports no problem.
 4. Host: `ciburst apply`, or `ciburst-setup`. Member: `ciburst-join`.
-   Check: the project's Settings, CI/CD, Runners lists `<name>-node24` with the tag `node24`; a lane job's delivery answers `started` with `pool` `<project id>-node24`, and the job passes.
+   Check: the project's Settings, CI/CD, Runners lists `<name>-node24` with the tag `node24`; a lane job's delivery answers `started` with `runner` `node24` and `kind` `lane`, and the job passes.
 
 ### Lane bootstrap
 
@@ -397,7 +397,7 @@ Config: the VM runner `vm` (`slots` 2, `maxRuns` 4) in a zone with quota, the ho
 7. Sweep: in the VM zone create a powered-on server without user data, tagged `ciburst`, `<name>`, `pool:vm`, `ciburst-state:starting`.
    Check: the first sweep after its tenth minute terminates it; reporting VMs stay.
 8. A member: a second project joins with its own lane (section Fleet members) and runs a pipeline.
-   Check: its VM jobs share the host's VMs, its lane jobs answer `pool` `<project id>-<lane tag>`; `ciburst-leave` removes its definitions, runners and webhook.
+   Check: its VM jobs share the host's VMs, its lane jobs answer `runner` `<lane tag>` with `kind` `lane`; `ciburst-leave` removes its definitions, runners and webhook.
 9. Cost on the consumption page.
    Check: Instances, IPv4 and local SSD for the VM hours only; Serverless Jobs inside the free tier.
 

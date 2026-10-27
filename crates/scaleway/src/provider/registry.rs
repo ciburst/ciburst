@@ -60,7 +60,7 @@ pub async fn create_namespace(
                 "name": name,
                 "project_id": project_id,
                 "is_public": is_public,
-                "description": "ciburst pool images",
+                "description": "ciburst job images",
             }),
         )
         .await?;

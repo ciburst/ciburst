@@ -304,7 +304,7 @@ async fn a_member_joins_and_leaves_with_one_code() {
     assert!(members[0].lanes.is_empty() && members[0].ignore_jobs.is_empty());
     let lint = s.member_event(&secret, "lint", 1).await;
     assert_eq!(lint["result"], "started", "{lint}");
-    assert_eq!(lint["pool"], "vm", "the host's lane is not the member's");
+    assert_eq!(lint["runner"], "vm", "the host's lane is not the member's");
 
     // spec 8.3: the member's own lanes and ignoreJobs from its own ciburst.json.
     let file = r#"{
@@ -329,7 +329,7 @@ async fn a_member_joins_and_leaves_with_one_code() {
     );
     assert_eq!(s.gitlab.hooks().len(), 1);
     let lint = s.member_event(&secret, "lint", 2).await;
-    assert_eq!(lint["pool"], "8-node", "{lint}");
+    assert_eq!(lint["runner"], "node", "{lint}");
     let pages = s.member_event(&secret, "pages", 3).await;
     assert_eq!(pages["reason"], "ignore_jobs", "{pages}");
 
