@@ -156,6 +156,58 @@ async fn members_are_sealed_at_rest_and_read_back() {
     assert_ne!(again["hookSecret"], stored["hookSecret"]);
 }
 
+/// The S3 fake with a round trip of 100 ms that counts the requests in flight.
+struct Slow {
+    inner: Arc<FakeS3>,
+    now: std::sync::atomic::AtomicUsize,
+    most: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ciburst_core::http::HttpClient for Slow {
+    async fn send(
+        &self,
+        request: ciburst_core::http::Request,
+    ) -> ciburst_core::Result<ciburst_core::http::Response> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let now = self.now.fetch_add(1, SeqCst) + 1;
+        self.most.fetch_max(now, SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let response = self.inner.send(request).await;
+        self.now.fetch_sub(1, SeqCst);
+        response
+    }
+}
+
+/// Found in the M6.3 drill: a cold dispatcher read the members one by one before answering, and
+/// GitLab gave up on its first events after 10 s.
+#[tokio::test(start_paused = true)]
+async fn members_are_read_at_once() {
+    let (fake, store) = store().await;
+    for id in [7, 8, 9] {
+        store.put_member(&member(id, HOOK)).await.unwrap();
+    }
+    let slow = Arc::new(Slow {
+        inner: fake.clone(),
+        now: Default::default(),
+        most: Default::default(),
+    });
+    let store = ScalewayFleetStore::new(
+        slow.clone(),
+        "fr-par",
+        BUCKET,
+        &cache_key(),
+        FleetKey::from_secret(FLEET_SECRET).unwrap(),
+    );
+    let started = tokio::time::Instant::now();
+    assert_eq!(store.members().await.unwrap().len(), 3);
+    assert_eq!(slow.most.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(250),
+        "one listing and one round of reads"
+    );
+}
+
 #[tokio::test]
 async fn joining_twice_replaces_and_leaving_deletes() {
     let (fake, store) = store().await;

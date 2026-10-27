@@ -109,7 +109,8 @@ impl Dispatcher {
             return;
         }
         let mut ok = true;
-        let config = store.config().await.and_then(|json| {
+        let (config, members) = tokio::join!(store.config(), store.members());
+        let config = config.and_then(|json| {
             json.map(|json| parse_config(&json).map(Arc::new))
                 .transpose()
         });
@@ -120,7 +121,7 @@ impl Dispatcher {
                 self.fleet_failed(at, "config", &error);
             }
         }
-        match store.members().await {
+        match members {
             Ok(members) => cached.members = members,
             Err(error) => {
                 ok = false;

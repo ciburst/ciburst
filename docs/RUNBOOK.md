@@ -491,6 +491,8 @@ Result (2026-10-26, the demo as host in `nl-ams`, a member project in a personal
 - `ciburst-join` failed with `pull access denied` for the cli image until the member's path was on the job token allowlist of `ciburst/ciburst` (private until M7); then it registered the runners `vm`, `node24`, `rust`, created the webhook and logged `joined fleet <name>` within 3 s;
 - a host job and a member job ran on the same VM at once, under their own runners (`runner-<token prefix>-project-<id>-concurrent-0` each, so their volumes stay apart); the third pending job started a second VM, as `slots` 2 asks;
 - a routing-only config change (`ignoreJobs`) redeployed the function (about 10 minutes), against rule R1; fixed by comparing the function settings with `Config::deployment_view` (spec section 5.6).
+- after that fix, removing `prettier` from `ignoreJobs` again: setup in 27 s with `update fleet config` and the function `noop`; the next member pipeline routed `prettier` to the VM pool;
+- in the first minute after a function deploy, cold instances answered in 4 to 9 s, and two pending events got no answer within GitLab's 10 s, which stranded that pipeline; warm, a fleet refresh took 0.6 to 1 s and a burst of 10 requests stayed under 1.4 s. The refresh read the config, the member listing and each member one after another; it now reads the config and the members at once, and all members at once (`members_are_read_at_once`).
 
 ## `run-single` flags
 

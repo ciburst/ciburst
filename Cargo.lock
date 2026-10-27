@@ -299,6 +299,7 @@ dependencies = [
  "async-trait",
  "ciburst-core",
  "ciburst-scaleway",
+ "futures-util",
  "hex",
  "hmac",
  "md-5",

@@ -17,6 +17,7 @@
 //! HMAC-SHA256(secret, `ciburst fleet aes-256-gcm`), the MAC key HMAC-SHA256(secret, `ciburst
 //! fleet config`). Errors name the object key and the field, never a value.
 
+use futures_util::future::join_all;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -314,13 +315,24 @@ impl FleetStore for ScalewayFleetStore {
             .s3
             .list_all(&self.bucket, MEMBER_PREFIX, MAX_PAGES)
             .await?;
+        if let Some(object) = listed
+            .iter()
+            .find(|object| parse_member_key(&object.key).is_none())
+        {
+            return Err(invalid(format!("{}: not a member key", object.key)));
+        }
+        // All at once: a cold dispatcher reads the fleet before it answers GitLab, which gives
+        // up after 10 s (M6.3 drill).
+        let bodies = join_all(
+            listed
+                .iter()
+                .map(|object| self.s3.get_object(&self.bucket, &object.key)),
+        )
+        .await;
         let mut members = Vec::with_capacity(listed.len());
-        for object in listed {
-            if parse_member_key(&object.key).is_none() {
-                return Err(invalid(format!("{}: not a member key", object.key)));
-            }
+        for (object, body) in listed.iter().zip(bodies) {
             // Deleted between the listing and the read: a member that left.
-            let Some(body) = self.s3.get_object(&self.bucket, &object.key).await? else {
+            let Some(body) = body? else {
                 continue;
             };
             members.push(self.open_member(&object.key, &body)?);
