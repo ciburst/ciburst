@@ -1,16 +1,18 @@
-# ciburst CI/CD component. Every job of the including pipeline runs on the pool `pool`: a VM
-# with its own Docker daemon and GitLab's Docker executor, so `image:`, `services:` and
-# Docker-in-Docker work as on GitLab's hosted runners. The manual jobs `ciburst-setup`,
-# `ciburst-check`, `ciburst-destroy` and `ciburst-invite` run `ciburst --ci` on a hosted runner,
-# on the default branch when it is protected. With `role: member` a project joins the fleet of
-# another project instead, through the manual jobs `ciburst-join` and `ciburst-leave`.
+# ciburst CI/CD component. Every job of the including pipeline without its own `tags` runs on
+# the VM runner `vm_tag`: a VM with its own Docker daemon and GitLab's Docker executor, so
+# `image:`, `services:` and Docker-in-Docker work as on GitLab's hosted runners. A job tagged
+# with a lane of this project's own `ciburst.json` runs in that lane. The manual jobs
+# `ciburst-setup`, `ciburst-check`, `ciburst-destroy` and `ciburst-invite` run `ciburst --ci` on
+# a hosted runner, on the default branch when it is protected. With `role: member` a project
+# joins the fleet of another project instead, through the manual jobs `ciburst-join` and
+# `ciburst-leave`; `ciburst-join` reads the member's own `ciburst.json` for its lanes.
 #
 # Usage. `@main` goes with the cli image `edge`; a release `@vX.Y.Z` goes with `version: X.Y.Z`.
 #
 # include:
 #   - component: gitlab.com/ciburst/ciburst/ciburst@main
 #     inputs:
-#       pool: vm
+#       vm_tag: vm
 #       version: edge
 #
 # test:
@@ -37,8 +39,8 @@
 
 spec:
   inputs:
-    pool:
-      description: Runner tag of the pool that runs every job without its own `tags`.
+    vm_tag:
+      description: Runner tag of the VM runner, which runs every job without its own `tags`.
       default: vm
     version:
       description: Tag of the image registry.gitlab.com/ciburst/ciburst/cli for the ciburst jobs.
@@ -53,7 +55,7 @@ spec:
 ---
 default:
   tags:
-    - $[[ inputs.pool ]]
+    - $[[ inputs.vm_tag ]]
 
 .ciburst-docker:
   image: docker:27
