@@ -70,6 +70,7 @@ Status: M5 roundup done 2026-10-25; M6 serverless lanes (D45 to D47) drilled on 
 | D62 | 2026-10-27 | No `vmFirst` and no spill (owner: "Drop vmFirst"): lane jobs run only in lanes, the VM runner carries only its own tag. Replaces D47, D54, D55: VM slots racing lane runs billed idle lane tails, and lane tags on a shared VM runner would cross projects. |
 | D63 | 2026-10-27 | One VM runner per fleet (owner: "we have a generic serverless runner and a vm runner"): the config key `vm` replaces `pools`; a job that no lane of its project and no `ignoreJobs` entry takes runs on the VM runner. `defaultPool`, `stages` routing and further VM pools go. |
 | D64 | 2026-10-27 | The docs describe the current state only (owner: "Reorganize the project documentation completely"): the decision log holds the decisions in force; superseded ones keep one row with the reason they were dropped; the milestone contracts fold into the spec. |
+| D65 | 2026-10-27 | Hetzner is removed for now (owner: "you can also remove the hetzner plug for now"): the crate `crates/hetzner`, the `providers` config key, VM runtimes other than Scaleway Instances, `CIBURST_HCLOUD_TOKEN` and `.local/hetzner.env` go. Scaleway is the only provider; the ports stay so a provider can return. Replaces D34 and D35. |
 
 ## 1. Purpose and scope
 
