@@ -324,7 +324,7 @@ The project hooks deliver pipeline events (`pipeline_events: true`). A pipeline 
 - `success`, `failed`, `canceled`, `skipped`: deletes the pipeline's records and writes `ciburst/intents/_closed/<pipeline>` with the time and the ids of its builds with status `manual` (D56); answer `closed` with `pipeline`.
 - Any other status: `ignored`, reason `status`.
 
-A VM job's pending event writes the marker `seen/<job>` beside the pipeline's record when the record exists (one HEAD per VM job event). A pending job event of a closed pipeline whose job was created before the close and was not manual then answers `ignored`, reason `pipeline_closed` (D56). A records error logs `warn records_failed` with `op` and the dispatcher acts as without records. The lifecycle rule of `ciburst/intents/` expires leftovers.
+Closing deletes everything below the pipeline's prefix, the `seen/<job>` markers of earlier versions included. A pending job event of a closed pipeline whose job was created before the close and was not manual then answers `ignored`, reason `pipeline_closed` (D56). A records error logs `warn records_failed` with `op` and the dispatcher acts as without records. The lifecycle rule of `ciburst/intents/` expires leftovers.
 
 ### 6.6 Start path
 

@@ -1,6 +1,6 @@
 //! `ScalewayPipelineRecords` against the S3 fake (spec 6.5): the key layout, one record per
-//! pipeline, seen markers only beside a record, listings across pages, `close`, the failures
-//! that may be retried (spec 6.6), and the burst ledger reading past the records.
+//! pipeline, `close` across pages with the markers of earlier versions, the failures that may
+//! be retried (spec 6.6), and the burst ledger reading past the records.
 
 use std::sync::Arc;
 
@@ -44,12 +44,12 @@ async fn records() -> (Arc<FakeS3>, ScalewayPipelineRecords) {
     (fake, records)
 }
 
-fn vm_jobs(pools: &[(&str, &[&str])]) -> VmJobs {
-    pools
+fn vm_jobs(runners: &[(&str, &[&str])]) -> VmJobs {
+    runners
         .iter()
-        .map(|(pool, jobs)| {
+        .map(|(runner, jobs)| {
             (
-                pool.to_string(),
+                runner.to_string(),
                 jobs.iter().map(|j| j.to_string()).collect(),
             )
         })
@@ -80,9 +80,13 @@ fn keys(fake: &FakeS3) -> Vec<String> {
         .collect()
 }
 
-fn sorted(mut jobs: Vec<String>) -> Vec<String> {
-    jobs.sort_by(|a, b| (a.len(), a).cmp(&(b.len(), b)));
-    jobs
+/// A seen marker as earlier versions wrote it below a pipeline's prefix.
+fn marker(fake: &FakeS3, pipeline: &str, job: &str) {
+    fake.put_object(
+        BUCKET,
+        &format!("ciburst/intents/_pipelines/{pipeline}/seen/{job}"),
+        b"",
+    );
 }
 
 #[tokio::test]
@@ -92,27 +96,17 @@ async fn open_writes_the_vm_jobs_once() {
     let jobs = vm_jobs(&[("vm", &["11", "12"]), ("big", &["13"])]);
 
     let from = fake.calls().len();
-    assert_eq!(records.vm_jobs("9").await.unwrap(), None);
     assert!(records.open("9", &jobs).await.unwrap());
-    assert_eq!(records.vm_jobs("9").await.unwrap(), Some(jobs.clone()));
     assert!(
         !records
             .open("9", &vm_jobs(&[("vm", &["14"])]))
             .await
             .unwrap()
     );
-    assert_eq!(records.vm_jobs("9").await.unwrap(), Some(jobs));
     let call = |method: &str| format!("{method} /{BUCKET}/{RECORD_9}");
     assert_eq!(
         calls_since(&fake, from),
-        [
-            call("GET"),
-            call("HEAD"),
-            call("PUT"),
-            call("GET"),
-            call("HEAD"),
-            call("GET")
-        ]
+        [call("HEAD"), call("PUT"), call("HEAD")]
     );
     assert_eq!(
         fake.objects(BUCKET),
@@ -123,107 +117,38 @@ async fn open_writes_the_vm_jobs_once() {
     );
 
     assert!(records.open("10", &VmJobs::new()).await.unwrap());
-    assert_eq!(records.vm_jobs("10").await.unwrap(), Some(VmJobs::new()));
-}
-
-#[tokio::test]
-async fn seen_marks_a_job_only_beside_a_record() {
-    let (fake, records) = records().await;
-    let from = fake.calls().len();
-    records.seen("9", "11").await.unwrap();
     assert_eq!(
-        calls_since(&fake, from),
-        [format!("HEAD /{BUCKET}/{RECORD_9}")]
+        fake.objects(BUCKET)[0],
+        (
+            "ciburst/intents/_pipelines/10/vm-jobs.json".to_string(),
+            b"{}".to_vec()
+        )
     );
-    assert!(fake.objects(BUCKET).is_empty());
-    assert!(records.seen_jobs("9").await.unwrap().is_empty());
-
-    records
-        .open("9", &vm_jobs(&[("vm", &["11", "12"])]))
-        .await
-        .unwrap();
-    let from = fake.calls().len();
-    records.seen("9", "11").await.unwrap();
-    assert_eq!(
-        calls_since(&fake, from),
-        [
-            format!("HEAD /{BUCKET}/{RECORD_9}"),
-            format!("PUT /{BUCKET}/ciburst/intents/_pipelines/9/seen/11"),
-        ]
-    );
-    records.seen("9", "11").await.unwrap();
-    assert_eq!(
-        fake.objects(BUCKET),
-        [
-            (
-                "ciburst/intents/_pipelines/9/seen/11".to_string(),
-                Vec::new()
-            ),
-            (RECORD_9.to_string(), br#"{"vm":["11","12"]}"#.to_vec()),
-        ]
-    );
-    assert_eq!(records.seen_jobs("9").await.unwrap(), ["11"]);
-}
-
-#[tokio::test]
-async fn seen_jobs_reads_the_markers_across_pages() {
-    let (fake, records) = records().await;
-    let jobs = ["1", "2", "10", "11", "12", "300", "18446744073709551615"];
-    records.open("9", &vm_jobs(&[("vm", &jobs)])).await.unwrap();
-    records
-        .open("90", &vm_jobs(&[("vm", &["5"])]))
-        .await
-        .unwrap();
-    for job in jobs {
-        records.seen("9", job).await.unwrap();
-    }
-    records.seen("90", "5").await.unwrap();
-    for junk in ["x", "042", "1/2", ""] {
-        fake.put_object(
-            BUCKET,
-            &format!("ciburst/intents/_pipelines/9/seen/{junk}"),
-            b"",
-        );
-    }
-
-    let from = fake.calls().len();
-    assert_eq!(sorted(records.seen_jobs("9").await.unwrap()), jobs);
-    let queries = listings_since(&fake, from);
-    assert!(queries.len() >= 3, "{queries:?}");
-    for (index, query) in queries.iter().enumerate() {
-        assert!(
-            query.contains("prefix=ciburst%2Fintents%2F_pipelines%2F9%2Fseen%2F"),
-            "{query}"
-        );
-        assert!(!query.contains("start-after"), "{query}");
-        assert_eq!(query.contains("continuation-token="), index > 0, "{query}");
-    }
-    assert_eq!(records.seen_jobs("90").await.unwrap(), ["5"]);
-    assert!(records.seen_jobs("8").await.unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn a_listing_follows_at_most_max_pages() {
     let (fake, records) = records().await;
     fake.set_page_size(1);
-    for job in 1..=MAX_PAGES {
-        fake.put_object(
-            BUCKET,
-            &format!("ciburst/intents/_pipelines/9/seen/{job}"),
-            b"",
-        );
+    for job in 1..MAX_PAGES {
+        marker(&fake, "9", &job.to_string());
     }
-    assert_eq!(records.seen_jobs("9").await.unwrap().len(), MAX_PAGES);
-    fake.put_object(BUCKET, "ciburst/intents/_pipelines/9/seen/999", b"");
-    let error = records.seen_jobs("9").await.unwrap_err().to_string();
+    records.open("9", &VmJobs::new()).await.unwrap();
+    records.close("9").await.unwrap();
+    assert!(keys(&fake).is_empty());
+
+    for job in 1..=MAX_PAGES {
+        marker(&fake, "9", &job.to_string());
+    }
+    records.open("9", &VmJobs::new()).await.unwrap();
+    let error = records.close("9").await.unwrap_err().to_string();
     assert_eq!(
         error,
         format!(
-            "scaleway s3 list {BUCKET}/ciburst/intents/_pipelines/9/seen/: more than \
+            "scaleway s3 list {BUCKET}/ciburst/intents/_pipelines/9/: more than \
              {MAX_PAGES} pages"
         )
     );
-    assert!(records.close("9").await.is_err());
     assert_eq!(keys(&fake).len(), MAX_PAGES + 1, "nothing deleted");
 }
 
@@ -241,9 +166,9 @@ async fn close_deletes_every_record_of_the_pipeline_and_nothing_else() {
         .await
         .unwrap();
     for job in ["11", "12", "13", "14"] {
-        records.seen("9", job).await.unwrap();
+        marker(&fake, "9", job);
     }
-    records.seen("90", "5").await.unwrap();
+    marker(&fake, "90", "5");
     fake.put_object(BUCKET, "ciburst/intents/_pipelines/9/other", b"x");
     fake.set_page_size(2);
 
@@ -267,8 +192,8 @@ async fn close_deletes_every_record_of_the_pipeline_and_nothing_else() {
             "ciburst/intents/vm/1800000000-00000000000000000011",
         ]
     );
-    assert_eq!(records.vm_jobs("9").await.unwrap(), None);
-    assert!(records.seen_jobs("9").await.unwrap().is_empty());
+    assert!(records.open("9", &VmJobs::new()).await.unwrap(), "reopens");
+    records.close("9").await.unwrap();
 
     for pipeline in ["9", "8"] {
         let from = fake.calls().len();
@@ -285,11 +210,8 @@ async fn bad_ids_send_nothing_and_bucket_errors_name_the_cause() {
     let calls = fake.calls().len();
     for id in ["", "09", "x", "a/b", ".."] {
         assert!(records.open(id, &VmJobs::new()).await.is_err(), "{id:?}");
-        assert!(records.vm_jobs(id).await.is_err(), "{id:?}");
-        assert!(records.seen(id, "1").await.is_err(), "{id:?}");
-        assert!(records.seen("9", id).await.is_err(), "{id:?}");
-        assert!(records.seen_jobs(id).await.is_err(), "{id:?}");
         assert!(records.close(id).await.is_err(), "{id:?}");
+        assert!(records.closed(id).await.is_err(), "{id:?}");
     }
     assert_eq!(fake.calls().len(), calls, "nothing sent");
 
@@ -297,17 +219,16 @@ async fn bad_ids_send_nothing_and_bucket_errors_name_the_cause() {
         ScalewayPipelineRecords::new(fake.clone(), "fr-par", "missing-bucket", &cache_key());
     for error in [
         elsewhere.open("9", &VmJobs::new()).await.unwrap_err(),
-        elsewhere.vm_jobs("9").await.unwrap_err(),
-        elsewhere.seen_jobs("9").await.unwrap_err(),
         elsewhere.close("9").await.unwrap_err(),
+        elsewhere.closed("9").await.unwrap_err(),
     ] {
         assert!(error.to_string().contains("404 NoSuchBucket"), "{error}");
     }
 
-    fake.put_object(BUCKET, RECORD_9, b"not json");
-    let error = records.vm_jobs("9").await.unwrap_err().to_string();
+    fake.put_object(BUCKET, "ciburst/intents/_closed/9", b"not json");
+    let error = records.closed("9").await.unwrap_err().to_string();
     assert!(
-        error.starts_with(&format!("scaleway records: {RECORD_9}: ")),
+        error.starts_with("scaleway records: ciburst/intents/_closed/9: "),
         "{error}"
     );
 
@@ -316,7 +237,11 @@ async fn bad_ids_send_nothing_and_bucket_errors_name_the_cause() {
         secret_key: "not-the-secret".into(),
     };
     let forged = ScalewayPipelineRecords::new(fake.clone(), "fr-par", BUCKET, &wrong);
-    let error = forged.vm_jobs("9").await.unwrap_err().to_string();
+    let error = forged
+        .open("9", &VmJobs::new())
+        .await
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("403 SignatureDoesNotMatch"), "{error}");
 }
 
@@ -327,36 +252,30 @@ async fn failures_are_retryable_where_a_repeat_may_pass() {
     let (fake, records) = records().await;
     let record = format!("/{BUCKET}/{RECORD_9}");
     let record = record.as_str();
-    let marker = format!("/{BUCKET}/ciburst/intents/_pipelines/9/seen/*");
-    let marker = marker.as_str();
     let any_key = format!("/{BUCKET}/ciburst/intents/_pipelines/9/*");
     let listing = format!("/{BUCKET}");
     let jobs = vm_jobs(&[("vm", &["11"])]);
     for (method, path, failure, retryable) in [
         ("HEAD", record, Failure::Status(500), true),
+        ("HEAD", record, Failure::Timeout, true),
         ("PUT", record, Failure::Status(429), true),
         ("PUT", record, Failure::Status(503), true),
         ("PUT", record, Failure::Status(500), false),
-        ("GET", record, Failure::Status(500), true),
-        ("GET", record, Failure::Timeout, true),
-        ("PUT", marker, Failure::Status(503), true),
-        ("PUT", marker, Failure::Timeout, false),
+        ("PUT", record, Failure::Timeout, false),
         ("GET", &listing, Failure::Status(502), true),
         ("DELETE", &any_key, Failure::Status(503), true),
         ("DELETE", &any_key, Failure::Status(500), false),
     ] {
         records.close("9").await.unwrap();
-        let opens = (method, path) == ("PUT", record);
+        let opens = matches!(method, "HEAD" | "PUT");
         if !opens {
             records.open("9", &jobs).await.unwrap();
         }
         fake.fail_next(method, path, failure);
-        let error = match (method, path) {
-            ("GET", p) if p == record => records.vm_jobs("9").await.unwrap_err(),
-            ("PUT", p) if p == marker => records.seen("9", "11").await.unwrap_err(),
-            ("GET", _) => records.seen_jobs("9").await.unwrap_err(),
-            ("DELETE", _) => records.close("9").await.unwrap_err(),
-            _ => records.open("9", &jobs).await.unwrap_err(),
+        let error = if opens {
+            records.open("9", &jobs).await.unwrap_err()
+        } else {
+            records.close("9").await.unwrap_err()
         };
         assert_eq!(
             error.is_retryable(),
@@ -374,8 +293,8 @@ async fn failures_are_retryable_where_a_repeat_may_pass() {
     assert!(records.open("9", &jobs).await.unwrap(), "the repeat opens");
 }
 
-/// The ledger lists `ciburst/intents/<pool>/`, and no pool tag starts with an underscore, so
-/// the records neither show up in a burst nor add pages to its listing.
+/// The ledger lists `ciburst/intents/<runner>/`, and no runner tag starts with an underscore,
+/// so the records neither show up in a burst nor add pages to its listing.
 #[tokio::test]
 async fn the_ledger_reads_past_the_records() {
     let (fake, records) = records().await;
@@ -399,7 +318,7 @@ async fn the_ledger_reads_past_the_records() {
             .await
             .unwrap();
         for job in ["1", "2", "3"] {
-            records.seen(&pipeline, job).await.unwrap();
+            marker(&fake, &pipeline, job);
         }
     }
     let from = fake.calls().len();
@@ -430,51 +349,11 @@ async fn destroy_deletes_the_records_with_the_bucket() {
             .open(pipeline, &vm_jobs(&[("vm", &["1", "2"])]))
             .await
             .unwrap();
-        records.seen(pipeline, "1").await.unwrap();
+        marker(&fake, pipeline, "1");
     }
     assert_eq!(keys(&fake).len(), 4);
     owner(&fake).empty_and_delete(BUCKET).await.unwrap();
     assert!(fake.buckets().is_empty());
-}
-
-#[tokio::test]
-async fn open_pipelines_lists_the_records_without_their_seen_jobs() {
-    let (fake, records) = records().await;
-    records
-        .open("9", &vm_jobs(&[("vm", &["11", "12"]), ("big", &["13"])]))
-        .await
-        .unwrap();
-    records
-        .open("90", &vm_jobs(&[("vm", &["21"])]))
-        .await
-        .unwrap();
-    records.seen("9", "11").await.unwrap();
-    records.seen("9", "13").await.unwrap();
-    let owner = owner(&fake);
-    for key in [
-        "ciburst/intents/_pipelines/7/seen/1",
-        "ciburst/intents/_pipelines/x/vm-jobs.json",
-        "ciburst/intents/_pipelines/9/notes",
-    ] {
-        owner.put_object(BUCKET, key, Vec::new()).await.unwrap();
-    }
-
-    let open = records.open_pipelines().await.unwrap();
-    let found: Vec<(String, VmJobs)> = open.into_iter().map(|p| (p.pipeline, p.unseen)).collect();
-    assert_eq!(
-        found,
-        [
-            ("9".to_string(), vm_jobs(&[("vm", &["12"])])),
-            ("90".to_string(), vm_jobs(&[("vm", &["21"])])),
-        ]
-    );
-
-    records.close("9").await.unwrap();
-    let open = records.open_pipelines().await.unwrap();
-    assert_eq!(
-        open.iter().map(|p| p.pipeline.as_str()).collect::<Vec<_>>(),
-        ["90"]
-    );
 }
 
 #[tokio::test]
@@ -493,7 +372,6 @@ async fn closed_records_sit_beside_the_open_ones() {
     records.mark_closed("9", &closed).await.unwrap();
     assert_eq!(records.closed("9").await.unwrap(), Some(closed));
     assert_eq!(records.closed("90").await.unwrap(), None);
-    assert!(records.open_pipelines().await.unwrap().is_empty());
     assert_eq!(
         fake.objects(BUCKET),
         [(

@@ -1,17 +1,17 @@
 //! The warm start records of D48 (spec 6.5) in the cache bucket, beside the burst
 //! intents: `ciburst/intents/_pipelines/<pipeline id>/vm-jobs.json` holds the pipeline's VM jobs
-//! per pool, `ciburst/intents/_pipelines/<pipeline id>/seen/<job id>` is an empty object per VM
-//! job that went pending. A pool tag starts with a letter or a digit, so the intents of a pool
-//! never share this prefix; the lifecycle rule of `ciburst/intents/` expires what a pipeline's
-//! final event did not delete. Signed with the cache key, like the ledger.
+//! by runner tag; earlier versions also wrote `seen/<job id>` markers below that prefix, which
+//! `close` deletes with the record. A runner tag starts with a letter or a digit, so the
+//! intents of a runner never share this prefix; the lifecycle rule of `ciburst/intents/`
+//! expires what a pipeline's final event did not delete. Signed with the cache key, like the
+//! ledger.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use ciburst_core::config::Config;
 use ciburst_core::http::HttpClient;
-use ciburst_core::ledger::{Closed, OpenPipeline, PipelineRecords, VmJobs, unseen_of};
+use ciburst_core::ledger::{Closed, PipelineRecords, VmJobs};
 use ciburst_core::types::KeyPair;
 use ciburst_core::{Error, Result};
 
@@ -23,8 +23,6 @@ use crate::provider::s3::S3;
 pub const PIPELINE_PREFIX: &str = "ciburst/intents/_pipelines/";
 /// The object of a pipeline's VM jobs, below its prefix.
 pub const VM_JOBS: &str = "vm-jobs.json";
-/// The markers of a pipeline's pending VM jobs, below its prefix.
-pub const SEEN: &str = "seen/";
 
 pub struct ScalewayPipelineRecords {
     s3: S3,
@@ -88,25 +86,6 @@ pub fn vm_jobs_key(pipeline: &str) -> Result<String> {
     Ok(format!("{}{VM_JOBS}", pipeline_prefix(pipeline)?))
 }
 
-pub fn seen_prefix(pipeline: &str) -> Result<String> {
-    Ok(format!("{}{SEEN}", pipeline_prefix(pipeline)?))
-}
-
-/// The marker of job `job`; the job id is an [`is_id`] number.
-pub fn seen_key(pipeline: &str, job: &str) -> Result<String> {
-    let prefix = seen_prefix(pipeline)?;
-    if !is_id(job) {
-        return Err(invalid(format!("job id {job:?} is not a number")));
-    }
-    Ok(format!("{prefix}{job}"))
-}
-
-/// The job a key below `prefix` marks; `None` for any other key.
-pub fn parse_seen(prefix: &str, key: &str) -> Option<String> {
-    let job = key.strip_prefix(prefix)?;
-    is_id(job).then(|| job.to_string())
-}
-
 #[async_trait]
 impl PipelineRecords for ScalewayPipelineRecords {
     async fn open(&self, pipeline: &str, vm_jobs: &VmJobs) -> Result<bool> {
@@ -119,42 +98,6 @@ impl PipelineRecords for ScalewayPipelineRecords {
         let body = serde_json::to_vec(vm_jobs)?;
         self.s3.put_object(&self.bucket, &key, body).await?;
         Ok(true)
-    }
-
-    async fn vm_jobs(&self, pipeline: &str) -> Result<Option<VmJobs>> {
-        let key = vm_jobs_key(pipeline)?;
-        let Some(body) = self.s3.get_object(&self.bucket, &key).await? else {
-            return Ok(None);
-        };
-        serde_json::from_slice(&body)
-            .map(Some)
-            .map_err(|error| invalid(format!("{key}: {error}")))
-    }
-
-    /// One HEAD of the pipeline's record, and the marker only when there is one (spec 6.5).
-    /// A job event that comes before the record leaves no marker, so the reserve counts that
-    /// job until the pipeline ends.
-    async fn seen(&self, pipeline: &str, job: &str) -> Result<()> {
-        let marker = seen_key(pipeline, job)?;
-        if self
-            .s3
-            .object_exists(&self.bucket, &vm_jobs_key(pipeline)?)
-            .await?
-        {
-            self.s3
-                .put_object(&self.bucket, &marker, Vec::new())
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn seen_jobs(&self, pipeline: &str) -> Result<Vec<String>> {
-        let prefix = seen_prefix(pipeline)?;
-        let objects = self.s3.list_all(&self.bucket, &prefix, MAX_PAGES).await?;
-        Ok(objects
-            .iter()
-            .filter_map(|object| parse_seen(&prefix, &object.key))
-            .collect())
     }
 
     /// Lists first, then deletes, so no listing continues behind its own deletes.
@@ -181,50 +124,6 @@ impl PipelineRecords for ScalewayPipelineRecords {
             .map(Some)
             .map_err(|error| invalid(format!("{key}: {error}")))
     }
-
-    /// One listing of every record (spec 6.5): a pipeline is open while its `vm-jobs.json`
-    /// is listed, `opened` is that object's `LastModified`; its jobs come from one GET each, and
-    /// the listed seen markers are subtracted. Markers without a record are ignored.
-    async fn open_pipelines(&self) -> Result<Vec<OpenPipeline>> {
-        let objects = self
-            .s3
-            .list_all(&self.bucket, PIPELINE_PREFIX, MAX_PAGES)
-            .await?;
-        let mut opened: BTreeMap<String, Option<u64>> = BTreeMap::new();
-        let mut seen: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for object in &objects {
-            let Some((pipeline, rest)) = object
-                .key
-                .strip_prefix(PIPELINE_PREFIX)
-                .and_then(|key| key.split_once('/'))
-            else {
-                continue;
-            };
-            if !is_id(pipeline) {
-                continue;
-            }
-            if rest == VM_JOBS {
-                opened.insert(pipeline.to_string(), object.modified);
-            } else if let Some(job) = rest.strip_prefix(SEEN).filter(|job| is_id(job)) {
-                seen.entry(pipeline.to_string())
-                    .or_default()
-                    .push(job.to_string());
-            }
-        }
-        let mut open = Vec::new();
-        for (pipeline, opened) in opened {
-            let Some(jobs) = self.vm_jobs(&pipeline).await? else {
-                continue;
-            };
-            let marked = seen.get(&pipeline).map(Vec::as_slice).unwrap_or(&[]);
-            open.push(OpenPipeline {
-                unseen: unseen_of(&jobs, marked),
-                pipeline,
-                opened,
-            });
-        }
-        Ok(open)
-    }
 }
 
 #[cfg(test)]
@@ -240,12 +139,8 @@ mod tests {
             "ciburst/intents/_pipelines/9/vm-jobs.json"
         );
         assert_eq!(
-            seen_key("9", "42").unwrap(),
-            "ciburst/intents/_pipelines/9/seen/42"
-        );
-        assert_eq!(
-            seen_prefix("18446744073709551615").unwrap(),
-            "ciburst/intents/_pipelines/18446744073709551615/seen/"
+            vm_jobs_key("18446744073709551615").unwrap(),
+            "ciburst/intents/_pipelines/18446744073709551615/vm-jobs.json"
         );
         assert!(
             !pipeline_prefix("90")
@@ -260,26 +155,7 @@ mod tests {
         for id in ["", "09", "x", "-1", "1/2", "..", "123456789012345678901"] {
             assert!(pipeline_prefix(id).is_err(), "{id:?}");
             assert!(vm_jobs_key(id).is_err(), "{id:?}");
-            assert!(seen_key(id, "1").is_err(), "{id:?}");
-            assert!(seen_key("1", id).is_err(), "{id:?}");
-        }
-    }
-
-    #[test]
-    fn parses_only_markers_below_the_prefix() {
-        let prefix = "ciburst/intents/_pipelines/9/seen/";
-        assert_eq!(
-            parse_seen(prefix, "ciburst/intents/_pipelines/9/seen/42"),
-            Some("42".into())
-        );
-        for key in [
-            "ciburst/intents/_pipelines/9/seen/042",
-            "ciburst/intents/_pipelines/9/seen/",
-            "ciburst/intents/_pipelines/9/seen/4/2",
-            "ciburst/intents/_pipelines/9/vm-jobs.json",
-            "ciburst/intents/_pipelines/90/seen/42",
-        ] {
-            assert_eq!(parse_seen(prefix, key), None, "{key}");
+            assert!(closed_key(id).is_err(), "{id:?}");
         }
     }
 

@@ -3894,10 +3894,7 @@ mod tests {
                 }
             )]
         );
-        assert_eq!(
-            records.vm_jobs("9").await.unwrap(),
-            vm_jobs(&[("vm", &["2", "3", "8"])])
-        );
+        assert_eq!(records.recorded("9"), vm_jobs(&[("vm", &["2", "3", "8"])]));
         assert!(s.lines().contains(&format!(
             r#"info warm pipeline="9" project="7" pool="vm" action="started" run="{run}" vm_jobs="3" ms="0""#
         )));
@@ -3930,7 +3927,7 @@ mod tests {
             closed.body,
             json!({ "result": "closed", "pipeline": 9, "ms": 0 })
         );
-        assert_eq!(records.vm_jobs("9").await.unwrap(), None);
+        assert_eq!(records.recorded("9"), None);
         assert!(
             s.lines()
                 .contains(&r#"info closed pipeline="9" project="7" ms="0""#.to_string())
@@ -4042,7 +4039,7 @@ mod tests {
             json!([{ "pool": "vm", "action": "disabled", "vmJobs": 1 }])
         );
         assert_eq!(
-            records.vm_jobs("11").await.unwrap(),
+            records.recorded("11"),
             vm_jobs(&[("vm", &["1"])]),
             "the record still serves the reservation"
         );
@@ -4134,7 +4131,7 @@ mod tests {
                 json!({ "result": "ignored", "reason": "no_vm_jobs", "ms": 0 })
             );
         }
-        assert_eq!(records.vm_jobs("9").await.unwrap(), None, "nothing written");
+        assert_eq!(records.recorded("9"), None, "nothing written");
         for status in ["success", "failed", "canceled", "skipped"] {
             let response = post(pipeline_body(json!(9), status, 7, &unit)).await;
             assert_eq!(
@@ -4177,7 +4174,7 @@ mod tests {
         assert_eq!(own.body["reason"], "own_job");
         assert!(s.recording.started.lock().unwrap().is_empty());
         assert!(s.recording.asked.lock().unwrap().is_empty());
-        assert_eq!(records.vm_jobs("9").await.unwrap(), None);
+        assert_eq!(records.recorded("9"), None);
         assert_eq!(
             s.job_at("unit", "test", 4, 9, T0).await.body["result"],
             "started"
@@ -4187,20 +4184,14 @@ mod tests {
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum Op {
         Open,
-        VmJobs,
-        Seen,
         Close,
-        OpenPipelines,
     }
 
     impl Op {
         fn name(self) -> &'static str {
             match self {
                 Op::Open => "open",
-                Op::VmJobs => "vm_jobs",
-                Op::Seen => "seen",
                 Op::Close => "close",
-                Op::OpenPipelines => "open_pipelines",
             }
         }
     }
@@ -4225,24 +4216,9 @@ mod tests {
             self.check(Op::Open)?;
             self.inner.open(pipeline, vm_jobs).await
         }
-        async fn vm_jobs(&self, pipeline: &str) -> Result<Option<VmJobs>> {
-            self.check(Op::VmJobs)?;
-            self.inner.vm_jobs(pipeline).await
-        }
-        async fn seen(&self, pipeline: &str, job: &str) -> Result<()> {
-            self.check(Op::Seen)?;
-            self.inner.seen(pipeline, job).await
-        }
-        async fn seen_jobs(&self, pipeline: &str) -> Result<Vec<String>> {
-            self.inner.seen_jobs(pipeline).await
-        }
         async fn close(&self, pipeline: &str) -> Result<()> {
             self.check(Op::Close)?;
             self.inner.close(pipeline).await
-        }
-        async fn open_pipelines(&self) -> Result<Vec<crate::ledger::OpenPipeline>> {
-            self.check(Op::OpenPipelines)?;
-            self.inner.open_pipelines().await
         }
     }
 
@@ -4361,17 +4337,14 @@ mod tests {
         }
     }
 
-    /// A dispatcher with ledger, records and `schedule`; the records take the setup's clock.
+    /// A dispatcher with ledger, records and `schedule`.
     async fn queue_setup(
         config: Arc<Config>,
         secrets: Secrets,
         schedule: Arc<dyn Schedule>,
     ) -> (VmSetup, Arc<MemoryPipelineRecords>) {
         let mut s = setup_of(config, secrets, Some(Arc::new(MemoryLedger::new()))).await;
-        let clock = s.clock.clone();
-        let records = Arc::new(
-            MemoryPipelineRecords::new().with_clock(Arc::new(move || clock.load(Ordering::SeqCst))),
-        );
+        let records = Arc::new(MemoryPipelineRecords::new());
         s.dispatcher = s
             .dispatcher
             .with_records(Some(records.clone()))

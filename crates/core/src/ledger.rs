@@ -75,17 +75,6 @@ impl Ledger for MemoryLedger {
 /// The VM jobs of one pipeline by VM pool tag, as the warm step recorded them (spec 6.5).
 pub type VmJobs = BTreeMap<String, Vec<String>>;
 
-/// A pipeline with a record and its VM jobs that have not gone pending yet (spec 6.5).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OpenPipeline {
-    pub pipeline: String,
-    /// Unix seconds the record was written, `None` where the store keeps no time.
-    pub opened: Option<u64>,
-    /// The recorded VM jobs without a seen marker, by pool; a pool whose every VM job has a
-    /// marker is left out.
-    pub unseen: VmJobs,
-}
-
 /// A finished pipeline (D56): when it ended and which of its jobs were still manual then, so a
 /// pending event that GitLab delivers late for one of its jobs can be told from a new one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,28 +86,15 @@ pub struct Closed {
     pub manual: Vec<String>,
 }
 
-/// Warm start records of a pipeline (spec 6.5): the pipeline's VM jobs per pool and
-/// a marker per VM job that went pending. Lives beside the intents, under
+/// Warm start records of a pipeline (spec 6.5): the pipeline's VM jobs by runner tag, so a
+/// pipeline warms once. Lives beside the intents, under
 /// `ciburst/intents/_pipelines/<pipeline>/` in the cache bucket.
 #[async_trait]
 pub trait PipelineRecords: Send + Sync {
     /// Writes the VM jobs of `pipeline`; `false`, and nothing written, when a record exists.
     async fn open(&self, pipeline: &str, vm_jobs: &VmJobs) -> Result<bool>;
-    /// The recorded VM jobs of `pipeline`, `None` without a record.
-    async fn vm_jobs(&self, pipeline: &str) -> Result<Option<VmJobs>>;
-    /// Marks VM job `job` of `pipeline` as gone pending.
-    async fn seen(&self, pipeline: &str, job: &str) -> Result<()>;
-    /// The jobs of `pipeline` marked by [`PipelineRecords::seen`], in any order.
-    async fn seen_jobs(&self, pipeline: &str) -> Result<Vec<String>>;
     /// Removes every record of `pipeline`; no error when there is none.
     async fn close(&self, pipeline: &str) -> Result<()>;
-    /// Every pipeline with a record, in any order, with its VM jobs that have no seen marker
-    /// (spec 6.5). A store without it fails; the dispatcher does not call it.
-    async fn open_pipelines(&self) -> Result<Vec<OpenPipeline>> {
-        Err(crate::Error::other(
-            "the records cannot list open pipelines",
-        ))
-    }
     /// Records that `pipeline` finished (D56); a later call replaces the earlier one.
     async fn mark_closed(&self, _pipeline: &str, _closed: &Closed) -> Result<()> {
         Ok(())
@@ -130,19 +106,11 @@ pub trait PipelineRecords: Send + Sync {
     }
 }
 
-/// One pipeline's record in [`MemoryPipelineRecords`].
-struct MemoryRecord {
-    jobs: VmJobs,
-    seen: Vec<String>,
-    opened: Option<u64>,
-}
-
 /// In-memory pipeline records for tests and the fake modules.
 #[derive(Default)]
 pub struct MemoryPipelineRecords {
-    records: Mutex<BTreeMap<String, MemoryRecord>>,
+    records: Mutex<BTreeMap<String, VmJobs>>,
     closed: Mutex<BTreeMap<String, Closed>>,
-    clock: Option<crate::fake::Clock>,
 }
 
 impl MemoryPipelineRecords {
@@ -150,69 +118,26 @@ impl MemoryPipelineRecords {
         MemoryPipelineRecords::default()
     }
 
-    /// Stamps each record with the clock's time, which [`PipelineRecords::open_pipelines`]
-    /// answers as `opened`; without a clock it answers `None`.
-    pub fn with_clock(mut self, clock: crate::fake::Clock) -> MemoryPipelineRecords {
-        self.clock = Some(clock);
-        self
+    /// The VM jobs [`PipelineRecords::open`] recorded for `pipeline`, `None` without a record.
+    pub fn recorded(&self, pipeline: &str) -> Option<VmJobs> {
+        self.records.lock().expect("records").get(pipeline).cloned()
     }
 }
 
 #[async_trait]
 impl PipelineRecords for MemoryPipelineRecords {
     async fn open(&self, pipeline: &str, vm_jobs: &VmJobs) -> Result<bool> {
-        let opened = self.clock.as_ref().map(|clock| clock());
         let mut records = self.records.lock().expect("records");
         if records.contains_key(pipeline) {
             return Ok(false);
         }
-        let record = MemoryRecord {
-            jobs: vm_jobs.clone(),
-            seen: Vec::new(),
-            opened,
-        };
-        records.insert(pipeline.to_string(), record);
+        records.insert(pipeline.to_string(), vm_jobs.clone());
         Ok(true)
-    }
-
-    async fn vm_jobs(&self, pipeline: &str) -> Result<Option<VmJobs>> {
-        let records = self.records.lock().expect("records");
-        Ok(records.get(pipeline).map(|record| record.jobs.clone()))
-    }
-
-    async fn seen(&self, pipeline: &str, job: &str) -> Result<()> {
-        let mut records = self.records.lock().expect("records");
-        if let Some(record) = records.get_mut(pipeline)
-            && !record.seen.iter().any(|j| j == job)
-        {
-            record.seen.push(job.to_string());
-        }
-        Ok(())
-    }
-
-    async fn seen_jobs(&self, pipeline: &str) -> Result<Vec<String>> {
-        let records = self.records.lock().expect("records");
-        Ok(records
-            .get(pipeline)
-            .map(|record| record.seen.clone())
-            .unwrap_or_default())
     }
 
     async fn close(&self, pipeline: &str) -> Result<()> {
         self.records.lock().expect("records").remove(pipeline);
         Ok(())
-    }
-
-    async fn open_pipelines(&self) -> Result<Vec<OpenPipeline>> {
-        let records = self.records.lock().expect("records");
-        Ok(records
-            .iter()
-            .map(|(pipeline, record)| OpenPipeline {
-                pipeline: pipeline.clone(),
-                opened: record.opened,
-                unseen: unseen_of(&record.jobs, &record.seen),
-            })
-            .collect())
     }
 
     async fn mark_closed(&self, pipeline: &str, closed: &Closed) -> Result<()> {
@@ -228,21 +153,7 @@ impl PipelineRecords for MemoryPipelineRecords {
     }
 }
 
-/// The jobs of `jobs` without a marker in `seen`, by pool; pools left empty are left out.
-pub fn unseen_of(jobs: &VmJobs, seen: &[String]) -> VmJobs {
-    jobs.iter()
-        .filter_map(|(pool, ids)| {
-            let left: Vec<String> = ids
-                .iter()
-                .filter(|id| !seen.contains(id))
-                .cloned()
-                .collect();
-            (!left.is_empty()).then(|| (pool.clone(), left))
-        })
-        .collect()
-}
-
-/// A VM job waiting for a paid slot (spec 6.4).
+// A VM job waiting for a paid slot (spec 6.4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Queued {
     pub job: String,
@@ -397,60 +308,17 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn pipeline_records_open_once_mark_seen_and_close() {
+    async fn pipeline_records_open_once_and_close() {
         let records = MemoryPipelineRecords::new();
         let jobs: VmJobs = [("vm".to_string(), vec!["11".to_string(), "12".to_string()])].into();
         assert!(records.open("9", &jobs).await.unwrap());
         assert!(!records.open("9", &VmJobs::new()).await.unwrap());
-        assert_eq!(records.vm_jobs("9").await.unwrap(), Some(jobs));
-        records.seen("9", "11").await.unwrap();
-        records.seen("9", "11").await.unwrap();
-        records.seen("8", "1").await.unwrap();
-        assert_eq!(
-            records.seen_jobs("9").await.unwrap(),
-            vec!["11".to_string()]
-        );
-        assert!(records.seen_jobs("8").await.unwrap().is_empty());
+        assert_eq!(records.recorded("9"), Some(jobs));
         records.close("9").await.unwrap();
-        assert_eq!(records.vm_jobs("9").await.unwrap(), None);
+        assert_eq!(records.recorded("9"), None);
         records.close("9").await.unwrap();
     }
 
-    #[tokio::test]
-    async fn open_pipelines_list_the_vm_jobs_still_to_come() {
-        let records = MemoryPipelineRecords::new().with_clock(std::sync::Arc::new(|| 500));
-        let jobs: VmJobs = [
-            ("vm".to_string(), vec!["11".to_string(), "12".to_string()]),
-            ("big".to_string(), vec!["13".to_string()]),
-        ]
-        .into();
-        records.open("9", &jobs).await.unwrap();
-        records.open("8", &VmJobs::new()).await.unwrap();
-        records.seen("9", "11").await.unwrap();
-        records.seen("9", "13").await.unwrap();
-        let mut open = records.open_pipelines().await.unwrap();
-        open.sort_by(|a, b| a.pipeline.cmp(&b.pipeline));
-        assert_eq!(
-            open,
-            [
-                OpenPipeline {
-                    pipeline: "8".into(),
-                    opened: Some(500),
-                    unseen: VmJobs::new(),
-                },
-                OpenPipeline {
-                    pipeline: "9".into(),
-                    opened: Some(500),
-                    unseen: [("vm".to_string(), vec!["12".to_string()])].into(),
-                },
-            ]
-        );
-        records.close("9").await.unwrap();
-        assert_eq!(records.open_pipelines().await.unwrap().len(), 1);
-        let plain = MemoryPipelineRecords::new();
-        plain.open("7", &jobs).await.unwrap();
-        assert_eq!(plain.open_pipelines().await.unwrap()[0].opened, None);
-    }
     #[test]
     fn durations_fold_three_to_seven() {
         assert_eq!(fold_duration(None, 60), 60);

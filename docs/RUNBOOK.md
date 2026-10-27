@@ -232,7 +232,7 @@ Inspect the VM runner's intents:
    Check: a cold burst of N jobs at `slots` S shows N keys within about 2 s and `ceil(N / S)` new servers.
 3. Never delete intents by hand. A key outside the format is ignored; a forged key in the format costs at most one VM-hour.
 
-Warm start (spec section 6.5): a warm intent is `<unix seconds>-warm-<pipeline id, 20 digits>`, and the pipeline's records live in `ciburst/intents/_pipelines/<pipeline>/` (`vm-jobs.json`, `seen/<job>`) until its final status, which writes `ciburst/intents/_closed/<pipeline>`. Check: after a pipeline event with VM jobs `vm-jobs.json` exists; after the pipeline the folder is gone.
+Warm start (spec section 6.5): a warm intent is `<unix seconds>-warm-<pipeline id, 20 digits>`, and the pipeline's records live in `ciburst/intents/_pipelines/<pipeline>/` (`vm-jobs.json`; earlier versions also wrote `seen/<job>`) until its final status, which writes `ciburst/intents/_closed/<pipeline>`. Check: after a pipeline event with VM jobs `vm-jobs.json` exists; after the pipeline the folder is gone.
 
 Known limits, each at most one VM-hour: a VM created in the 2 to 3 s after its intent left the 30 s window counts neither as old nor by rank, so a new burst at that instant can pass `maxRuns` by one; a repeated delivery within the same second is not recognised as a duplicate.
 

@@ -663,9 +663,9 @@ async fn failures_are_retryable_where_a_repeat_may_pass() {
     );
 }
 
-/// The ledger lists `ciburst/intents/<pool>/` and the records `ciburst/intents/_pipelines/`,
-/// and no pool tag starts with an underscore, so the schedule neither shows up in a burst or a
-/// pipeline's markers nor adds pages to their listings.
+/// The ledger lists `ciburst/intents/<runner>/` and the records `ciburst/intents/_pipelines/`,
+/// and no runner tag starts with an underscore, so the schedule neither shows up in a burst nor
+/// adds pages to its listing, and closing a pipeline leaves the schedule alone.
 #[tokio::test]
 async fn the_ledger_and_the_records_read_past_the_schedule() {
     let (fake, schedule) = schedule().await;
@@ -676,13 +676,9 @@ async fn the_ledger_and_the_records_read_past_the_schedule() {
     }
     let jobs: VmJobs = [("vm".to_string(), vec!["1".to_string()])].into();
     records.open("9", &jobs).await.unwrap();
-    records.seen("9", "1").await.unwrap();
     let from = fake.calls().len();
     let before = ledger.since("vm", NOW - 30).await.unwrap();
     let ledger_pages = listings_since(&fake, from).len();
-    let from = fake.calls().len();
-    assert_eq!(records.seen_jobs("9").await.unwrap(), ["1"]);
-    let records_pages = listings_since(&fake, from).len();
     let intent = |job: &str| Intent {
         at: NOW,
         job: job.to_string(),
@@ -706,14 +702,16 @@ async fn the_ledger_and_the_records_read_past_the_schedule() {
     let from = fake.calls().len();
     assert_eq!(ledger.since("vm", NOW - 30).await.unwrap(), before);
     assert_eq!(listings_since(&fake, from).len(), ledger_pages);
+    let count = keys(&fake).len();
     let from = fake.calls().len();
-    assert_eq!(records.seen_jobs("9").await.unwrap(), ["1"]);
-    assert_eq!(listings_since(&fake, from).len(), records_pages);
+    records.close("9").await.unwrap();
+    assert_eq!(listings_since(&fake, from).len(), 1);
+    assert_eq!(keys(&fake).len(), count - 1, "only the record went");
     assert_eq!(schedule.queued("vm").await.unwrap().len(), 30);
     assert_eq!(schedule.running("vm").await.unwrap().len(), 30);
 }
 
-/// Destroy empties the cache bucket page by page, the schedule with everything else.
+// Destroy empties the cache bucket page by page, the schedule with everything else.
 #[tokio::test]
 async fn destroy_deletes_the_schedule_with_the_bucket() {
     let (fake, schedule) = schedule().await;

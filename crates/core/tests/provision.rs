@@ -7,7 +7,7 @@ use ciburst_core::config::{Config, parse_config};
 use ciburst_core::dispatch::Dispatcher;
 use ciburst_core::fake::{FakeHost, FakeProvider};
 use ciburst_core::gitlab::Gitlab;
-use ciburst_core::ledger::{MemoryPipelineRecords, PipelineRecords};
+use ciburst_core::ledger::MemoryPipelineRecords;
 use ciburst_core::log::Log;
 use ciburst_core::plan::format_plan;
 use ciburst_core::plan::{GitlabOutputs, MemoryOutputs, OUTPUTS_SCOPE, OutputsStore};
@@ -717,7 +717,7 @@ async fn the_hook_delivers_pipeline_events_that_warm_a_vm() {
     assert_eq!(response.body["pipeline"], 31);
     assert_eq!(response.body["pools"][0]["action"], "started");
     assert_eq!(response.body["pools"][0]["vmJobs"], 2);
-    let jobs = records.vm_jobs("31").await.unwrap().unwrap();
+    let jobs = records.recorded("31").unwrap();
     assert_eq!(jobs["vm"], ["12", "16"]);
     let vms = s.provider.capacity("vm").await.unwrap().unwrap();
     assert_eq!(vms.len(), 1);
@@ -733,7 +733,7 @@ async fn the_hook_delivers_pipeline_events_that_warm_a_vm() {
         .handle_request("POST", "/", &headers, &body, 2)
         .await;
     assert_eq!(closed.body["result"], "closed");
-    assert_eq!(records.vm_jobs("31").await.unwrap(), None);
+    assert_eq!(records.recorded("31"), None);
 
     s.fake.clear_pipeline_events(hook);
     assert!(

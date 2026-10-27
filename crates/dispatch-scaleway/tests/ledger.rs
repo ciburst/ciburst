@@ -264,21 +264,12 @@ async fn the_records_live_beside_the_ledger_under_the_cache_key() {
     let jobs: VmJobs = [("vm".to_string(), vec!["41".to_string(), "42".to_string()])].into();
     assert!(records.open("9", &jobs).await.unwrap());
     assert!(!records.open("9", &jobs).await.unwrap());
-    records.seen("9", "41").await.unwrap();
-    assert_eq!(records.vm_jobs("9").await.unwrap(), Some(jobs));
-    assert_eq!(records.seen_jobs("9").await.unwrap(), ["41"]);
     assert_eq!(
         intents(&backend, &vars),
-        [
-            (
-                "ciburst/intents/_pipelines/9/seen/41".to_string(),
-                Vec::new()
-            ),
-            (
-                "ciburst/intents/_pipelines/9/vm-jobs.json".to_string(),
-                br#"{"vm":["41","42"]}"#.to_vec()
-            ),
-        ]
+        [(
+            "ciburst/intents/_pipelines/9/vm-jobs.json".to_string(),
+            br#"{"vm":["41","42"]}"#.to_vec()
+        )]
     );
     records.close("9").await.unwrap();
     assert!(intents(&backend, &vars).is_empty());
@@ -317,8 +308,8 @@ fn record_keys(backend: &ScalewayFake, vars: &BTreeMap<String, String>) -> Vec<S
         .collect()
 }
 
-/// spec 6.5 through the function: the warm step writes the record, a VM job's
-/// pending event its marker, the final status deletes both.
+/// spec 6.5 through the function: the warm step writes the record, and the final status
+/// deletes it.
 #[tokio::test]
 async fn pipeline_events_keep_their_records_in_the_cache_bucket() {
     let (backend, vars) = deployed("instances").await;
@@ -333,8 +324,12 @@ async fn pipeline_events_keep_their_records_in_the_cache_bucket() {
     .await;
     assert_eq!((status, &body["result"]), (200, &json!("warm")), "{body}");
     assert_eq!(body["pools"][0]["action"], "started", "{body}");
-    let records = env.records_on(backend.clone()).unwrap();
-    let mut jobs = records.vm_jobs("9").await.unwrap().expect("record")["vm"].clone();
+    let record = intents(&backend, &vars)
+        .into_iter()
+        .find(|(key, _)| key == "ciburst/intents/_pipelines/9/vm-jobs.json")
+        .expect("record")
+        .1;
+    let mut jobs = serde_json::from_slice::<VmJobs>(&record).unwrap()["vm"].clone();
     jobs.sort();
     assert_eq!(jobs, ["41", "42"]);
 
