@@ -66,14 +66,14 @@ Each row states the current state. The date is that of the decision.
 | D2 | One serverless `run-single` container per job, no VMs | Serverless containers have no Docker daemon, so `image:`, `services:` and image builds failed | D30, D45 |
 | D4 | Shell executor in ciburst's own image; the job's `image:` ignored | Jobs lost their own images | D30, D45 |
 | D5 | No Docker daemon anywhere; Docker jobs on hosted runners | Docker jobs belong on the adopter's runners at VM prices | D30 |
-| D7 | Pool images built by the framework's CI | Lanes run the job's own image; nothing to build or keep current | D45 |
+| D7 | ciburst's own job images built by the framework's CI | Lanes run the job's own image; nothing to build or keep current | D45 |
 | D14 | Fixed lanes `ci`, `rust`, `playwright` | Each project derives its lanes from its own images | D45, D60 |
 | D20 | A kaniko build lane | Kaniko cannot unpack images in the Serverless Jobs sandbox | D30 |
 | D21 | Images write their `PATH` to `/etc/profile.d` | No ciburst images; the bootstrap passes the image's `PATH` as a job variable | D45 |
 | D29 | Image builds on hosted runners through `.ciburst-image-build` | VMs build images with Docker-in-Docker at VM prices | D30, D40 |
 | D34 | Hetzner Cloud as a second VM backend | One provider keeps setup and code small; it was never drilled | D65 |
 | D35 | A composite provider per runtime | One provider remains | D65 |
-| D36 | Stage routing with an optional default pool | Stages say nothing about the image or the runner a job needs; a project's `ignoreJobs` names the jobs that run elsewhere | D49, D61, D63 |
+| D36 | Routing by stage with an optional default runner | Stages say nothing about the image or the runner a job needs; a project's `ignoreJobs` names the jobs that run elsewhere | D49, D61, D63 |
 | D37 | The scope of the M5 roundup | A milestone scope, delivered (section 14) | D64 |
 | D47 | Free VM slots take lane jobs first (`vmFirst`) | Lane jobs took the slots Docker jobs needed, which started extra VMs (4 instead of 1 on the drill consumer); lane tags on a shared VM runner would cross projects | D62 |
 | D54 | A spill runner that pointed idle slots at lane jobs | Lane runs that lost the race billed idle tails, and a shared VM runner must not carry a project's lane tags | D62 |
