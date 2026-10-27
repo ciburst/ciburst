@@ -1,15 +1,15 @@
-//! Queue first (spec D53, M6.2 rules R4, R5 and R7): the start rule that decides which queued VM
+//! Queue first (D53, spec 6.2 and 6.4): the start rule that decides which queued VM
 //! jobs wait for a paid slot and how many VMs to buy, and the report interval a VM gets.
 
 use crate::ledger::Queued;
 
-/// M6.2 rule R5: queued entries older than this count as gone, a lost job event.
+/// spec 6.4: queued entries older than this count as gone, a lost job event.
 pub const QUEUED_MAX_AGE_S: u64 = 1800;
-/// M6.2 rule R7: the report interval while VM jobs queue.
+/// spec 6.2: the report interval while VM jobs queue.
 pub const REPORT_QUEUE_S: u64 = 15;
-/// M6.2 rule R7: the report interval of a busy VM.
+/// spec 6.2: the report interval of a busy VM.
 pub const REPORT_BUSY_S: u64 = 30;
-/// M6.2 rule R7: the report interval otherwise.
+/// spec 6.2: the report interval otherwise.
 pub const REPORT_IDLE_S: u64 = 600;
 
 /// A running VM job of the pool as the start rule sees it.
@@ -21,14 +21,14 @@ pub struct RunningJob {
     pub typical: Option<u64>,
 }
 
-/// What the start rule of one VM pool reads (M6.2 rule R4).
+/// What the start rule of one VM pool reads (spec 6.4).
 #[derive(Debug, Clone)]
 pub struct RuleInput<'a> {
     pub now: u64,
     pub queued: &'a [Queued],
     pub running: &'a [RunningJob],
     /// Free slots that take queued jobs as soon as they are up: those of VMs in state
-    /// `starting` younger than 10 minutes, and those of the claim candidates (M4 rule R1).
+    /// `starting` younger than 10 minutes, and those of the claim candidates (spec 6.3).
     pub ready: u32,
     pub slots: u32,
     pub max_queue_s: u64,
@@ -60,7 +60,7 @@ impl RulePlan {
     }
 }
 
-/// M6.2 rule R4, steps 1 to 6:
+/// spec 6.4, steps 1 to 6:
 /// 1. each running job frees its slot after `max(0, typical - (now - started))`, 0 without a
 ///    typical duration; ascending;
 /// 2. queued jobs oldest first, by `at`, then job id (numbers before other ids);
@@ -119,7 +119,7 @@ fn job_key(job: &str) -> (u8, u64, &str) {
     }
 }
 
-/// M6.2 rule R7: 15 s while VM jobs queue, 30 s while the VM is busy, 600 s otherwise.
+/// spec 6.2: 15 s while VM jobs queue, 30 s while the VM is busy, 600 s otherwise.
 pub fn next_report_s(queued: bool, busy: bool) -> u64 {
     if queued {
         REPORT_QUEUE_S

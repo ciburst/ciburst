@@ -1,4 +1,4 @@
-//! The queue-first schedule of spec D53 (M6.2 rules R2 to R4) in the cache bucket, beside the
+//! The queue-first schedule of D53 (spec 6.4) in the cache bucket, beside the
 //! burst intents, one object per entry:
 //! - `ciburst/intents/_queue/<pool>/<job id>`: a waiting job, JSON [`Queued`];
 //! - `ciburst/intents/_running/<pool>/<job id>`: a running job, JSON [`Running`];

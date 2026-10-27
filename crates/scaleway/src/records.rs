@@ -1,4 +1,4 @@
-//! The warm start records of spec D48 (M6.1 rule R5) in the cache bucket, beside the burst
+//! The warm start records of D48 (spec 6.5) in the cache bucket, beside the burst
 //! intents: `ciburst/intents/_pipelines/<pipeline id>/vm-jobs.json` holds the pipeline's VM jobs
 //! per pool, `ciburst/intents/_pipelines/<pipeline id>/seen/<job id>` is an empty object per VM
 //! job that went pending. A pool tag starts with a letter or a digit, so the intents of a pool
@@ -131,7 +131,7 @@ impl PipelineRecords for ScalewayPipelineRecords {
             .map_err(|error| invalid(format!("{key}: {error}")))
     }
 
-    /// One HEAD of the pipeline's record, and the marker only when there is one (M6.1 rule R5).
+    /// One HEAD of the pipeline's record, and the marker only when there is one (spec 6.5).
     /// A job event that comes before the record leaves no marker, so the reserve counts that
     /// job until the pipeline ends.
     async fn seen(&self, pipeline: &str, job: &str) -> Result<()> {
@@ -182,7 +182,7 @@ impl PipelineRecords for ScalewayPipelineRecords {
             .map_err(|error| invalid(format!("{key}: {error}")))
     }
 
-    /// One listing of every record (M6.2 rule R7): a pipeline is open while its `vm-jobs.json`
+    /// One listing of every record (spec 6.5): a pipeline is open while its `vm-jobs.json`
     /// is listed, `opened` is that object's `LastModified`; its jobs come from one GET each, and
     /// the listed seen markers are subtracted. Markers without a record are ignored.
     async fn open_pipelines(&self) -> Result<Vec<OpenPipeline>> {

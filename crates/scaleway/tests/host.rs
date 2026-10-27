@@ -267,7 +267,7 @@ async fn a_new_fleet_key_updates_the_function_only() {
     );
 }
 
-/// M6.3 rule R1, found in the live drill: a routing change of a fleet redeployed the function.
+/// D58, found in the live drill: a routing change of a fleet redeployed the function.
 #[tokio::test]
 async fn a_fleet_routing_change_leaves_the_function_alone() {
     let fake = Arc::new(FakeFunctions::new());
@@ -488,7 +488,7 @@ impl HttpClient for Apis {
     }
 }
 
-/// M7 hardening rule R3: with a VM pool of the `scaleway` provider the function gets the
+/// spec 6.6: with a VM pool of the `scaleway` provider the function gets the
 /// security group and per instance type the image a start would look up, and a changed image
 /// plans the function update.
 #[tokio::test]

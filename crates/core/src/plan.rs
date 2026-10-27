@@ -11,7 +11,7 @@ use crate::store::write_private;
 use crate::types::{Action, Outputs, Step};
 use crate::{Error, Result};
 
-/// Environment scope of the outputs in project variables (spec D39): only jobs of the
+/// Environment scope of the outputs in project variables (D39): only jobs of the
 /// environment `ciburst` see them.
 pub const OUTPUTS_SCOPE: &str = "ciburst";
 
@@ -180,7 +180,7 @@ impl OutputsStore for MemoryOutputs {
     }
 }
 
-/// Outputs as variables of the setup's own project, for `ciburst --ci` (M5 rule R2). GitLab
+/// Outputs as variables of the setup's own project, for `ciburst --ci` (spec 11.3). GitLab
 /// never returns a hidden variable's value, so reads come from the job environment, where
 /// GitLab put the variables, overlaid by this run's writes. Variables are protected, raw and in
 /// scope [`OUTPUTS_SCOPE`]; created masked and hidden, or unmasked where GitLab refuses.

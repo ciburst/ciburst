@@ -2,7 +2,7 @@
 //! VM per run with its own Docker daemon, spec section 6.1); each project's lanes run on
 //! Serverless Jobs (one job definition `<name>-<project id>-<tag>` per lane, one job run per
 //! pending job, D45, D60). Shared resources:
-//! project, IAM applications and keys, cache bucket with lifecycle, the runner (M6 rule R6) and
+//! project, IAM applications and keys, cache bucket with lifecycle, the runner (spec 9.1) and
 //! the VM agent (D38) in it, the optional registry namespace; per runtime the VM security group
 //! or the job definitions. Every resource is looked up by name or tag; nothing is stored
 //! locally.
@@ -57,7 +57,7 @@ pub const PROVIDER_NAME: &str = "scaleway";
 /// The provider type of M2, which only had Serverless Jobs; read as `scaleway`.
 pub const LEGACY_JOBS_TYPE: &str = "scaleway-jobs";
 
-/// Commercial types tried in order when a pool names none (rule 4 of M3). PLAY2 types have no
+/// Commercial types tried in order when a pool names none (spec 6.1). PLAY2 types have no
 /// local storage, so no local image fits them and start skips them.
 /// Types with a local root volume, which terminate deletes; PLAY2 types only take block
 /// volumes, which terminate detaches and which would keep billing.
@@ -106,7 +106,7 @@ pub struct Scaleway {
     agent: Option<PathBuf>,
     /// `CIBURST_AGENT_SHA256` of the function's environment.
     agent_sha256: Option<String>,
-    /// The runner that `apply` copies into the cache bucket (M6 rule R6).
+    /// The runner that `apply` copies into the cache bucket (spec 9.1).
     runner: RunnerSource,
     /// `CIBURST_VM_SECURITY_GROUP` and `CIBURST_VM_IMAGES` of the function's environment.
     vm_start: VmStart,
@@ -320,7 +320,7 @@ async fn list_all(
 
 #[async_trait]
 impl Provider for Scaleway {
-    /// The fleet store in the deployment's cache bucket (M6.3 rule R1); `None` before the first
+    /// The fleet store in the deployment's cache bucket (D58); `None` before the first
     /// apply made the project and the bucket, or without the cache and fleet keys.
     async fn fleet(
         &self,

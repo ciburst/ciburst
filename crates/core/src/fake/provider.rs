@@ -76,7 +76,7 @@ impl Vm {
         }
     }
 
-    /// Rule 10 of the M3 milestone, with the limits of `crate::vm`.
+    /// spec 6.8, with the limits of `crate::vm`.
     fn swept(&self, now: u64) -> bool {
         let since = |t: u64| now.saturating_sub(t);
         if since(self.created_at) > vm::SWEEP_MAX_AGE_S {
@@ -125,7 +125,7 @@ impl FakeProvider {
         }
     }
 
-    /// The fleet state the provider answers from [`Provider::fleet`] (M6.3 rule R1).
+    /// The fleet state the provider answers from [`Provider::fleet`] (D58).
     pub fn with_fleet(mut self, fleet: Arc<dyn FleetStore>) -> FakeProvider {
         self.fleet = Some(fleet);
         self
@@ -142,7 +142,7 @@ impl FakeProvider {
     }
 
     /// Whether `tag` is the key of a lane of another project than the host: the dispatcher
-    /// keeps those definitions on `/join` (M6.4 rule R5), so `apply` leaves them alone.
+    /// keeps those definitions on `/join` (spec 8.3), so `apply` leaves them alone.
     fn is_member_lane(&self, tag: &str) -> bool {
         parse_lane_key(tag).is_some_and(|(project, _)| project != self.config.host_project())
     }

@@ -1,4 +1,4 @@
-//! Join codes (M6.3 rule R3). A code is the base64url (no padding) of the JSON
+//! Join codes (spec 8.2). A code is the base64url (no padding) of the JSON
 //! `{"v":1,"url":<dispatcher url>,"project":<id>,"exp":<unix>}`, a `.`, and the base64url of
 //! the HMAC-SHA256 of the first part under the host's hook token. The dispatcher verifies it
 //! with its hook token and stores nothing before a join.
@@ -10,7 +10,7 @@ use subtle::ConstantTimeEq;
 
 /// The version a code carries.
 pub const VERSION: u64 = 1;
-/// Seconds a code is valid (M6.3 rule R3).
+/// Seconds a code is valid (spec 8.2).
 pub const TTL_S: u64 = 7 * 24 * 3600;
 /// Header of `/join`, `/leave` and `GET /fleet` that carries the code.
 pub const HEADER: &str = "X-Ciburst-Join";

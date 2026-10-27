@@ -20,7 +20,7 @@ pub enum Error {
     #[error("{0}")]
     Provider(String),
     /// A provider call that may succeed when repeated: 429, 503, or for an idempotent call
-    /// another 5xx or a transport timeout (M7 hardening rule R4).
+    /// another 5xx or a transport timeout (spec 6.6).
     #[error("{0}")]
     Retryable(String),
     #[error("{0}")]
@@ -40,7 +40,7 @@ impl Error {
         Error::Retryable(message.into())
     }
 
-    /// Whether repeating the call may succeed (M7 hardening rule R4).
+    /// Whether repeating the call may succeed (spec 6.6).
     pub fn is_retryable(&self) -> bool {
         matches!(self, Error::Retryable(_))
     }

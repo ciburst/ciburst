@@ -131,7 +131,7 @@ pub struct Secrets {
     /// (`CIBURST_AGENT_SHA256`); the host stores them as ordinary environment variables.
     #[serde(default)]
     pub dispatcher_env: BTreeMap<String, String>,
-    /// Seals the fleet's member records and binds its config (M6.3 rule R2); never leaves the
+    /// Seals the fleet's member records and binds its config (spec 8.1); never leaves the
     /// dispatcher and the setup.
     #[serde(default)]
     pub fleet_key: Option<String>,
@@ -187,8 +187,8 @@ pub struct StartRequest {
     pub pool: Pool,
     pub env: BTreeMap<String, String>,
     pub labels: BTreeMap<String, String>,
-    /// Slots of the new VM the dispatcher already assigned (M4 R6), 0 for the warm VM of a
-    /// pipeline (M6.1 rule R4); a VM provider creates the VM with `free = slots - taken`.
+    /// Slots of the new VM the dispatcher already assigned (spec 6.3), 0 for the warm VM of a
+    /// pipeline (spec 6.5); a VM provider creates the VM with `free = slots - taken`.
     /// One-job runtimes ignore it.
     pub taken: u32,
 }
@@ -204,7 +204,7 @@ pub trait Provider: Send + Sync {
     }
 
     /// Fails when a pool could not start a run after `apply` (no quota, no agent): `apply`
-    /// calls it before changing anything (M5 rule R6). `plan` only warns.
+    /// calls it before changing anything (D42). `plan` only warns.
     async fn preflight(&self) -> Result<()> {
         Ok(())
     }
@@ -243,7 +243,7 @@ pub trait Provider: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// D60, M6.4 rule R5: makes the job definitions of project `project`'s lanes match
+    /// D60, spec 8.3: makes the job definitions of project `project`'s lanes match
     /// `lanes`, run specs of [`crate::config::Lane::pool`], creating and updating them, and
     /// deletes the project's other lane definitions. Answers each definition's id by lane
     /// tag. The dispatcher calls it on `/join` and `/leave` with the dispatch key.
@@ -251,7 +251,7 @@ pub trait Provider: Send + Sync {
         Err(crate::Error::provider("this provider runs no lanes"))
     }
 
-    /// The deployment's fleet state (M6.3 rule R1), opened with the secrets of `apply`;
+    /// The deployment's fleet state (D58), opened with the secrets of `apply`;
     /// `None` for a provider that keeps none, whose deployments serve their config's projects.
     async fn fleet(&self, _secrets: &Secrets) -> Result<Option<std::sync::Arc<dyn FleetStore>>> {
         Ok(None)
@@ -304,13 +304,13 @@ pub struct VmReport {
 pub struct VmReportAnswer {
     #[serde(rename = "nextReportS", default = "default_next_report_s")]
     pub next_report_s: u64,
-    /// The runners of every member for the VM's pool (M6.3 rule R5); the agent runs one
+    /// The runners of every member for the VM's pool (spec 8.5); the agent runs one
     /// `gitlab-runner run` with an entry for each. Empty from dispatchers before M6.3.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runners: Vec<VmRunner>,
 }
 
-/// One member runner a VM serves (M6.3 rule R5).
+/// One member runner a VM serves (spec 8.5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmRunner {
     #[serde(rename = "projectId")]

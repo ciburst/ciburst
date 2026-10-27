@@ -1,9 +1,7 @@
 # Drill pipeline for the drill consumer's branch `ciburst-drill` (docs/RUNBOOK.md, Acceptance drill).
-# Drill config: `vm` is the default pool (Scaleway Instances, Docker executor); `ci` is a
-# Serverless Jobs lane for stage `test` in `node:24-bookworm-slim`, the image its job names.
-# The dispatcher maps a job's stage to a pool, so every VM job uses stage `vm`, which no other
-# pool lists. The hosted-runner job sits in stage `test` so its pending event starts a lane
-# run, not a VM.
+# Drill config: the VM runner `vm` (Scaleway Instances, Docker executor), the lane `ci` from
+# `node:24-bookworm-slim` with `"jobs": ["fast-lane"]`, and `"ignoreJobs": ["hosted"]`, so the
+# hosted-runner job starts nothing on ciburst.
 
 stages: [vm, test]
 
@@ -86,7 +84,7 @@ fast-lane:
   needs: []
   image: node:24-bookworm-slim
   script:
-    - echo "pool ci, runner $CI_RUNNER_DESCRIPTION"
+    - echo "lane ci, runner $CI_RUNNER_DESCRIPTION"
     - node --version
 
 hosted:

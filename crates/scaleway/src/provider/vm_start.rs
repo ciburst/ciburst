@@ -1,4 +1,4 @@
-//! What a VM start needs besides the request (M7 hardening rule R3): the id of the security
+//! What a VM start needs besides the request (spec 6.6): the id of the security
 //! group `<name>-vm` and per commercial type the image and whether cloud-init installs Docker.
 //! `apply` resolves them with the start's own rules and hands them to the function as the plain
 //! variables [`SECURITY_GROUP_VAR`] and [`IMAGES_VAR`]; a start without them, or whose create
@@ -86,7 +86,7 @@ impl Lookups {
         Ok(self.security_group.clone().flatten())
     }
 
-    /// Rule 4 of M3: the first local Docker image compatible with `commercial_type`, else the
+    /// spec 6.1: the first local Docker image compatible with `commercial_type`, else the
     /// first local Ubuntu image, on which cloud-init installs Docker; `None` without either.
     pub(super) async fn image(
         &mut self,
@@ -147,7 +147,7 @@ impl Scaleway {
         }))
     }
 
-    /// The values `start` uses instead of looking them up (M7 hardening rule R3).
+    /// The values `start` uses instead of looking them up (spec 6.6).
     pub fn with_vm_start(mut self, vm_start: VmStart) -> Scaleway {
         self.vm_start = vm_start;
         self

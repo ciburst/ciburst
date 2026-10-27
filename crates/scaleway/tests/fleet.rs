@@ -1,4 +1,4 @@
-//! `ScalewayFleetStore` against the S3 fake (M6.3 rules R1 and R2): the key layout, the config
+//! `ScalewayFleetStore` against the S3 fake (spec 8.1): the key layout, the config
 //! and its MAC, member records sealed at rest, listings across pages, replace and delete, the
 //! errors of a wrong key or an altered object, and a lifecycle that never expires the fleet.
 
@@ -157,7 +157,7 @@ async fn members_are_sealed_at_rest_and_read_back() {
     assert_ne!(again["hookSecret"], stored["hookSecret"]);
 }
 
-/// M6.4 rule R6: a member's lanes keep their routing fields in clear text and their runner
+/// spec 8.1: a member's lanes keep their routing fields in clear text and their runner
 /// token sealed; a record written before M6.4 reads as a member without lanes.
 #[tokio::test]
 async fn member_lanes_seal_their_runner_token_and_old_records_have_none() {

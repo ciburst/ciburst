@@ -1,4 +1,4 @@
-//! The runner in the cache bucket and the lanes that fetch it (D45, M6 rules R5 and R6): step
+//! The runner in the cache bucket and the lanes that fetch it (D45, spec 7.1 and 9.1): step
 //! `runner-binary` against the S3 fake and the download host, the public object lane runs and
 //! VMs read without credentials, and lane job definitions that run `lane-bootstrap.sh` with the
 //! runner's URL and SHA-256.

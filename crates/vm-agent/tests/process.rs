@@ -1,4 +1,4 @@
-//! The real binary with the pinned `gitlab-runner` (M6.3 rule R5), a fake `docker` and one
+//! The real binary with the pinned `gitlab-runner` (spec 8.5), a fake `docker` and one
 //! loopback server playing both GitLab's job request API and the dispatcher: one `gitlab-runner
 //! run` polls with every runner entry, reloads the rewritten `config.toml`, and exits on
 //! `SIGQUIT`, after which the agent starts it again.

@@ -56,7 +56,7 @@ pub struct Hook {
     /// RFC 3339 end of a temporary disable.
     #[serde(default)]
     pub disabled_until: Option<String>,
-    /// Pipeline events reach the dispatcher (M6.1 rule R2).
+    /// Pipeline events reach the dispatcher (spec 9.5).
     #[serde(default)]
     pub pipeline_events: bool,
 }
@@ -110,8 +110,8 @@ pub struct Delivery {
     pub subject: String,
     pub status: String,
     pub result: String,
-    /// The answer's `pool`; for the warm step every pool and its action, `vm:started` (M6.1
-    /// rule R4).
+    /// The answer's `pool`; for the warm step every pool and its action, `vm:started` (spec
+    /// 6.5).
     pub pool: String,
     pub ms: String,
 }

@@ -10,12 +10,12 @@
 //!   `CIBURST_REGION` (Scaleway reserves the `SCW_` prefix), every variable of
 //!   `Secrets::dispatcher_env` under its own name (`CIBURST_AGENT_SHA256`, D38), and
 //!   `CIBURST_VM_SECURITY_GROUP` and `CIBURST_VM_IMAGES`, which
-//!   this host resolves on every plan and apply (`Scaleway::resolve_vm_start`, M7 hardening
-//!   rule R3), so a changed image or security group plans a function update;
+//!   this host resolves on every plan and apply (`Scaleway::resolve_vm_start`, spec
+//!   6.6), so a changed image or security group plans a function update;
 //! - secret: `HOOK_TOKEN`, `CIBURST_DISPATCH_KEY` (the dispatch key), `RUNNER_TOKEN_<TAG>` for
 //!   the VM runner and each host lane, `CACHE_S3_ACCESS_KEY` and `CACHE_S3_SECRET_KEY` when a
-//!   cache key exists, `CIBURST_VM_SECRET`, `CIBURST_SWEEP_TOKEN` and `CIBURST_FLEET_KEY` (M6.3
-//!   rule R2) when the provisioner made them.
+//!   cache key exists, `CIBURST_VM_SECRET`, `CIBURST_SWEEP_TOKEN` and `CIBURST_FLEET_KEY` (spec
+//!   8.1) when the provisioner made them.
 //!
 //! On top, the plain variable `CIBURST_CODE_DIGEST` records the sha256 of the deployed zip for
 //! this host's plan; the function does not read it. The sha256 of the settings and both
@@ -80,12 +80,12 @@ pub mod vars {
     pub const CACHE_SECRET_KEY: &str = "CACHE_S3_SECRET_KEY";
     pub const VM_SECRET: &str = "CIBURST_VM_SECRET";
     pub const SWEEP_TOKEN: &str = "CIBURST_SWEEP_TOKEN";
-    /// Seals the fleet state in the bucket (M6.3 rule R2).
+    /// Seals the fleet state in the bucket (spec 8.1).
     pub const FLEET_KEY: &str = "CIBURST_FLEET_KEY";
     pub const CODE_DIGEST: &str = "CIBURST_CODE_DIGEST";
     /// The agent VMs download (D38), from `Secrets::dispatcher_env`.
     pub const AGENT_SHA256: &str = ciburst_core::provision::keys::AGENT_SHA256;
-    /// What a VM start uses without looking it up (M7 hardening rule R3).
+    /// What a VM start uses without looking it up (spec 6.6).
     pub const VM_SECURITY_GROUP: &str = crate::provider::SECURITY_GROUP_VAR;
     pub const VM_IMAGES: &str = crate::provider::IMAGES_VAR;
 
@@ -175,7 +175,7 @@ struct Settings {
     environment_variables: BTreeMap<String, String>,
     secret_environment_variables: BTreeMap<String, String>,
     /// `CIBURST_CONFIG` as the digest sees it: [`Config::deployment_view`], so a routing
-    /// change alone leaves the function as it is (M6.3 rule R1).
+    /// change alone leaves the function as it is (D58).
     #[serde(skip)]
     config_view: String,
 }

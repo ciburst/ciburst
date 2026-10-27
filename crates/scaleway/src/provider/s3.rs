@@ -33,7 +33,7 @@ pub const LIFECYCLE_RULES: [(&str, &str); 3] = [
 pub const PUBLIC_READ: &str = "public-read";
 
 /// How long the transfer of a binary may take: the runner has about 120 MB, which the HTTP
-/// client's own timeout of 30 s would cut off below 4 MB/s (M6 rule R6).
+/// client's own timeout of 30 s would cut off below 4 MB/s (spec 9.1).
 pub const TRANSFER_TIMEOUT: Duration = Duration::from_secs(600);
 /// Request bodies above this size are transfers and get [`TRANSFER_TIMEOUT`].
 pub const LARGE_BODY: usize = 1024 * 1024;
@@ -331,7 +331,7 @@ impl S3 {
     }
 }
 
-/// Reads change nothing, so a failed one may be repeated (M7 hardening rule R4).
+/// Reads change nothing, so a failed one may be repeated (spec 6.6).
 fn idempotent(method: &str) -> bool {
     matches!(method, "GET" | "HEAD")
 }

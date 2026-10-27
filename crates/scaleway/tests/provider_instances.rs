@@ -1,7 +1,7 @@
 //! The `instances` runtime against the fake Instance API: plan, start with type fallback, the
 //! cloud-init user data, capacity, claim, report, list, stop, sweep and destroy; the start on
-//! the values `apply` resolved (M7 hardening rule R3) and which of its failures may be retried
-//! (rule R4).
+//! the values `apply` resolved (spec 6.6) and which of its failures may be retried
+//! (spec 6.6).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -343,7 +343,7 @@ async fn start_creates_the_server_of_rule_four_then_user_data_then_poweron() {
         format!(
             "curl -fsSL -o /tmp/gitlab-runner https://{bucket}.s3.fr-par.scw.cloud/ciburst/runner/{runner} && echo \"{runner}  /tmp/gitlab-runner\" | sha256sum -c - && install -m 0755 /tmp/gitlab-runner /usr/local/bin/gitlab-runner && rm -f /tmp/gitlab-runner"
         ),
-        "M6 rule R6: the runner object of the cache bucket"
+        "spec 9.1: the runner object of the cache bucket"
     );
     assert!(!user_data.contains("gitlab-runner-downloads"));
     let sha = agent_fixture_sha256();
@@ -1340,7 +1340,7 @@ fn warnings(lines: &[String]) -> Vec<&str> {
         .collect()
 }
 
-/// M7 hardening rule R3, measured on the fake: with the values `apply` resolved a start makes
+/// spec 6.6, measured on the fake: with the values `apply` resolved a start makes
 /// three calls, create, user data and power on; without them it first looks up the security
 /// group and the images. The project id comes from `CIBURST_PROJECT_ID` without a call.
 #[tokio::test]
@@ -1579,7 +1579,7 @@ async fn a_refusal_the_lookups_cannot_fix_ends_the_start() {
     assert!(backend.instance.servers().is_empty());
 }
 
-/// M7 hardening rule R4 until a server exists: 429 and 503 may pass on a repeat for every call,
+/// spec 6.6 until a server exists: 429 and 503 may pass on a repeat for every call,
 /// another 5xx and a transport timeout only for reads. A failed start leaves no server.
 #[tokio::test]
 async fn start_failures_are_retryable_until_the_server_exists() {
@@ -1617,7 +1617,7 @@ async fn start_with_retry(provider: &Scaleway, config: &Config) -> ciburst_core:
     }
 }
 
-/// M7 hardening rule R4 once the server exists: a repeat of the whole start would create a
+/// spec 6.6 once the server exists: a repeat of the whole start would create a
 /// second server, so the start repeats user data and power on itself, once after 300 ms, and
 /// reads the server first in case a power on whose answer got lost started it. What still
 /// fails removes the server and ends the start for good.

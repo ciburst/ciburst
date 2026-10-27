@@ -1,4 +1,4 @@
-//! The fleet state of spec D58 (M6.3 rules R1 and R2) in the cache bucket, beside the ledger and
+//! The fleet state of D58 (spec 8.1) in the cache bucket, beside the ledger and
 //! signed with the same cache key:
 //!
 //! - `ciburst/fleet/config.json`: `{"config": "<the routing config JSON as given>", "mac":
@@ -200,7 +200,7 @@ struct StoredMember {
     #[serde(rename = "hookSecret")]
     hook_secret: String,
     runners: BTreeMap<String, String>,
-    /// The member's lanes with sealed runner tokens (M6.4 rule R6); a record before M6.4 has
+    /// The member's lanes with sealed runner tokens (spec 8.1); a record before M6.4 has
     /// none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     lanes: Vec<MemberLane>,

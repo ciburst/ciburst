@@ -3,7 +3,7 @@
 //! `api/jobs/v1alpha1`: `job_definitions`, `job_runs`, `total_count`; start answers
 //! `{ "job_runs": [...] }`; run states `queued`, `scheduled`, `running`, `succeeded`, `failed`,
 //! `canceled`, `internal_error`. [`FakeJobs::fail_next`] fails the next call of a method on a
-//! path once (M7 hardening rule R4).
+//! path once (spec 6.6).
 
 use std::sync::Mutex;
 

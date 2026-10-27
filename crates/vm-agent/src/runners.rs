@@ -1,4 +1,4 @@
-//! The `config.toml` of the VM's one `gitlab-runner run` (M6.3 rule R5, D59): `concurrent` is
+//! The `config.toml` of the VM's one `gitlab-runner run` (D59, spec 8.5): `concurrent` is
 //! the VM's slots, one `[[runners]]` entry for the VM runner and one per member runner of the
 //! last report answer.
 

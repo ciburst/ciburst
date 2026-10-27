@@ -1,9 +1,9 @@
-//! M6.3: the dispatcher across the fleet's members. The routing config and the members come
-//! from the fleet store, cached for [`FLEET_CACHE`] (rule R1); events are accepted per member
-//! secret (rule R6); `GET /fleet`, `POST /join` and `POST /leave` take a join code (rules R3
-//! and R4); VM reports answer the member runners of the VM runner (rule R5). Each project
+//! The dispatcher across the fleet's members (spec 8). The routing config and the members come
+//! from the fleet store, cached for [`FLEET_CACHE`] (D58); events are accepted per member
+//! secret (spec 8.5); `GET /fleet`, `POST /join` and `POST /leave` take a join code (spec
+//! 8.3); VM reports answer the member runners of the VM runner (spec 8.5). Each project
 //! routes its jobs by its own lanes and `ignoreJobs` (D60, D61), and `/join` makes a member's
-//! lane definitions (M6.4 rule R5).
+//! lane definitions (spec 8.3).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -22,10 +22,10 @@ use crate::fleet::{FleetStore, Member, MemberLane};
 use crate::invite::{self, Invite};
 use crate::types::VmRunner;
 
-/// M6.3 rule R1: the longest a warm dispatcher keeps the fleet state it read.
+/// D58: the longest a warm dispatcher keeps the fleet state it read.
 pub const FLEET_CACHE: Duration = Duration::from_secs(30);
 
-/// M6.4 rule R5: `/join` and `/leave` finish their steps this long after the request arrived,
+/// spec 8.3: `/join` and `/leave` finish their steps this long after the request arrived,
 /// inside the function's 30 s, or answer with the step that did not finish.
 pub const JOIN_BUDGET: Duration = Duration::from_secs(25);
 
@@ -71,7 +71,7 @@ impl FleetCache {
 /// Whose runner takes a project's VM jobs.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum RunnerOf {
-    /// The host's runner: the host, and projects that use the host's runners (rule R9).
+    /// The host's runner: the host, and projects that use the host's runners (spec 8.6).
     Host,
     /// The runner the member registered, with its token.
     Member(String),
@@ -90,7 +90,7 @@ pub(super) enum Routed {
     Lane(Pool),
 }
 
-/// The body of `POST /join` (M6.4 rule R5): the member's VM runner token by the VM runner's
+/// The body of `POST /join` (spec 8.3): the member's VM runner token by the VM runner's
 /// tag, its lanes, each lane's runner token by lane tag, and its `ignoreJobs`.
 #[derive(Deserialize)]
 struct JoinBody {
@@ -111,7 +111,7 @@ struct StepFailed {
 }
 
 impl Dispatcher {
-    /// The fleet store (M6.3 rule R1). Without it, or while it holds no config, the dispatcher
+    /// The fleet store (D58). Without it, or while it holds no config, the dispatcher
     /// routes by the config of its environment and the host's hook token.
     pub fn with_fleet(mut self, fleet: Option<Arc<dyn FleetStore>>) -> Dispatcher {
         self.fleet = fleet;
@@ -199,7 +199,7 @@ impl Dispatcher {
 
     /// Every member: the stored ones; the host with the hook token and runners of the
     /// environment; and each further project of `gitlab.projectIds` without a record, with the
-    /// host's secret and runners until it joins (M6.3 rule R9).
+    /// host's secret and runners until it joins (spec 8.6).
     pub(super) fn members(&self) -> Vec<Member> {
         let config = self.config();
         let host = self.host_project(&config);
@@ -241,7 +241,7 @@ impl Dispatcher {
             .find(|member| member.project_id == project_id)
     }
 
-    /// M6.3 rule R6: an event of a member carries that member's secret; any other event the
+    /// spec 8.5: an event of a member carries that member's secret; any other event the
     /// host's hook token, and answers as today.
     pub(super) fn authorized(&self, token: Option<&str>, project_id: Option<u64>) -> bool {
         match project_id.and_then(|id| self.member(id)) {
@@ -265,7 +265,7 @@ impl Dispatcher {
         }
     }
 
-    /// M6.3 rule R5: the VM runner of every member that registered its own, one per token.
+    /// spec 8.5: the VM runner of every member that registered its own, one per token.
     /// The host's runner is the VM's `RUNNER_TOKEN` and not among them.
     pub(super) fn member_runners(&self, pool: &str) -> Vec<VmRunner> {
         let host = self.secrets.runner_tokens.get(pool);
@@ -441,7 +441,7 @@ impl Dispatcher {
         }
     }
 
-    /// `POST /join` (M6.3 rule R4, M6.4 rule R5): makes the job definitions of the member's
+    /// `POST /join` (spec 8.3, 8.4): makes the job definitions of the member's
     /// lanes with the dispatch key, deletes its definitions no longer listed, and stores the
     /// member of the code's project with its VM runner, its lanes and `ignoreJobs`, and the
     /// webhook secret derived from the hook token. A second join replaces the record.
@@ -541,7 +541,7 @@ impl Dispatcher {
         )
     }
 
-    /// `POST /leave` (M6.3 rule R4, M6.4 rule R5): deletes the job definitions of the
+    /// `POST /leave` (spec 8.3, 8.4): deletes the job definitions of the
     /// member's lanes and the member of the code's project. An expired code still leaves; the
     /// host cannot.
     pub(super) async fn leave(

@@ -22,7 +22,7 @@ use crate::time::parse_rfc3339;
 use crate::types::{Action, Host, KeyPair, Outputs, Provider, Rotation, Run, Secrets, Step};
 use crate::{Error, Result};
 
-/// Pending jobs younger than this still have their own webhook on the way (spec D41).
+/// Pending jobs younger than this still have their own webhook on the way (D41).
 pub const REPLAY_MIN_AGE_S: u64 = 60;
 
 /// Detail of a runner step that only replaces the runner's tags (D47).
@@ -39,14 +39,14 @@ pub mod keys {
     pub const HOOK_TOKEN: &str = "CIBURST_HOOK_TOKEN";
     pub const VM_SECRET: &str = "CIBURST_VM_SECRET";
     pub const SWEEP_TOKEN: &str = "CIBURST_SWEEP_TOKEN";
-    /// Seals the fleet state in the bucket (M6.3 rule R2); written once, never rotated.
+    /// Seals the fleet state in the bucket (spec 8.1); written once, never rotated.
     pub const FLEET_KEY: &str = "CIBURST_FLEET_KEY";
     pub const DISPATCH_URL: &str = "CIBURST_DISPATCH_URL";
     pub const DISPATCH_ACCESS_KEY: &str = "CIBURST_DISPATCH_ACCESS_KEY";
     pub const DISPATCH_SECRET_KEY: &str = "CIBURST_DISPATCH_SECRET_KEY";
     pub const CACHE_ACCESS_KEY: &str = "CIBURST_CACHE_ACCESS_KEY";
     pub const CACHE_SECRET_KEY: &str = "CIBURST_CACHE_SECRET_KEY";
-    /// SHA-256 of the uploaded VM agent (M5 rule R3); plain dispatcher environment.
+    /// SHA-256 of the uploaded VM agent (D38); plain dispatcher environment.
     pub const AGENT_SHA256: &str = "CIBURST_AGENT_SHA256";
     /// Outputs the dispatcher gets as plain environment variables.
     pub const DISPATCHER_ENV: [&str; 1] = [AGENT_SHA256];
@@ -188,10 +188,10 @@ pub struct PoolStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Status {
     pub url: Option<String>,
-    /// The VM runner, then each member's lanes, the host's first (M6.4 rule R8).
+    /// The VM runner, then each member's lanes, the host's first (spec 13.1).
     pub pools: Vec<PoolStatus>,
     pub runs: Vec<Run>,
-    /// The fleet's members, the host first (M6.3 rule R7); empty without fleet state.
+    /// The fleet's members, the host first (spec 8.6); empty without fleet state.
     pub members: Vec<Member>,
 }
 
@@ -203,12 +203,12 @@ pub struct ProjectReport {
     pub problems: Vec<Problem>,
     /// Lanes for the Docker-free jobs on the VM runner (D46).
     pub suggestions: Vec<Suggestion>,
-    /// Jobs of other runners that `ignoreJobs` misses (M6.1 rule R8).
+    /// Jobs of other runners that `ignoreJobs` misses (spec 13.2).
     pub ignore: Vec<String>,
     /// The project's hook to the dispatcher; `None` when the dispatcher's URL is unknown or
     /// the project has no hook to it (D51).
     pub hook: Option<Hook>,
-    /// Why a member's project could not be read with this token (M6.3 rule R7); the other
+    /// Why a member's project could not be read with this token (spec 8.6); the other
     /// fields are empty then.
     pub unreadable: Option<String>,
 }
@@ -220,7 +220,7 @@ pub struct HookStatus {
     /// `None` when the project has no hook to the dispatcher.
     pub hook: Option<Hook>,
     pub deliveries: Vec<Delivery>,
-    /// Why a member's hook could not be read with this token (M6.3 rule R7).
+    /// Why a member's hook could not be read with this token (spec 8.6).
     pub unreadable: Option<String>,
 }
 
@@ -234,7 +234,7 @@ pub struct Provisioner {
     log: Log,
     replay: Option<Arc<dyn HttpClient>>,
     clock: Clock,
-    /// Fleet state (M6.3 rule R1); `None` asks the provider with the secrets of the outputs.
+    /// Fleet state (D58); `None` asks the provider with the secrets of the outputs.
     fleet: Option<Arc<dyn FleetStore>>,
 }
 
@@ -282,7 +282,7 @@ impl Provisioner {
             .await
     }
 
-    /// The members besides the projects of the config: projects that joined (M6.3 rule R7).
+    /// The members besides the projects of the config: projects that joined (spec 8.6).
     async fn joined_members(&self) -> Result<Vec<Member>> {
         let Some(fleet) = self.stored_fleet().await? else {
             return Ok(Vec::new());
@@ -297,7 +297,7 @@ impl Provisioner {
         Ok(members)
     }
 
-    /// M6.3 rules R1 and R9: the routing config in the fleet state, the host as a member, and
+    /// spec 8.1 and 8.6: the routing config in the fleet state, the host as a member, and
     /// each further project of `gitlab.projectIds` as a member with the host's runners until it
     /// joins. `secrets` hold the hook token and the runner tokens.
     async fn fleet_steps(
@@ -362,7 +362,7 @@ impl Provisioner {
         Ok((steps, writes))
     }
 
-    /// The client `apply` posts waiting jobs to the dispatcher with (M5 rule R4); without it
+    /// The client `apply` posts waiting jobs to the dispatcher with (spec 11.4); without it
     /// nothing is replayed.
     pub fn with_replay(mut self, http: Arc<dyn HttpClient>) -> Provisioner {
         self.replay = Some(http);
@@ -675,7 +675,7 @@ impl Provisioner {
     }
 
     /// Creates missing hooks, gives existing ones a rotated token or the pipeline events they
-    /// lack (M6.1 rule R2), and enables a disabled one again with a test delivery (D51).
+    /// lack (spec 9.5), and enables a disabled one again with a test delivery (D51).
     async fn apply_hooks(&self, steps: &[Step], hook_token: &str, rotate: bool) -> Result<()> {
         let Some(gitlab) = &self.gitlab else {
             return Ok(());
@@ -753,7 +753,7 @@ impl Provisioner {
     }
 
     /// `rotate` plus the rotation of every output secret the config needs that `current`
-    /// lacks (M5 rule R7): a key that exists only at the provider would otherwise stay lost
+    /// lacks (spec 11.3): a key that exists only at the provider would otherwise stay lost
     /// behind a `noop`. A pool's missing runner token recreates that runner (`runner_steps`).
     fn with_missing_secrets(&self, rotate: &[Rotation], current: &Outputs) -> Vec<Rotation> {
         let mut all = rotate.to_vec();
@@ -796,7 +796,7 @@ impl Provisioner {
     }
 
     /// Applies in phases so that later phases see the outputs of earlier ones. Nothing changes
-    /// when the provider's preflight fails (M5 rule R6); waiting jobs are replayed last.
+    /// when the provider's preflight fails (D42); waiting jobs are replayed last.
     pub async fn apply(&self, rotate: &[Rotation]) -> Result<Vec<Step>> {
         self.provider.preflight().await?;
         let rotate = self.with_missing_secrets(rotate, &self.outputs.read().await?);
@@ -845,7 +845,7 @@ impl Provisioner {
         secrets.vm_secret = Some(vm_secret);
         secrets.fleet_key = Some(fleet_key);
         secrets.sweep_token = Some(sweep_token);
-        // M6.3 rule R1: the dispatcher reads the config from the fleet state, so a config change
+        // D58: the dispatcher reads the config from the fleet state, so a config change
         // needs no deploy; the host still redeploys when code or secrets change.
         if let Some(fleet) = self.fleet(&secrets).await? {
             let (fleet_steps, members) = self.fleet_steps(fleet.as_ref(), &secrets).await?;
@@ -880,7 +880,7 @@ impl Provisioner {
     }
 
     /// Posts every pending job that waits for a pool tag longer than [`REPLAY_MIN_AGE_S`] to the
-    /// dispatcher as GitLab would (M5 rule R4, spec D41), so jobs that queued before the setup
+    /// dispatcher as GitLab would (D41, spec 11.4), so jobs that queued before the setup
     /// start. Failures are logged; they never fail `apply`.
     async fn replay(&self, hook_token: &str) {
         let (Some(gitlab), Some(http)) = (&self.gitlab, &self.replay) else {
@@ -968,7 +968,7 @@ impl Provisioner {
     }
 
     pub async fn destroy(&self) -> Result<()> {
-        // M6.3 rule R7: members that joined lose their runners' VMs and lanes with the fleet.
+        // spec 8.6: members that joined lose their runners' VMs and lanes with the fleet.
         let joined = self.joined_members().await?;
         if !joined.is_empty() {
             let ids: Vec<String> = joined.iter().map(|m| m.project_id.to_string()).collect();
@@ -1044,7 +1044,7 @@ impl Provisioner {
             live: live(&self.config.vm.tag),
             max_runs: self.config.vm.max_runs,
         }];
-        // M6.4 rule R8: the host's lanes from the config, every other member's from its record.
+        // spec 13.1: the host's lanes from the config, every other member's from its record.
         for lane in &self.config.lanes {
             pools.push(PoolStatus {
                 project: Some(host),
@@ -1138,7 +1138,7 @@ impl Provisioner {
 }
 
 /// Whether a GitLab call failed because the token may not read the project: a member's
-/// project in another namespace (M6.3 rule R7).
+/// project in another namespace (spec 8.6).
 fn no_access(error: &Error) -> bool {
     matches!(
         error,
@@ -1158,7 +1158,7 @@ async fn dispatcher_hook(gitlab: &Gitlab, project_id: u64, url: &str) -> Result<
         .find(|hook| hook.url == url))
 }
 
-/// The projects of `gitlab.projectIds`, each with its own settings (M6.4 rule R8): the host's
+/// The projects of `gitlab.projectIds`, each with its own settings (spec 13.2): the host's
 /// lanes and `ignoreJobs`, none for the further projects, which use the host's VM runner.
 pub fn config_projects(config: &Config) -> Vec<(u64, ProjectConfig)> {
     let host = config.host_project();
@@ -1178,8 +1178,8 @@ pub fn config_projects(config: &Config) -> Vec<(u64, ProjectConfig)> {
 }
 
 /// Lints the host project's pipeline at `content_ref` (the default branch when `None`),
-/// compares its jobs with its own lanes and `ignoreJobs` and proposes lanes (D46, M6.4 rule
-/// R8). With the dispatcher's `url` it also reads the project's hook to it (D51). Needs only
+/// compares its jobs with its own lanes and `ignoreJobs` and proposes lanes (D46, spec
+/// 13.2). With the dispatcher's `url` it also reads the project's hook to it (D51). Needs only
 /// the config and GitLab.
 #[cfg(feature = "pipeline")]
 pub async fn check(
@@ -1191,8 +1191,8 @@ pub async fn check(
     check_projects(config, gitlab, &config_projects(config), content_ref, url).await
 }
 
-/// [`check`] of `projects`, each with its own settings (M6.4 rule R8): the config's and the
-/// fleet's members (M6.3 rule R7). A project outside the config that the token may not read is
+/// [`check`] of `projects`, each with its own settings (spec 13.2): the config's and the
+/// fleet's members (spec 8.6). A project outside the config that the token may not read is
 /// reported `unreadable`.
 #[cfg(feature = "pipeline")]
 pub async fn check_projects(

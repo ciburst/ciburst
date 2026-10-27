@@ -480,7 +480,7 @@ async fn start_refuses_without_token_or_definition() {
     assert_eq!(error, "scaleway: pool gone is not provisioned");
 }
 
-/// M7 hardening rule R4 for lanes: 429 and 503 may pass on a repeat for every call, another
+/// spec 6.6 for lanes: 429 and 503 may pass on a repeat for every call, another
 /// 5xx and a transport timeout only for reads. A start whose answer never came may have
 /// started a run, so it is not retryable.
 #[tokio::test]

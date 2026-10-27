@@ -1,4 +1,4 @@
-//! M5 rule R4: `apply` ends by posting the jobs that wait for a pool tag to the dispatcher.
+//! spec 11.4: `apply` ends by posting the jobs that wait for a pool tag to the dispatcher.
 
 use std::sync::{Arc, Mutex};
 

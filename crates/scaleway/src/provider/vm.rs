@@ -50,7 +50,7 @@ pub fn is_deployment(server: &Value, name: &str) -> bool {
 }
 
 /// Rule 4: `ciburst`, `<name>`, `pool:<tag>`, `job:<job>`, `ciburst-state:starting`,
-/// `ciburst-free:<free>` (slots minus those taken at start, M4 rule R6).
+/// `ciburst-free:<free>` (slots minus those taken at start, spec 6.3).
 pub fn initial_tags(name: &str, pool: &str, job: Option<&str>, free: u32) -> Vec<String> {
     let mut tags = vec![
         TAG_CIBURST.to_string(),

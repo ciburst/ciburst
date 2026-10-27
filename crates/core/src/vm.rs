@@ -32,7 +32,7 @@ pub const SWEEP_DRAINING_S: u64 = 900;
 pub const SWEEP_SILENT_S: u64 = 1800;
 pub const SWEEP_MAX_AGE_S: u64 = 86_400;
 
-/// Rule 10 of M3, shared by every VM provider: why the sweep ends this VM at `now`, or `None` to keep it. A VM that
+/// spec 6.8, shared by every VM provider: why the sweep ends this VM at `now`, or `None` to keep it. A VM that
 /// reported within `SWEEP_SILENT_S` is kept unless it is past the maximum age.
 pub fn sweep_reason(vm: &VmCapacity, drain_since: Option<u64>, now: u64) -> Option<&'static str> {
     let age = now.saturating_sub(vm.created_at);

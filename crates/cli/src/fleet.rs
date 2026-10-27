@@ -1,6 +1,6 @@
-//! M6.3 rules R3 and R4 on the command line: `invite` in the host, `join` and `leave` in a
+//! spec 8.2 to 8.4 on the command line: `invite` in the host, `join` and `leave` in a
 //! member's pipeline. A member joins with its own lanes and `ignoreJobs` from its own
-//! `ciburst.json` (D60, D61, M6.4 rule R5).
+//! `ciburst.json` (D60, D61, spec 8.3).
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -153,7 +153,7 @@ async fn call(
     response.json()
 }
 
-/// `ciburst --ci join` (M6.3 rule R4, M6.4 rule R5): the member's own `ciburst.json`
+/// `ciburst --ci join` (spec 8.3, 8.4): the member's own `ciburst.json`
 /// (`project_file`; none means no lanes and no `ignoreJobs`) is validated first, then this
 /// project's earlier runners of the fleet go, one runner for the fleet's VM runner and one per
 /// lane are registered in this project, the webhook gets the member's secret, and `/join`
@@ -228,7 +228,7 @@ pub async fn join(
     Ok(0)
 }
 
-/// `ciburst --ci leave` (M6.3 rule R4, M6.4 rule R5): `/leave`, which deletes the member's
+/// `ciburst --ci leave` (spec 8.3, 8.4): `/leave`, which deletes the member's
 /// lane definitions and record, then the member's runners and webhook go. An expired code
 /// still leaves.
 pub async fn leave(

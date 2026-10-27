@@ -1,4 +1,4 @@
-//! Fleet state (M6.3 rules R1 and R2, D57 and D58): the routing config and the member projects,
+//! Fleet state (spec 8.1, D57 and D58): the routing config and the member projects,
 //! kept in the deployment's bucket so that a change takes effect without a function deploy.
 
 use std::collections::BTreeMap;
@@ -14,7 +14,7 @@ use crate::config::{
 };
 use crate::store::Store;
 
-/// A project the fleet serves (M6.3 rule R2). The host is the first member.
+/// A project the fleet serves (spec 8.1). The host is the first member.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Member {
     #[serde(rename = "projectId")]
@@ -36,7 +36,7 @@ pub struct Member {
     pub joined_at: u64,
 }
 
-/// One lane of a member as its record keeps it (M6.4 rule R6): what routing reads in clear
+/// One lane of a member as its record keeps it (spec 8.1): what routing reads in clear
 /// text, the job definition the dispatcher made for it, and the token of the lane's runner.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberLane {
@@ -94,7 +94,7 @@ impl MemberLane {
 }
 
 /// Where a fleet keeps its state. A store that persists members encrypts their secrets at rest
-/// (M6.3 rule R2); callers always see them in plain text.
+/// (spec 8.1); callers always see them in plain text.
 #[async_trait]
 pub trait FleetStore: Send + Sync {
     /// The routing config as JSON, `None` before the first setup wrote it.
@@ -245,7 +245,7 @@ mod tests {
         assert!(fleet.members().await.unwrap().is_empty());
     }
 
-    /// M6.4: a record written before lanes per project reads as a member without lanes and
+    /// Spec 8.1: a record written before lanes per project reads as a member without lanes and
     /// without `ignoreJobs`; the lane tokens it kept under `runners` route nothing.
     #[test]
     fn an_old_record_reads_as_a_member_without_lanes() {

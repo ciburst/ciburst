@@ -1,6 +1,6 @@
-//! `ScalewayPipelineRecords` against the S3 fake (M6.1 rule R5): the key layout, one record per
+//! `ScalewayPipelineRecords` against the S3 fake (spec 6.5): the key layout, one record per
 //! pipeline, seen markers only beside a record, listings across pages, `close`, the failures
-//! that may be retried (M7 hardening rule R4), and the burst ledger reading past the records.
+//! that may be retried (spec 6.6), and the burst ledger reading past the records.
 
 use std::sync::Arc;
 
@@ -320,7 +320,7 @@ async fn bad_ids_send_nothing_and_bucket_errors_name_the_cause() {
     assert!(error.contains("403 SignatureDoesNotMatch"), "{error}");
 }
 
-/// M7 hardening rule R4 for the records: 429 and 503 may pass on a repeat for every call,
+/// spec 6.6 for the records: 429 and 503 may pass on a repeat for every call,
 /// another 5xx and a transport timeout only for reads.
 #[tokio::test]
 async fn failures_are_retryable_where_a_repeat_may_pass() {

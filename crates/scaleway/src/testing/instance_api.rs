@@ -12,8 +12,8 @@
 //! `stopping`, holding its security group, until a read has shown it so, as Scaleway keeps it
 //! for a while. The marketplace answers without a token, like the real one.
 //!
-//! [`FakeInstance::fail_next`] fails the next call of a method on a path once (M7 hardening
-//! rule R4).
+//! [`FakeInstance::fail_next`] fails the next call of a method on a path once (spec
+//! 6.6).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;

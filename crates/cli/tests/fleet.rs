@@ -1,4 +1,4 @@
-//! M6.3 rules R3 and R4: `invite` in the host, `join` and `leave` in a member, against the
+//! spec 8.2 to 8.4: `invite` in the host, `join` and `leave` in a member, against the
 //! GitLab fake and an in-process dispatcher with fleet state.
 
 use std::collections::BTreeMap;
@@ -306,7 +306,7 @@ async fn a_member_joins_and_leaves_with_one_code() {
     assert_eq!(lint["result"], "started", "{lint}");
     assert_eq!(lint["pool"], "vm", "the host's lane is not the member's");
 
-    // M6.4 rule R5: the member's own lanes and ignoreJobs from its own ciburst.json.
+    // spec 8.3: the member's own lanes and ignoreJobs from its own ciburst.json.
     let file = r#"{
       "lanes": [ { "tag": "node", "image": "node:24", "jobs": ["lint"], "vcpu": 1 } ],
       "ignoreJobs": ["pages"]
@@ -340,7 +340,7 @@ async fn a_member_joins_and_leaves_with_one_code() {
     assert!(s.fleet.members().await.unwrap().is_empty());
 }
 
-/// D60, M6.4 rule R1: a member's ciburst.json holds only lanes and ignoreJobs; a fleet
+/// D60, spec 5.4: a member's ciburst.json holds only lanes and ignoreJobs; a fleet
 /// setting or a removed key is refused before anything is registered.
 #[tokio::test]
 async fn a_member_file_with_a_fleet_setting_is_refused() {

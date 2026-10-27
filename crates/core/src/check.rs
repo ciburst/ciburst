@@ -10,7 +10,7 @@ pub const SUGGESTED_VCPU: u32 = 2;
 pub const SUGGESTED_MEMORY_MIB: u32 = 4096;
 
 /// Jobs of the CI/CD component run on hosted runners; the dispatcher and `check` skip them
-/// (spec D41).
+/// (D41).
 pub const OWN_JOB_PREFIX: &str = "ciburst-";
 
 pub fn is_own_job(name: &str) -> bool {
@@ -47,7 +47,7 @@ pub struct Suggestion {
     /// Job names and patterns for the lane's `jobs`.
     pub jobs: Vec<String>,
     /// The jobs of the pipeline's YAML that need the lane's tag, a parallel or matrix job
-    /// once under its own name (M7 rule R7).
+    /// once under its own name (spec 13.2).
     pub tagged: Vec<String>,
 }
 
@@ -60,7 +60,7 @@ fn own_tags<'a>(vm_tag: &str, project: &ProjectConfig, job: &'a LintJob) -> Vec<
         .collect()
 }
 
-/// M6.1 rule R8: a job tagged only for other runners whose pending events still start a VM or
+/// spec 13.2: a job tagged only for other runners whose pending events still start a VM or
 /// a lane run, because the project's `ignoreJobs` misses it.
 fn runs_elsewhere_unignored(vm_tag: &str, project: &ProjectConfig, job: &LintJob) -> bool {
     !job.tag_list.is_empty()
@@ -68,9 +68,9 @@ fn runs_elsewhere_unignored(vm_tag: &str, project: &ProjectConfig, job: &LintJob
         && project.route(&job.name) != Route::Ignored
 }
 
-/// Compares the jobs of a linted pipeline with the project's own lanes and `ignoreJobs` (M6.4
-/// rule R8): a lane job without the lane's tag, with another image or with a Docker need; a VM
-/// job with a lane's tag; the jobs of other runners that `ignoreJobs` misses (M6.1 rule R8).
+/// Compares the jobs of a linted pipeline with the project's own lanes and `ignoreJobs` (spec
+/// 13.2): a lane job without the lane's tag, with another image or with a Docker need; a VM
+/// job with a lane's tag; the jobs of other runners that `ignoreJobs` misses (spec 13.2).
 pub fn check_jobs(
     vm_tag: &str,
     project: &ProjectConfig,
@@ -179,11 +179,11 @@ fn lane_problems(lane: &Lane, job: &JobSpec, pipeline: &Pipeline) -> Vec<String>
     problems
 }
 
-/// D46, M6.4 rule R8: lanes for the project's Docker-free jobs on the VM runner, one per image
+/// D46, spec 13.2: lanes for the project's Docker-free jobs on the VM runner, one per image
 /// in the order the jobs come. A job that carries only tags of other runners runs elsewhere on
 /// purpose; a job without an image, or with one that names an unknown variable, gets no lane.
 /// The copies of a parallel or matrix job share one pattern `<name>*` unless another job's
-/// name starts with `<name>` (M7 rule R7).
+/// name starts with `<name>` (spec 13.2).
 pub fn suggest_lanes(
     vm_tag: &str,
     project: &ProjectConfig,
@@ -255,7 +255,7 @@ pub fn suggest_lanes(
     suggestions
 }
 
-/// M6.1 rule R8: the names for the project's `ignoreJobs` of the jobs tagged only for other
+/// spec 13.2: the names for the project's `ignoreJobs` of the jobs tagged only for other
 /// runners that it misses, in the order the jobs come.
 pub fn suggest_ignore_jobs(vm_tag: &str, project: &ProjectConfig, jobs: &[LintJob]) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();

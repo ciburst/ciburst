@@ -1,6 +1,6 @@
 //! The provider's fake Scaleway: Account, IAM, Serverless Jobs, Container Registry, Instances
 //! with the Marketplace, and S3 (path-style and virtual-hosted) behind one `HttpClient` that
-//! routes by host and path, plus the public download host of the runner (M6 rule R6) and the
+//! routes by host and path, plus the public download host of the runner (spec 9.1) and the
 //! helpers the fakes share.
 
 use std::sync::Arc;
@@ -172,7 +172,7 @@ pub fn paginate(items: Vec<Value>, url: &Url, max_page_size: usize) -> (Vec<Valu
     (page_items, total)
 }
 
-/// A failure a fake answers once in place of a call (M7 hardening rule R4).
+/// A failure a fake answers once in place of a call (spec 6.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Failure {
     /// The call is refused with this status before it has any effect.

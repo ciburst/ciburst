@@ -1,5 +1,5 @@
-//! The user data `cloud-init` of a VM, the contract between provider and agent (rule 6 of M3,
-//! D38, M6 rule R6): `/etc/ciburst/vm.env`, the pinned `gitlab-runner` and the agent, both
+//! The user data `cloud-init` of a VM, the contract between provider and agent (spec 6.1,
+//! D38, spec 9.1): `/etc/ciburst/vm.env`, the pinned `gitlab-runner` and the agent, both
 //! downloaded from the cache bucket, and the agent's systemd unit. The template and rendering
 //! live in `ciburst_core::cloud_init`.
 
@@ -53,7 +53,7 @@ pub fn base_env(
 }
 
 /// Where the S3 cache lives, without its key: the part of `vm.env` that `shared_env` answers
-/// (M4 rule R11).
+/// (spec 9.1).
 pub fn cache_location(config: &Config, region: &str, project_id: &str) -> BTreeMap<String, String> {
     [
         ("CACHE_TYPE", "s3".to_string()),

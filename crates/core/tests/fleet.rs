@@ -1,4 +1,4 @@
-//! M6.3 rules R1, R7 and R9 in the setup: the fleet state `apply` writes, and what `status`,
+//! spec 8.1 and 8.6 in the setup: the fleet state `apply` writes, and what `status`,
 //! `check` and `destroy` make of the members.
 
 use std::collections::BTreeMap;
@@ -205,7 +205,7 @@ async fn status_lists_the_members_and_their_deliveries() {
         .map(|m| m.project_id)
         .collect::<Vec<_>>();
     assert_eq!(hook, [7, 8, 21], "the host first");
-    // M6.4 rule R8: the VM runner, then the lanes per member, the host's first.
+    // spec 13.1: the VM runner, then the lanes per member, the host's first.
     let pools: Vec<(Option<u64>, &str, u32)> = status
         .pools
         .iter()
@@ -246,7 +246,7 @@ async fn status_lists_the_members_and_their_deliveries() {
     );
 }
 
-/// M6.4 rule R8: each member is checked against its own lanes, never the host's.
+/// spec 13.2: each member is checked against its own lanes, never the host's.
 #[tokio::test]
 async fn check_lints_every_member() {
     let s = setup(&[7]);

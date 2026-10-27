@@ -1,4 +1,4 @@
-//! The burst ledger of spec D33 (M4 rules R3 and R13) in the cache bucket: one empty object per
+//! The burst ledger of D33 (spec 6.3) in the cache bucket: one empty object per
 //! intent, `ciburst/intents/<pool>/<unix s, 10 digits>-<job id, 20 digits>`, so the keys of a pool
 //! sort by time, then job id, and ListObjectsV2 with `start-after` reads a time window. Signed
 //! with the cache key, which the function holds anyway.
@@ -92,7 +92,7 @@ pub fn is_id(id: &str) -> bool {
 }
 
 /// The object key of an intent; the job id is an [`is_id`] number, or `warm:<pipeline id>` for a
-/// warm start (M6.1 rule R4), stored as `<at>-warm-<pipeline id, 20 digits>` so that it sorts
+/// warm start (spec 6.5), stored as `<at>-warm-<pipeline id, 20 digits>` so that it sorts
 /// after the jobs of the same second.
 pub fn intent_key(pool: &str, at: u64, job: &str) -> Result<String> {
     let prefix = pool_prefix(pool)?;

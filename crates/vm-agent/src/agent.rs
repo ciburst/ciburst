@@ -1,5 +1,5 @@
 //! The runner process, state reports and the drain protocol of spec section 6.1; the member
-//! runners of M6.3 rule R5 as entries of the runner's `config.toml`.
+//! runners of spec 8.5 as entries of the runner's `config.toml`.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -18,7 +18,7 @@ pub const POLL: Duration = Duration::from_secs(5);
 pub const RUNNER: &str = "gitlab-runner";
 pub const CONFIG_FILE: &str = "config.toml";
 const HEARTBEAT: Duration = Duration::from_secs(vm::HEARTBEAT_S);
-/// Shortest report interval an answer may ask for (M6.2 rule R7); the longest is [`HEARTBEAT`].
+/// Shortest report interval an answer may ask for (spec 6.2); the longest is [`HEARTBEAT`].
 const REPORT_MIN: Duration = Duration::from_secs(10);
 const DRAIN_GRACE: Duration = Duration::from_secs(vm::DRAIN_GRACE_S);
 const TERMINATE_FOR: Duration = Duration::from_secs(600);
@@ -347,7 +347,7 @@ impl Agent {
     }
 
     /// Writes `config.toml` when the wanted runners differ from the file's; the runner reloads
-    /// it within about a second (`docs/RUNBOOK.md`, M6.3 phase 0).
+    /// it within about a second (`docs/RUNBOOK.md`, Measured).
     fn write_config(&mut self) {
         let rendered = render(&self.config, &self.answer.runners);
         if self

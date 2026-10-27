@@ -26,10 +26,10 @@ pub const DEFAULT_SLOTS: u32 = 2;
 pub const DEFAULT_VM_TAG: &str = "vm";
 /// The image of a VM job that names none.
 pub const DEFAULT_VM_IMAGE: &str = "ubuntu:24.04";
-/// M6.2 rule R1: seconds a VM job waits for a paid slot before another VM is bought, about one
+/// spec 5.4: seconds a VM job waits for a paid slot before another VM is bought, about one
 /// VM boot.
 pub const DEFAULT_MAX_QUEUE_S: u32 = 90;
-/// M6.2 rule R1: the largest `maxQueueS`.
+/// spec 5.4: the largest `maxQueueS`.
 pub const MAX_QUEUE_S_LIMIT: u32 = 3600;
 /// The longest job definition name `<name>-<project id>-<tag>` (D60). Scaleway documents no
 /// limit; 63 keeps the name a DNS label, the limit of its other resource names.
@@ -233,7 +233,7 @@ impl Pool {
         self.warm_start != Some(false)
     }
 
-    /// D53, M6.2 rule R1: the seconds a VM job may wait for a paid slot.
+    /// D53, spec 5.4: the seconds a VM job may wait for a paid slot.
     pub fn max_queue_s(&self) -> u64 {
         u64::from(self.max_queue_s.unwrap_or(DEFAULT_MAX_QUEUE_S))
     }
@@ -387,7 +387,7 @@ impl ProjectConfig {
 
 impl Config {
     /// The config without the keys only routing reads, which a fleet's dispatcher takes from
-    /// the fleet config (M6.3 rule R1): a change of these alone needs no function deploy.
+    /// the fleet config (D58): a change of these alone needs no function deploy.
     pub fn deployment_view(&self) -> Config {
         let mut view = self.clone();
         view.ignore_jobs.clear();
@@ -402,7 +402,7 @@ impl Config {
         view
     }
 
-    /// The config `ciburst --ci` starts from (M5 rule R1): the VM runner on Scaleway
+    /// The config `ciburst --ci` starts from (spec 11.3): the VM runner on Scaleway
     /// Instances and no lanes.
     pub fn ci_defaults(project_id: u64, server_url: &str) -> Config {
         let region = |kind: &str| Section {
@@ -569,7 +569,7 @@ pub fn parse_config(json: &str) -> Result<Config> {
 }
 
 /// The config document `overlay` over `base` by top-level key: a key of `overlay` replaces
-/// the whole value of `base` (M5 rule R1). The result is validated.
+/// the whole value of `base` (spec 11.3). The result is validated.
 pub fn merge_config(base: &Config, overlay: &str) -> Result<Config> {
     let overlay = object_of(overlay)?;
     let mut merged = match serde_json::to_value(base)? {

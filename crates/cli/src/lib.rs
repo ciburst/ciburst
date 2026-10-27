@@ -34,12 +34,12 @@ use serde_json::Value;
 pub const PROVIDERS: &[&str] = &["fake", "scaleway", "scaleway-jobs"];
 pub const HOSTS: &[&str] = &["fake", SCALEWAY_HOST];
 
-/// File name of the VM agent binary, Linux musl (spec D38).
+/// File name of the VM agent binary, Linux musl (D38).
 pub const AGENT_FILE: &str = "ciburst-vm-agent";
 /// Variable that names the VM agent binary.
 pub const AGENT_VAR: &str = "CIBURST_AGENT";
 
-/// The inputs of pipeline mode (M5 rule R1, spec D39); nothing else is read from the job.
+/// The inputs of pipeline mode (D39, spec 11.3); nothing else is read from the job.
 pub mod ci_vars {
     pub const SCW_ACCESS_KEY: &str = "CIBURST_SCW_ACCESS_KEY";
     pub const SCW_SECRET_KEY: &str = "CIBURST_SCW_SECRET_KEY";
@@ -299,8 +299,8 @@ impl Modules {
         })
     }
 
-    /// The projects `check` looks at, each with its own lanes and `ignoreJobs` (M6.4 rule
-    /// R8): the config's, then the members that joined the fleet (M6.3 rule R7). Without the
+    /// The projects `check` looks at, each with its own lanes and `ignoreJobs` (spec 8.6,
+    /// 13.2): the config's, then the members that joined the fleet (spec 8.6). Without the
     /// provider's credentials only the config's.
     async fn fleet_projects(&mut self) -> Result<Vec<(u64, ProjectConfig)>> {
         let mut projects = provision::config_projects(&self.config);
@@ -804,7 +804,7 @@ fn write_check(out: &mut dyn Write, report: &[ProjectReport]) -> Result<i32> {
 
 /// `check --suggest` (D46): per image a lane for the project's `ciburst.json` and the tags of
 /// its jobs,
-/// then the `ignoreJobs` key for the jobs of other runners (M6.1 rule R8). Exits 0 unless a
+/// then the `ignoreJobs` key for the jobs of other runners (spec 13.2). Exits 0 unless a
 /// pipeline is invalid.
 fn write_suggestions(out: &mut dyn Write, report: &[ProjectReport]) -> Result<i32> {
     let mut failed = false;
@@ -844,7 +844,7 @@ fn write_suggestions(out: &mut dyn Write, report: &[ProjectReport]) -> Result<i3
     Ok(if failed { 1 } else { 0 })
 }
 
-/// `ciburst --ci join` and `ciburst --ci leave` (M6.3 rule R4) in a member's pipeline: the
+/// `ciburst --ci join` and `ciburst --ci leave` (spec 8.4) in a member's pipeline: the
 /// code in `CIBURST_JOIN` and the member's own `CIBURST_GITLAB_TOKEN`, no config.
 async fn member(cli: &Cli, env: Env, out: &mut dyn Write) -> Result<i32> {
     if !cli.ci {
@@ -862,7 +862,7 @@ async fn member(cli: &Cli, env: Env, out: &mut dyn Write) -> Result<i32> {
     };
     let code = input(fleet::JOIN_VAR)?;
     let token = input(ci_vars::GITLAB_TOKEN)?;
-    // M6.4 rule R5: the member's own lanes and ignoreJobs; without the file it has none.
+    // spec 8.3: the member's own lanes and ignoreJobs; without the file it has none.
     let project_file = match &cli.config {
         Some(path) => Some(read_config_file(path).await?),
         None => {
@@ -909,7 +909,7 @@ async fn member(cli: &Cli, env: Env, out: &mut dyn Write) -> Result<i32> {
     }
 }
 
-/// M6.1 rule R8: the `ignoreJobs` key of `ciburst.json` for jobs of other runners.
+/// spec 13.2: the `ignoreJobs` key of `ciburst.json` for jobs of other runners.
 fn ignore_entry(names: &[String]) -> String {
     let names: Vec<String> = names
         .iter()

@@ -23,7 +23,7 @@
 //! (at most 1000, as on S3), so every caller meets pagination. The answer has the element order
 //! and names of the AWS documentation; continuation tokens are opaque.
 //!
-//! [`FakeS3::fail_next`] fails the next call of a method on a path once (M7 hardening rule R4),
+//! [`FakeS3::fail_next`] fails the next call of a method on a path once (spec 6.6),
 //! with the error codes of the AWS documentation: `SlowDown` for 503, `InternalError` for any
 //! other status.
 

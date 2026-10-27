@@ -1,5 +1,5 @@
-//! The user data `cloud-init` of a VM, shared by every VM provider (spec section 6.1, D38, M6
-//! rule R6): a swap file, `/etc/ciburst/vm.env`, the pinned `gitlab-runner` and the agent, both
+//! The user data `cloud-init` of a VM, shared by every VM provider (spec section 6.1, D38, spec
+//! 9.1): a swap file, `/etc/ciburst/vm.env`, the pinned `gitlab-runner` and the agent, both
 //! downloaded from the cache bucket and checked against their SHA-256, and the agent's systemd
 //! unit. The template is `cloud-init.yaml` next to this file.
 
@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use crate::provision::keys;
 use crate::{Error, Result, lane};
 
-/// The upstream download of the pinned runner. `apply` copies it into the cache bucket (M6
-/// rule R6); VMs and lane runs download the copy, never this URL.
+/// The upstream download of the pinned runner. `apply` copies it into the cache bucket (spec
+/// 9.1); VMs and lane runs download the copy, never this URL.
 pub const RUNNER_URL: &str =
     "https://gitlab-runner-downloads.s3.amazonaws.com/v18.11.4/binaries/gitlab-runner-linux-amd64";
 /// From `v18.11.4/release.sha256`, matched against the downloaded binary on 2026-10-24.
@@ -24,7 +24,7 @@ pub const DISPATCH_URL: &str = "CIBURST_DISPATCH_URL";
 pub const AGENT_URL_KEY: &str = "CIBURST_AGENT_URL";
 /// `shared_env` key with the agent's SHA-256, which cloud-init checks.
 pub const AGENT_SHA256_KEY: &str = keys::AGENT_SHA256;
-/// `shared_env` key with the HTTPS URL of the runner object in the cache bucket (M6 rule R6).
+/// `shared_env` key with the HTTPS URL of the runner object in the cache bucket (spec 9.1).
 pub const RUNNER_URL_KEY: &str = lane::RUNNER_URL_KEY;
 /// The name a runner SHA-256 goes by in errors, as in a lane run's environment.
 pub const RUNNER_SHA256_KEY: &str = lane::RUNNER_SHA256_KEY;

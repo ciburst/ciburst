@@ -27,7 +27,7 @@ pub trait Uptime: Send + Sync {
     fn seconds(&self) -> io::Result<u64>;
 }
 
-/// The VM's one `gitlab-runner run` process (M6.3 rule R5).
+/// The VM's one `gitlab-runner run` process (spec 8.5).
 pub trait Process: Send {
     /// Starts the process and returns its id.
     fn spawn(&mut self, command: &ProcessCommand) -> io::Result<u32>;

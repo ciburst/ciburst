@@ -1,9 +1,9 @@
-//! The function against the fake Scaleway: the burst ledger (M4 rule R13) and the warm start
-//! records beside it (M6.1 rule R5), built from the cache key, project and region, absent
+//! The function against the fake Scaleway: the burst ledger (spec 6.3) and the warm start
+//! records beside it (spec 6.5), built from the cache key, project and region, absent
 //! without them, the ledger written by `respond` for a pending job of a VM pool that finds no
 //! free slot; the agent of `CIBURST_AGENT_SHA256` (D38) and the pinned runner of the cache bucket
-//! (M6 rule R6) in the user data of the VMs it starts; and the Scaleway calls of such a start
-//! with and without the variables of M7 hardening rule R3.
+//! (spec 9.1) in the user data of the VMs it starts; and the Scaleway calls of such a start
+//! with and without the variables of spec 6.6.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -30,7 +30,7 @@ const NOW: u64 = 1_800_000_000;
 const HOST: &str = "demo-dispatch.functions.fnc.fr-par.scw.cloud";
 const INTENT: &str = "ciburst/intents/vm/1800000000-00000000000000000042";
 
-/// The VM runner on `runtime`; every config has an S3 cache (M6 rule R1).
+/// The VM runner on `runtime`; every config has an S3 cache (spec 5.4).
 fn config(runtime: &str) -> String {
     format!(
         r#"{{
@@ -194,7 +194,7 @@ async fn no_ledger_without_both_cache_keys_or_an_s3_cache() {
         assert!(backends.ledger.is_none() && backends.records.is_none());
         assert!(backends.schedule.is_none());
     }
-    // A config always has an S3 cache (M6 rule R1); the function still builds no
+    // A config always has an S3 cache (spec 5.4); the function still builds no
     // ledger from cache keys when the cache is not S3.
     let mut no_cache = env(&vars);
     assert!(no_cache.secrets.cache.is_some());
@@ -206,7 +206,7 @@ async fn no_ledger_without_both_cache_keys_or_an_s3_cache() {
     assert!(no_cache.schedule_on(backend.clone()).is_none());
 }
 
-/// The queue-first schedule (M6.2 rules R2 to R4) beside the intents, under the cache key IAM
+/// The queue-first schedule (spec 6.4) beside the intents, under the cache key IAM
 /// scoped to the deployment's project.
 #[tokio::test]
 async fn the_schedule_lives_beside_the_ledger_under_the_cache_key() {
@@ -254,7 +254,7 @@ async fn the_schedule_lives_beside_the_ledger_under_the_cache_key() {
     );
 }
 
-/// The warm start records (M6.1 rule R5) beside the intents, under the cache key IAM scoped to
+/// The warm start records (spec 6.5) beside the intents, under the cache key IAM scoped to
 /// the deployment's project.
 #[tokio::test]
 async fn the_records_live_beside_the_ledger_under_the_cache_key() {
@@ -317,7 +317,7 @@ fn record_keys(backend: &ScalewayFake, vars: &BTreeMap<String, String>) -> Vec<S
         .collect()
 }
 
-/// M6.1 rules R3 to R5 through the function: the warm step writes the record, a VM job's
+/// spec 6.5 through the function: the warm step writes the record, a VM job's
 /// pending event its marker, the final status deletes both.
 #[tokio::test]
 async fn pipeline_events_keep_their_records_in_the_cache_bucket() {
@@ -462,12 +462,12 @@ async fn vm_start_calls(backend: &Arc<ScalewayFake>, env: &Env) -> (Vec<String>,
     )
 }
 
-/// M7 hardening rule R3, measured on the fake: a pending job that starts a VM makes nine
+/// spec 6.6, measured on the fake: a pending job that starts a VM makes nine
 /// Scaleway calls through a function without `CIBURST_VM_SECURITY_GROUP` and
 /// `CIBURST_VM_IMAGES`: the capacity read, both lookups, create, user data and power on, the
 /// burst intent's write and read, and the read of its pipeline's closed record (D56). The
 /// second start makes no lookup; it finds the first VM alive, so it also reads the queue and
-/// the running jobs of the VM runner before it starts (M6.2 rule R2), nine calls again.
+/// the running jobs of the VM runner before it starts (spec 6.4), nine calls again.
 #[tokio::test]
 async fn the_function_starts_a_vm_without_lookups_on_the_resolved_variables() {
     let (backend, mut vars) = deployed("instances").await;

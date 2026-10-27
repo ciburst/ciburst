@@ -1,5 +1,5 @@
 //! The VM's settings in `/etc/ciburst/vm.env`, written by the provider's cloud-init
-//! (milestone M3, rule 6). Errors name keys, never values.
+//! (spec 6.1). Errors name keys, never values.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -43,7 +43,7 @@ pub struct Config {
     pub default_image: String,
     pub timeout_s: u64,
     pub cache: Option<S3Cache>,
-    /// Holds the runner's `config.toml` (M6.3 rule R5).
+    /// Holds the runner's `config.toml` (spec 8.5).
     pub state_dir: String,
 }
 

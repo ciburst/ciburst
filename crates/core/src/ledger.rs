@@ -1,4 +1,4 @@
-//! Burst intents (spec D33, M4 rules R3 and R13): one record per pending job that found no free
+//! Burst intents (D33, spec 6.3): one record per pending job that found no free
 //! slot, read back by every dispatcher call of the same burst. Records are append-only; the
 //! order is time, then job id.
 
@@ -72,10 +72,10 @@ impl Ledger for MemoryLedger {
     }
 }
 
-/// The VM jobs of one pipeline by VM pool tag, as the warm step recorded them (M6.1 rule R5).
+/// The VM jobs of one pipeline by VM pool tag, as the warm step recorded them (spec 6.5).
 pub type VmJobs = BTreeMap<String, Vec<String>>;
 
-/// A pipeline with a record and its VM jobs that have not gone pending yet (M6.2 rule R7).
+/// A pipeline with a record and its VM jobs that have not gone pending yet (spec 6.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenPipeline {
     pub pipeline: String,
@@ -97,7 +97,7 @@ pub struct Closed {
     pub manual: Vec<String>,
 }
 
-/// Warm start records of a pipeline (M6.1 rules R4 to R6): the pipeline's VM jobs per pool and
+/// Warm start records of a pipeline (spec 6.5): the pipeline's VM jobs per pool and
 /// a marker per VM job that went pending. Lives beside the intents, under
 /// `ciburst/intents/_pipelines/<pipeline>/` in the cache bucket.
 #[async_trait]
@@ -113,7 +113,7 @@ pub trait PipelineRecords: Send + Sync {
     /// Removes every record of `pipeline`; no error when there is none.
     async fn close(&self, pipeline: &str) -> Result<()>;
     /// Every pipeline with a record, in any order, with its VM jobs that have no seen marker
-    /// (M6.2 rule R7). A store without it fails, and the dispatcher then allows no spill.
+    /// (spec 6.5). A store without it fails; the dispatcher does not call it.
     async fn open_pipelines(&self) -> Result<Vec<OpenPipeline>> {
         Err(crate::Error::other(
             "the records cannot list open pipelines",
@@ -242,7 +242,7 @@ pub fn unseen_of(jobs: &VmJobs, seen: &[String]) -> VmJobs {
         .collect()
 }
 
-/// A VM job waiting for a paid slot (M6.2 rule R2).
+/// A VM job waiting for a paid slot (spec 6.4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Queued {
     pub job: String,
@@ -252,7 +252,7 @@ pub struct Queued {
     pub at: u64,
 }
 
-/// A VM job running on a VM of the pool (M6.2 rule R3).
+/// A VM job running on a VM of the pool (spec 6.4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Running {
     pub job: String,
@@ -262,7 +262,7 @@ pub struct Running {
 }
 
 /// The typical duration after one more finished run: the first run sets it, later runs weigh
-/// 3 to 7 against it (M6.2 rule R3). Every [`Schedule`] folds durations with this function.
+/// 3 to 7 against it (spec 6.4). Every [`Schedule`] folds durations with this function.
 pub fn fold_duration(typical: Option<u64>, duration_s: u64) -> u64 {
     match typical {
         None => duration_s,
@@ -270,7 +270,7 @@ pub fn fold_duration(typical: Option<u64>, duration_s: u64) -> u64 {
     }
 }
 
-/// Queue-first scheduling state of the VM pools (M6.2 rules R2 and R3): the VM jobs waiting for
+/// Queue-first scheduling state of the VM pools (spec 6.4): the VM jobs waiting for
 /// a slot, the VM jobs running, and per job name its typical duration. Lives beside the
 /// intents, under `ciburst/intents/_queue/`, `_running/` and `_stats/` in the cache bucket.
 #[async_trait]
@@ -296,7 +296,7 @@ pub trait Schedule: Send + Sync {
     async fn typical(&self, pool: &str, name: &str) -> Result<Option<u64>>;
     /// Takes the pool's start marker at `now` unless one taken less than [`START_MARKER_S`]
     /// earlier exists; `true` when taken. Keeps two evaluations at once from starting VMs twice
-    /// (M6.2 rule R4).
+    /// (spec 6.4).
     async fn take_start(&self, pool: &str, now: u64) -> Result<bool>;
 }
 

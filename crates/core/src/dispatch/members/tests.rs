@@ -478,7 +478,7 @@ async fn a_member_joins_with_its_lanes_and_leaves() {
         "the member's ignoreJobs are its own"
     );
 
-    // M6.4 rule R5: a rejoin updates a changed lane and deletes a removed one.
+    // spec 8.3: a rejoin updates a changed lane and deletes a removed one.
     let changed = join_body(
         "glrt-8b",
         &[
@@ -581,7 +581,7 @@ async fn lanes_route_only_the_jobs_of_their_own_project() {
     );
 }
 
-/// M6.4 rule R5: a step of `/join` that does not finish within the budget answers 504 naming
+/// spec 8.3: a step of `/join` that does not finish within the budget answers 504 naming
 /// it, and stores nothing.
 #[tokio::test(start_paused = true)]
 async fn a_join_that_cannot_finish_in_time_names_the_step() {

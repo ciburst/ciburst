@@ -1,5 +1,5 @@
-//! `ScalewayLedger` against the S3 fake (M4 rule R13): its failures that may be retried (M7
-//! hardening rule R4), and the fake's object writes and ListObjectsV2 against what S3 answers.
+//! `ScalewayLedger` against the S3 fake (spec 6.3): its failures that may be retried (spec
+//! 6.6), and the fake's object writes and ListObjectsV2 against what S3 answers.
 
 use std::sync::Arc;
 
@@ -63,7 +63,7 @@ fn listings(fake: &FakeS3) -> Vec<String> {
         .collect()
 }
 
-/// M7 hardening rule R4 for the cache bucket: 429 and 503 may pass on a repeat for every call,
+/// spec 6.6 for the cache bucket: 429 and 503 may pass on a repeat for every call,
 /// another 5xx and a transport timeout only for reads.
 #[tokio::test]
 async fn failures_are_retryable_where_a_repeat_may_pass() {

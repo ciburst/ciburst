@@ -1,6 +1,6 @@
-//! `ScalewaySchedule` against the S3 fake (M6.2 rules R2 to R4): the key layout and the calls
+//! `ScalewaySchedule` against the S3 fake (spec 6.4): the key layout and the calls
 //! of each method, the same answers as `MemorySchedule`, forged entries skipped, listings across
-//! pages, the failures that may be retried (M7 hardening rule R4), and the ledger and the warm
+//! pages, the failures that may be retried (spec 6.6), and the ledger and the warm
 //! start records reading past the schedule.
 
 use std::sync::Arc;
@@ -592,7 +592,7 @@ async fn bad_input_sends_nothing_and_bucket_errors_name_the_cause() {
     assert!(fake.objects(BUCKET).is_empty());
 }
 
-/// M7 hardening rule R4 for the schedule: 429 and 503 may pass on a repeat for every call,
+/// spec 6.6 for the schedule: 429 and 503 may pass on a repeat for every call,
 /// another 5xx and a transport timeout only for reads.
 #[tokio::test]
 async fn failures_are_retryable_where_a_repeat_may_pass() {

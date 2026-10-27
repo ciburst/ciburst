@@ -1,5 +1,5 @@
 //! Serverless Jobs `serverless-jobs/v1alpha1`: one job definition per lane of a project, runs,
-//! start and stop. A definition `<name>-<project id>-<tag>` is a lane (D45, D60, M6 rule R5):
+//! start and stop. A definition `<name>-<project id>-<tag>` is a lane (D45, D60, spec 7.1):
 //! the lane's image runs `lane-bootstrap.sh`, which its environment carries, and fetches the
 //! runner from the cache bucket.
 
@@ -44,7 +44,7 @@ pub fn bucket_name(config: &Config, project_id: &str) -> String {
 }
 
 /// The definition's environment: the lane's key and project (D60), GitLab, wait timeout, the
-/// bootstrap with the runner it downloads and checks (M6 rule R5), and the cache location with
+/// bootstrap with the runner it downloads and checks (spec 7.1), and the cache location with
 /// an S3 cache.
 pub fn definition_env(
     config: &Config,
@@ -350,7 +350,7 @@ impl Scaleway {
     }
 
     /// Whether `tag` is the key of a lane of another project than the host's, whose definition
-    /// follows that member's `/join` (M6.4 rule R5).
+    /// follows that member's `/join` (spec 8.3).
     pub(super) fn is_member_lane(&self, tag: &str) -> bool {
         parse_lane_key(tag).is_some_and(|(project, _)| project != self.config.host_project())
     }
@@ -390,7 +390,7 @@ impl Scaleway {
         Ok(runs)
     }
 
-    /// D60, M6.4 rule R5: the definitions of project `project`'s lanes become `lanes`, created
+    /// D60, spec 8.3: the definitions of project `project`'s lanes become `lanes`, created
     /// or updated, and the project's other definitions go. Answers each definition's id by lane
     /// tag. Runs with the dispatch key, whose policy holds `ServerlessJobsFullAccess`.
     pub(super) async fn sync_lane_definitions(

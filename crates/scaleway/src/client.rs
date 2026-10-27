@@ -178,7 +178,7 @@ impl ScalewayClient {
     }
 }
 
-/// M7 hardening rule R4: a 429 or a 503 may pass when the call is repeated, and for an
+/// spec 6.6: a 429 or a 503 may pass when the call is repeated, and for an
 /// idempotent call every other 5xx too.
 pub fn retryable_status(status: u16, idempotent: bool) -> bool {
     status == 429 || status == 503 || (idempotent && (500..600).contains(&status))

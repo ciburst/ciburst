@@ -1,4 +1,4 @@
-//! Pipeline mode, `ciburst --ci` (M5 rules R1 and R2).
+//! Pipeline mode, `ciburst --ci` (spec 11.3).
 
 use std::collections::BTreeMap;
 use std::path::Path;

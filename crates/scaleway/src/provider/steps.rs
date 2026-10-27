@@ -210,7 +210,7 @@ impl Scaleway {
             let Some(tag) = self.definition_tag(definition) else {
                 continue;
             };
-            // A member's lanes follow its `/join` (M6.4 rule R5), not this config.
+            // A member's lanes follow its `/join` (spec 8.3), not this config.
             let kept = self.is_member_lane(tag)
                 || runtimes
                     .iter()

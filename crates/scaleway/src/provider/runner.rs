@@ -1,4 +1,4 @@
-//! gitlab-runner in the cache bucket (D45, M6 rule R6), step `runner-binary`: the pinned runner
+//! gitlab-runner in the cache bucket (D45, spec 9.1), step `runner-binary`: the pinned runner
 //! as the public object `ciburst/runner/<sha256>`, which lane runs and the VMs of every
 //! provider download and check against its SHA-256. `apply` copies it from the upstream
 //! download `cloud_init::RUNNER_URL` and refuses any other hash. Every pool's runs fetch it, so

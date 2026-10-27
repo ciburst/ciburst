@@ -31,16 +31,16 @@ mod members;
 pub use members::{FLEET_CACHE, FleetCache, JOIN_BUDGET, PATH_FLEET, PATH_JOIN, PATH_LEAVE};
 use members::{Routed, RunnerOf};
 
-/// M7 rule R4: the pause before the one retry of a start that failed with a retryable error.
+/// spec 6.6: the pause before the one retry of a start that failed with a retryable error.
 pub const START_RETRY_PAUSE: Duration = Duration::from_millis(300);
-/// M7 rule R4: a retry begins only this long after the request arrived, at the latest.
+/// spec 6.6: a retry begins only this long after the request arrived, at the latest.
 pub const START_RETRY_WITHIN: Duration = Duration::from_secs(5);
 
-/// M6.1 rule R4: the burst ledger records a pipeline's warm VM as this prefix and the pipeline
+/// spec 6.5: the burst ledger records a pipeline's warm VM as this prefix and the pipeline
 /// id, where a job records its job id.
 pub const WARM_PREFIX: &str = "warm:";
 
-/// M6.1 rule R4: statuses of the builds a pipeline event counts, jobs yet to run.
+/// spec 6.5: statuses of the builds a pipeline event counts, jobs yet to run.
 const WAITING_STATUSES: [&str; 5] = [
     "created",
     "pending",
@@ -49,7 +49,7 @@ const WAITING_STATUSES: [&str; 5] = [
     "scheduled",
 ];
 
-/// M6.1 rule R3: the statuses that end a pipeline and its records.
+/// spec 6.5: the statuses that end a pipeline and its records.
 const FINAL_STATUSES: [&str; 4] = ["success", "failed", "canceled", "skipped"];
 
 /// D56: the ids of a pipeline event's builds with status `manual`.
@@ -65,10 +65,10 @@ fn manual_jobs(event: &Value) -> Vec<String> {
         .collect()
 }
 
-/// M6.2 rule R3: the job statuses the schedule tracks, `running` and the final ones.
+/// spec 6.4: the job statuses the schedule tracks, `running` and the final ones.
 const TRACKED_STATUSES: [&str; 5] = ["running", "success", "failed", "canceled", "skipped"];
 
-/// M6.2 rule R4: VMs started for the queue carry the label `job` with this prefix and the id of
+/// spec 6.4: VMs started for the queue carry the label `job` with this prefix and the id of
 /// the oldest job that needs one.
 pub const QUEUE_PREFIX: &str = "queue:";
 
@@ -76,7 +76,7 @@ pub const QUEUE_PREFIX: &str = "queue:";
 /// ([`vm::SWEEP_MAX_AGE_S`]).
 pub const RUNNING_MAX_AGE_S: u64 = vm::SWEEP_MAX_AGE_S;
 
-/// When a request arrived, on tokio's clock, which tests pause and advance (M7 rule R1).
+/// When a request arrived, on tokio's clock, which tests pause and advance (spec 5.2).
 #[derive(Debug, Clone, Copy)]
 struct Arrival(Instant);
 
@@ -150,15 +150,15 @@ pub struct Dispatcher {
     secrets: Arc<Secrets>,
     log: Log,
     dispatch_url: Option<String>,
-    /// Burst intents (M4 rule R3); `None` keeps the M3 rule.
+    /// Burst intents (spec 6.3); `None` starts one VM per job (spec 6.3).
     ledger: Option<Arc<dyn Ledger>>,
-    /// Warm start records (M6.1 rule R5); `None` starts no warm VM.
+    /// Warm start records (spec 6.5); `None` starts no warm VM.
     records: Option<Arc<dyn PipelineRecords>>,
-    /// Queue-first scheduling (M6.2); `None` queues nothing (rule R9).
+    /// Queue-first scheduling (D53, spec 6.4); `None` queues nothing.
     schedule: Option<Arc<dyn Schedule>>,
     /// Pause between recording an intent and reading the burst.
     group_wait: Duration,
-    /// Fleet state (M6.3 rule R1); `None` serves the projects of the config.
+    /// Fleet state (D58); `None` serves the projects of the config.
     fleet: Option<Arc<dyn FleetStore>>,
     fleet_cache: Arc<FleetCache>,
 }
@@ -185,21 +185,21 @@ impl Dispatcher {
         }
     }
 
-    /// The burst ledger (M4 rule R7).
+    /// The burst ledger (spec 6.3).
     pub fn with_ledger(mut self, ledger: Option<Arc<dyn Ledger>>) -> Dispatcher {
         self.ledger = ledger;
         self
     }
 
-    /// The warm start records (M6.1 rule R5). Without them a pipeline event answers every VM
+    /// The warm start records (spec 6.5). Without them a pipeline event answers every VM
     /// pool `disabled`.
     pub fn with_records(mut self, records: Option<Arc<dyn PipelineRecords>>) -> Dispatcher {
         self.records = records;
         self
     }
 
-    /// The queue-first schedule (M6.2). Without it VM jobs never queue and job events other
-    /// than `pending` are ignored (rule R9).
+    /// The queue-first schedule (spec 6.4). Without it VM jobs never queue and job events other
+    /// than `pending` are ignored.
     pub fn with_schedule(mut self, schedule: Option<Arc<dyn Schedule>>) -> Dispatcher {
         self.schedule = schedule;
         self
@@ -214,7 +214,7 @@ impl Dispatcher {
     /// Entry of every request. `POST /vm` and `POST /terminate` come from VMs with their
     /// capability token, a body with `ciburst_sweep` from the cron trigger, everything else is a
     /// GitLab webhook. `now` is unix seconds. Every answer with a body carries `ms`, the whole
-    /// milliseconds since the request arrived (M7 rule R1).
+    /// milliseconds since the request arrived (spec 5.2).
     pub async fn handle_request(
         &self,
         method: &str,
@@ -278,7 +278,7 @@ impl Dispatcher {
         stamp(self.webhook(headers, body, now, at).await, at)
     }
 
-    /// Log lines of a request end with `ms` (M7 rule R1).
+    /// Log lines of a request end with `ms` (spec 5.2).
     fn info(&self, at: Arrival, message: &str, fields: &[(&str, &str)]) {
         let ms = at.ms().to_string();
         self.log.info(message, &with_ms(fields, &ms));
@@ -369,7 +369,7 @@ impl Dispatcher {
             Routed::Lane(pool) => pool,
             Routed::Vm => {
                 let pool = config.vm_pool();
-                // M6.3 rule R5: only the project's own VM runner takes the job.
+                // spec 8.5: only the project's own VM runner takes the job.
                 if self.runner_of(project_id, &pool.tag) == RunnerOf::Missing {
                     return ignored("no_runner", json!({ "pool": pool.tag }));
                 }
@@ -457,9 +457,9 @@ impl Dispatcher {
         }
     }
 
-    /// Spec 6.1, scheduling, M4 rules R1 to R6: a free slot of a claim candidate is claimed;
+    /// Spec 6.1, scheduling, spec 6.3: a free slot of a claim candidate is claimed;
     /// otherwise, with a schedule and a live VM, the job queues unless the start rule gives it a
-    /// VM (M6.2 rule R2); else it joins the burst ledger, or without one a VM starts unless
+    /// VM (spec 6.4); else it joins the burst ledger, or without one a VM starts unless
     /// `maxRuns` VMs are live (not draining), where it queues with a schedule. Providers without
     /// VMs answer `None` from `capacity` and count live runs.
     async fn schedule(
@@ -526,7 +526,7 @@ impl Dispatcher {
             .burst_path(pool, &vms, labels, &job, now, callback, at)
             .await?;
         match (decision, schedule) {
-            // M6.2 rule R2: at `maxRuns` live VMs a VM job queues instead.
+            // spec 6.4: at `maxRuns` live VMs a VM job queues instead.
             (Decision::AtCapacity(live), Some(schedule)) => {
                 match schedule.enqueue(&pool.tag, &entry).await {
                     Ok(()) => Ok(Decision::Queued { wait_s }),
@@ -540,11 +540,11 @@ impl Dispatcher {
         }
     }
 
-    /// M6.2 rules R2 and R4 for a pending VM job without a free slot: with no live VM it takes
+    /// spec 6.4 for a pending VM job without a free slot: with no live VM it takes
     /// the burst path; else the start rule runs with the job as the newest queued one. A job the
-    /// rule gives a VM takes the burst path when no VM has a ready slot (rule R4 step 3); every
-    /// other job queues, and the VMs the rule starts for the queue start (rule R5). A schedule
-    /// error takes the burst path (rule R9).
+    /// rule gives a VM takes the burst path when no VM has a ready slot (start rule step 3); every
+    /// other job queues, and the VMs the rule starts for the queue start. A schedule
+    /// error takes the burst path.
     #[allow(clippy::too_many_arguments)]
     async fn queue_first(
         &self,
@@ -599,7 +599,7 @@ impl Dispatcher {
         QueueFirst::Queued { wait_s }
     }
 
-    /// M4 rules R3 to R6: the job joins the burst ledger and a leader starts a VM for its group;
+    /// spec 6.3: the job joins the burst ledger and a leader starts a VM for its group;
     /// without a ledger, or when it fails, a VM starts unless `maxRuns` VMs are live.
     #[allow(clippy::too_many_arguments)]
     async fn burst_path(
@@ -628,7 +628,7 @@ impl Dispatcher {
                     }
                     return self.start(pool, labels, true, callback, taken, at).await;
                 }
-                // Only a warm intent is covered; a job with such an id keeps the M3 rule.
+                // Only a warm intent is covered; a job with such an id takes the fallback of spec 6.3.
                 Ok(Burst::Covered) => {}
                 Err(error) => {
                     let message = error.to_string();
@@ -647,7 +647,7 @@ impl Dispatcher {
         self.start(pool, labels, true, callback, 1, at).await
     }
 
-    /// M6.2 rule R4 over the queue `queued` of VM pool `pool`, reading the running jobs and
+    /// spec 6.4 over the queue `queued` of VM pool `pool`, reading the running jobs and
     /// their typical durations; an empty queue reads nothing more. A running job that started
     /// more than [`RUNNING_MAX_AGE_S`] ago is a lost finished event and is removed.
     async fn evaluate(
@@ -702,7 +702,7 @@ impl Dispatcher {
         }))
     }
 
-    /// M6.2 rule R4 step 6: starts the VMs `plan` gives the queue, each with every slot free and
+    /// spec 6.4, start rule step 6: starts the VMs `plan` gives the queue, each with every slot free and
     /// the labels `job=queue:<oldest job that needs one>` and its `pipeline`, once the pool's
     /// start marker is taken. A start begins only within [`START_RETRY_WITHIN`] of the arrival,
     /// so the answer stays inside GitLab's 10 s; the next evaluation starts the rest.
@@ -783,7 +783,7 @@ impl Dispatcher {
     }
 
     /// The queue of `pool` without entries older than [`QUEUED_MAX_AGE_S`], which it removes
-    /// (M6.2 rule R5).
+    /// (spec 6.4).
     async fn live_queue(
         &self,
         schedule: &dyn Schedule,
@@ -805,9 +805,9 @@ impl Dispatcher {
         Ok(fresh)
     }
 
-    /// M6.2 rule R3: a `running` job event of a VM job or lane job records it as running, a
+    /// spec 6.4: a `running` job event of a VM job or lane job records it as running, a
     /// final one as finished, with its duration for `success` and `failed`. A schedule error
-    /// (rule R9) answers as without a schedule.
+    /// answers as without a schedule.
     #[allow(clippy::too_many_arguments)]
     async fn track(
         &self,
@@ -861,7 +861,7 @@ impl Dispatcher {
         )
     }
 
-    /// M6.2 rule R5: the start rule over the queue of `pool` and its VM starts.
+    /// spec 6.4: the start rule over the queue of `pool` and its VM starts.
     #[allow(clippy::too_many_arguments)]
     async fn reevaluate(
         &self,
@@ -896,7 +896,7 @@ impl Dispatcher {
         }
     }
 
-    /// M6.2 rule R9: a schedule error never fails an answer; the caller goes on as without one.
+    /// spec 6.4: a schedule error never fails an answer; the caller goes on as without one.
     fn schedule_failed(&self, at: Arrival, op: &str, pool: &str, error: &Error) {
         let message = error.to_string();
         self.warn(
@@ -915,7 +915,7 @@ impl Dispatcher {
         );
     }
 
-    /// M6.1 rule R5: a failed record call never fails an answer; the caller goes on as without
+    /// spec 6.5: a failed record call never fails an answer; the caller goes on as without
     /// records.
     fn records_failed(&self, at: Arrival, op: &str, pipeline: &str, error: &Error) {
         let message = error.to_string();
@@ -926,7 +926,7 @@ impl Dispatcher {
         );
     }
 
-    /// M6.1 rules R3 and R4: a pending or running pipeline gets the warm step, a final status
+    /// spec 6.5: a pending or running pipeline gets the warm step, a final status
     /// deletes the pipeline's records.
     /// D56: a pending event of a job that existed before its pipeline's final event and was not
     /// manual then. GitLab delivered it late, the job has run, and starting a VM or a lane run
@@ -1026,7 +1026,7 @@ impl Dispatcher {
         }
     }
 
-    /// M6.1 rule R4: the jobs of a pipeline event of `member` that will go pending, under the
+    /// spec 6.5: the jobs of a pipeline event of `member` that will go pending, under the
     /// VM runner's tag: waiting, neither manual nor `on_failure`, not own, and routed to the VM
     /// runner by the project's own lanes and `ignoreJobs` (D60, D61).
     fn vm_jobs_of(&self, member: &Member, event: &Value) -> VmJobs {
@@ -1052,7 +1052,7 @@ impl Dispatcher {
         jobs
     }
 
-    /// M6.1 rule R4 for the VM runner when the pipeline has VM jobs: `disabled` without
+    /// spec 6.5 for the VM runner when the pipeline has VM jobs: `disabled` without
     /// records or with `warmStart` false; `capacity` with a claim candidate, or with an intent
     /// ranked before the warm intent after the ledger's wait; `at_capacity` at `maxRuns` live
     /// VMs; else `started`, a VM with every slot free that leads its burst group. A failed
@@ -1150,8 +1150,8 @@ impl Dispatcher {
     }
 
     /// Whether an intent of the window ranks before the warm intent `warm` just recorded, so
-    /// that the VMs of the window take the pipeline's jobs (M6.1 rule R4). A failed read counts
-    /// as none, as a failed ledger falls back to starting (M4 rule R4).
+    /// that the VMs of the window take the pipeline's jobs (spec 6.5). A failed read counts
+    /// as none, as a failed ledger falls back to starting (spec 6.3).
     async fn warm_covered(&self, pool: &Pool, warm: &str, now: u64, at: Arrival) -> bool {
         let Some(ledger) = &self.ledger else {
             return false;
@@ -1197,7 +1197,7 @@ impl Dispatcher {
         reply(500, "error", json!({}))
     }
 
-    /// M4 rule R3: records the intent, waits for the rest of the burst and ranks the intents of
+    /// spec 6.3: records the intent, waits for the rest of the burst and ranks the intents of
     /// the window. An error means the ledger failed (R4).
     async fn burst(&self, ledger: &dyn Ledger, pool: &Pool, job: &str, now: u64) -> Result<Burst> {
         ledger.record(&pool.tag, now, job).await?;
@@ -1211,9 +1211,9 @@ impl Dispatcher {
             .ok_or_else(|| Error::other("the ledger lacks the intent just recorded"))
     }
 
-    /// Starts a run; `taken` slots of a new VM are already assigned (M4 rule R6). A retryable
+    /// Starts a run; `taken` slots of a new VM are already assigned (spec 6.3). A retryable
     /// failure is retried once after [`START_RETRY_PAUSE`] when the retry begins within
-    /// [`START_RETRY_WITHIN`] of the request's arrival (M7 rule R4).
+    /// [`START_RETRY_WITHIN`] of the request's arrival (spec 6.6).
     async fn start(
         &self,
         pool: &Pool,
@@ -1349,9 +1349,9 @@ impl Dispatcher {
         }
     }
 
-    /// M6.2 rules R5 and R7, after the provider stored the report of `run`: the member runners
-    /// of the VM runner (M6.3 rule R5), the start rule over its queue, and the seconds until the
-    /// next report. Without a schedule nothing queues (rule R9).
+    /// spec 6.2 and 6.4, after the provider stored the report of `run`: the member runners
+    /// of the VM runner (spec 8.5), the start rule over its queue, and the seconds until the
+    /// next report. Without a schedule nothing queues.
     async fn report_answer(
         &self,
         run: &str,
@@ -1445,19 +1445,19 @@ enum Decision {
         run_id: String,
         taken: u32,
     },
-    /// Rides on the VM its burst leader starts (M4 rule R3).
+    /// Rides on the VM its burst leader starts (spec 6.3).
     Grouped {
         leader: String,
     },
-    /// The job's intent was already recorded by an earlier event (M4 rule R3).
+    /// The job's intent was already recorded by an earlier event (spec 6.3).
     Duplicate,
-    /// The job waits for a paid slot, expected in `wait_s` seconds (M6.2 rule R2).
+    /// The job waits for a paid slot, expected in `wait_s` seconds (spec 6.4).
     Queued {
         wait_s: Option<u64>,
     },
 }
 
-/// The start rule's answer for a pending VM job (M6.2 rule R2); `wait_s` is the job's expected
+/// The start rule's answer for a pending VM job (spec 6.4); `wait_s` is the job's expected
 /// wait, which a burst path that ends at `maxRuns` answers with.
 enum QueueFirst {
     Queued { wait_s: Option<u64> },
@@ -1478,7 +1478,7 @@ enum Warm {
 /// minute, so one lost report does not matter but a hung VM stops absorbing claims.
 pub const CAPACITY_FRESH_S: u64 = 2 * vm::HEARTBEAT_S + 60;
 
-/// M4 rule R1: a VM takes a claim when it has a free slot, was created more than
+/// spec 6.3: a VM takes a claim when it has a free slot, was created more than
 /// [`GROUP_WINDOW_S`] ago (younger VMs are accounted for by the burst ledger), and is `idle` or
 /// `busy` with a report within [`CAPACITY_FRESH_S`], or `starting` and younger than
 /// [`vm::SWEEP_STARTING_S`]. `draining` VMs stop soon and silent ones may hang.
@@ -1505,7 +1505,7 @@ fn live_count(vms: &[VmCapacity]) -> usize {
     vms.iter().filter(|v| v.state != VmState::Draining).count()
 }
 
-/// M6.2 rule R4 step 3: the free slots of VMs in state `starting` younger than
+/// spec 6.4, start rule step 3: the free slots of VMs in state `starting` younger than
 /// [`vm::SWEEP_STARTING_S`], and of the claim candidates, whose free slots take a queued job as
 /// soon as GitLab hands it out.
 fn ready_slots(vms: &[VmCapacity], now: u64) -> u32 {
@@ -1519,14 +1519,14 @@ fn ready_slots(vms: &[VmCapacity], now: u64) -> u32 {
         .sum()
 }
 
-/// The VM `job` claims (M4 rules R1, R2) and the free slots of every candidate.
+/// The VM `job` claims (spec 6.3) and the free slots of every candidate.
 fn claim_target<'a>(vms: &'a [VmCapacity], job: &str, now: u64) -> Option<(&'a VmCapacity, u64)> {
     let candidates = claim_candidates(vms, now);
     let target = spread(&candidates, job)?;
     Some((target, candidates.iter().map(|v| u64::from(v.free)).sum()))
 }
 
-/// M4 rule R2: among the candidates with the most free slots, sorted by run id, the one at
+/// spec 6.3: among the candidates with the most free slots, sorted by run id, the one at
 /// index `fnv1a64(job) % count`, so parallel claims of one burst spread over the VMs.
 fn spread<'a>(candidates: &[&'a VmCapacity], job: &str) -> Option<&'a VmCapacity> {
     let most = candidates.iter().map(|v| v.free).max()?;
@@ -1563,7 +1563,7 @@ impl JobKey {
             .unwrap_or_else(|_| JobKey::Text(job.to_string()))
     }
 
-    /// The warm intent of a pipeline (M6.1 rule R4).
+    /// The warm intent of a pipeline (spec 6.5).
     fn is_warm(&self) -> bool {
         matches!(self, JobKey::Text(text) if text.starts_with(WARM_PREFIX))
     }
@@ -1578,7 +1578,7 @@ impl fmt::Display for JobKey {
     }
 }
 
-/// A job's place in its burst (M4 rule R3, M6.1 rule R4).
+/// A job's place in its burst (spec 6.3, 6.5).
 #[derive(Debug, PartialEq, Eq)]
 enum Burst {
     /// The job's earliest intent is older than this event.
@@ -1672,7 +1672,7 @@ fn unauthorized() -> DispatchResponse {
     }
 }
 
-/// M7 rule R1: a body gets `ms`, the whole milliseconds since the request arrived.
+/// spec 5.2: a body gets `ms`, the whole milliseconds since the request arrived.
 fn stamp(mut response: DispatchResponse, at: Arrival) -> DispatchResponse {
     if let Value::Object(map) = &mut response.body {
         map.insert("ms".to_string(), Value::from(at.ms()));

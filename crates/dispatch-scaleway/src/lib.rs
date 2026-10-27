@@ -3,7 +3,7 @@
 //! method, path, headers, body and the current time to
 //! `ciburst_core::dispatch::Dispatcher::handle_request` with a `Scaleway` provider and, with an
 //! S3 cache, the burst ledger, the warm start records and the queue-first schedule in the cache
-//! bucket, with `CIBURST_FLEET_KEY` also the fleet state there (M6.3 rule R1), all built from
+//! bucket, with `CIBURST_FLEET_KEY` also the fleet state there (D58), all built from
 //! the function's environment. The variable names are
 //! `ciburst_scaleway::host::vars`, the ones the host sets.
 //!
@@ -49,12 +49,12 @@ pub struct Env {
     /// start without it fails naming the variable.
     pub agent_sha256: Option<String>,
     /// `CIBURST_VM_SECURITY_GROUP` and `CIBURST_VM_IMAGES`, which spare a VM start its lookups
-    /// (M7 hardening rule R3); a start without them looks them up.
+    /// (spec 6.6); a start without them looks them up.
     pub vm_start: VmStart,
-    /// Pause between recording a burst intent and reading the burst (M4 rule R3); not read from
+    /// Pause between recording a burst intent and reading the burst (spec 6.3); not read from
     /// the environment.
     pub group_wait: Duration,
-    /// `CIBURST_FLEET_KEY`, which seals the fleet state in the cache bucket (M6.3 rule R2);
+    /// `CIBURST_FLEET_KEY`, which seals the fleet state in the cache bucket (spec 8.1);
     /// without it the function keeps no fleet store.
     pub fleet_key: Option<FleetKey>,
 }
@@ -62,14 +62,14 @@ pub struct Env {
 /// What the dispatcher works on besides the environment.
 pub struct Backends {
     pub provider: Arc<dyn Provider>,
-    /// The burst ledger in the cache bucket (M4 rule R13); `None` without an S3 cache key.
+    /// The burst ledger in the cache bucket (spec 6.3); `None` without an S3 cache key.
     pub ledger: Option<Arc<dyn Ledger>>,
-    /// The warm start records beside it (M6.1 rule R5); `None` without an S3 cache key.
+    /// The warm start records beside it (spec 6.5); `None` without an S3 cache key.
     pub records: Option<Arc<dyn PipelineRecords>>,
-    /// The queue-first schedule beside it (M6.2 rules R2 to R4); `None` without an S3 cache
+    /// The queue-first schedule beside it (spec 6.4); `None` without an S3 cache
     /// key.
     pub schedule: Option<Arc<dyn Schedule>>,
-    /// The fleet state beside it (M6.3 rule R1); `None` without an S3 cache key or the fleet
+    /// The fleet state beside it (D58); `None` without an S3 cache key or the fleet
     /// key.
     pub fleet: Option<Arc<dyn FleetStore>>,
 }
@@ -289,7 +289,7 @@ impl Env {
     }
 }
 
-/// The fleet state of this warm instance (M6.3 rule R1), read at most every 30 s.
+/// The fleet state of this warm instance (D58), read at most every 30 s.
 static FLEET: std::sync::OnceLock<Arc<FleetCache>> = std::sync::OnceLock::new();
 
 /// One request as the dispatcher sees it.
@@ -574,7 +574,7 @@ mod tests {
     }
 
     /// The body without `ms`, which every answer of the dispatcher carries as a whole number
-    /// (M7 rule R1).
+    /// (spec 5.2).
     fn parse(body: &[u8]) -> Value {
         let mut value: Value = serde_json::from_slice(body).unwrap();
         if let Some(ms) = value.as_object_mut().and_then(|map| map.remove("ms")) {
@@ -617,7 +617,7 @@ mod tests {
         assert!(env_from(&no_vm).unwrap().secrets.vm_secret.is_none());
     }
 
-    /// M6.3 rules R1 and R2: `CIBURST_FLEET_KEY` builds the fleet store in the cache bucket,
+    /// spec 8.1: `CIBURST_FLEET_KEY` builds the fleet store in the cache bucket,
     /// which reads what the setup wrote with the same key.
     #[tokio::test]
     async fn the_fleet_key_builds_the_fleet_store() {
@@ -878,7 +878,7 @@ mod tests {
         assert_eq!(parse(&bytes), json!({ "result": "error" }));
     }
 
-    /// A pipeline event lists every job of the pipeline (M6.1 rule R2): one of a thousand jobs,
+    /// A pipeline event lists every job of the pipeline (spec 9.5): one of a thousand jobs,
     /// each with the fields GitLab sends, fits the body limit and reaches the dispatcher.
     #[tokio::test]
     async fn a_pipeline_event_of_a_thousand_jobs_reaches_the_dispatcher() {

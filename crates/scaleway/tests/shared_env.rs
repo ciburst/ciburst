@@ -1,4 +1,4 @@
-//! `Provider::shared_env` of the Scaleway provider (D38, M4 rule R11): what a VM needs besides
+//! `Provider::shared_env` of the Scaleway provider (D38, spec 9.1): what a VM needs besides
 //! its own secrets, the agent's URL and SHA-256, the runner's URL and the cache location, the
 //! same values the provider writes into `vm.env`. The port stays so a provider can return (D65).
 

@@ -5,7 +5,7 @@
 //! the sweep cron. Each scenario asserts that every pending job starts within one job duration
 //! plus one boot, that no VM ends while a slot holds a job, and a bound on VM-hours. Bursts of
 //! simultaneous events run their dispatcher calls concurrently on paused tokio time, so with a
-//! ledger every call records its intent before any call reads the burst (M4 rule R3).
+//! ledger every call records its intent before any call reads the burst (spec 6.3).
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -190,7 +190,7 @@ struct Sim {
 }
 
 impl Sim {
-    /// The M3 rule: no burst ledger.
+    /// Without a burst ledger (spec 6.3).
     async fn new(slots: u32, max_runs: u32) -> Sim {
         Sim::build(slots, max_runs, false).await
     }

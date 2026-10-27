@@ -37,7 +37,7 @@ pub struct ApiError {
     /// What the answer names besides its message: `resource`, the `argument_name` of each of
     /// `details` and the keys of `fields` (`scw/errors.go`).
     pub names: Vec<String>,
-    /// Whether repeating the call may succeed (M7 hardening rule R4).
+    /// Whether repeating the call may succeed (spec 6.6).
     pub retryable: bool,
 }
 
@@ -79,7 +79,7 @@ impl ApiError {
     }
 
     /// Whether a create was refused because its image or security group does not exist: a 404,
-    /// or an invalid request that names one of them (M7 hardening rule R3).
+    /// or an invalid request that names one of them (spec 6.6).
     pub fn is_missing_image_or_group(&self) -> bool {
         if self.status == 404 {
             return true;
@@ -137,8 +137,8 @@ impl<'a> InstanceApi<'a> {
         format!("/instance/v1/zones/{}/{rest}", self.zone)
     }
 
-    /// One call. `idempotent` marks a call that may be repeated without a second effect (M7
-    /// hardening rule R4): GETs, user data and power on.
+    /// One call. `idempotent` marks a call that may be repeated without a second effect (spec
+    /// 6.6): GETs, user data and power on.
     async fn send(
         &self,
         method: &str,
@@ -343,7 +343,7 @@ impl<'a> InstanceApi<'a> {
             .and_then(|g| g["id"].as_str().map(String::from)))
     }
 
-    /// Rule 3 of M3: inbound drop, outbound accept, stateful.
+    /// spec 9.1: inbound drop, outbound accept, stateful.
     pub async fn create_security_group(&self, project_id: &str, name: &str) -> Result<String> {
         let created = self
             .json(

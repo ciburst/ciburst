@@ -54,7 +54,7 @@ pub trait VmProviderFactory: Send + Sync {
 }
 
 /// Everything a VM start of any provider reads from the request: runner token, VM secret,
-/// dispatcher URL, the agent of D38, the runner object of M6 rule R6 and the S3 cache.
+/// dispatcher URL, the agent of D38, the runner object of spec 9.1 and the S3 cache.
 pub fn start_env() -> BTreeMap<String, String> {
     [
         ("RUNNER_TOKEN", "glrt-vm-contract"),

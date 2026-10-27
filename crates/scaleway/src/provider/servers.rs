@@ -20,7 +20,7 @@ use super::{PROVIDER_NAME, Runtime, Scaleway, USER_DATA_KEY, cloud_init, iam, in
 
 pub(super) const SECURITY_GROUP_STEP: &str = "vm:security-group";
 
-/// M7 hardening rule R4: the pause before a call on a created server is repeated.
+/// spec 6.6: the pause before a call on a created server is repeated.
 const RETRY_PAUSE: Duration = Duration::from_millis(300);
 
 /// What a start attempt on one commercial type came to.
@@ -39,7 +39,7 @@ async fn power_on(api: &InstanceApi<'_>, id: &str) -> Result<Option<ApiError>> {
     }
 }
 
-/// M7 hardening rule R4: the dispatcher repeats a start that failed with a retryable error.
+/// spec 6.6: the dispatcher repeats a start that failed with a retryable error.
 /// Once a server was created, a repeat would create a second one, so the error ends the start.
 fn settled(error: Error) -> Error {
     match error {
@@ -146,10 +146,10 @@ impl Scaleway {
         Ok(())
     }
 
-    /// Rule 4 of M3: the first commercial type that has a local image and capacity runs the
+    /// spec 6.1: the first commercial type that has a local image and capacity runs the
     /// VM; the server id is the run id. Security group and images come from the function's
     /// environment; a value missing there or refused by Scaleway is looked up and logged as
-    /// `warn start_lookup` (M7 hardening rule R3). `CIBURST_PROJECT_ID` makes the project
+    /// `warn start_lookup` (spec 6.6). `CIBURST_PROJECT_ID` makes the project
     /// lookup a no-op in the function.
     pub(super) async fn start_vm(&self, request: StartRequest) -> Result<String> {
         let pool = &request.pool;
@@ -334,7 +334,7 @@ impl Scaleway {
 
     /// User data, then power on. The VM gets its token, never the secret behind it, and the
     /// URLs and SHA-256 of runner and agent. The server exists, so a retryable failure of
-    /// either call is repeated here once (M7 hardening rule R4): the dispatcher's retry would
+    /// either call is repeated here once (spec 6.6): the dispatcher's retry would
     /// repeat the whole start and create a second server. Before power on is repeated, the
     /// server is read, as a power on whose answer got lost may have started it.
     async fn boot(
@@ -379,7 +379,7 @@ impl Scaleway {
     }
 
     /// `warn start_lookup`: the start looks up what the function's environment lacks or what
-    /// Scaleway refused (M7 hardening rule R3).
+    /// Scaleway refused (spec 6.6).
     fn start_lookup(&self, pool: &str, commercial_type: Option<&str>, reason: &str) {
         let mut fields = vec![("pool", pool)];
         fields.extend(commercial_type.map(|t| ("type", t)));
@@ -564,7 +564,7 @@ impl Scaleway {
             .await
     }
 
-    /// D38, M6 rule R6: the URL and SHA-256 of the agent and the URL of the runner in the cache
+    /// D38, spec 9.1: the URL and SHA-256 of the agent and the URL of the runner in the cache
     /// bucket, which VMs of every provider download without credentials, and with an S3 cache
     /// the bucket's location. No secret.
     pub(super) async fn vm_shared_env(&self) -> Result<BTreeMap<String, String>> {
