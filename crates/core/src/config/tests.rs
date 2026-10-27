@@ -97,6 +97,34 @@ fn a_refused_key_names_its_replacement() {
 }
 
 #[test]
+fn an_unknown_top_level_key_is_refused_by_name() {
+    let mut raw = valid();
+    raw["ignorejobs"] = serde_json::json!(["pages"]);
+    raw["lane"] = serde_json::json!([]);
+    raw["stages"] = serde_json::json!(["test"]);
+    let keys = "name, gitlab, host, provider, cache, vm, lanes, ignoreJobs";
+    assert_eq!(
+        errors_of(raw),
+        [
+            "stages: removed: lanes take jobs by name with their jobs patterns".to_string(),
+            format!("ignorejobs: unknown key; the keys are {keys}"),
+            format!("lane: unknown key; the keys are {keys}"),
+        ]
+    );
+
+    let defaults = Config::ci_defaults(5, "https://gitlab.example");
+    match merge_config(&defaults, r#"{ "ignorejobs": ["pages"] }"#) {
+        Err(Error::Config(errors)) => assert_eq!(
+            errors,
+            [format!("ignorejobs: unknown key; the keys are {keys}")]
+        ),
+        other => panic!("expected a config error, got {other:?}"),
+    }
+    let merged = merge_config(&defaults, r#"{ "ignoreJobs": ["pages"] }"#).unwrap();
+    assert_eq!(merged.ignore_jobs, ["pages"]);
+}
+
+#[test]
 fn collects_every_semantic_error() {
     let mut raw = valid();
     raw["name"] = "Bad Name".into();
@@ -492,6 +520,18 @@ fn a_members_file_holds_lanes_and_ignore_jobs_only() {
     }
     match parse_project_config(r#"{ "pools": [] }"#, "ci-1", "vm", 77) {
         Err(Error::Config(errors)) => assert!(errors[0].starts_with("pools: replaced by vm")),
+        other => panic!("expected a config error, got {other:?}"),
+    }
+    let typo = r#"{ "ignorejobs": ["pages"], "vmFirst": false, "vm": {} }"#;
+    match parse_project_config(typo, "ci-1", "vm", 77) {
+        Err(Error::Config(errors)) => assert_eq!(
+            errors,
+            [
+                "vmFirst: removed: lane jobs run only in their lane, the VM runner carries only its tag",
+                "vm: a fleet setting; it belongs in the host's ciburst.json",
+                "ignorejobs: unknown key; the keys are lanes, ignoreJobs",
+            ]
+        ),
         other => panic!("expected a config error, got {other:?}"),
     }
 }

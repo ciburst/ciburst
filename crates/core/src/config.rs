@@ -43,6 +43,9 @@ pub const JOBS_RUNTIME: &str = "jobs";
 /// The keys of the fleet settings, which only the host's `ciburst.json` holds (D60).
 pub const FLEET_KEYS: [&str; 6] = ["name", "gitlab", "host", "provider", "cache", "vm"];
 
+/// The keys of the project settings, which every project's `ciburst.json` may hold (D60).
+pub const PROJECT_KEYS: [&str; 2] = ["lanes", "ignoreJobs"];
+
 /// Keys of earlier configs and what replaces them (D62, D63, D65).
 const REMOVED_KEYS: [(&str, &str); 6] = [
     (
@@ -323,7 +326,7 @@ pub struct ProjectConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Config {
     pub name: String,
     pub gitlab: GitlabConfig,
@@ -542,6 +545,21 @@ fn removed_keys(document: &Map<String, Value>) -> Vec<String> {
     errors
 }
 
+/// The messages for top-level keys of `document` that are neither in `known` nor a removed
+/// key, each listing `allowed`, so a misspelt key is refused instead of dropped.
+fn unknown_keys(document: &Map<String, Value>, known: &[&str], allowed: &[&str]) -> Vec<String> {
+    document
+        .keys()
+        .filter(|key| !known.contains(&key.as_str()) && !REMOVED_KEYS.iter().any(|(k, _)| k == key))
+        .map(|key| format!("{key}: unknown key; the keys are {}", allowed.join(", ")))
+        .collect()
+}
+
+/// Every key of a host's `ciburst.json`: the fleet settings and the project settings.
+fn host_keys() -> Vec<&'static str> {
+    FLEET_KEYS.iter().chain(&PROJECT_KEYS).copied().collect()
+}
+
 fn structural(error: serde_json::Error) -> Error {
     Error::Config(vec![error.to_string()])
 }
@@ -553,11 +571,13 @@ fn object_of(json: &str) -> Result<Map<String, Value>> {
     }
 }
 
-/// The config of `document`, refusing removed keys first.
+/// The config of `document`, refusing removed and unknown keys first.
 fn config_of(document: Map<String, Value>) -> Result<Config> {
-    let removed = removed_keys(&document);
-    if !removed.is_empty() {
-        return Err(Error::Config(removed));
+    let keys = host_keys();
+    let mut errors = removed_keys(&document);
+    errors.extend(unknown_keys(&document, &keys, &keys));
+    if !errors.is_empty() {
+        return Err(Error::Config(errors));
     }
     validate(serde_json::from_value(Value::Object(document)).map_err(structural)?)
 }
@@ -598,6 +618,7 @@ pub fn parse_project_config(
             ));
         }
     }
+    errors.extend(unknown_keys(&document, &host_keys(), &PROJECT_KEYS));
     if !errors.is_empty() {
         return Err(Error::Config(errors));
     }
