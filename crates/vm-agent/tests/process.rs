@@ -271,7 +271,7 @@ fn one_runner_process_serves_every_entry_and_reloads_its_config() {
             "CIBURST_RUN_ID=run-e2e\nCIBURST_VM_TOKEN=vm-token-secret\n\
              CIBURST_DISPATCH_URL={url}\nCI_SERVER_URL={url}\n\
              RUNNER_TOKEN={POOL}\nRUNNER_SPILL_TOKEN={SPILL}\n\
-             CIBURST_POOL=vm\nCIBURST_SLOTS=2\n\
+             CIBURST_RUNNER=vm\nCIBURST_SLOTS=2\n\
              CIBURST_DEFAULT_IMAGE=node:24\nCIBURST_TIMEOUT_S=3600\n\
              CIBURST_STATE_DIR={}\n",
             state.display()

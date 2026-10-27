@@ -16,7 +16,7 @@ const REQUIRED: [&str; 9] = [
     "CIBURST_DISPATCH_URL",
     "CI_SERVER_URL",
     "RUNNER_TOKEN",
-    "CIBURST_POOL",
+    "CIBURST_RUNNER",
     "CIBURST_SLOTS",
     "CIBURST_DEFAULT_IMAGE",
     "CIBURST_TIMEOUT_S",
@@ -38,7 +38,7 @@ pub struct Config {
     pub dispatch_url: String,
     pub server_url: String,
     pub runner_token: String,
-    pub pool: String,
+    pub runner: String,
     pub slots: u32,
     pub default_image: String,
     pub timeout_s: u64,
@@ -63,7 +63,7 @@ impl fmt::Debug for Config {
             .field("run_id", &self.run_id)
             .field("dispatch_url", &self.dispatch_url)
             .field("server_url", &self.server_url)
-            .field("runner", &self.pool)
+            .field("runner", &self.runner)
             .field("slots", &self.slots)
             .field("default_image", &self.default_image)
             .field("timeout_s", &self.timeout_s)
@@ -165,7 +165,7 @@ pub fn parse(text: &str) -> Result<Config, ConfigError> {
             .to_string(),
         server_url: required("CI_SERVER_URL"),
         runner_token: required("RUNNER_TOKEN"),
-        pool: required("CIBURST_POOL"),
+        runner: required("CIBURST_RUNNER"),
         slots,
         default_image: required("CIBURST_DEFAULT_IMAGE"),
         timeout_s,
@@ -197,7 +197,7 @@ CIBURST_VM_TOKEN=vm-token-secret
 CIBURST_DISPATCH_URL=https://dispatch.example.invalid/
 CI_SERVER_URL=https://gitlab.example.invalid
 RUNNER_TOKEN=glrt-runner-secret
-CIBURST_POOL=vm
+CIBURST_RUNNER=vm
 CIBURST_SLOTS=2
 CIBURST_DEFAULT_IMAGE=registry.example.invalid/ciburst/node:1
 CIBURST_TIMEOUT_S=3600
@@ -235,7 +235,7 @@ CACHE_SHARED=true
         assert_eq!(config.dispatch_url, "https://dispatch.example.invalid");
         assert_eq!(config.server_url, "https://gitlab.example.invalid");
         assert_eq!(config.runner_token, "glrt-runner-secret");
-        assert_eq!(config.pool, "vm");
+        assert_eq!(config.runner, "vm");
         assert_eq!(config.slots, 2);
         assert_eq!(
             config.default_image,
@@ -274,8 +274,8 @@ CACHE_SHARED=true
             assert!(!error.to_string().contains(secret));
         }
 
-        let error = parse(&with("CIBURST_POOL", "")).unwrap_err();
-        assert_eq!(error.to_string(), "missing CIBURST_POOL");
+        let error = parse(&with("CIBURST_RUNNER", "")).unwrap_err();
+        assert_eq!(error.to_string(), "missing CIBURST_RUNNER");
     }
 
     #[test]
@@ -325,8 +325,8 @@ CACHE_SHARED=true
 
     #[test]
     fn quotes_and_spaces_are_trimmed() {
-        let config = parse(&with("CIBURST_POOL", "\"vm\"")).unwrap();
-        assert_eq!(config.pool, "vm");
+        let config = parse(&with("CIBURST_RUNNER", "\"vm\"")).unwrap();
+        assert_eq!(config.runner, "vm");
         let config = parse(&with("CIBURST_DEFAULT_IMAGE", " 'node:24' ")).unwrap();
         assert_eq!(config.default_image, "node:24");
     }

@@ -283,7 +283,7 @@ async fn start_creates_the_server_of_rule_four_then_user_data_then_poweron() {
         json!([
             "ciburst",
             "contract",
-            "pool:ci",
+            "runner:ci",
             "job:2",
             "ciburst-state:starting",
             "ciburst-free:1"
@@ -306,7 +306,7 @@ async fn start_creates_the_server_of_rule_four_then_user_data_then_poweron() {
         ("CIBURST_DISPATCH_URL", DISPATCH_URL),
         ("CI_SERVER_URL", "https://gitlab.example"),
         ("RUNNER_TOKEN", RUNNER_TOKEN),
-        ("CIBURST_POOL", "ci"),
+        ("CIBURST_RUNNER", "ci"),
         ("CIBURST_SLOTS", "2"),
         ("CIBURST_DEFAULT_IMAGE", "example.invalid/node:24"),
         ("CIBURST_TIMEOUT_S", "3600"),
@@ -609,12 +609,12 @@ async fn capacity_reads_the_pool_servers_and_ignores_other_deployments() {
     backend.instance.add_server(
         "other-ci-00000000",
         &project_id,
-        &["ciburst", "other", "pool:ci", "ciburst-free:5"],
+        &["ciburst", "other", "runner:ci", "ciburst-free:5"],
     );
     backend.instance.add_server(
         "contract-ci-manual",
         &project_id,
-        &["contract", "pool:ci", "ciburst-free:5"],
+        &["contract", "runner:ci", "ciburst-free:5"],
     );
     let report = VmReport {
         state: VmState::Busy,
@@ -704,7 +704,7 @@ async fn report_rewrites_the_state_tags_and_keeps_every_other_tag() {
     let expected: BTreeSet<String> = strings(&[
         "ciburst",
         "contract",
-        "pool:ci",
+        "runner:ci",
         "job:2",
         "owner:ops",
         "ciburst-state:draining",
@@ -734,7 +734,7 @@ async fn claim_report_and_stop_refuse_servers_of_others() {
     let foreign = backend.instance.add_server(
         "other-ci-00000000",
         &project_id,
-        &["ciburst", "other", "pool:ci", "ciburst-free:1"],
+        &["ciburst", "other", "runner:ci", "ciburst-free:1"],
     );
     let idle = VmReport {
         state: VmState::Idle,
@@ -764,7 +764,7 @@ async fn claim_report_and_stop_refuse_servers_of_others() {
     );
     assert_eq!(
         tags(&backend.instance.server(&foreign).unwrap()),
-        strings(&["ciburst", "other", "pool:ci", "ciburst-free:1"])
+        strings(&["ciburst", "other", "runner:ci", "ciburst-free:1"])
     );
 }
 
@@ -872,7 +872,7 @@ async fn sweep_applies_each_rule_at_its_boundary() {
     let now = FAKE_CLOCK + 200_000;
     let add = |name: &str, age: u64, state_tags: &[String]| {
         backend.instance.set_clock(now - age);
-        let mut tags = strings(&["ciburst", "contract", "pool:ci"]);
+        let mut tags = strings(&["ciburst", "contract", "runner:ci"]);
         tags.extend(state_tags.iter().cloned());
         let tags: Vec<&str> = tags.iter().map(String::as_str).collect();
         backend.instance.add_server(name, &project_id, &tags)
@@ -940,7 +940,7 @@ async fn sweep_applies_each_rule_at_its_boundary() {
     let foreign = backend.instance.add_server(
         "other-ci-00000000",
         &project_id,
-        &["ciburst", "other", "pool:ci", "ciburst-state:starting"],
+        &["ciburst", "other", "runner:ci", "ciburst-state:starting"],
     );
 
     let result: BTreeSet<String> = provider.sweep(now).await.unwrap().into_iter().collect();
@@ -962,6 +962,97 @@ async fn sweep_applies_each_rule_at_its_boundary() {
             "{reason} in {lines:?}"
         );
     }
+}
+
+/// D66: a server started before the rename carries `pool:<tag>` instead of `runner:<tag>` and is
+/// counted, listed, claimed, reported and swept as before; its tag is kept as it is.
+#[tokio::test]
+async fn servers_with_the_old_pool_tag_are_still_served() {
+    let config = config(|c| c.vm.slots = 2);
+    let (backend, provider, project_id) = provisioned(config.clone(), Log::silent()).await;
+    let new = provider.start(request(&config, "ci")).await.unwrap();
+    assert!(tags(&backend.instance.server(&new).unwrap()).contains(&"runner:ci".to_string()));
+    assert!(
+        !tags(&backend.instance.server(&new).unwrap())
+            .iter()
+            .any(|t| t.starts_with("pool:"))
+    );
+    let old = backend.instance.add_server(
+        "contract-ci-0000old0",
+        &project_id,
+        &[
+            "ciburst",
+            "contract",
+            "pool:ci",
+            "job:1",
+            "ciburst-state:idle",
+            "ciburst-free:2",
+        ],
+    );
+    let other = backend.instance.add_server(
+        "contract-ci-0000oth0",
+        &project_id,
+        &["ciburst", "contract", "pool:gpu", "ciburst-state:idle"],
+    );
+
+    let ids = |runs: Vec<ciburst_core::types::Run>| -> BTreeSet<String> {
+        runs.into_iter().map(|r| r.run_id).collect()
+    };
+    assert_eq!(
+        ids(provider.list(Some("ci")).await.unwrap()),
+        BTreeSet::from([new.clone(), old.clone()])
+    );
+    let runs = provider.list(None).await.unwrap();
+    let old_run = runs.iter().find(|r| r.run_id == old).unwrap();
+    assert_eq!(old_run.pool, "ci");
+    assert_eq!(old_run.labels["job"], "1");
+    assert_eq!(runs.iter().find(|r| r.run_id == other).unwrap().pool, "gpu");
+
+    let capacity = provider.capacity("ci").await.unwrap().unwrap();
+    let old_capacity = capacity.iter().find(|c| c.run_id == old).expect("counted");
+    assert_eq!(capacity.len(), 2, "{capacity:?}");
+    assert_eq!(old_capacity.state, VmState::Idle);
+    assert_eq!(old_capacity.free, 2);
+
+    provider.claim(&old).await.unwrap();
+    let report = VmReport {
+        state: VmState::Busy,
+        free: 1,
+        slots: 2,
+    };
+    provider.report(&old, &report, 1_000).await.unwrap();
+    let after: BTreeSet<String> = tags(&backend.instance.server(&old).unwrap())
+        .into_iter()
+        .collect();
+    let expected: BTreeSet<String> = strings(&[
+        "ciburst",
+        "contract",
+        "pool:ci",
+        "job:1",
+        "ciburst-state:busy",
+        "ciburst-free:1",
+        "ciburst-seen:1000",
+    ])
+    .into_iter()
+    .collect();
+    assert_eq!(after, expected);
+
+    let swept = provider
+        .sweep(1_000 + SWEEP_SILENT_S + 1)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect::<BTreeSet<String>>();
+    assert!(swept.contains(&old), "{swept:?}");
+    assert!(
+        provider
+            .capacity("ci")
+            .await
+            .unwrap()
+            .unwrap()
+            .iter()
+            .all(|c| c.run_id != old)
+    );
 }
 
 #[tokio::test]
@@ -1127,7 +1218,7 @@ async fn listings_read_every_page_of_servers() {
             &[
                 "ciburst",
                 "contract",
-                "pool:ci",
+                "runner:ci",
                 "ciburst-state:idle",
                 "ciburst-free:1",
             ],

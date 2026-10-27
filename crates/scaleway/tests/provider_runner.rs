@@ -258,7 +258,7 @@ async fn lane_definitions_run_the_bootstrap_with_the_runner_of_the_bucket() {
             sha,
             "the bytes the bootstrap checks"
         );
-        for key in ["CIBURST_POOL", "CI_SERVER_URL", "RUNNER_WAIT_TIMEOUT"] {
+        for key in ["CIBURST_RUNNER", "CI_SERVER_URL", "RUNNER_WAIT_TIMEOUT"] {
             assert!(env[key].is_string(), "{key} stays");
         }
         assert_eq!(env["CACHE_S3_BUCKET_NAME"], bucket.as_str());

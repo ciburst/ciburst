@@ -136,7 +136,7 @@ impl Agent {
             "agent started",
             &[
                 ("run", &self.config.run_id),
-                ("runner", &self.config.pool),
+                ("runner", &self.config.runner),
                 ("slots", &self.config.slots.to_string()),
                 ("timeout_s", &self.config.timeout_s.to_string()),
             ],

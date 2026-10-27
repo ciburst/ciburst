@@ -513,7 +513,7 @@ impl Scaleway {
             .iter()
             .filter_map(|server| {
                 let tags = vm::tags_of(server);
-                let tag = vm::tag_value(&tags, vm::TAG_POOL).unwrap_or_default();
+                let tag = vm::runner_of(&tags).unwrap_or_default();
                 if pool.is_some_and(|p| p != tag) {
                     return None;
                 }
@@ -542,7 +542,7 @@ impl Scaleway {
             .servers(&project_id)
             .await?
             .iter()
-            .filter(|s| vm::tag_value(&vm::tags_of(s), vm::TAG_POOL) == Some(pool))
+            .filter(|s| vm::runner_of(&vm::tags_of(s)) == Some(pool))
             .filter(|s| matches!(s["state"].as_str(), Some("starting" | "running")))
             .filter_map(vm::capacity)
             .collect())

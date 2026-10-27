@@ -60,7 +60,7 @@ Step `runner-binary`: the object `ciburst/runner/<ciburst_core::cloud_init::RUNN
 
 The provider adds `CIBURST_RUN_ID` (known before the user data is set) and `CIBURST_VM_TOKEN`, which is `ciburst_core::vm::token(<CIBURST_VM_SECRET>, <run id>)`, and renders the user data with `ciburst_core::cloud_init::render`. The user data downloads the runner object and the agent object and checks each against its SHA-256. The VM secret never enters user data.
 
-`/etc/ciburst/vm.env`, read by the agent: `CIBURST_RUN_ID`, `CIBURST_VM_TOKEN`, `CIBURST_DISPATCH_URL`, `CI_SERVER_URL`, `RUNNER_TOKEN`, `CIBURST_POOL` (the VM runner's tag), `CIBURST_SLOTS`, `CIBURST_DEFAULT_IMAGE` (`vm.image`), `CIBURST_TIMEOUT_S`; with the S3 cache also `CACHE_TYPE=s3`, `CACHE_S3_SERVER_ADDRESS`, `CACHE_S3_BUCKET_NAME`, `CACHE_S3_BUCKET_LOCATION`, `CACHE_S3_ACCESS_KEY`, `CACHE_S3_SECRET_KEY`, `CACHE_SHARED`. The agent exits 64 naming a missing key. Members' VM runners reach the agent through the report answer, not through `vm.env` (spec 6.2).
+`/etc/ciburst/vm.env`, read by the agent: `CIBURST_RUN_ID`, `CIBURST_VM_TOKEN`, `CIBURST_DISPATCH_URL`, `CI_SERVER_URL`, `RUNNER_TOKEN`, `CIBURST_RUNNER` (the VM runner's tag), `CIBURST_SLOTS`, `CIBURST_DEFAULT_IMAGE` (`vm.image`), `CIBURST_TIMEOUT_S`; with the S3 cache also `CACHE_TYPE=s3`, `CACHE_S3_SERVER_ADDRESS`, `CACHE_S3_BUCKET_NAME`, `CACHE_S3_BUCKET_LOCATION`, `CACHE_S3_ACCESS_KEY`, `CACHE_S3_SECRET_KEY`, `CACHE_SHARED`. The agent exits 64 naming a missing key. Members' VM runners reach the agent through the report answer, not through `vm.env` (spec 6.2).
 
 A VM's state, free slots, last report and drain time live with the server (tags on Scaleway), so the function stays stateless.
 
@@ -73,7 +73,7 @@ A lane is a one-job runtime that runs the lane's image (D45, `runtime` `jobs` on
 | name | `<name>-<project id>-<lane tag>` |
 | image | the lane's `image` |
 | command | `ciburst_core::lane::COMMAND`: `/bin/sh -c` with one argument without spaces (Scaleway splits a command at spaces and ignores quotes), which decodes `CIBURST_LANE` with `base64 -d` and evaluates it |
-| environment | `CIBURST_LANE` (base64 of `ciburst_core::lane::BOOTSTRAP`, the script `lane-bootstrap.sh`), `CIBURST_RUNNER_URL` (the runner object's public URL), `CIBURST_RUNNER_SHA256` (`cloud_init::RUNNER_SHA256`), `CIBURST_POOL` (the lane key), `CIBURST_PROJECT` (the lane's project), `CI_SERVER_URL`, `RUNNER_WAIT_TIMEOUT` (`waitTimeoutS`) and, with the S3 cache, `CACHE_TYPE`, `CACHE_S3_SERVER_ADDRESS`, `CACHE_S3_BUCKET_NAME`, `CACHE_S3_BUCKET_LOCATION`, `CACHE_SHARED` |
+| environment | `CIBURST_LANE` (base64 of `ciburst_core::lane::BOOTSTRAP`, the script `lane-bootstrap.sh`), `CIBURST_RUNNER_URL` (the runner object's public URL), `CIBURST_RUNNER_SHA256` (`cloud_init::RUNNER_SHA256`), `CIBURST_RUNNER` (the lane key), `CIBURST_PROJECT` (the lane's project), `CI_SERVER_URL`, `RUNNER_WAIT_TIMEOUT` (`waitTimeoutS`) and, with the S3 cache, `CACHE_TYPE`, `CACHE_S3_SERVER_ADDRESS`, `CACHE_S3_BUCKET_NAME`, `CACHE_S3_BUCKET_LOCATION`, `CACHE_SHARED` |
 
 `plan` and `sync_lanes` update a definition when any of these changes. `StartRequest.env` of a lane holds `RUNNER_TOKEN` (the lane's runner in its own project) and, with the S3 cache, `CACHE_S3_ACCESS_KEY` and `CACHE_S3_SECRET_KEY`, never `CIBURST_VM_SECRET`; the run also gets the labels as `CIBURST_PROJECT`, `CIBURST_PIPELINE`, `CIBURST_JOB` and `CIBURST_STAGE`.
 

@@ -54,7 +54,7 @@ pub fn definition_env(
     runner_sha256: &str,
 ) -> Value {
     let mut env = BTreeMap::from([
-        ("CIBURST_POOL".to_string(), pool.tag.clone()),
+        ("CIBURST_RUNNER".to_string(), pool.tag.clone()),
         ("CI_SERVER_URL".to_string(), config.gitlab.url.clone()),
         (
             "RUNNER_WAIT_TIMEOUT".to_string(),
@@ -519,7 +519,7 @@ mod tests {
         assert_eq!(merged["RUNNER_TOKEN"], "t");
         assert!(!merged.contains_key("CIBURST_VM_SECRET"));
         let mut as_run = json!(merged);
-        as_run["CIBURST_POOL"] = json!("ci");
+        as_run["CIBURST_RUNNER"] = json!("ci");
         assert_eq!(labels_from_env(&as_run), labels);
         assert!(labels_from_env(&Value::Null).is_empty());
     }
@@ -547,7 +547,7 @@ mod tests {
         assert_eq!(
             rest,
             json!({
-                "CIBURST_POOL": "7-ci",
+                "CIBURST_RUNNER": "7-ci",
                 "CIBURST_PROJECT": "7",
                 "CI_SERVER_URL": "https://gitlab.example",
                 "RUNNER_WAIT_TIMEOUT": "60",

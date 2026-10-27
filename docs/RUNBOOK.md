@@ -210,7 +210,7 @@ Rules: spec sections 6.1, 6.2 and 6.8.
 - cloud-init writes `/etc/ciburst/vm.env`, downloads `gitlab-runner` 18.11.4 from the runner object and the agent from the agent object, checks each SHA-256, then starts `ciburst-vm-agent.service` (`Restart=on-failure`, 5 s).
 - The agent reports on every change and at the latest after the answer's `nextReportS` (15 s while VM jobs queue, 30 s while busy, else 600 s); a failed report is retried every 5 s without limit. After the drain it posts `/terminate`, retried for 10 minutes (2 s doubling to 60 s); then it exits 1 and systemd restarts it.
 - A slot that pulls its job's image has no labelled container yet and counts as free, 10 to 50 s per job.
-- Tags: `ciburst-state:<state>`, `ciburst-free:<n>`, `ciburst-seen:<unix time>` and, once draining, `ciburst-drain:<unix time>`, beside `ciburst`, `<name>`, `pool:<vm tag>`, `job:<id>`. Read them in the console (Instances, the server, Tags) or with `GET https://api.scaleway.com/instance/v1/zones/<zone>/servers?tags=<name>` and the header `X-Auth-Token: <secret key>`.
+- Tags: `ciburst-state:<state>`, `ciburst-free:<n>`, `ciburst-seen:<unix time>` and, once draining, `ciburst-drain:<unix time>`, beside `ciburst`, `<name>`, `runner:<vm tag>` (`pool:<vm tag>` on a server started before D66), `job:<id>`. Read them in the console (Instances, the server, Tags) or with `GET https://api.scaleway.com/instance/v1/zones/<zone>/servers?tags=<name>` and the header `X-Auth-Token: <secret key>`.
 - The cron `<name>-sweep` runs at minutes 0 and 30 (UTC) and ends a VM older than 24 hours, a VM that has not reported 10 minutes after its creation, and a VM whose last report is more than 30 minutes old. A VM that reported within 30 minutes and is younger than 24 hours stays.
 
 End a VM by hand, when the sweep does not:
@@ -394,7 +394,7 @@ Config: the VM runner `vm` (`slots` 2, `maxRuns` 4) in a zone with quota, the ho
    Check: `claimed` or `queued` for every VM job; no new server.
 6. Drain.
    Check: each VM reports `draining` at minute 55 of its hour and is gone before minute 60; no server, IP or volume remains.
-7. Sweep: in the VM zone create a powered-on server without user data, tagged `ciburst`, `<name>`, `pool:vm`, `ciburst-state:starting`.
+7. Sweep: in the VM zone create a powered-on server without user data, tagged `ciburst`, `<name>`, `runner:vm`, `ciburst-state:starting`.
    Check: the first sweep after its tenth minute terminates it; reporting VMs stay.
 8. A member: a second project joins with its own lane (section Fleet members) and runs a pipeline.
    Check: its VM jobs share the host's VMs, its lane jobs answer `runner` `<lane tag>` with `kind` `lane`; `ciburst-leave` removes its definitions, runners and webhook.

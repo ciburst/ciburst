@@ -6,7 +6,7 @@ use std::sync::Arc;
 use ciburst_core::config::{Lane, MAX_DEFINITION_NAME, Pool};
 use ciburst_core::log::Log;
 use ciburst_core::testing::contract::contract_config;
-use ciburst_core::types::Provider;
+use ciburst_core::types::{Action, Provider};
 use ciburst_scaleway::provider::Scaleway;
 use ciburst_scaleway::testing::scaleway_fake::{FAKE_ACCESS_KEY, ScalewayFake};
 use ciburst_scaleway::testing::{RUNNER_FIXTURE_URL, agent_fixture, runner_fixture_sha256};
@@ -85,7 +85,7 @@ async fn a_new_member_lane_gets_its_definition() {
     assert_eq!(created["memory_limit"], 4096);
     assert_eq!(created["description"], "ciburst lane 8-node");
     let env = &created["environment_variables"];
-    assert_eq!(env["CIBURST_POOL"], "8-node");
+    assert_eq!(env["CIBURST_RUNNER"], "8-node");
     assert_eq!(env["CIBURST_PROJECT"], "8");
     assert_eq!(env["CIBURST_RUNNER_SHA256"], runner_fixture_sha256());
     assert!(env.get("CIBURST_VM_SECRET").is_none());
@@ -144,6 +144,55 @@ async fn a_changed_image_size_or_environment_updates_in_place() {
         assert_eq!(actual, expected, "{field}");
     }
     assert_eq!(backend.jobs.definitions().len(), 3);
+}
+
+/// D66: a definition of an earlier version names the lane key `CIBURST_POOL`; setup plans an
+/// update of the host's and `/join` patches the member's to `CIBURST_RUNNER`.
+#[tokio::test]
+async fn a_definition_with_the_old_pool_variable_is_updated() {
+    let (backend, provider) = provisioned().await;
+    let ids = provider.sync_lanes(8, &[node(8)]).await.unwrap();
+    let old_env = |name: &str| {
+        let current = definition(&backend, name);
+        let mut env = current["environment_variables"].clone();
+        let map = env.as_object_mut().unwrap();
+        let key = map.remove("CIBURST_RUNNER").expect("CIBURST_RUNNER");
+        map.insert("CIBURST_POOL".into(), key);
+        backend
+            .jobs
+            .set_environment(current["id"].as_str().unwrap(), env);
+    };
+    old_env("contract-7-build");
+    old_env("contract-8-node");
+
+    let steps = provider.plan(&[]).await.unwrap();
+    let step = steps
+        .iter()
+        .find(|s| s.id == "definition:7-build")
+        .expect("definition step");
+    assert_eq!(step.action, Action::Update, "{step:?}");
+    provider.apply(&steps).await.unwrap();
+    let host = definition(&backend, "contract-7-build");
+    assert_eq!(host["environment_variables"]["CIBURST_RUNNER"], "7-build");
+    assert!(host["environment_variables"].get("CIBURST_POOL").is_none());
+
+    let calls = backend.jobs.calls().len();
+    let again = provider.sync_lanes(8, &[node(8)]).await.unwrap();
+    assert_eq!(again, ids);
+    let id = &ids["node"];
+    assert_eq!(
+        writes_since(&backend, calls),
+        [format!(
+            "PATCH /serverless-jobs/v1alpha1/regions/fr-par/job-definitions/{id}"
+        )]
+    );
+    let member = definition(&backend, "contract-8-node");
+    assert_eq!(member["environment_variables"]["CIBURST_RUNNER"], "8-node");
+    assert!(
+        member["environment_variables"]
+            .get("CIBURST_POOL")
+            .is_none()
+    );
 }
 
 #[tokio::test]

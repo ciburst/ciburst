@@ -10,6 +10,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 pub const TAG_CIBURST: &str = "ciburst";
+pub const TAG_RUNNER: &str = "runner";
+/// The runner tag of a server started before the rename to `runner:<tag>`; read, never written.
 pub const TAG_POOL: &str = "pool";
 pub const TAG_JOB: &str = "job";
 pub const TAG_STATE: &str = "ciburst-state";
@@ -26,6 +28,12 @@ const STATE_TAGS: [&str; 5] = [TAG_STATE, TAG_FREE, TAG_SPILL, TAG_SEEN, TAG_DRA
 pub fn tag_value<'a>(tags: &'a [String], key: &str) -> Option<&'a str> {
     tags.iter()
         .find_map(|tag| tag.strip_prefix(key)?.strip_prefix(':'))
+}
+
+/// The runner tag a server serves: `runner:<tag>`, or `pool:<tag>` on a server started before the
+/// rename.
+pub fn runner_of(tags: &[String]) -> Option<&str> {
+    tag_value(tags, TAG_RUNNER).or_else(|| tag_value(tags, TAG_POOL))
 }
 
 fn has_key(tag: &str, key: &str) -> bool {
@@ -49,13 +57,13 @@ pub fn is_deployment(server: &Value, name: &str) -> bool {
     tags.iter().any(|t| t == TAG_CIBURST) && tags.iter().any(|t| t == name)
 }
 
-/// Rule 4: `ciburst`, `<name>`, `pool:<tag>`, `job:<job>`, `ciburst-state:starting`,
+/// Rule 4: `ciburst`, `<name>`, `runner:<tag>`, `job:<job>`, `ciburst-state:starting`,
 /// `ciburst-free:<free>` (slots minus those taken at start, spec 6.3).
-pub fn initial_tags(name: &str, pool: &str, job: Option<&str>, free: u32) -> Vec<String> {
+pub fn initial_tags(name: &str, runner: &str, job: Option<&str>, free: u32) -> Vec<String> {
     let mut tags = vec![
         TAG_CIBURST.to_string(),
         name.to_string(),
-        format!("{TAG_POOL}:{pool}"),
+        format!("{TAG_RUNNER}:{runner}"),
     ];
     if let Some(job) = job.filter(|j| !j.is_empty()) {
         tags.push(format!("{TAG_JOB}:{job}"));
@@ -203,7 +211,7 @@ mod tests {
             tags(&[
                 "ciburst",
                 "demo",
-                "pool:ci",
+                "runner:ci",
                 "job:42",
                 "ciburst-state:starting",
                 "ciburst-free:2"
@@ -221,7 +229,7 @@ mod tests {
         let before = tags(&[
             "ciburst",
             "demo",
-            "pool:ci",
+            "runner:ci",
             "job:42",
             "owner:x",
             "ciburst-state:starting",
@@ -238,7 +246,7 @@ mod tests {
             tags(&[
                 "ciburst",
                 "demo",
-                "pool:ci",
+                "runner:ci",
                 "job:42",
                 "owner:x",
                 "ciburst-state:busy",
@@ -293,11 +301,11 @@ mod tests {
 
     #[test]
     fn claims_floor_at_zero_and_keep_order() {
-        let start = tags(&["ciburst", "ciburst-free:2", "pool:ci"]);
+        let start = tags(&["ciburst", "ciburst-free:2", "runner:ci"]);
         let one = claimed(&start);
-        assert_eq!(one, tags(&["ciburst", "ciburst-free:1", "pool:ci"]));
+        assert_eq!(one, tags(&["ciburst", "ciburst-free:1", "runner:ci"]));
         let zero = claimed(&claimed(&one));
-        assert_eq!(zero, tags(&["ciburst", "ciburst-free:0", "pool:ci"]));
+        assert_eq!(zero, tags(&["ciburst", "ciburst-free:0", "runner:ci"]));
         assert_eq!(
             claimed(&tags(&["ciburst"])),
             tags(&["ciburst", "ciburst-free:0"])
@@ -306,6 +314,15 @@ mod tests {
             claimed(&tags(&["ciburst-free:x", "ciburst-free:3"])),
             tags(&["ciburst-free:0"])
         );
+    }
+
+    #[test]
+    fn runner_tag_reads_the_old_pool_tag_after_the_new_one() {
+        assert_eq!(runner_of(&tags(&["ciburst", "runner:ci"])), Some("ci"));
+        assert_eq!(runner_of(&tags(&["ciburst", "pool:ci"])), Some("ci"));
+        assert_eq!(runner_of(&tags(&["pool:old", "runner:ci"])), Some("ci"));
+        assert_eq!(runner_of(&tags(&["ciburst", "pooled:ci"])), None);
+        assert_eq!(runner_of(&tags(&["ciburst"])), None);
     }
 
     #[test]

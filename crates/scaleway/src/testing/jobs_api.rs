@@ -92,6 +92,17 @@ impl FakeJobs {
         id
     }
 
+    /// Replaces the environment of the definition `id`, as an earlier version would have set it.
+    pub fn set_environment(&self, id: &str, environment: Value) {
+        let mut inner = self.inner.lock().expect("fake jobs");
+        let definition = inner
+            .definitions
+            .iter_mut()
+            .find(|d| d["id"] == id)
+            .unwrap_or_else(|| panic!("definition {id}"));
+        definition["environment_variables"] = environment;
+    }
+
     /// Caps `page_size` so that tests can force several pages.
     pub fn set_max_page_size(&self, size: usize) {
         self.inner.lock().expect("fake jobs").max_page_size = size.max(1);

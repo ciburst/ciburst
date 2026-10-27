@@ -41,7 +41,7 @@ pub fn base_env(
         (DISPATCH_URL.to_string(), required(DISPATCH_URL)?),
         ("CI_SERVER_URL".to_string(), config.gitlab.url.clone()),
         ("RUNNER_TOKEN".to_string(), required("RUNNER_TOKEN")?),
-        ("CIBURST_POOL".to_string(), pool.tag.clone()),
+        ("CIBURST_RUNNER".to_string(), pool.tag.clone()),
         ("CIBURST_SLOTS".to_string(), pool.slots.to_string()),
         ("CIBURST_DEFAULT_IMAGE".to_string(), pool.image.clone()),
         ("CIBURST_TIMEOUT_S".to_string(), pool.timeout_s.to_string()),
