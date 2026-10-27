@@ -36,7 +36,7 @@ Goal: the project's jobs run on ciburst: jobs that need a Docker daemon on the V
 
 Verify:
 - The CI file is valid: Pipeline editor, Validate; or `POST /projects/:id/ci/lint` with a token that may.
-- `ciburst.json` is valid: `ciburst-setup` refuses an invalid file and names each field; a key of an earlier config (`pools`, `defaultPool`, `stages`, `vmFirst`, `spillRunner`, `providers`) is refused with its replacement.
+- `ciburst.json` is valid: `ciburst-setup` refuses an invalid file and names each field; a key of an earlier config (`pools`, `defaultPool`, `stages`, `vmFirst`, `spillRunner`, `providers`) is refused with its replacement, any other unknown key by its name.
 - After the setup: VM jobs run on the runner `ci-<project id>-vm`, lane jobs on `ci-<project id>-<lane tag>`; `ciburst-check` prints `every job matches its lanes and the VM runner`.
 - Webhook: Settings, Webhooks, recent events show each delivery's answer with `ms` (under 10 s, or GitLab counts it failed); `ciburst status` with a token lists the same.
 - The first pipeline starts with empty caches: the jobs' caches live in the deployment's own bucket, and GitLab's hosted-runner cache does not carry over.
