@@ -493,6 +493,7 @@ Result (2026-10-26, the demo as host in `nl-ams`, a member project in a personal
 - a routing-only config change (`ignoreJobs`) redeployed the function (about 10 minutes), against rule R1; fixed by comparing the function settings with `Config::deployment_view` (spec section 5.6).
 - after that fix, removing `prettier` from `ignoreJobs` again: setup in 27 s with `update fleet config` and the function `noop`; the next member pipeline routed `prettier` to the VM pool;
 - in the first minute after a function deploy, cold instances answered in 4 to 9 s, and two pending events got no answer within GitLab's 10 s, which stranded that pipeline; warm, a fleet refresh took 0.6 to 1 s and a burst of 10 requests stayed under 1.4 s. The refresh read the config, the member listing and each member one after another; it now reads the config and the members at once, and all members at once (`members_are_read_at_once`).
+- with that fix deployed (`update function code`, 18 resources `noop`), a member pipeline right after the deploy: the cold answers took 3.4 to 5.3 s, warm ones 0.2 to 2 s; every event got an answer, a VM started for the first pending job, the second was `grouped` onto it, and the pipeline passed.
 
 ## `run-single` flags
 
