@@ -131,7 +131,7 @@ unit-api:
     - npm test
 ```
 
-Lane images: `linux/amd64` with `/bin/sh`, public or in the deployment's Scaleway registry. RPM-based images (UBI, Fedora) and images that run as a non-root user must already contain `git` and `curl`. A run gets up to 6 vCPU, 16 GB memory, 10 GB disk and 24 hours, with at most 400 runs per organization at once; it has no Docker daemon and no privileged mode, and `/tmp` lives in memory.
+Lane images: `linux/amd64` with `/bin/sh`, public or in the deployment's Scaleway registry. RPM-based images (UBI, Fedora) and images that run as a non-root user must already contain `git` and `curl`. A run gets up to 6 vCPU, 16 GB memory, 10 GB disk and 24 hours, with at most 400 runs per organization at once; it has no Docker daemon and no privileged mode, root has no capabilities (`chown` fails: extract archives with `tar --no-same-owner`), and `/tmp` lives in memory.
 
 `ciburst check --suggest` proposes lanes: per image of the Docker-free jobs on the VM runner, a lane for `ciburst.json` and the `tags:` line each job needs, and the `ignoreJobs` list of the jobs that run on other runners. `ciburst check` and the `ciburst-check` job report a lane job with `services:`, a Docker image, a `docker` command, or an image other than its lane's. Details: `docs/RUNBOOK.md`, Lanes.
 

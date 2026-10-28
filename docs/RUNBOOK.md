@@ -374,6 +374,7 @@ Job containers on VMs: the Docker executor labels build and service containers w
 | `ciburst-lane: cannot download gitlab-runner` | the runner object is missing (deleted, or `apply` stopped before the `runner-binary` step) or the bucket is unreachable | `ciburst plan` shows `runner-binary` as `create`; `ciburst apply`; re-run the job |
 | `ciburst-lane: gitlab-runner does not match its SHA-256` | the object at `CIBURST_RUNNER_URL` is not the pinned runner, for example overwritten by a job, which holds the cache key | delete `ciburst/runner/<sha256>` from the cache bucket, `ciburst apply`, re-run the job |
 | `ciburst-lane: RUNNER_WAIT_TIMEOUT must be a whole number of seconds`, or `ciburst-lane: CACHE_TYPE must be s3 or empty` | the job definition's environment was edited outside ciburst | `ciburst apply`, in a member `ciburst-join`, restores it |
+| Lane job: `tar: <file>: Cannot change ownership to uid <n>, gid <n>: Operation not permitted` | the sandbox drops root's capabilities, and `tar` as root restores the archive's owners | extract with `tar --no-same-owner` in the job's script |
 | Lane: run ends `out of memory` | files in `/tmp` count against memory | raise `memoryMiB` or write to the builds dir |
 | Lane: costs beyond the free tier | Serverless Jobs free tier exceeded | consumption page; per-second prices apply (section Facts) |
 | Function deploy fails with an unknown runtime | Scaleway retired `rust196` | runtime bump (Rotation and updates) |
