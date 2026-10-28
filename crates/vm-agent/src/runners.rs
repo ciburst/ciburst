@@ -4,6 +4,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
+use std::net::SocketAddr;
 
 use ciburst_core::types::VmRunner;
 
@@ -21,8 +22,10 @@ pub struct RunnerConfig {
 }
 
 /// One entry per distinct token: the VM runner first, then the members by project id, so the
-/// same runners always render the same text.
-pub fn render(config: &Config, members: &[VmRunner]) -> RunnerConfig {
+/// same runners always render the same text. Every entry reaches GitLab through the agent's
+/// proxy at `proxy` (D67).
+pub fn render(config: &Config, members: &[VmRunner], proxy: SocketAddr) -> RunnerConfig {
+    let proxy_url = format!("http://{proxy}");
     let mut seen: BTreeSet<&str> = BTreeSet::from([config.runner_token.as_str()]);
     let mut sorted: Vec<&VmRunner> = members.iter().collect();
     sorted.sort_by_key(|member| member.project_id);
@@ -38,7 +41,7 @@ pub fn render(config: &Config, members: &[VmRunner]) -> RunnerConfig {
     let _ = writeln!(content, "concurrent = {}", config.slots);
     let _ = writeln!(content, "check_interval = {CHECK_INTERVAL_S}");
     for (name, token) in &entries {
-        entry(&mut content, config, name, token);
+        entry(&mut content, config, &proxy_url, name, token);
     }
     RunnerConfig {
         content,
@@ -46,10 +49,13 @@ pub fn render(config: &Config, members: &[VmRunner]) -> RunnerConfig {
     }
 }
 
-fn entry(out: &mut String, config: &Config, name: &str, token: &str) {
+fn entry(out: &mut String, config: &Config, proxy_url: &str, name: &str, token: &str) {
     let _ = writeln!(out, "\n[[runners]]");
     let _ = writeln!(out, "name = {}", quote(name));
-    let _ = writeln!(out, "url = {}", quote(&config.server_url));
+    let _ = writeln!(out, "url = {}", quote(proxy_url));
+    // Without it the runner derives git's `insteadOf` rewrites from `url`, and with
+    // `GIT_SUBMODULE_FORCE_HTTPS` submodules would be cloned through the proxy (spec 6.2).
+    let _ = writeln!(out, "clone_url = {}", quote(&config.server_url));
     let _ = writeln!(out, "token = {}", quote(token));
     let _ = writeln!(out, "executor = \"docker\"");
     if config.cache.is_some() {
@@ -104,9 +110,14 @@ fn quote(value: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::tests::sample;
+
+    pub(crate) const PROXY: SocketAddr = SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 17, 0, 1)),
+        8780,
+    );
 
     fn member(project_id: u64, token: &str) -> VmRunner {
         VmRunner {
@@ -120,7 +131,8 @@ mod tests {
             "
 [[runners]]
 name = \"{name}\"
-url = \"https://gitlab.example.invalid\"
+url = \"http://172.17.0.1:8780\"
+clone_url = \"https://gitlab.example.invalid\"
 token = \"{token}\"
 executor = \"docker\"
 environment = [\"FF_USE_FASTZIP=true\", \"CACHE_COMPRESSION_LEVEL=fastest\"]
@@ -145,7 +157,7 @@ SecretKey = \"cache-secret-key\"
 
     #[test]
     fn without_members_only_the_pool_runner() {
-        let rendered = render(&sample(), &[]);
+        let rendered = render(&sample(), &[], PROXY);
         assert_eq!(
             rendered.content,
             format!("{HEAD}{}", entry_text("vm", "glrt-runner-secret"))
@@ -155,7 +167,7 @@ SecretKey = \"cache-secret-key\"
 
     #[test]
     fn one_member_gets_its_own_entry() {
-        let rendered = render(&sample(), &[member(42, "glrt-member-42")]);
+        let rendered = render(&sample(), &[member(42, "glrt-member-42")], PROXY);
         assert_eq!(
             rendered.content,
             format!(
@@ -174,7 +186,7 @@ SecretKey = \"cache-secret-key\"
             member(10, "glrt-member-10"),
             member(20, "glrt-member-20"),
         ];
-        let rendered = render(&sample(), &members);
+        let rendered = render(&sample(), &members, PROXY);
         assert_eq!(
             rendered.content,
             format!(
@@ -188,7 +200,7 @@ SecretKey = \"cache-secret-key\"
         assert_eq!(rendered.runners, 4);
         let mut reversed = members.to_vec();
         reversed.reverse();
-        assert_eq!(render(&sample(), &reversed), rendered);
+        assert_eq!(render(&sample(), &reversed, PROXY), rendered);
     }
 
     #[test]
@@ -200,7 +212,7 @@ SecretKey = \"cache-secret-key\"
             member(4, "glrt-member-3"),
             member(5, ""),
         ];
-        let rendered = render(&sample(), &members);
+        let rendered = render(&sample(), &members, PROXY);
         assert_eq!(rendered.runners, 3);
         assert_eq!(rendered.content.matches("[[runners]]").count(), 3);
         assert!(rendered.content.contains("name = \"member-2\""));
@@ -214,13 +226,14 @@ SecretKey = \"cache-secret-key\"
         let mut config = sample();
         config.cache = None;
         config.slots = 3;
-        let rendered = render(&config, &[]);
+        let rendered = render(&config, &[], PROXY);
         assert_eq!(
             rendered.content,
             "# Written by ciburst-vm-agent.\nconcurrent = 3\ncheck_interval = 3\n
 [[runners]]
 name = \"vm\"
-url = \"https://gitlab.example.invalid\"
+url = \"http://172.17.0.1:8780\"
+clone_url = \"https://gitlab.example.invalid\"
 token = \"glrt-runner-secret\"
 executor = \"docker\"
 [runners.docker]
@@ -228,6 +241,25 @@ image = \"registry.example.invalid/ciburst/node:1\"
 privileged = true
 volumes = [\"/cache\", \"/certs/client\"]
 "
+        );
+    }
+
+    #[test]
+    fn every_entry_asks_gitlab_through_the_proxy_and_clones_from_gitlab() {
+        let other = SocketAddr::from(([10, 200, 0, 1], 8780));
+        let rendered = render(&sample(), &[member(42, "glrt-member-42")], other);
+        let urls: Vec<&str> = rendered
+            .content
+            .lines()
+            .filter(|line| line.starts_with("url = "))
+            .collect();
+        assert_eq!(urls, ["url = \"http://10.200.0.1:8780\""; 2]);
+        assert_eq!(
+            rendered
+                .content
+                .matches("clone_url = \"https://gitlab.example.invalid\"\n")
+                .count(),
+            2
         );
     }
 

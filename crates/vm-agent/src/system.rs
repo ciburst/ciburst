@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::io::{self, Write};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -10,6 +11,9 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use ciburst_core::http::HttpClient;
+use ciburst_core::log::Log;
+
+use crate::proxy;
 
 /// Label the Docker executor puts on every job container (`executors/docker/internal/labels`).
 pub const JOB_LABEL: &str = "com.gitlab.gitlab-runner.job.id";
@@ -51,6 +55,14 @@ pub trait Docker: Send + Sync {
     async fn job_labels(&self) -> io::Result<String>;
 }
 
+/// The runner's proxy to GitLab (D67).
+#[async_trait]
+pub trait Proxy: Send {
+    /// Starts the proxy on the Docker bridge address and returns where it listens; the runner
+    /// and its helper containers both reach that address.
+    async fn listen(&mut self) -> io::Result<SocketAddr>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessCommand {
     pub program: String,
@@ -64,6 +76,7 @@ pub struct System {
     pub files: Arc<dyn Files>,
     pub docker: Arc<dyn Docker>,
     pub http: Arc<dyn HttpClient>,
+    pub proxy: Box<dyn Proxy>,
 }
 
 pub struct SystemClock {
@@ -138,6 +151,50 @@ pub fn docker_ps_args() -> Vec<String> {
         "--format".to_string(),
         format!("{{{{.Label \"{JOB_LABEL}\"}}}}"),
     ]
+}
+
+/// The proxy of [`proxy::serve`] on the address of the `docker0` bridge.
+pub struct BridgeProxy {
+    /// `gitlab.url`.
+    pub upstream: String,
+    pub log: Log,
+}
+
+#[async_trait]
+impl Proxy for BridgeProxy {
+    async fn listen(&mut self) -> io::Result<SocketAddr> {
+        let output = tokio::time::timeout(
+            DOCKER_TIMEOUT,
+            tokio::process::Command::new("ip")
+                .args(["-4", "-o", "addr", "show", "dev", "docker0"])
+                .stdin(Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "ip addr timed out"))??;
+        let address =
+            parse_bridge_address(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "docker0 has no IPv4 address")
+            })?;
+        let listener = tokio::net::TcpListener::bind((address, proxy::PORT)).await?;
+        let local = listener.local_addr()?;
+        let (upstream, log) = (self.upstream.clone(), self.log.clone());
+        tokio::spawn(async move {
+            if let Err(error) = proxy::serve(listener, &upstream, log.clone()).await {
+                log.error("proxy stopped", &[("error", &error.to_string())]);
+            }
+        });
+        Ok(local)
+    }
+}
+
+/// The IPv4 address in the output of `ip -4 -o addr show dev docker0`:
+/// `3: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0 ...`.
+pub fn parse_bridge_address(text: &str) -> Option<Ipv4Addr> {
+    let mut words = text.split_whitespace();
+    words.find(|word| *word == "inet")?;
+    words.next()?.split('/').next()?.parse().ok()
 }
 
 pub struct LocalFiles;
@@ -324,6 +381,22 @@ mod tests {
             let mode = fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn the_bridge_address_is_the_first_ipv4_address() {
+        let text = "3: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0\\       valid_lft forever preferred_lft forever\n";
+        assert_eq!(
+            parse_bridge_address(text),
+            Some(Ipv4Addr::new(172, 17, 0, 1))
+        );
+        assert_eq!(
+            parse_bridge_address("5: docker0    inet 10.200.0.1/24 scope global docker0"),
+            Some(Ipv4Addr::new(10, 200, 0, 1))
+        );
+        assert_eq!(parse_bridge_address(""), None);
+        assert_eq!(parse_bridge_address("3: docker0    inet"), None);
+        assert_eq!(parse_bridge_address("3: docker0    inet fe80::1/64"), None);
     }
 
     #[test]

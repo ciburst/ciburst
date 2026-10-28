@@ -2,6 +2,7 @@
 //! runners of spec 8.5 as entries of the runner's `config.toml`.
 
 use std::collections::BTreeSet;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -112,6 +113,8 @@ pub struct Agent {
     answer: VmReportAnswer,
     /// The `config.toml` on disk, `None` before the first write.
     written: Option<RunnerConfig>,
+    /// Where the proxy to GitLab listens, `None` until it does (D67).
+    proxy: Option<SocketAddr>,
 }
 
 impl Agent {
@@ -126,6 +129,7 @@ impl Agent {
             reported: None,
             answer: no_answer(),
             written: None,
+            proxy: None,
         }
     }
 
@@ -151,6 +155,7 @@ impl Agent {
 
     pub async fn tick(&mut self) -> Option<i32> {
         self.reap();
+        self.listen().await;
         if self.phase != Phase::Quitting {
             self.write_config();
         }
@@ -346,10 +351,29 @@ impl Agent {
         self.phase = next;
     }
 
+    /// Starts the proxy to GitLab until it listens (D67): the runner's entries point at it, so
+    /// neither `config.toml` nor the runner exists before.
+    async fn listen(&mut self) {
+        if self.proxy.is_some() {
+            return;
+        }
+        match self.sys.proxy.listen().await {
+            Ok(address) => {
+                self.log
+                    .info("proxy listening", &[("address", &address.to_string())]);
+                self.proxy = Some(address);
+            }
+            Err(error) => self
+                .log
+                .warn("proxy failed", &[("error", &error.to_string())]),
+        }
+    }
+
     /// Writes `config.toml` when the wanted runners differ from the file's; the runner reloads
     /// it within about a second (`docs/RUNBOOK.md`, Measured).
     fn write_config(&mut self) {
-        let rendered = render(&self.config, &self.answer.runners);
+        let Some(proxy) = self.proxy else { return };
+        let rendered = render(&self.config, &self.answer.runners, proxy);
         if self
             .written
             .as_ref()
@@ -473,7 +497,8 @@ mod tests {
     use super::*;
     use crate::config::tests::{SAMPLE, sample};
     use crate::config::{Config, parse};
-    use crate::system::{Clock, Docker, Files, Process, Uptime};
+    use crate::runners::tests::PROXY;
+    use crate::system::{Clock, Docker, Files, Process, Proxy, Uptime};
 
     const SECRETS: [&str; 6] = [
         "vm-token-secret",
@@ -645,6 +670,34 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct ProxyState {
+        /// Times of the attempts to listen.
+        attempts: Vec<u64>,
+        /// The bridge address cannot be bound.
+        failing: bool,
+    }
+
+    struct FakeProxy {
+        clock: FakeClock,
+        state: Arc<Mutex<ProxyState>>,
+    }
+
+    #[async_trait]
+    impl Proxy for FakeProxy {
+        async fn listen(&mut self) -> io::Result<std::net::SocketAddr> {
+            let mut state = self.state.lock().unwrap();
+            state.attempts.push(self.clock.elapsed());
+            if state.failing {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "cannot assign requested address",
+                ));
+            }
+            Ok(PROXY)
+        }
+    }
+
     type Responder = Box<dyn Fn(&str, u64) -> u16 + Send + Sync>;
     type Answerer = Box<dyn Fn(u64) -> Value + Send + Sync>;
 
@@ -726,6 +779,7 @@ mod tests {
         docker: FakeDocker,
         process: Arc<Mutex<ProcState>>,
         files: Arc<Mutex<FileState>>,
+        proxy: Arc<Mutex<ProxyState>>,
         sent: Arc<Mutex<Vec<Sent>>>,
         respond: Arc<Mutex<Responder>>,
         answer: Arc<Mutex<Answerer>>,
@@ -753,6 +807,7 @@ mod tests {
         };
         let process = Arc::new(Mutex::new(ProcState::default()));
         let files = Arc::new(Mutex::new(FileState::default()));
+        let proxy = Arc::new(Mutex::new(ProxyState::default()));
         let sent = Arc::new(Mutex::new(Vec::new()));
         let respond: Arc<Mutex<Responder>> = Arc::new(Mutex::new(Box::new(|_, _| 200)));
         let answer: Arc<Mutex<Answerer>> = Arc::new(Mutex::new(Box::new(|_| old_answer())));
@@ -775,6 +830,10 @@ mod tests {
                 respond: Arc::clone(&respond),
                 answer: Arc::clone(&answer),
             }),
+            proxy: Box::new(FakeProxy {
+                clock: clock.clone(),
+                state: Arc::clone(&proxy),
+            }),
         };
         Harness {
             agent: Agent::new(config.clone(), sys, log),
@@ -782,6 +841,7 @@ mod tests {
             docker,
             process,
             files,
+            proxy,
             sent,
             respond,
             answer,
@@ -939,7 +999,7 @@ mod tests {
         assert_eq!(h.run_until(0).await, None);
         assert_eq!(h.configs(), [names(0, &["vm"])]);
         let written = h.files.lock().unwrap().writes[0].2.clone();
-        assert_eq!(written, render(&h.config, &[]).content);
+        assert_eq!(written, render(&h.config, &[], PROXY).content);
         let spawns = h.process.lock().unwrap().spawns.clone();
         assert_eq!(spawns, [(0, runner_command(&h.config).args)]);
         assert_eq!(h.reports(), [report(0, "idle", 2)]);
@@ -951,10 +1011,40 @@ mod tests {
             json!({"state": "idle", "free": 2, "slots": 2})
         );
         h.assert_lines(&[
+            r#"info proxy listening address="172.17.0.1:8780""#,
             r#"info config written runners="1""#,
             r#"info runner started pid="101""#,
             r#"info state from="starting" to="idle" free="2""#,
         ]);
+        assert_eq!(
+            h.proxy.lock().unwrap().attempts,
+            [0],
+            "one proxy for the agent's life"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_config_and_no_runner_before_the_proxy_listens() {
+        let mut h = harness(2, 0);
+        h.proxy.lock().unwrap().failing = true;
+        assert_eq!(h.run_until(10).await, None);
+        assert!(h.configs().is_empty());
+        assert!(h.spawns().is_empty());
+        assert_eq!(
+            h.reports(),
+            [report(0, "idle", 0)],
+            "no runner, no free slot"
+        );
+        assert_eq!(
+            h.count(r#"warn proxy failed error="cannot assign requested address""#),
+            3
+        );
+        h.proxy.lock().unwrap().failing = false;
+        assert_eq!(h.run_until(15).await, None);
+        assert_eq!(h.proxy.lock().unwrap().attempts, [0, 5, 10, 15]);
+        assert_eq!(h.configs(), [names(15, &["vm"])]);
+        assert_eq!(h.spawns(), [15]);
+        assert_eq!(h.reports(), [report(0, "idle", 0), report(15, "idle", 2)]);
     }
 
     #[tokio::test]

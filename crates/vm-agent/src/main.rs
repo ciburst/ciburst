@@ -4,6 +4,7 @@
 
 mod agent;
 mod config;
+mod proxy;
 mod runners;
 mod system;
 
@@ -13,7 +14,9 @@ use std::sync::Arc;
 use ciburst_core::http::ReqwestClient;
 use ciburst_core::log::Log;
 
-use crate::system::{DockerCli, LocalFiles, LocalProcess, ProcUptime, System, SystemClock};
+use crate::system::{
+    BridgeProxy, DockerCli, LocalFiles, LocalProcess, ProcUptime, System, SystemClock,
+};
 
 const USAGE: u8 = 64;
 
@@ -48,7 +51,9 @@ fn main() -> ExitCode {
             return ExitCode::from(USAGE);
         }
     };
-    let runtime = match tokio::runtime::Builder::new_current_thread()
+    // The proxy's transfers run beside the agent's loop (D67).
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
     {
@@ -73,6 +78,10 @@ fn main() -> ExitCode {
         files: Arc::new(LocalFiles),
         docker: Arc::new(DockerCli),
         http: Arc::new(http),
+        proxy: Box::new(BridgeProxy {
+            upstream: config.server_url.clone(),
+            log: log.clone(),
+        }),
     };
     let code = runtime.block_on(agent::Agent::new(config, sys, log).run());
     if code == 0 {

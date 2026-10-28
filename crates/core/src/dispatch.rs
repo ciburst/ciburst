@@ -716,6 +716,13 @@ impl Dispatcher {
                     typical: typical.get(&job.name).copied().flatten(),
                 })
                 .collect();
+            // D68: a reported busy slot without a running record frees now; its job ended
+            // and the VM's next report is still on its way.
+            let unaccounted = busy_slots(vms, pool.slots).saturating_sub(running.len());
+            running.extend((0..unaccounted).map(|_| RunningJob {
+                started: now,
+                typical: None,
+            }));
         }
         Ok(start_rule(&RuleInput {
             now,
@@ -1544,6 +1551,16 @@ fn claim_candidates(vms: &[VmCapacity], now: u64) -> Vec<&VmCapacity> {
 /// VMs that are not draining.
 fn live_count(vms: &[VmCapacity]) -> usize {
     vms.iter().filter(|v| v.state != VmState::Draining).count()
+}
+
+/// spec 6.4, start rule step 1 (D68): the busy slots of the VMs that reported `idle` or
+/// `busy`. A `starting` VM's missing slots are the burst jobs it was started for, which are not
+/// in the queue.
+fn busy_slots(vms: &[VmCapacity], slots: u32) -> usize {
+    vms.iter()
+        .filter(|v| matches!(v.state, VmState::Idle | VmState::Busy))
+        .map(|v| slots.saturating_sub(v.free) as usize)
+        .sum()
 }
 
 /// spec 6.4, start rule step 3: the free slots of VMs in state `starting` younger than
@@ -4731,22 +4748,39 @@ mod tests {
     async fn at_max_runs_a_vm_job_queues_instead_of_answering_at_capacity() {
         let schedule = Arc::new(MemorySchedule::new());
         let (s, _) = queue_setup(vm_config(), vm_secrets(), schedule.clone()).await;
+        s.finished("image-a", 100, "success", 600.0, T0).await;
         let a = run_of(&s.pending_job("image-a", 1, T0).await);
+        for job in [1, 11] {
+            s.running("image-a", job, T0 + 2).await;
+        }
         s.report_at(&a, VmState::Busy, 0, T0 + 60).await;
         let second = s.pending_job("image-b", 2, T0 + 60).await;
         assert_eq!(
             second.body["result"], "started",
-            "no running job will free a slot"
+            "both slots free only after maxQueueS"
         );
         let b = run_of(&second);
+        for job in [2, 12] {
+            s.running("image-a", job, T0 + 61).await;
+        }
         s.report_at(&b, VmState::Busy, 0, T0 + 61).await;
         let third = s.pending_job("deploy", 3, T0 + 62).await;
         assert_eq!(
             third.body,
-            json!({ "result": "queued", "runner": "vm", "kind": "vm", "etaS": null, "ms": 0 })
+            json!({ "result": "queued", "runner": "vm", "kind": "vm", "etaS": 540, "ms": 0 })
+        );
+        for job in 4..=6 {
+            let queued = s.pending_job("deploy", job, T0 + 62).await;
+            assert_eq!(queued.body["result"], "queued");
+        }
+        let seventh = s.pending_job("deploy", 7, T0 + 62).await;
+        assert_eq!(
+            seventh.body,
+            json!({ "result": "queued", "runner": "vm", "kind": "vm", "etaS": null, "ms": 0 }),
+            "four running jobs free four slots"
         );
         assert!(s.lines().contains(
-            &r#"info queued job="3" pipeline="9" project="7" stage="test" runner="vm" eta_s="null" ms="0""#
+            &r#"info queued job="7" pipeline="9" project="7" stage="test" runner="vm" eta_s="null" ms="0""#
                 .to_string()
         ));
         assert_eq!(
@@ -4754,7 +4788,73 @@ mod tests {
             reported(15)
         );
         assert_eq!(s.started_pools(), ["vm", "vm"], "maxRuns 2");
+        assert_eq!(schedule.queued("vm").await.unwrap().len(), 5);
+    }
+
+    /// A VM of one slot started at `T0` for job 1, which ran from `T0 + 2`; the VM reported its
+    /// slot busy at `T0 + 60` and job 1's success event arrived at `T0 + 100`, before the VM's
+    /// next report.
+    async fn one_slot_vm_after_its_job(schedule: Arc<MemorySchedule>) -> (VmSetup, String) {
+        let mut config = (*lane_config()).clone();
+        config.vm.slots = 1;
+        let (s, _) = queue_setup(Arc::new(config), lane_secrets(), schedule).await;
+        let vm = run_of(&s.pending_job("image-a", 1, T0).await);
+        s.running("image-a", 1, T0 + 2).await;
+        s.report_at(&vm, VmState::Busy, 0, T0 + 60).await;
+        let done = s.finished("image-a", 1, "success", 98.0, T0 + 100).await;
+        assert_eq!(done.body["result"], "tracked");
+        (s, vm)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_slot_without_a_running_job_frees_now() {
+        let schedule = Arc::new(MemorySchedule::new());
+        let (s, _) = one_slot_vm_after_its_job(schedule.clone()).await;
+        let next = s.pending_job("image-b", 2, T0 + 101).await;
+        assert_eq!(
+            next.body,
+            json!({ "result": "queued", "runner": "vm", "kind": "vm", "etaS": 0, "ms": 0 }),
+            "the VM's report of free 0 predates the end of job 1 (D68)"
+        );
+        assert_eq!(s.started_pools(), ["vm"]);
         assert_eq!(schedule.queued("vm").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_slot_that_never_frees_gets_a_vm_after_max_queue_s() {
+        let schedule = Arc::new(MemorySchedule::new());
+        let (s, vm) = one_slot_vm_after_its_job(schedule.clone()).await;
+        s.pending_job("image-b", 2, T0 + 101).await;
+        assert_eq!(
+            s.report_at(&vm, VmState::Busy, 0, T0 + 191).await.body,
+            reported(15)
+        );
+        assert_eq!(s.started_pools(), ["vm"], "90 s are allowed");
+        s.set_clock(T0 + 192);
+        s.report_at(&vm, VmState::Busy, 0, T0 + 192).await;
+        let started = s.recording.started.lock().unwrap().clone();
+        assert_eq!(started.len(), 2);
+        assert_eq!(started[1].labels["job"], "queue:2");
+        assert_eq!(started[1].taken, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_starting_vm_s_taken_slots_free_nothing() {
+        let mut config = (*lane_config()).clone();
+        config.vm.slots = 1;
+        let (s, _) = queue_setup(
+            Arc::new(config),
+            lane_secrets(),
+            Arc::new(MemorySchedule::new()),
+        )
+        .await;
+        s.pending_job("image-a", 1, T0).await;
+        let next = s.pending_job("image-b", 2, T0 + 40).await;
+        assert_eq!(
+            next.body["result"], "started",
+            "the starting VM's slot belongs to job 1: {}",
+            next.body
+        );
     }
 
     #[tokio::test(start_paused = true)]

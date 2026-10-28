@@ -1,7 +1,8 @@
-//! The real binary with the pinned `gitlab-runner` (spec 8.5), a fake `docker` and one
-//! loopback server playing both GitLab's job request API and the dispatcher: one `gitlab-runner
-//! run` polls with every runner entry, reloads the rewritten `config.toml`, and exits on
-//! `SIGQUIT`, after which the agent starts it again.
+//! The real binary with the pinned `gitlab-runner` (spec 8.5), a fake `docker`, a fake `ip`
+//! that names `127.0.0.1` as the bridge address, and one loopback server playing both GitLab's
+//! job request API and the dispatcher: one `gitlab-runner run` polls with every runner entry
+//! through the agent's proxy, which drops `last_update` (D67), reloads the rewritten
+//! `config.toml`, and exits on `SIGQUIT`, after which the agent starts it again.
 //!
 //! The runner is `ciburst_core::cloud_init::RUNNER_URL`, downloaded once into the target
 //! directory and checked against `RUNNER_SHA256`, or the file `CIBURST_TEST_GITLAB_RUNNER` names.
@@ -142,7 +143,8 @@ fn connection(stream: TcpStream, server: &Server) {
             body: String::from_utf8_lossy(&body).into_owned(),
         });
         let response = if status.starts_with("204") {
-            format!("HTTP/1.1 {status}\r\n\r\n")
+            // Workhorse's queue marker; the runner sends it back as `last_update`.
+            format!("HTTP/1.1 {status}\r\nx-gitlab-last-update: 3f2a9c\r\n\r\n")
         } else {
             format!(
                 "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{answer}",
@@ -255,6 +257,13 @@ fn one_runner_process_serves_every_entry_and_reloads_its_config() {
         &bin.join("docker"),
         &format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{at}/docker.args\"\nexit 0\n"),
     );
+    script(
+        &bin.join("ip"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{at}/ip.args\"\n\
+             echo '1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever'\n"
+        ),
+    );
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
@@ -309,6 +318,16 @@ fn one_runner_process_serves_every_entry_and_reloads_its_config() {
     let config_path = state.join("config.toml");
     let config = fs::read_to_string(&config_path).unwrap();
     assert!(config.contains("concurrent = 2\n"), "{config}");
+    assert_eq!(
+        config.matches("url = \"http://127.0.0.1:8780\"\n").count(),
+        2,
+        "{config}"
+    );
+    assert_eq!(
+        config.matches(&format!("clone_url = \"{url}\"\n")).count(),
+        2,
+        "{config}"
+    );
     assert_eq!(config.matches("[[runners]]").count(), 2, "{config}");
     let mode = fs::metadata(&config_path).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o600);
@@ -371,6 +390,27 @@ fn one_runner_process_serves_every_entry_and_reloads_its_config() {
         (requests.contains_key(POOL) && requests.contains_key(MEMBER_B)).then_some(())
     });
 
+    // Through the proxy every job request reaches GitLab without `last_update`.
+    let bodies: Vec<String> = server
+        .inbox
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|received| received.path == JOB_REQUEST)
+        .map(|received| received.body.clone())
+        .collect();
+    assert!(bodies.len() > 3, "{bodies:?}");
+    for body in &bodies {
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert!(body.get("token").is_some(), "{body}");
+        assert!(body.get("last_update").is_none(), "{body}");
+    }
+    let ip = fs::read_to_string(root.join("ip.args")).unwrap();
+    assert_eq!(
+        ip.lines().collect::<Vec<_>>(),
+        ["-4", "-o", "addr", "show", "dev", "docker0"]
+    );
+
     let docker = fs::read_to_string(root.join("docker.args")).unwrap();
     assert_eq!(
         docker.lines().collect::<Vec<_>>(),
@@ -386,6 +426,7 @@ fn one_runner_process_serves_every_entry_and_reloads_its_config() {
     let log = agent_log();
     for line in [
         r#"info agent started run="run-e2e" runner="vm" slots="2" timeout_s="3600""#,
+        r#"info proxy listening address="127.0.0.1:8780""#,
         r#"info config written runners="2""#,
         r#"info config written runners="3""#,
         r#"info state from="starting" to="idle" free="2""#,
