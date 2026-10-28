@@ -126,9 +126,13 @@ test:
       changes: *test-paths
       variables:
         CARGO_CACHE_POLICY: pull-push
+  variables:
+    # The hosted small runner's disk does not hold the full debug info of every test binary.
+    CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    CARGO_INCREMENTAL: "0"
   cache:
-    key: test-$CI_COMMIT_REF_SLUG
-    fallback_keys: [test-main]
+    key: test-lines-$CI_COMMIT_REF_SLUG
+    fallback_keys: [test-lines-main]
     paths: [.cargo/registry/, .cargo/git/, target/]
     policy: $CARGO_CACHE_POLICY
   script:
