@@ -29,6 +29,11 @@ pub const LIFECYCLE_RULES: [(&str, &str); 3] = [
     ("ciburst-expire-intents", INTENT_PREFIX),
 ];
 
+/// The rule over the whole bucket that aborts a multipart upload [`ABORT_DAYS`] after it began
+/// (D69): the parts of an upload that never completes are billed and no listing shows them.
+pub const ABORT_RULE_ID: &str = "ciburst-abort-uploads";
+pub const ABORT_DAYS: u32 = 1;
+
 /// The canned ACL that lets anybody read an object without credentials.
 pub const PUBLIC_READ: &str = "public-read";
 
@@ -355,7 +360,8 @@ fn s3_error(method: &str, path: &str, response: &Response) -> Error {
     }
 }
 
-/// The lifecycle document of [`LIFECYCLE_RULES`], each expiring after `days`.
+/// The lifecycle document of [`LIFECYCLE_RULES`], each expiring after `days`, and the rule
+/// [`ABORT_RULE_ID`] with an empty filter, which covers the whole bucket.
 pub fn lifecycle_xml(days: u32) -> String {
     let rules: String = LIFECYCLE_RULES
         .iter()
@@ -370,31 +376,50 @@ pub fn lifecycle_xml(days: u32) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
          <LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{rules}\
-         </LifecycleConfiguration>"
+         <Rule><ID>{ABORT_RULE_ID}</ID><Filter></Filter><Status>Enabled</Status>\
+         <AbortIncompleteMultipartUpload><DaysAfterInitiation>{ABORT_DAYS}</DaysAfterInitiation>\
+         </AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>"
     )
+}
+
+/// The rule's prefix: `Filter/Prefix`, else the older bare `Prefix`.
+fn rule_prefix(rule: &str) -> Option<String> {
+    let filter = first(rule, "Filter").unwrap_or_default();
+    first(&filter, "Prefix").or_else(|| first(rule, "Prefix"))
 }
 
 /// The expiration days of the ciburst rules in a lifecycle document: `Some` only when the
 /// rules whose id starts with `ciburst-` are exactly those of [`LIFECYCLE_RULES`], enabled,
-/// on their prefixes and with the same days. The single rule of M4 expired the agent too, so a
-/// document that still has it reads as `None` and plans an update.
+/// on their prefixes and with the same days, plus [`ABORT_RULE_ID`], enabled, on the whole
+/// bucket and after [`ABORT_DAYS`]. The single rule of M4 expired the agent too, so a document
+/// that still has it reads as `None` and plans an update.
 pub fn parse_lifecycle_days(xml: &str) -> Option<u32> {
     let ours: Vec<String> = xml_values(xml, "Rule")
         .into_iter()
         .filter(|rule| first(rule, "ID").is_some_and(|id| id.starts_with("ciburst-")))
         .collect();
-    if ours.len() != LIFECYCLE_RULES.len() {
+    if ours.len() != LIFECYCLE_RULES.len() + 1 {
+        return None;
+    }
+    let find = |id: &str| {
+        ours.iter()
+            .find(|rule| first(rule, "ID").as_deref() == Some(id))
+    };
+    let abort = find(ABORT_RULE_ID)?;
+    let abort_days = first(abort, "AbortIncompleteMultipartUpload")
+        .and_then(|action| first(&action, "DaysAfterInitiation"))
+        .and_then(|days| days.parse::<u32>().ok());
+    if first(abort, "Status").as_deref() != Some("Enabled")
+        || !rule_prefix(abort).unwrap_or_default().is_empty()
+        || abort_days != Some(ABORT_DAYS)
+    {
         return None;
     }
     let mut days = None;
     for (id, prefix) in LIFECYCLE_RULES {
-        let rule = ours
-            .iter()
-            .find(|rule| first(rule, "ID").as_deref() == Some(id))?;
-        let filter = first(rule, "Filter").unwrap_or_default();
-        let found_prefix = first(&filter, "Prefix").or_else(|| first(rule, "Prefix"));
+        let rule = find(id)?;
         if first(rule, "Status").as_deref() != Some("Enabled")
-            || found_prefix.as_deref() != Some(prefix)
+            || rule_prefix(rule).as_deref() != Some(prefix)
         {
             return None;
         }
@@ -541,11 +566,15 @@ mod tests {
                  </Status><Expiration><Days>14</Days></Expiration></Rule>"
             )
         };
+        let abort = "<Rule><ID>ciburst-abort-uploads</ID><Filter></Filter><Status>Enabled\
+                     </Status><AbortIncompleteMultipartUpload><DaysAfterInitiation>1\
+                     </DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule>";
         assert_eq!(
             xml,
             format!(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?><LifecycleConfiguration \
-                 xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{}{}{}</LifecycleConfiguration>",
+                 xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{}{}{}{abort}\
+                 </LifecycleConfiguration>",
                 rule("ciburst-expire-project", "project/"),
                 rule("ciburst-expire-runner", "runner/"),
                 rule("ciburst-expire-intents", "ciburst/intents/"),
@@ -566,6 +595,16 @@ mod tests {
                 "<Rule><ID>ciburst-expire</ID><Filter><Prefix></Prefix></Filter><Status>Enabled\
                  </Status><Expiration><Days>14</Days></Expiration></Rule></LifecycleConfiguration>",
             ),
+            xml.replace(abort, ""),
+            xml.replace(abort, &abort.replace("Enabled", "Disabled")),
+            xml.replace(abort, &abort.replace(">1<", ">2<")),
+            xml.replace(
+                abort,
+                &abort.replace(
+                    "<Filter></Filter>",
+                    "<Filter><Prefix>project/</Prefix></Filter>",
+                ),
+            ),
             m4_document(14),
             "<LifecycleConfiguration/>".to_string(),
         ] {
@@ -585,6 +624,22 @@ mod tests {
             .replace("<Filter><Prefix>", "<Prefix>")
             .replace("</Prefix></Filter>", "</Prefix>");
         assert_eq!(parse_lifecycle_days(&legacy_prefix), Some(14));
+
+        // What Scaleway answered to a GET of this document (2026-11-03), and the same with the
+        // abort rule written without a filter, which it accepts as well.
+        let answered = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Configuration><Rule>\
+            <Expiration><Days>14</Days></Expiration><Filter><Prefix>project/</Prefix></Filter>\
+            <ID>ciburst-expire-project</ID><Status>Enabled</Status></Rule><Rule><Expiration><Days>\
+            14</Days></Expiration><Filter><Prefix>runner/</Prefix></Filter><ID>\
+            ciburst-expire-runner</ID><Status>Enabled</Status></Rule><Rule><Expiration><Days>14\
+            </Days></Expiration><Filter><Prefix>ciburst/intents/</Prefix></Filter><ID>\
+            ciburst-expire-intents</ID><Status>Enabled</Status></Rule><Rule>\
+            <AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation>\
+            </AbortIncompleteMultipartUpload><Filter></Filter><ID>ciburst-abort-uploads</ID>\
+            <Status>Enabled</Status></Rule></Configuration>";
+        assert_eq!(parse_lifecycle_days(answered), Some(14));
+        let without_filter = answered.replace("<Filter></Filter>", "");
+        assert_eq!(parse_lifecycle_days(&without_filter), Some(14));
     }
 
     #[test]

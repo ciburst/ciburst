@@ -356,6 +356,14 @@ async fn the_lifecycle_expires_the_cache_and_the_intents_and_upgrades_the_m4_rul
     }
     assert!(!document.contains("<Prefix></Prefix>"));
     assert!(!document.contains("ciburst/agent/"));
+    assert!(
+        document.contains(
+            "<ID>ciburst-abort-uploads</ID><Filter></Filter><Status>Enabled</Status>\
+             <AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation>"
+        ),
+        "incomplete uploads end on the whole bucket"
+    );
+    assert_eq!(backend.s3.expiry_days(&bucket, "ciburst/agent/x"), None);
 
     let m4 = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><LifecycleConfiguration \
               xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule><ID>ciburst-expire</ID>\
@@ -367,11 +375,127 @@ async fn the_lifecycle_expires_the_cache_and_the_intents_and_upgrades_the_m4_rul
     assert_eq!(step.action, Action::Update);
     assert_eq!(
         step.detail.as_deref(),
-        Some("lifecycle 14 days on project/, runner/, ciburst/intents/")
+        Some(
+            "lifecycle 14 days on project/, runner/, ciburst/intents/, incomplete uploads \
+             aborted after 1 day"
+        )
     );
     provider.apply(&steps).await.unwrap();
     assert_eq!(backend.s3.lifecycle(&bucket), Some(lifecycle_xml(14)));
     assert!(provider.plan(&[]).await.unwrap().iter().all(Step::is_noop));
+
+    // The three rules of D38 without the abort rule, as every bucket had them before D69.
+    let d38 = lifecycle_xml(14).replace(
+        "<Rule><ID>ciburst-abort-uploads</ID><Filter></Filter><Status>Enabled</Status>\
+         <AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation>\
+         </AbortIncompleteMultipartUpload></Rule>",
+        "",
+    );
+    assert_ne!(d38, lifecycle_xml(14));
+    backend.s3.set_lifecycle(&bucket, Some(d38));
+    let steps = provider.plan(&[]).await.unwrap();
+    let bucket_step = steps.iter().find(|s| s.id == "bucket").unwrap();
+    assert_eq!(bucket_step.action, Action::Update);
+    provider.apply(&steps).await.unwrap();
+    assert_eq!(backend.s3.lifecycle(&bucket), Some(lifecycle_xml(14)));
+}
+
+/// D69: the plan deletes every agent but the current one and the two newest others, and
+/// `apply` leaves exactly those three.
+#[tokio::test]
+async fn older_agents_beyond_the_two_newest_others_are_deleted() {
+    let backend = Arc::new(ScalewayFake::new());
+    let dir = tempfile::tempdir().unwrap();
+    let builds: Vec<(PathBuf, String)> = ["one", "two", "three", "four", "five"]
+        .iter()
+        .map(|content| binary(&dir, content))
+        .collect();
+    let mut project_id = String::new();
+    for (hour, (path, _)) in builds[..4].iter().enumerate() {
+        backend.s3.set_clock(FAKE_CLOCK + 3_600 * hour as u64);
+        let provider = provider(&backend, Some(path.clone()));
+        let outputs = provider
+            .apply(&provider.plan(&[]).await.unwrap())
+            .await
+            .unwrap();
+        project_id = outputs["CIBURST_PROJECT_ID"].clone();
+    }
+    let bucket = bucket(&project_id);
+    let sha = |i: usize| builds[i].1.clone();
+    let mut kept: Vec<String> = agents(&backend, &bucket)
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    kept.sort();
+    let mut expected: Vec<String> = [1, 2, 3]
+        .iter()
+        .map(|i| format!("ciburst/agent/{}", sha(*i)))
+        .collect();
+    expected.sort();
+    assert_eq!(kept, expected, "the fourth apply deleted the first agent");
+
+    backend.s3.set_clock(FAKE_CLOCK + 3_600 * 4);
+    let (log, lines) = Log::memory();
+    let newest = with_config(contract_config(), &backend, Some(builds[4].0.clone()), log);
+    let steps = newest.plan(&[]).await.unwrap();
+    let agent_steps: Vec<(String, Action, String)> = steps
+        .iter()
+        .filter(|s| s.id.starts_with("vm:agent"))
+        .map(|s| (s.id.clone(), s.action, s.resource.clone()))
+        .collect();
+    assert_eq!(
+        agent_steps,
+        [
+            (
+                "vm:agent".to_string(),
+                Action::Create,
+                format!("vm agent ciburst/agent/{}", sha(4))
+            ),
+            (
+                format!("vm:agent:{}", sha(1)),
+                Action::Delete,
+                format!("vm agent ciburst/agent/{}", sha(1))
+            ),
+        ],
+        "the function still names the fourth, a failed apply may have left it on the third"
+    );
+    let outputs = newest.apply(&steps).await.unwrap();
+    assert_eq!(outputs["CIBURST_AGENT_SHA256"], sha(4));
+    let mut left: Vec<String> = agents(&backend, &bucket)
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    left.sort();
+    let mut expected: Vec<String> = [2, 3, 4]
+        .iter()
+        .map(|i| format!("ciburst/agent/{}", sha(*i)))
+        .collect();
+    expected.sort();
+    assert_eq!(left, expected);
+    let deleted = format!("ciburst/agent/{}", sha(1));
+    assert!(lines.lock().unwrap().iter().any(|l| {
+        l.starts_with("info deleted agent") && l.contains(&format!("key=\"{deleted}\""))
+    }));
+    assert!(newest.plan(&[]).await.unwrap().iter().all(Step::is_noop));
+
+    // Without a binary the newest uploaded agent is current, and an older build passed again
+    // keeps the newest two others.
+    let without = provider(&backend, None);
+    assert!(without.plan(&[]).await.unwrap().iter().all(Step::is_noop));
+    let older = provider(&backend, Some(builds[2].0.clone()));
+    let steps = older.plan(&[]).await.unwrap();
+    assert!(steps.iter().all(Step::is_noop), "{steps:?}");
+
+    let error = newest
+        .apply(&[Step::new(
+            "vm:agent:latest",
+            Action::Delete,
+            "vm agent ciburst/agent/latest",
+        )])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(error, "scaleway: unknown step vm:agent:latest");
 }
 
 #[tokio::test]

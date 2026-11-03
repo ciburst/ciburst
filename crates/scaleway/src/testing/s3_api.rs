@@ -517,7 +517,23 @@ fn no_bucket() -> Response {
     s3_error(404, "NoSuchBucket", "The specified bucket does not exist")
 }
 
-/// `PUT ?lifecycle`: every rule has a unique id, a status and an expiration of at least a day.
+/// The positive days of `action`'s `field` in a rule: `None` without the action,
+/// `Some(Err(()))` when the days are missing or not positive.
+fn action_days(rule: &str, action: &str, field: &str) -> Option<std::result::Result<u32, ()>> {
+    let action = xml_values(rule, action).into_iter().next()?;
+    Some(
+        xml_values(&action, field)
+            .into_iter()
+            .next()
+            .and_then(|d| d.parse::<u32>().ok())
+            .filter(|d| *d >= 1)
+            .ok_or(()),
+    )
+}
+
+/// `PUT ?lifecycle`: every rule has a unique id, a status and at least one action, an
+/// expiration or an abort of incomplete multipart uploads, each after at least a day (Scaleway,
+/// 2026-11-03).
 fn put_lifecycle(bucket: &mut Bucket, request: &Request) -> Response {
     let body = request.body.clone().unwrap_or_default();
     if request.header_value("content-md5") != Some(content_md5(&body).as_str()) {
@@ -535,27 +551,53 @@ fn put_lifecycle(bucket: &mut Bucket, request: &Request) -> Response {
             .next()
             .unwrap_or_default();
         let status = xml_values(rule, "Status").into_iter().next();
-        let days = xml_values(rule, "Expiration")
-            .into_iter()
-            .next()
-            .and_then(|e| xml_values(&e, "Days").into_iter().next())
-            .and_then(|d| d.parse::<u32>().ok());
+        let expiration = action_days(rule, "Expiration", "Days");
+        let abort = action_days(
+            rule,
+            "AbortIncompleteMultipartUpload",
+            "DaysAfterInitiation",
+        );
         if id.len() > 255 || !ids.insert(id) {
             return s3_error(400, "InvalidArgument", "Rule ID must be unique");
         }
         if !matches!(status.as_deref(), Some("Enabled" | "Disabled")) {
             return s3_error(400, "MalformedXML", "rule status");
         }
-        if days.is_none_or(|d| d < 1) {
+        if expiration.is_none() && abort.is_none() {
+            return s3_error(
+                400,
+                "InvalidRequest",
+                "At least one action needs to be specified in a rule",
+            );
+        }
+        if expiration.is_some_and(|days| days.is_err()) {
             return s3_error(
                 400,
                 "InvalidArgument",
                 "'Days' for Expiration action must be a positive integer",
             );
         }
+        if abort.is_some_and(|days| days.is_err()) {
+            return s3_error(
+                400,
+                "InvalidArgument",
+                "'DaysAfterInitiation' for AbortIncompleteMultipartUpload action must be a \
+                 positive integer",
+            );
+        }
     }
     bucket.lifecycle = Some(text);
     Response::empty(200)
+}
+
+/// A lifecycle document as Scaleway's `GET ?lifecycle` answers it: the rules below a root
+/// `<Configuration>` without a namespace (2026-11-03).
+fn lifecycle_answer(document: &str) -> String {
+    let rules: String = xml_values(document, "Rule")
+        .iter()
+        .map(|rule| format!("<Rule>{rule}</Rule>"))
+        .collect();
+    format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Configuration>{rules}</Configuration>")
 }
 
 /// `GET ?list-type=2`: keys below `prefix`, after `start-after` or, when given, after the key
@@ -750,7 +792,7 @@ impl FakeS3 {
                 Some(Bucket {
                     lifecycle: Some(document),
                     ..
-                }) => Ok(xml(200, document.clone())),
+                }) => Ok(xml(200, lifecycle_answer(document))),
                 Some(_) => Ok(s3_error(
                     404,
                     "NoSuchLifecycleConfiguration",
@@ -828,5 +870,67 @@ mod tests {
             assert_eq!(split_host(other), None, "{other}");
         }
         assert_eq!(last_modified(FAKE_CLOCK + 1), "2026-10-24T00:00:01.000Z");
+    }
+
+    /// The answers Scaleway gave to these rules (2026-11-03).
+    #[test]
+    fn lifecycle_rules_need_an_action_after_at_least_a_day() {
+        let put = |rules: &str| {
+            let body = format!(
+                "<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                 {rules}</LifecycleConfiguration>"
+            )
+            .into_bytes();
+            let mut request = Request::new("PUT", "https://b.s3.nl-ams.scw.cloud/?lifecycle")
+                .header("content-md5", content_md5(&body));
+            request.body = Some(body);
+            let mut bucket = Bucket::default();
+            let response = put_lifecycle(&mut bucket, &request);
+            let code = xml_values(&String::from_utf8_lossy(&response.body), "Code")
+                .into_iter()
+                .next();
+            (response.status, code, bucket.lifecycle.is_some())
+        };
+        let abort = |filter: &str, days: &str| {
+            format!(
+                "<Rule><ID>a</ID>{filter}<Status>Enabled</Status><AbortIncompleteMultipartUpload>\
+                 <DaysAfterInitiation>{days}</DaysAfterInitiation>\
+                 </AbortIncompleteMultipartUpload></Rule>"
+            )
+        };
+        for filter in [
+            "<Filter><Prefix></Prefix></Filter>",
+            "<Filter></Filter>",
+            "",
+        ] {
+            assert_eq!(put(&abort(filter, "1")), (200, None, true), "{filter}");
+        }
+        assert_eq!(
+            put(&abort("<Filter></Filter>", "0")),
+            (400, Some("InvalidArgument".to_string()), false)
+        );
+        assert_eq!(
+            put("<Rule><ID>n</ID><Filter></Filter><Status>Enabled</Status></Rule>"),
+            (400, Some("InvalidRequest".to_string()), false)
+        );
+        let both = "<Rule><ID>e</ID><Filter><Prefix>project/</Prefix></Filter><Status>Enabled\
+                    </Status><Expiration><Days>30</Days></Expiration><AbortIncompleteMultipartUpload>\
+                    <DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload>\
+                    </Rule>";
+        assert_eq!(put(both), (200, None, true));
+        assert_eq!(
+            put(&both.replace("<Days>30</Days>", "<Days>0</Days>")),
+            (400, Some("InvalidArgument".to_string()), false)
+        );
+        let answer = lifecycle_answer(&format!(
+            "<LifecycleConfiguration xmlns=\"x\">{}</LifecycleConfiguration>",
+            abort("<Filter></Filter>", "1")
+        ));
+        assert!(answer.starts_with("<?xml"), "{answer}");
+        assert!(
+            answer.contains("\n<Configuration><Rule><ID>a</ID>"),
+            "{answer}"
+        );
+        assert!(!answer.contains("LifecycleConfiguration"), "{answer}");
     }
 }

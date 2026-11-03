@@ -1,6 +1,6 @@
 //! Plan, apply, preflight and destroy: the steps `project`, `key:dispatch`, `key:cache`,
-//! `bucket`, `runner-binary`, `registry`, `vm:agent`, `vm:security-group` and
-//! `definition:<tag>`, each found by name before it is planned.
+//! `bucket`, `runner-binary`, `registry`, `vm:agent`, `vm:agent:<sha256>`, `vm:security-group`
+//! and `definition:<tag>`, each found by name before it is planned.
 
 use std::time::Duration;
 
@@ -9,12 +9,12 @@ use ciburst_core::types::{Action, Outputs, Rotation, Step};
 use ciburst_core::{Error, Result};
 use serde_json::Value;
 
-use super::agent::{AGENT_STEP, NO_AGENT, NO_CACHE};
+use super::agent::{AGENT_STEP, NO_AGENT, NO_CACHE, OLD_AGENT_STEP};
 use super::iam::{self, AppState};
 use super::keys::KeyKind;
 use super::registry::{self, NamespaceState};
 use super::runner::RUNNER_STEP;
-use super::s3::LIFECYCLE_RULES;
+use super::s3::{ABORT_DAYS, LIFECYCLE_RULES};
 use super::servers::SECURITY_GROUP_STEP;
 use super::{PROVIDER_NAME, Runtime, Scaleway, jobs};
 
@@ -113,7 +113,8 @@ impl Scaleway {
                 Some(_) => {
                     let prefixes: Vec<&str> = LIFECYCLE_RULES.iter().map(|(_, p)| *p).collect();
                     Step::new("bucket", Action::Update, bucket_resource).with_detail(format!(
-                        "lifecycle {expire_days} days on {}",
+                        "lifecycle {expire_days} days on {}, incomplete uploads aborted after \
+                         {ABORT_DAYS} day",
                         prefixes.join(", ")
                     ))
                 }
@@ -153,8 +154,8 @@ impl Scaleway {
             steps.push(Step::new("registry", Action::Delete, registry_resource));
         }
         if needs_agent && self.cache_on() {
-            steps.push(
-                self.agent_step(&observed.project, observed.bucket.is_some())
+            steps.extend(
+                self.agent_steps(&observed.project, observed.bucket.is_some())
                     .await?,
             );
         }
@@ -306,6 +307,7 @@ impl Scaleway {
                     }
                 }
                 AGENT_STEP => agent = Some(self.apply_agent(&project).await?),
+                id if id.starts_with(OLD_AGENT_STEP) => self.delete_agent(id, &project).await?,
                 id => {
                     let tag = id.strip_prefix("definition:").ok_or_else(|| {
                         Error::provider(format!("{PROVIDER_NAME}: unknown step {id}"))
