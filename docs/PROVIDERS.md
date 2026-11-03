@@ -40,7 +40,7 @@ A host registers in `Modules::host` and `HOSTS` of the CLI and needs its own fun
 
 ## Step ids, run ids, run specs
 
-- Step ids are stable across plans. Lane definitions are `definition:<project id>-<lane tag>`; shared resources have fixed ids such as `project`, `bucket`, `runner-binary`, `vm:agent`, `vm:security-group`.
+- Step ids are stable across plans. Lane definitions are `definition:<project id>-<lane tag>`; shared resources have fixed ids such as `project`, `bucket`, `runner-binary`, `vm:agent`, `vm:security-group`; an older agent object to delete is `vm:agent:<sha256>`.
 - `plan` and `apply` handle the host's lanes from the config. A definition whose project is not the host's belongs to a member and follows that member's `/join`; `apply` leaves it alone.
 - A run spec (`config::Pool`) is either the VM runner (`project` `None`, `tag` the VM runner's tag) or one lane (`project` set, `tag` the lane key `<project id>-<lane tag>`, `runner_tag()` the lane tag).
 

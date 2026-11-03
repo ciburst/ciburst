@@ -9,7 +9,7 @@ Rules and design: `docs/SPEC.md`. Below, `ciburst` stands for the release binary
 | Region | `provider.region` (default `fr-par`) holds the dispatcher, the cache bucket, the agent and runner objects, the VMs and the lane runs; `provider.zone` defaults to `<region>-1` and must lie in the region |
 | Scaleway resources | project `<name>`, IAM applications `<name>-dispatch` and `<name>-cache`, bucket `<name>-cache-<project id>`, namespace `<name>`, function `<name>-dispatch`, cron `<name>-sweep`, security group `<name>-vm`, servers `<name>-<vm tag>-<8 hex>`, one job definition `<name>-<project id>-<lane tag>` per lane of every member; with `provider.registry` the registry namespace `<name>` |
 | GitLab resources | in the host: runner `<name>-<vm tag>`, enabled in the further projects of `gitlab.projectIds`, and runner `<name>-<lane tag>` per host lane; in a member: runner `<name>-<vm tag>` and `<name>-<lane tag>` per member lane; a webhook to the function URL in every project |
-| Agent object | `ciburst/agent/<sha256>` in the cache bucket, public read: the musl `ciburst-vm-agent` |
+| Agent object | `ciburst/agent/<sha256>` in the cache bucket, public read: the musl `ciburst-vm-agent`; `apply` deletes all but the current one and the two newest others (D69) |
 | Runner object | `ciburst/runner/<sha256>` in the cache bucket, public read: `gitlab-runner` 18.11.4, which VMs and lane runs download and check against its SHA-256 |
 | Bucket state | `ciburst/intents/` (burst intents, queue, running jobs, typical durations, pipeline records, closed pipelines; expired by the lifecycle rule), `ciburst/fleet/` (fleet config and member records; never expire) |
 | Image | `registry.gitlab.com/ciburst/ciburst/cli` (the component's jobs, with `ciburst` and `ciburst-vm-agent`); `edge` from `main`, `X.Y.Z`, `X.Y`, `X` and `latest` from a tag `vX.Y.Z` |
@@ -201,7 +201,7 @@ Check after each: `ciburst plan` prints only `noop`; a test pipeline passes.
 2. Runner bump: the new version and its SHA-256 (from the release's `release.sha256`) in `RUNNER_URL` and `RUNNER_SHA256` of `crates/core/src/cloud_init.rs`, then in every file `scripts/check-pins.sh` lists; `ciburst apply`.
    Check: the plan shows `create` for the runner object (`runner-binary`) and `update` for every host `definition:<project id>-<tag>`; members update theirs with `ciburst-join`; VMs created and lane runs started afterwards run the new version.
 3. Agent: after a change in `crates/vm-agent`, `scripts/agent-binary.sh`, then `ciburst apply`; in pipeline mode a new `cli` image carries the agent and `ciburst-setup` uploads it. VMs created afterwards download the new object.
-   Check: `CIBURST_AGENT_SHA256` in the outputs changed.
+   Check: `CIBURST_AGENT_SHA256` in the outputs changed; the plan lists `delete vm agent ciburst/agent/<sha256>` for each agent older than the two before it.
 
 ## VM runtime and the sweep
 
