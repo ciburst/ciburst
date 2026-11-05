@@ -11,7 +11,7 @@ Goal: the project's jobs run on ciburst: jobs that need a Docker daemon on the V
 1. Add the component to `.gitlab-ci.yml` on the default branch:
    ```yaml
    include:
-     - component: gitlab.com/ciburst/ciburst/ciburst@main
+     - component: gitlab.com/ciburst/ciburst/ciburst@1
    ```
    It sets `default: tags: [vm]` and adds the manual jobs `ciburst-setup`, `ciburst-check`, `ciburst-destroy` and `ciburst-invite` in stage `.pre`. Inputs, all optional: `vm_tag` (`vm`, the VM runner's tag; keep it equal to `vm.tag` in `ciburst.json`), `version` (cli image tag when the component is included by a branch, `edge`; a release include runs its own version), `hosted_tag` (`saas-linux-small-amd64`), `role` (`host`). GitLab merges this `default:` with the project's own `default:` keys (`interruptible`, `image`); a `default: tags` in the project overrides it and keeps every job where it was.
 2. Keep each job's `image:`, `services:` and `script:`. A job without `image:` would get `ubuntu:24.04` instead of GitLab's `ruby:3.1`: add `image:` where a job relied on the default.
@@ -54,7 +54,6 @@ Goal: the project's jobs run on another project's ciburst setup (the host): its 
 3. The member's own `ciburst.json` holds only `lanes` and `ignoreJobs`; any other key belongs to the host and makes `ciburst-join` fail with `<key>: a fleet setting; it belongs in the host's ciburst.json`. Leave the file out when the project has neither.
 4. Hand the human this list, unchanged:
    - In the host: the project variable `CIBURST_INVITE` with this project's id, then run `ciburst-invite` and copy the code.
-   - While `gitlab.com/ciburst/ciburst` is private and this project is outside the group `ciburst`: add this project's path to its job token allowlist (Settings, CI/CD, Job token permissions).
    - In this project: `CIBURST_JOIN` (the code) and `CIBURST_GITLAB_TOKEN` (an Owner's personal access token with `api` and `create_runner`): protected, "Masked and hidden", environment scope `ciburst`; the default branch protected.
    - Then run `ciburst-join`; its log prints `lane <tag> (<image>)` per lane and ends with `joined fleet <name>`.
    - After a later change of `lanes` or `ignoreJobs`: run `ciburst-join` again, with a fresh code when the old one expired (7 days).

@@ -6,7 +6,7 @@ A job webhook reaches a small dispatcher, a Scaleway Function, which offers two 
 
 Design: `docs/SPEC.md`. Operations: `docs/RUNBOOK.md`. Providers: `docs/PROVIDERS.md`. AI agents: `AGENTS.md`.
 
-Status: pre-release. `ciburst/ciburst` stays private until v1.0.0; the component and the `cli` image track `main` (`@main`, image tag `edge`).
+Status: 1.0.0. The component is in the GitLab CI/CD Catalog: `@1` is the newest 1.x release and runs the `cli` image of that release; `@main` runs the image `edge`.
 
 ## How it works
 
@@ -49,7 +49,7 @@ VMs reach their per-minute price only when pipelines keep them busy through thei
 
 ## Adopt
 
-You need a Scaleway account with a payment method and the Owner role in the GitLab project. While `ciburst/ciburst` is private, the adopting user also needs access to it and the adopting project an entry in its CI/CD job token allowlist.
+You need a Scaleway account with a payment method and the Owner role in the GitLab project.
 
 1. Scaleway key. Console, IAM: an application with a policy on the organization holding `IAMManager`, `ProjectManager`, `InstancesFullAccess`, `ServerlessJobsFullAccess`, `FunctionsFullAccess` and `ObjectStorageFullAccess`; then an API key for it.
    Check: you hold its access key, its secret key and the organization id.
@@ -60,7 +60,7 @@ You need a Scaleway account with a payment method and the Owner role in the GitL
 4. Include. In `.gitlab-ci.yml` on the default branch:
    ```yaml
    include:
-     - component: gitlab.com/ciburst/ciburst/ciburst@main
+     - component: gitlab.com/ciburst/ciburst/ciburst@1
    ```
    Every job without its own `tags` now runs on the VM runner. Docker-in-Docker jobs extend `.ciburst-docker`. Jobs that must stay on GitLab's runners keep `tags: [saas-linux-small-amd64]` and go into `ignoreJobs` of `ciburst.json` (below), or their pending events start VMs.
    Check: the pipeline shows the manual jobs `ciburst-setup`, `ciburst-check`, `ciburst-destroy` and `ciburst-invite`; the other jobs wait.
@@ -89,11 +89,10 @@ One setup serves many projects, from any group or organization: they share its d
 2. In the joining project: include the component with `role: member`:
    ```yaml
    include:
-     - component: gitlab.com/ciburst/ciburst/ciburst@main
+     - component: gitlab.com/ciburst/ciburst/ciburst@1
        inputs:
          role: member
    ```
-   While `gitlab.com/ciburst/ciburst` is private, a project outside the group `ciburst` cannot pull the cli image: a maintainer of `ciburst/ciburst` adds the joining project's path under Settings, CI/CD, Job token permissions, otherwise `ciburst-join` fails with `pull access denied`.
 3. Optional: the joining project's own `ciburst.json` with only `lanes` and `ignoreJobs` (section Lanes); fleet settings such as `vm` or `provider` belong to the host and are refused.
 4. Add two project variables, protected, "Masked and hidden", environment scope `ciburst`: `CIBURST_JOIN` (the code) and `CIBURST_GITLAB_TOKEN` (a personal access token of an Owner of this project with `api` and `create_runner`). No Scaleway credentials.
 5. Run the manual job `ciburst-join` (about a minute).

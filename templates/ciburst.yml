@@ -11,7 +11,7 @@
 # by branch or SHA (`@main`) runs the cli image `version`, `edge` by default.
 #
 # include:
-#   - component: gitlab.com/ciburst/ciburst/ciburst@main
+#   - component: gitlab.com/ciburst/ciburst/ciburst@1
 #     inputs:
 #       vm_tag: vm
 #

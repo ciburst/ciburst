@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/core", "crates/cli", "crates/scaleway", "crates/dispatch-scaleway", "crates/vm-agent"]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.96"
 license = "Apache-2.0"

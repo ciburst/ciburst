@@ -1,6 +1,6 @@
 # Spec: ciburst, GitLab runners that exist only while jobs run
 
-Status: built through M6.4 (one VM runner per fleet, lanes per project); next M7, go public.
+Status: 1.0.0, public (M7); next the GitHub mirror, the crates.io publication and the Pages site (D72).
 
 ## 0. Decisions
 
@@ -649,7 +649,7 @@ Risks:
 
 ## 15. Owner inputs
 
-1. While `ciburst/ciburst` is private: each adopting or joining project's entry in its CI/CD job token allowlist; a token that can read the `ciburst` group's pipelines for drills.
+1. A token that can read the `ciburst` group's pipelines for drills.
 2. For 1.0.0: the OK for the one force push of the rewritten history (force push allowed on `main` for it), and for the visibility change.
 3. After 1.0.0: DNS for `ciburst.zwa.la` (CNAME to GitLab Pages plus the verification TXT record), the GitHub organization `ciburst` with a token for the push mirror, and a crates.io API token.
 

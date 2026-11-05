@@ -232,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "ciburst"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "ciburst-core",
@@ -246,7 +246,7 @@ dependencies = [
 
 [[package]]
 name = "ciburst-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "ciburst-core",
@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "ciburst-dispatch-scaleway"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -279,7 +279,7 @@ dependencies = [
 
 [[package]]
 name = "ciburst-scaleway"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -301,7 +301,7 @@ dependencies = [
 
 [[package]]
 name = "ciburst-vm-agent"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "axum",
