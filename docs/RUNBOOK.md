@@ -12,7 +12,7 @@ Rules and design: `docs/SPEC.md`. Below, `ciburst` stands for the release binary
 | Agent object | `ciburst/agent/<sha256>` in the cache bucket, public read: the musl `ciburst-vm-agent`; `apply` deletes all but the current one and the two newest others (D69) |
 | Runner object | `ciburst/runner/<sha256>` in the cache bucket, public read: `gitlab-runner` 18.11.4, which VMs and lane runs download and check against its SHA-256 |
 | Bucket state | `ciburst/intents/` (burst intents, queue, running jobs, typical durations, pipeline records, closed pipelines; expired by the lifecycle rule), `ciburst/fleet/` (fleet config and member records; never expire) |
-| Image | `registry.gitlab.com/ciburst/ciburst/cli` (the component's jobs, with `ciburst` and `ciburst-vm-agent`); `edge` from `main`, `X.Y.Z`, `X.Y`, `X` and `latest` from a tag `vX.Y.Z` |
+| Image | `registry.gitlab.com/ciburst/ciburst/cli` (the component's jobs, with `ciburst` and `ciburst-vm-agent`); `edge` from `main`, `X.Y.Z`, `X.Y`, `X` and `latest` from a tag `X.Y.Z`; a component job runs the image of the component's release, `version` (default `edge`) when included by a branch or a SHA |
 | Binary | `ciburst-x86_64-unknown-linux-musl` in the framework project's generic package registry, linked from each release |
 | Runner | `gitlab-runner` 18.11.4. VM runner: one `run` per VM with the Docker executor, `concurrent = slots`, an entry for the host's and for each member's VM runner. Lanes: `run-single` with the shell executor in the lane's image, one run per pending lane job below `maxRuns`, exits after `waitTimeoutS` idle seconds |
 | VM cost | DEV1-M 0.0272 EUR per hour by price list (VM 0.020196, IPv4 0.005, 40 GB local SSD 0.00196), about 0.030 in practice because the SSD bills per clock hour |
@@ -56,7 +56,7 @@ Rules and design: `docs/SPEC.md`. Below, `ciburst` stands for the release binary
 
 The adopter follows README, Adopt. The operator's view:
 
-1. Component: an `include:` entry `component: gitlab.com/ciburst/ciburst/ciburst@main` (`@1` after the first catalog release) in the project's `.gitlab-ci.yml`.
+1. Component: an `include:` entry `component: gitlab.com/ciburst/ciburst/ciburst@1` (the newest 1.x release) in the project's `.gitlab-ci.yml`; deployments made before 1.0.0 include `@main`.
    Check: a default-branch pipeline shows `ciburst-setup`, `ciburst-check`, `ciburst-destroy` and `ciburst-invite` as manual jobs in `.pre`.
 2. Variables: `CIBURST_SCW_ACCESS_KEY`, `CIBURST_SCW_SECRET_KEY`, `CIBURST_SCW_ORGANIZATION_ID`, `CIBURST_GITLAB_TOKEN`; optional `CIBURST_SCW_PROJECT_ID` (an existing Scaleway project instead of a new one). Each protected, masked and hidden, environment scope `ciburst`.
    Check: Settings, CI/CD, Variables lists them with environment `ciburst`.
@@ -202,6 +202,30 @@ Check after each: `ciburst plan` prints only `noop`; a test pipeline passes.
    Check: the plan shows `create` for the runner object (`runner-binary`) and `update` for every host `definition:<project id>-<tag>`; members update theirs with `ciburst-join`; VMs created and lane runs started afterwards run the new version.
 3. Agent: after a change in `crates/vm-agent`, `scripts/agent-binary.sh`, then `ciburst apply`; in pipeline mode a new `cli` image carries the agent and `ciburst-setup` uploads it. VMs created afterwards download the new object.
    Check: `CIBURST_AGENT_SHA256` in the outputs changed; the plan lists `delete vm agent ciburst/agent/<sha256>` for each agent older than the two before it.
+
+## Release
+
+1. Version: `version` in `[workspace.package]` of `Cargo.toml` and the `version` of each internal path dependency in `crates/*/Cargo.toml` become `X.Y.Z`; `cargo build` updates `Cargo.lock`; commit and push to `main`.
+   Check: the `main` pipeline passes; `cargo run -p ciburst -- --version` prints `ciburst X.Y.Z`.
+2. Tag: `git tag X.Y.Z` on that commit, `git push origin X.Y.Z`; no `v` (D71).
+   Check: the tag pipeline runs `lint`, `deny`, `test`, `lane-bootstrap`, `image:cli`, `release:binary` and `release`; the release links both binaries and their checksums; Build, CI/CD Catalog lists `X.Y.Z`; `registry.gitlab.com/ciburst/ciburst/cli:X.Y.Z` exists.
+3. Deployments: a project that includes `@1` runs the new jobs from its next pipeline on; its `ciburst-setup` uploads the new agent and redeploys the function when the code changed.
+   Check: in a project on `@1`, the `ciburst-setup` log pulls `cli:X.Y.Z`; `ciburst-check` passes.
+
+## Going public
+
+Once, for 1.0.0 (D70, D72). The maintainer's personal address, the noreply address and the private project names live in `.local/history-rewrite.txt` and `.local/mailmap` (gitignored), never in the repository.
+
+1. Readiness: the policy files are on `main`; the project has its description (Settings, General) and is a CI/CD Catalog project (Settings, General, Visibility); `main` is green.
+   Check: Build, CI/CD Catalog lists `ciburst/ciburst` without versions.
+2. Rewrite: in a fresh `git clone --mirror`, `git filter-repo --mailmap ../.local/mailmap --replace-text ../.local/history-rewrite.txt --replace-message ../.local/history-rewrite.txt`; keep `filter-repo/commit-map`.
+   Check: `git log --all --format='%ae%n%ce%n%(trailers:key=Signed-off-by,valueonly)' | sort -u` prints only the noreply address and an empty line; `git log --all -i --grep` and `git grep -i` over `git rev-list --all` find none of the names in `.local/history-rewrite.txt`; `git diff <old main> main` is empty.
+3. Push: force push allowed on `main` (Settings, Repository, Protected branches), `git push --force origin main` from the rewritten clone, force push disallowed again; then Settings, Repository, Repository maintenance, Repository cleanup with `commit-map`, which drops GitLab's internal references to the old commits. Every working clone is cloned anew.
+   Check: `git ls-remote origin main` names the rewritten head; the old head's commit page answers 404.
+4. Visibility: the group `ciburst` public first (a project cannot be more visible than its group; other projects in it stay private), then `ciburst/ciburst` public, with the container and package registries visible to everyone with access.
+   Check: without a session, `https://gitlab.com/ciburst/ciburst` opens and `docker pull registry.gitlab.com/ciburst/ciburst/cli:edge` works.
+5. Release `1.0.0` (section Release).
+   Check: the catalog page of `ciburst/ciburst` shows `1.0.0` to a visitor without a session.
 
 ## VM runtime and the sweep
 
@@ -448,7 +472,7 @@ Config: the VM runner `vm` (`slots` 2, `maxRuns` 4) in a zone with quota, the ho
 | Date | Decision |
 |---|---|
 | 2026-10-25 | The lane bootstrap passes every value as a flag and unsets `RUNNER_TOKEN`, `CACHE_S3_ACCESS_KEY` and `CACHE_S3_SECRET_KEY` before `exec`, so job scripts do not inherit them. |
-| 2026-10-24 | Releases use `glab release create` in `registry.gitlab.com/gitlab-org/cli:v1.124.0` with `GLAB_ENABLE_CI_AUTOLOGIN`; `release-cli` is deprecated since GitLab 18.0. |
+| 2026-11-05 | Releases use the `release` keyword in `registry.gitlab.com/gitlab-org/cli:v1.124.0`, the only way a version reaches the CI/CD Catalog (D71); `release-cli` is deprecated since GitLab 18.0. |
 | 2026-10-24 | Framework image builds use `docker:27.5.1` with `docker:27.5.1-dind`. |
 | 2026-10-24 | VM jobs mount `/certs/client` besides `/cache`, so Docker-in-Docker with TLS (`DOCKER_TLS_CERTDIR: "/certs"`) works as on GitLab's hosted runners. |
 | 2026-10-24 | The agent starts the runner with only `PATH` and `HOME` in its environment: the runner reads `CI_SERVER_URL`, `CACHE_*` and `DOCKER_*` from its environment, and `config.toml` stays the only source. |
