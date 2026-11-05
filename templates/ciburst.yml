@@ -7,13 +7,13 @@
 # joins the fleet of another project instead, through the manual jobs `ciburst-join` and
 # `ciburst-leave`; `ciburst-join` reads the member's own `ciburst.json` for its lanes.
 #
-# Usage. `@main` goes with the cli image `edge`; a release `@vX.Y.Z` goes with `version: X.Y.Z`.
+# Usage. A release include (`@1`, `@1.2`, `@1.2.3`) runs the cli image of that release; an include
+# by branch or SHA (`@main`) runs the cli image `version`, `edge` by default.
 #
 # include:
 #   - component: gitlab.com/ciburst/ciburst/ciburst@main
 #     inputs:
 #       vm_tag: vm
-#       version: edge
 #
 # test:
 #   image: node:24
@@ -38,12 +38,15 @@
 #     - echo "runs on a GitLab hosted runner"
 
 spec:
+  component: [version]
   inputs:
     vm_tag:
       description: Runner tag of the VM runner, which runs every job without its own `tags`.
       default: vm
     version:
-      description: Tag of the image registry.gitlab.com/ciburst/ciburst/cli for the ciburst jobs.
+      description: >-
+        Tag of the image registry.gitlab.com/ciburst/ciburst/cli for the ciburst jobs when the
+        component is included by a branch or a SHA; a release include runs its own version.
       default: edge
     hosted_tag:
       description: Runner tag of the GitLab hosted runner for the ciburst jobs.
@@ -66,9 +69,12 @@ default:
   before_script:
     - echo "$CI_REGISTRY_PASSWORD" | docker login --username "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
 
+# The cli image is the component's release (`component.version`). Included by a branch or a SHA,
+# the version is empty (YAML null as a whole value, refused in `rules:variables`), so it sits in
+# the job's variables and each role's first rule replaces it with the input (D71).
 ciburst-setup: &ciburst-job
   stage: .pre
-  image: registry.gitlab.com/ciburst/ciburst/cli:$[[ inputs.version ]]
+  image: registry.gitlab.com/ciburst/ciburst/cli:$CIBURST_CLI_TAG
   tags:
     - $[[ inputs.hosted_tag ]]
   environment:
@@ -76,7 +82,14 @@ ciburst-setup: &ciburst-job
     action: prepare
   resource_group: ciburst
   interruptible: false
+  variables:
+    CIBURST_CLI_TAG: "$[[ component.version ]]"
   rules:
+    - if: '"$[[ inputs.role ]]" == "host" && "$[[ component.version ]]" == "" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+      variables:
+        CIBURST_CLI_TAG: "$[[ inputs.version ]]"
+      when: manual
+      allow_failure: true
     - if: '"$[[ inputs.role ]]" == "host" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
       when: manual
       allow_failure: true
@@ -101,6 +114,11 @@ ciburst-invite:
 ciburst-join: &ciburst-member-job
   <<: *ciburst-job
   rules:
+    - if: '"$[[ inputs.role ]]" == "member" && "$[[ component.version ]]" == "" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+      variables:
+        CIBURST_CLI_TAG: "$[[ inputs.version ]]"
+      when: manual
+      allow_failure: true
     - if: '"$[[ inputs.role ]]" == "member" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
       when: manual
       allow_failure: true

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Tags and pushes the built cli image to the project registry as `cli`: `edge` on the default
-# branch; X.Y.Z, X.Y, X and `latest` on a tag vX.Y.Z; nothing elsewhere (merge request
+# branch; X.Y.Z, X.Y, X and `latest` on a tag X.Y.Z; nothing elsewhere (merge request
 # pipelines only build and test).
 # Usage: scripts/ci-push-image.sh <local reference>
 set -euo pipefail
@@ -8,7 +8,7 @@ set -euo pipefail
 source_ref="${1:?usage: ci-push-image.sh <local reference>}"
 
 tags=()
-if [[ "${CI_COMMIT_TAG:-}" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+if [[ "${CI_COMMIT_TAG:-}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
   major="${BASH_REMATCH[1]}"
   minor="${BASH_REMATCH[2]}"
   patch="${BASH_REMATCH[3]}"

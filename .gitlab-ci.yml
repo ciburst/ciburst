@@ -21,8 +21,7 @@ workflow:
 
 # Inputs of each job for `rules:changes`. Merge requests compare with main, pushes to main with
 # the previous push. Pipelines started without a push (web, API) run every job; tags run lint,
-# deny and test, tags v* also lane-bootstrap, release tags vX.Y.Z also the cli image and the
-# release.
+# deny and test, release tags X.Y.Z also lane-bootstrap, the cli image and the release.
 .paths:
   test: &test-paths
     - Cargo.toml
@@ -155,7 +154,7 @@ lane-bootstrap:
   needs: []
   timeout: 15 minutes
   rules:
-    - if: $CI_COMMIT_TAG =~ /^v/
+    - if: $CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       changes:
         paths: *lane-bootstrap-paths
@@ -174,7 +173,7 @@ image:cli:
     - job: test
       optional: true
   rules:
-    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
+    - if: $CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       changes:
         paths: *cli-image-paths
@@ -188,21 +187,41 @@ image:cli:
 .release:
   stage: release
   rules:
-    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/
+    - if: $CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+$/
 
 release:binary:
   extends: .release
   script:
     - scripts/ci-release-binary.sh
   artifacts:
-    paths: [dist/, release-notes.md, release-assets.json]
+    paths: [dist/, release-notes.md]
     expire_in: 1 week
 
+# The `release` keyword, not `glab release create`: only its releases become versions in the
+# CI/CD Catalog (D71).
 release:
   extends: .release
   image: registry.gitlab.com/gitlab-org/cli:v1.124.0
   needs: [release:binary, image:cli]
   variables:
-    GLAB_ENABLE_CI_AUTOLOGIN: "true"
+    PACKAGE_URL: $CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/ciburst/$CI_COMMIT_TAG
   script:
-    - glab release create "$CI_COMMIT_TAG" --name "ciburst $CI_COMMIT_TAG" --notes-file release-notes.md --assets-links "$(cat release-assets.json)"
+    - echo "release $CI_COMMIT_TAG"
+  release:
+    tag_name: $CI_COMMIT_TAG
+    name: ciburst $CI_COMMIT_TAG
+    description: release-notes.md
+    assets:
+      links:
+        - name: ciburst-x86_64-unknown-linux-musl
+          url: $PACKAGE_URL/ciburst-x86_64-unknown-linux-musl
+          link_type: package
+        - name: ciburst-x86_64-unknown-linux-musl.sha256
+          url: $PACKAGE_URL/ciburst-x86_64-unknown-linux-musl.sha256
+          link_type: other
+        - name: ciburst-vm-agent-x86_64-unknown-linux-musl
+          url: $PACKAGE_URL/ciburst-vm-agent-x86_64-unknown-linux-musl
+          link_type: package
+        - name: ciburst-vm-agent-x86_64-unknown-linux-musl.sha256
+          url: $PACKAGE_URL/ciburst-vm-agent-x86_64-unknown-linux-musl.sha256
+          link_type: other

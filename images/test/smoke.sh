@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds the cli image and checks its two static binaries.
 # Usage: images/test/smoke.sh [image reference]
-# SMOKE_NO_BUILD=1 skips the build and tests an existing reference. On a tag vX.Y.Z (CI_COMMIT_TAG)
+# SMOKE_NO_BUILD=1 skips the build and tests an existing reference. On a tag X.Y.Z (CI_COMMIT_TAG)
 # the binaries must report X.Y.Z, else the workspace version of Cargo.toml.
 set -euo pipefail
 
@@ -35,7 +35,7 @@ fi
 echo "image bytes: $(docker image inspect --format '{{.Size}}' "$ref")"
 
 version="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' "$root/Cargo.toml")"
-if [[ "${CI_COMMIT_TAG:-}" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+if [[ "${CI_COMMIT_TAG:-}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
   version="${BASH_REMATCH[1]}"
 fi
 

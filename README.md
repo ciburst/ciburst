@@ -163,8 +163,8 @@ Global options: `--ci` (pipeline mode), `--config <path>`, `--local <dir>`, `--a
 
 ## Development
 
-Rust 1.96.0 (`rust-toolchain.toml`). Before a commit: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features`, `cargo deny check`, `scripts/shellcheck.sh`, `scripts/check-pins.sh`; `scripts/test-linux.sh` for Linux-only code, `images/test/lane-bootstrap.sh` after a change to the lane bootstrap. New providers: `docs/PROVIDERS.md`.
+Rust 1.96.0 (`rust-toolchain.toml`). Before a commit: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features`, `cargo deny check`, `scripts/shellcheck.sh`, `scripts/check-pins.sh`; `scripts/test-linux.sh` for Linux-only code, `images/test/lane-bootstrap.sh` after a change to the lane bootstrap. New providers: `docs/PROVIDERS.md`. Contributions: `CONTRIBUTING.md` (Developer Certificate of Origin, `git commit -s`); conduct: `CODE_OF_CONDUCT.md`; vulnerabilities: `SECURITY.md`.
 
 ## License
 
-Apache-2.0, see `LICENSE`.
+Apache-2.0, see `LICENSE` and `NOTICE`.
