@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,6 +14,7 @@ use ciburst_core::gitlab::Gitlab;
 use ciburst_core::http::{HttpClient, Request, Response};
 use ciburst_core::invite::{self, Invite};
 use ciburst_core::log::Log;
+use ciburst_core::store::write_private;
 use ciburst_core::time::rfc3339;
 use ciburst_core::{Error, Result};
 use serde::Deserialize;
@@ -22,6 +24,9 @@ use serde_json::{Value, json};
 pub const JOIN_VAR: &str = "CIBURST_JOIN";
 /// The project, id or path, the host's `ciburst-invite` makes a code for.
 pub const INVITE_VAR: &str = "CIBURST_INVITE";
+/// The file in `CI_PROJECT_DIR` that holds the code of `ciburst-invite`, kept as an artifact
+/// for Maintainers and Owners (D73).
+pub const JOIN_CODE_FILE: &str = "join-code.txt";
 
 /// The answer of `GET /fleet`: the fleet's name, its VM runner and the member's webhook secret.
 #[derive(Debug, Deserialize)]
@@ -53,7 +58,9 @@ pub fn now() -> u64 {
 }
 
 /// `ciburst invite <project>`: a join code for `project`, an id or a path, signed with the
-/// host's hook token. The host's own project gets none.
+/// host's hook token. The host's own project gets none. With `artifact_dir` (pipeline mode)
+/// the code goes to `JOIN_CODE_FILE` there and never into the log, which a public project
+/// shows to everyone (D73).
 #[allow(clippy::too_many_arguments)]
 pub async fn invite(
     out: &mut dyn Write,
@@ -62,6 +69,7 @@ pub async fn invite(
     project: &str,
     hook_token: Option<String>,
     url: Option<String>,
+    artifact_dir: Option<&Path>,
     now: u64,
 ) -> Result<i32> {
     let hook_token = hook_token
@@ -95,10 +103,18 @@ pub async fn invite(
         )));
     }
     let code = invite::issue(&hook_token, &url, project_id, now);
+    let until = rfc3339(now + invite::TTL_S);
+    if let Some(dir) = artifact_dir {
+        write_private(&dir.join(JOIN_CODE_FILE), format!("{code}\n").as_bytes()).await?;
+        writeln!(
+            out,
+            "join code for project {project_id}, valid until {until}, in the artifact {JOIN_CODE_FILE} (Maintainers and Owners)"
+        )?;
+        return Ok(0);
+    }
     writeln!(
         out,
-        "join code for project {project_id}, valid until {}; treat it as a secret:",
-        rfc3339(now + invite::TTL_S)
+        "join code for project {project_id}, valid until {until}; treat it as a secret:"
     )?;
     writeln!(out, "{code}")?;
     Ok(0)

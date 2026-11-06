@@ -6,6 +6,8 @@ A job webhook reaches a small dispatcher, a Scaleway Function, which offers two 
 
 Design: `docs/SPEC.md`. Operations: `docs/RUNBOOK.md`. Providers: `docs/PROVIDERS.md`. AI agents: `AGENTS.md`.
 
+Example: [ciburst-adopt-demo](https://gitlab.com/ciburst/ciburst-adopt-demo), a small project before and after adopting ciburst. Its second commit, `Adopt ciburst`, is the whole change, and its pipelines show which job ran on a VM and which in a lane.
+
 Status: 1.0.0. The component is in the GitLab CI/CD Catalog: `@1` is the newest 1.x release and runs the `cli` image of that release; `@main` runs the image `edge`.
 
 ## How it works
@@ -49,7 +51,7 @@ VMs reach their per-minute price only when pipelines keep them busy through thei
 
 ## Adopt
 
-You need a Scaleway account with a payment method and the Owner role in the GitLab project.
+You need a Scaleway account with a payment method and the Owner role in the GitLab project. The commit `Adopt ciburst` of [ciburst-adopt-demo](https://gitlab.com/ciburst/ciburst-adopt-demo) shows the repository side on a real project: the include, a `ciburst.json` with two lanes, and the lane jobs' tags.
 
 1. Scaleway key. Console, IAM: an application with a policy on the organization holding `IAMManager`, `ProjectManager`, `InstancesFullAccess`, `ServerlessJobsFullAccess`, `FunctionsFullAccess` and `ObjectStorageFullAccess`; then an API key for it.
    Check: you hold its access key, its secret key and the organization id.
@@ -84,8 +86,8 @@ Check: the log ends with `destroyed <name>`; the webhook, the runners, the outpu
 
 One setup serves many projects, from any group or organization: they share its dispatcher and its VM runner, so a VM's paid hour serves all of them. Each project keeps its own lanes and `ignoreJobs`. Jobs of all projects share the VMs, and VM jobs run privileged: join only projects you trust.
 
-1. In the project that ran `ciburst-setup` (the host): add the project variable `CIBURST_INVITE` with the joining project's id or path (protected, environment scope `ciburst`), run `ciburst-invite` and copy the code from its log. The code is valid for 7 days; treat it as a secret.
-   Check: the log reads `join code for project <id>, valid until <time>`.
+1. In the project that ran `ciburst-setup` (the host): add the project variable `CIBURST_INVITE` with the joining project's id or path (protected, environment scope `ciburst`), run `ciburst-invite` and download `join-code.txt` from its artifacts (Maintainers and Owners can; the code never enters the log). The code is valid for 7 days; treat it as a secret.
+   Check: the log reads `join code for project <id>, valid until <time>, in the artifact join-code.txt`.
 2. In the joining project: include the component with `role: member`:
    ```yaml
    include:

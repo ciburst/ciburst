@@ -49,6 +49,8 @@ pub mod ci_vars {
     pub const PROJECT_ID: &str = "CI_PROJECT_ID";
     pub const SERVER_URL: &str = "CI_SERVER_URL";
     pub const REF_PROTECTED: &str = "CI_COMMIT_REF_PROTECTED";
+    /// Where `invite` writes the join code for the job's artifact (D73).
+    pub const PROJECT_DIR: &str = "CI_PROJECT_DIR";
 }
 
 #[derive(Parser)]
@@ -107,7 +109,7 @@ enum Command {
     /// Replace a secret and redeploy: runner, hook, key, cache or vm
     Rotate { kind: String },
     /// Print a code that lets another project join this fleet [--ci: the project in
-    /// CIBURST_INVITE]
+    /// CIBURST_INVITE, the code in CI_PROJECT_DIR/join-code.txt instead of the log]
     Invite {
         /// Project id or path
         project: Option<String>,
@@ -592,6 +594,10 @@ pub async fn run_with_env(args: Vec<String>, env: Env, out: &mut dyn Write) -> R
                     return Ok(2);
                 }
             };
+            let artifact_dir = match &modules.mode {
+                Mode::Ci { .. } => Some(PathBuf::from(modules.input(ci_vars::PROJECT_DIR)?)),
+                Mode::Local(_) => None,
+            };
             let outputs = modules.stored_outputs().await?;
             let gitlab = modules.gitlab_if_token().await?;
             return fleet::invite(
@@ -601,6 +607,7 @@ pub async fn run_with_env(args: Vec<String>, env: Env, out: &mut dyn Write) -> R
                 &project,
                 outputs.get(keys::HOOK_TOKEN).cloned(),
                 modules.dispatch_url().await?,
+                artifact_dir.as_deref(),
                 fleet::now(),
             )
             .await;

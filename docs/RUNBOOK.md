@@ -116,7 +116,7 @@ Every answer with a body carries `ms`, the dispatcher's elapsed milliseconds; Gi
 Rules: spec section 8.
 
 - State: `ciburst/fleet/config.json` (the host's config with a MAC; `ciburst-setup` writes it, the dispatcher reads it within 30 s) and `ciburst/fleet/members/<project id>.json` (webhook secret, VM runner token, lanes, `ignoreJobs`; secrets sealed with AES-256-GCM under `CIBURST_FLEET_KEY`). These keys never expire; never edit them by hand: a forged config or record makes the reads fail (`warn fleet_failed`).
-- Invite: `ciburst-invite` with `CIBURST_INVITE`, or `ciburst invite <project>`; the code carries the dispatcher URL, the project id and a 7-day expiry, signed with the hook token. Rotating the hook token (`ciburst rotate hook`) invalidates open codes; joined members keep the webhook secret stored at their join.
+- Invite: `ciburst-invite` with `CIBURST_INVITE` writes the code to its artifact `join-code.txt` (Maintainers and Owners, 7 days), never into the log (D73); `ciburst invite <project>` prints it. The code carries the dispatcher URL, the project id and a 7-day expiry, signed with the hook token. Rotating the hook token (`ciburst rotate hook`) invalidates open codes; joined members keep the webhook secret stored at their join.
 - VMs serve every member: each VM runs one `gitlab-runner run` with an entry per member VM runner, from the `runners` of the report answer.
 - Status: `ciburst status` prints `member <id> joined <time>`, each member's lanes and deliveries; `ciburst check` lints every member against its own lanes; `ciburst-destroy` refuses with `fleet <name> has members <ids>: run ciburst-leave there first`.
 
@@ -124,8 +124,8 @@ Join a project:
 
 1. The project's own `ciburst.json`, when it gets lanes or has jobs on other runners: only `lanes` and `ignoreJobs`.
    Check: no other top-level key; a fleet setting fails the join with `<key>: a fleet setting; it belongs in the host's ciburst.json`.
-2. In the host, `CIBURST_INVITE=<project id or path>`, then `ciburst-invite`.
-   Check: `join code for project <id>, valid until <time>`.
+2. In the host, `CIBURST_INVITE=<project id or path>`, then `ciburst-invite`; the code is in its artifact `join-code.txt` (job page, Job artifacts, Browse).
+   Check: `join code for project <id>, valid until <time>, in the artifact join-code.txt`; the log holds no code.
 3. In the member, `CIBURST_JOIN` (the code) and `CIBURST_GITLAB_TOKEN`, both protected, masked and hidden, scope `ciburst`; then `ciburst-join`.
    Check: the log shows `info runner tag="<vm tag>"`, `info runner tag="<lane tag>"` per lane, `info hook`, then `lane <tag> (<image>)` per lane and `joined fleet <name>`; the member's Runners page lists `<name>-<vm tag>` and `<name>-<lane tag>`; the console lists the job definitions `<name>-<project id>-<lane tag>`.
 4. A member pipeline.
@@ -214,18 +214,22 @@ Check after each: `ciburst plan` prints only `noop`; a test pipeline passes.
 
 ## Going public
 
-Once, for 1.0.0 (D70, D72). The maintainer's personal address, the noreply address and the private project names live in `.local/history-rewrite.txt` and `.local/mailmap` (gitignored), never in the repository.
+Once, for 1.0.0 (D70, D72, D74). The maintainer's personal address, the noreply address and the private project names live in `.local/history-rewrite.txt` and `.local/mailmap` (gitignored), never in the repository.
 
 1. Readiness: the policy files are on `main`; the project has its description (Settings, General) and is a CI/CD Catalog project (Settings, General, Visibility); `main` is green.
    Check: Build, CI/CD Catalog lists `ciburst/ciburst` without versions.
 2. Rewrite: in a fresh `git clone --mirror`, `git filter-repo --mailmap ../.local/mailmap --replace-text ../.local/history-rewrite.txt --replace-message ../.local/history-rewrite.txt`; keep `filter-repo/commit-map`.
    Check: `git log --all --format='%ae%n%ce%n%(trailers:key=Signed-off-by,valueonly)' | sort -u` prints only the noreply address and an empty line; `git log --all -i --grep` and `git grep -i` over `git rev-list --all` find none of the names in `.local/history-rewrite.txt`; `git diff <old main> main` is empty.
-3. Push: force push allowed on `main` (Settings, Repository, Protected branches), `git push --force origin main` from the rewritten clone, force push disallowed again; then Settings, Repository, Repository maintenance, Repository cleanup with `commit-map`, which drops GitLab's internal references to the old commits. Every working clone is cloned anew.
-   Check: `git ls-remote origin main` names the rewritten head; the old head's commit page answers 404.
-4. Visibility: the group `ciburst` public first (a project cannot be more visible than its group; other projects in it stay private), then `ciburst/ciburst` public, with the container and package registries visible to everyone with access.
-   Check: without a session, `https://gitlab.com/ciburst/ciburst` opens and `docker pull registry.gitlab.com/ciburst/ciburst/cli:edge` works.
-5. Release `1.0.0` (section Release).
-   Check: the catalog page of `ciburst/ciburst` shows `1.0.0` to a visitor without a session.
+3. Push: force push allowed on `main` (Settings, Repository, Protected branches), `git push --force origin main` from the rewritten clone, force push disallowed again; then Settings, Repository, Repository maintenance (`/-/settings/repository#cleanup`), the last card Repository cleanup: Upload commit-map file, Start cleanup. It drops GitLab's internal references to the old commits; GitLab mails the new size when done. Every working clone is cloned anew.
+   Check: `git ls-remote origin main` names the rewritten head; `GET /projects/:id/repository/commits/<sha>` answers 404 for every old commit of `commit-map` (one request at a time: parallel requests meet 429).
+4. Release `1.0.0` (section Release) while the projects are still private, so the demo can be tested before anyone sees it.
+   Check: the release lists the four binary links; the registry holds `cli:1.0.0`; Build, CI/CD Catalog shows `1.0.0` to members.
+5. Demo history (D74), after the release because it includes `@1`: a fresh repository with two commits, a plain project on GitLab's hosted runners, then `Adopt ciburst`; force push as in step 3; delete its old pipelines (`DELETE /projects/:id/pipelines/:pipeline_id`); Repository cleanup with a commit-map of its old commits, `<old sha> 0000000000000000000000000000000000000000` per line below the filter-repo header line.
+   Check: every old commit answers 404 as in step 3; the pipelines page lists only the new head's pipeline.
+6. Demo setup: `ciburst-setup`, then `ciburst-check`, in the demo's new pipeline.
+   Check: both jobs run the image `cli:1.0.0`; the check prints `every job matches its lanes and the VM runner`; the other jobs pass on `ci-<project id>-vm` and the demo's lanes.
+7. Visibility, all at once: the group `ciburst` first (a project cannot be more visible than its group; other projects in it stay private), then `ciburst/ciburst` with the container and package registries visible to everyone with access, then the demo with public pipelines on.
+   Check: without a session, `https://gitlab.com/ciburst/ciburst` opens, its catalog page shows `1.0.0`, `docker pull registry.gitlab.com/ciburst/ciburst/cli:1.0.0` works, and the README's link opens the demo with its pipeline and job logs.
 
 ## VM runtime and the sweep
 

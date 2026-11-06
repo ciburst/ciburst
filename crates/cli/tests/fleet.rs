@@ -168,17 +168,37 @@ impl Setup {
         (code, String::from_utf8(out).unwrap())
     }
 
-    /// `ciburst-invite` in the host: the code is the output's last line.
+    /// `ciburst-invite` in the host; the code goes to the job's artifact (D73).
     async fn invite(&self, project: &str) -> (i32, String) {
+        let job_dir = self.job_dir();
         let vars = vars(
             HOST,
             &[
                 ("CIBURST_INVITE", project),
                 ("CIBURST_HOOK_TOKEN", HOOK),
                 ("CIBURST_DISPATCH_URL", URL),
+                ("CI_PROJECT_DIR", job_dir.to_str().unwrap()),
             ],
         );
         self.run(vars, &["--ci", "invite"]).await
+    }
+
+    /// The code of a successful `ciburst-invite` for `project`, read from its artifact.
+    async fn code_for(&self, project: &str) -> String {
+        let (status, out) = self.invite(project).await;
+        assert_eq!(status, 0, "{out}");
+        self.artifact_code()
+    }
+
+    fn job_dir(&self) -> std::path::PathBuf {
+        let dir = self.dir.path().join("job");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn artifact_code(&self) -> String {
+        let text = std::fs::read_to_string(self.job_dir().join("join-code.txt")).unwrap();
+        text.strip_suffix('\n').unwrap().to_string()
     }
 
     /// `ciburst-join` or `ciburst-leave` in the member, without a `ciburst.json`.
@@ -239,29 +259,39 @@ fn fake_modules(dir: &Path) -> String {
     path.display().to_string()
 }
 
-fn code_of(out: &str) -> String {
-    out.lines().last().unwrap().to_string()
-}
-
 #[tokio::test]
 async fn the_host_invites_a_project_by_id_or_path() {
     let s = setup().await;
     let (code, out) = s.invite("8").await;
     assert_eq!(code, 0, "{out}");
     let lines: Vec<&str> = out.lines().collect();
-    assert_eq!(lines.len(), 2);
+    assert_eq!(lines.len(), 1, "the code stays out of the log: {out}");
     assert!(
         lines[0].starts_with("join code for project 8, valid until ")
-            && lines[0].ends_with("; treat it as a secret:"),
+            && lines[0].ends_with(", in the artifact join-code.txt (Maintainers and Owners)"),
         "{out}"
     );
-    let invite = invite::verify(HOOK, lines[1], now()).unwrap();
+    let code = s.artifact_code();
+    let invite = invite::verify(HOOK, &code, now()).unwrap();
     assert_eq!((invite.project, invite.url.as_str()), (MEMBER, URL));
+    assert!(!out.contains(&code));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(s.job_dir().join("join-code.txt"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
 
     s.gitlab.add_project(MEMBER, "other-group/member");
-    let (code, out) = s.invite("other-group/member").await;
-    assert_eq!(code, 0, "{out}");
-    assert_eq!(invite::decode(&code_of(&out)).unwrap().project, MEMBER);
+    assert_eq!(
+        invite::decode(&s.code_for("other-group/member").await)
+            .unwrap()
+            .project,
+        MEMBER
+    );
 
     let (code, out) = s.invite("unknown/project").await;
     assert_eq!(code, 1);
@@ -276,10 +306,58 @@ async fn the_host_invites_a_project_by_id_or_path() {
     );
 }
 
+/// D73: a pipeline needs the job's directory for the code; a workstation prints it.
+#[tokio::test]
+async fn the_code_reaches_a_log_only_on_a_workstation() {
+    let s = setup().await;
+    let vars_without_dir = vars(
+        HOST,
+        &[
+            ("CIBURST_INVITE", "8"),
+            ("CIBURST_HOOK_TOKEN", HOOK),
+            ("CIBURST_DISPATCH_URL", URL),
+        ],
+    );
+    let (status, out) = s.run(vars_without_dir, &["--ci", "invite"]).await;
+    assert_eq!((status, out.as_str()), (1, "CI_PROJECT_DIR missing"));
+
+    let local = s.dir.path().join("local");
+    std::fs::create_dir_all(&local).unwrap();
+    std::fs::write(
+        local.join("outputs.env"),
+        format!("CIBURST_HOOK_TOKEN={HOOK}\nCIBURST_DISPATCH_URL={URL}\n"),
+    )
+    .unwrap();
+    let config = s.dir.path().join("config.json");
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{ "name": "demo", "gitlab": {{ "url": "https://gitlab.example", "projectIds": [{HOST}] }},
+                 "host": {{ "type": "fake" }}, "provider": {{ "type": "fake" }},
+                 "cache": {{ "type": "s3" }} }}"#
+        ),
+    )
+    .unwrap();
+    let (status, out) = s
+        .run_with(
+            BTreeMap::new(),
+            Some(config.display().to_string()),
+            &["--local", local.to_str().unwrap(), "invite", "8"],
+        )
+        .await;
+    assert_eq!(status, 0, "{out}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines[0].ends_with("; treat it as a secret:"), "{out}");
+    assert_eq!(
+        invite::verify(HOOK, lines[1], now()).unwrap().project,
+        MEMBER
+    );
+}
+
 #[tokio::test]
 async fn a_member_joins_and_leaves_with_one_code() {
     let s = setup().await;
-    let code = code_of(&s.invite("8").await.1);
+    let code = s.code_for("8").await;
     let (status, out) = s.member("join", &code).await;
     assert_eq!((status, out.as_str()), (0, "joined fleet demo\n"));
 
@@ -345,7 +423,7 @@ async fn a_member_joins_and_leaves_with_one_code() {
 #[tokio::test]
 async fn a_member_file_with_a_fleet_setting_is_refused() {
     let s = setup().await;
-    let code = code_of(&s.invite("8").await.1);
+    let code = s.code_for("8").await;
     for (file, error) in [
         (
             r#"{ "vm": { "slots": 1 }, "lanes": [] }"#,

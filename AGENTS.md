@@ -53,7 +53,7 @@ Goal: the project's jobs run on another project's ciburst setup (the host): its 
 2. Steps 2 to 5 and 7 of the adopt task apply unchanged: keep `image:`, handle Docker-in-Docker, hosted-runner jobs and lane tags.
 3. The member's own `ciburst.json` holds only `lanes` and `ignoreJobs`; any other key belongs to the host and makes `ciburst-join` fail with `<key>: a fleet setting; it belongs in the host's ciburst.json`. Leave the file out when the project has neither.
 4. Hand the human this list, unchanged:
-   - In the host: the project variable `CIBURST_INVITE` with this project's id, then run `ciburst-invite` and copy the code.
+   - In the host: the project variable `CIBURST_INVITE` with this project's id, then run `ciburst-invite` and download `join-code.txt` from its artifacts.
    - In this project: `CIBURST_JOIN` (the code) and `CIBURST_GITLAB_TOKEN` (an Owner's personal access token with `api` and `create_runner`): protected, "Masked and hidden", environment scope `ciburst`; the default branch protected.
    - Then run `ciburst-join`; its log prints `lane <tag> (<image>)` per lane and ends with `joined fleet <name>`.
    - After a later change of `lanes` or `ignoreJobs`: run `ciburst-join` again, with a fresh code when the old one expired (7 days).
@@ -82,7 +82,7 @@ images/test/lane-bootstrap.sh  # Docker, after a change to the lane bootstrap
 Rules:
 - Spec first: a design change gets a decision row in `docs/SPEC.md` section 0 and its rules in the section it governs before code; a decision it replaces moves to the dropped table with the reason.
 - Every external API is tested against an in-process fake that is as strict as the real service. A live finding becomes a rule of the fake and a test that fails without the fix.
-- No identifying data in the repository: no real hostnames, ids, emails or personal namespaces. The only real names allowed are `ciburst`, `gitlab.com/ciburst/ciburst`, `registry.gitlab.com/ciburst/ciburst` and `ciburst.zwa.la`. Secrets live in `.local/` (gitignored) or CI variables.
+- No identifying data in the repository: no real hostnames, ids, emails or personal namespaces. The only real names allowed are `ciburst`, `gitlab.com/ciburst/ciburst`, `registry.gitlab.com/ciburst/ciburst`, `gitlab.com/ciburst/ciburst-adopt-demo` and `ciburst.zwa.la`. Secrets live in `.local/` (gitignored) or CI variables.
 - No em or en dashes anywhere. Docs state facts, numbered steps with checks, and decisions; no narrative.
 - Rust stays on 1.96.0: Scaleway compiles the function with the runtime `rust196`; `scripts/check-pins.sh` lists every pin.
 - Commits are signed off (`git commit -s`, DCO).

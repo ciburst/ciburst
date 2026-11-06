@@ -106,10 +106,16 @@ ciburst-destroy:
   script:
     - ciburst --ci destroy --yes "$CIBURST_DESTROY"
 
+# The join code goes to an artifact for Maintainers and Owners, never into the log, which a public
+# project shows to everyone (D73).
 ciburst-invite:
   <<: *ciburst-job
   script:
     - ciburst --ci invite
+  artifacts:
+    paths: [join-code.txt]
+    access: maintainer
+    expire_in: 7 days
 
 ciburst-join: &ciburst-member-job
   <<: *ciburst-job
