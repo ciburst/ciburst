@@ -65,6 +65,7 @@ Each row states the current state. The date is that of the decision.
 | D72 | 2026-11-05 | The project turns public with 1.0.0 (owner: "v1.0.0 first"): policy files, the project description and catalog entry, the versioned component, the release binaries and the `cli` image. The GitHub mirror, the crates.io publication and the Pages site at `ciburst.zwa.la` follow; until the site exists, the README is the documentation. Deployments that include `@main` keep running `edge`. |
 | D73 | 2026-11-06 | A join code never enters a job log. GitLab shows a public project's job logs to everyone by default (public pipelines), and a code in the log of a host's `ciburst-invite` would let anyone join as the invited project within 7 days: set that project's lanes, so its lane jobs run another image with its variables, and receive its webhook secret. In pipeline mode `ciburst-invite` writes the code to `join-code.txt`, a job artifact only Maintainers and Owners can download (`artifacts:access: maintainer`, GitLab 18.4) that expires with the code; `ciburst invite <project>` on a workstation prints it. Found in the demo's logs before it turned public (2026-11-06). |
 | D74 | 2026-11-06 | The demo `gitlab.com/ciburst/ciburst-adopt-demo` turns public with 1.0.0 as the worked example, and the README links it (owner: "prepare the demo as well. Cross link it to show how to use ciburst"). Its history is two commits (owner: "Two clean commits"): a plain project on GitLab's hosted runners, then the adoption, whose diff is the whole change. Its drill pipelines are deleted (owner: "Delete all 31"), and its own deployment runs its pipelines, which visitors see and only members start. Its path joins the real names allowed in the repository. |
+| D75 | 2026-11-07 | The site at `ciburst.zwa.la` (D26) leads with serverless and is generated from the repository's own Markdown (owner: "all fine" on design proposal 2, after "Present the vision more with a lean on serverless" and "we can also keep the vm hour granularity explainer"). `README.md`, `AGENTS.md` and `docs/` stay the one source; the crate `crates/site` turns them into pages (section 11.5). The home page draws a measured pipeline of the demo to scale, its two lane jobs and two VM jobs, and the cost section draws the VM hour. Type: Source Sans 3 and Source Code Pro under the SIL Open Font License, self-hosted. Six colors, each with one role: amber for serverless time, links and the one primary button, blue for VM time, red for minute 55. No JavaScript. A shared styling library for this and other sites was considered and left out (owner: "forget it, just do the page from scratch"). |
 
 ### 0.2 Dropped
 
@@ -240,6 +241,7 @@ crates/cli/                binary ciburst: commands, pipeline mode, invite, join
 crates/scaleway/           provider scaleway (instances, jobs, IAM, S3, registry), host scaleway-function, ledger, schedule, records and fleet store in S3, build.rs packing the function zip, API fakes
 crates/dispatch-scaleway/  the function: handle, serve, respond
 crates/vm-agent/           binary ciburst-vm-agent: config.toml, reports, drain
+crates/site/               binary ciburst-site: the site from README.md, AGENTS.md and docs/ (section 11.5); assets/ with the stylesheet, fonts and pipeline.json
 images/cli/                the setup image with ciburst and ciburst-vm-agent
 images/test/               the lane bootstrap test, runner checks, the cli smoke test
 templates/ciburst.yml      the CI/CD component
@@ -572,6 +574,31 @@ Lanes are the project's `ciburst.json` and its jobs' tags, not part of the compo
 
 `apply` ends by posting every pending job of each project of `gitlab.projectIds` whose tags contain a tag of the host's runners and which is more than 60 s old to the dispatcher as a pending job event (`X-Gitlab-Event: Job Hook`, the hook token, `object_kind`, `build_status`, `project_id`, `build_id`, `build_name`, `build_stage`, `pipeline_id`), logging `replayed` with the answer's result per job; a failure logs `replay_failed` and `apply` still succeeds. The dispatcher answers jobs named `ciburst-*` with `ignored`, reason `own_job`, and `check` skips them.
 
+### 11.5 Site
+
+`crates/site`, the binary `ciburst-site` (not published), writes the site into a directory from the repository's files (D75):
+
+| Page | Path | Source |
+|---|---|---|
+| Home | `/` | `README.md` up to its first section, then How it works, Cost and limits, Development, License |
+| Adopt | `/adopt/` | `README.md`, Adopt |
+| Join an existing setup | `/join/` | `README.md`, Join an existing setup |
+| Lanes | `/lanes/` | `README.md`, Lanes |
+| ciburst.json | `/ciburst-json/` | `docs/SPEC.md`, section 5.4 |
+| Command line | `/command-line/` | `README.md`, Run from a workstation |
+| For AI agents | `/agents/` | `README.md`, With an AI assistant, then `AGENTS.md` |
+| Operations | `/operations/` | `docs/RUNBOOK.md` |
+| Design | `/design/` | `docs/SPEC.md` |
+| Providers | `/design/providers/` | `docs/PROVIDERS.md` |
+
+- Markdown with tables; every heading gets an id from its text; a table sits in its own box that scrolls sideways.
+- In a list item, a line that starts with `Check:` becomes a check row: the word Check, then the rest of the line.
+- A link or a code span that names one of the source files (`README.md`, `AGENTS.md`, `docs/SPEC.md`, `docs/RUNBOOK.md`, `docs/PROVIDERS.md`) links to its page; a link to another repository path goes to that file on `gitlab.com/ciburst/ciburst`.
+- Home: the README's first paragraph is the page heading and its second the lede. The drawing of `crates/site/assets/pipeline.json` follows: a measured pipeline of the demo with each job's start, run and exit in seconds, no ids. Cost and limits opens with the VM hour: about 90 s of boot, two slots, the end at minute 55.
+- Assets: one stylesheet; Source Sans 3 (400, 700) and Source Code Pro (400) as latin WOFF2 files with their license; no JavaScript and no request to another host. The page heading and every drawing are SVG or HTML generated at build time.
+- Tests: every page builds from the repository's files; every internal link and anchor resolves; no page holds a `<script>`; the home page with its stylesheet and fonts stays under 100 KB; each README section of the table appears on its page.
+- CI: the job `pages` on `main`, when the README, `AGENTS.md`, `docs/`, the crate or the CI file change, runs `ciburst-site public` and keeps `public` as its artifact; GitLab Pages serves it at `ciburst.zwa.la` with a Let's Encrypt certificate.
+
 ## 12. Testing
 
 | Level | What | Where |
@@ -586,6 +613,7 @@ Lanes are the project's `ciburst.json` and its jobs' tags, not part of the compo
 | Function | routes, environment errors, the ledger | `crates/dispatch-scaleway` |
 | Agent | `config.toml`, busy detection, reports, drain protocol, terminate retries; the real binary with fake `gitlab-runner` and `docker` on Linux | `crates/vm-agent`, `scripts/test-linux.sh` |
 | Lane bootstrap | `images/test/lane-bootstrap.sh` (section 11.1) | CI job `lane-bootstrap`, locally with Docker |
+| Site | every page from the repository's files, internal links and anchors, no script, the home page's weight (section 11.5) | `crates/site` |
 | `cli` image | smoke test of its binaries | CI image job, locally with Docker |
 | Drill | real Scaleway and GitLab | runbook, Acceptance drill |
 
@@ -632,7 +660,7 @@ Routes every job of each project's pipeline as the dispatcher does (section 5.5)
 | M6.4 | Lanes and `ignoreJobs` per project, one VM runner per fleet, Scaleway as the only provider, docs of the current state |
 | M7, part 1 | Hardening: `ms` in every answer, function size, start without lookups, retries, webhook health, deliveries in `status` |
 | M7, go public | Policy files (D70), tags `X.Y.Z` and the catalog release, the component on its own version (D71), version 1.0.0 in the crates, the project description, the history rewrite (D70), the join code as an artifact (D73), the demo as the worked example (D74), visibility public and the tag `1.0.0` (D72) |
-| M7, after | GitHub mirror, crates.io publication of `ciburst-core`, `ciburst-scaleway` and `ciburst`, Pages site at `ciburst.zwa.la` (D72) |
+| M7, after | GitHub mirror, crates.io publication of `ciburst-core`, `ciburst-scaleway` and `ciburst`, Pages site at `ciburst.zwa.la` (D72, D75) |
 
 Definition of done per milestone: tests green locally and on CI, `cargo fmt`, `clippy -D warnings` and `cargo deny` clean, docs updated, no secret and no identifying value in the repo, no em or en dash, summary to the owner with the go question for the next milestone.
 
