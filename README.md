@@ -2,7 +2,7 @@
 
 Serverless GitLab runners in your own cloud account.
 
-Jobs that need no Docker daemon can run as Scaleway Serverless Jobs in their own image, billed per second. Jobs that need one get a VM with GitLab's Docker executor, so `services:` and `docker build` work as on GitLab's runners; the VM ends itself when it is idle at minute 55 of its paid hour. Between pipelines nothing runs.
+ciburst runs your GitLab CI jobs in your own Scaleway account: each job in its own image, billed per second, and a VM only for the jobs that need Docker. Between pipelines nothing runs.
 
 ![A web app's pipeline on ciburst: GitLab sends each job's event to the dispatcher, which starts a lane for each Docker-free job and gives each Docker job a slot on a VM; a lane ends 60 s after its job, the idle VM at minute 55.](docs/flow.svg)
 
@@ -13,6 +13,24 @@ Design: `docs/SPEC.md`. Operations: `docs/RUNBOOK.md`. Providers: `docs/PROVIDER
 Example: [ciburst-adopt-demo](https://gitlab.com/ciburst/ciburst-adopt-demo), a small project before and after adopting ciburst. Its second commit, `Adopt ciburst`, is the whole change, and its pipelines show which job ran on a VM and which in a lane.
 
 Status: 1.0.0. The component is in the GitLab CI/CD Catalog: `@1` is the newest 1.x release and runs the `cli` image of that release; `@main` runs the image `edge`.
+
+## What ciburst does
+
+### Each job in its own image
+
+A job that needs no Docker daemon runs as a Scaleway Serverless Job in its own image. Most images start in 5 to 28 s; the run is billed per second and ends 60 s after its job, unless another job of its image comes.
+
+### Docker when a job needs it
+
+A job with `services:` or `docker build` gets a slot on a VM with GitLab's Docker executor and runs as on GitLab's own runners. Two jobs share a VM; another VM starts only when a job would wait longer than a VM takes to boot.
+
+### Nothing runs between pipelines
+
+An idle VM ends itself at minute 55 of the hour it is paid for, a lane 60 s after its last job. A month of 3,000 job-minutes costs about 2.24 EUR in lanes, against 23.23 EUR on GitLab's hosted runners.
+
+### In your own cloud account
+
+Runners, caches and the dispatcher run in your Scaleway account, set up from your own pipeline: one include, four CI/CD variables and one manual job. The [demo project](https://gitlab.com/ciburst/ciburst-adopt-demo) shows the whole change in one commit. ciburst is open source under Apache-2.0.
 
 ## How it works
 
@@ -49,7 +67,7 @@ Compared per job-minute for a small runner (providers' price pages, 2026-10-25, 
 | ciburst VMs, measured: the drill consumer's 3 pipelines on one DEV1-L per job | 0.0046 | per started hour, VMs busy about 20 % of it |
 | ciburst lane, 2 vCPU | 0.0017, free up to about 1,700 minutes a month | per second |
 
-A month of 3,000 job-minutes: GitLab 23.23 EUR, self-built AWS spot 12.95, RocketRunner 9.46, ciburst lanes 2.24, ciburst VM slots 1.36. A VM slot has 1.5 shared vCPU and 2 GB, GitLab's small runner 2 vCPU and 8 GB.
+A month of 3,000 job-minutes: GitLab hosted 23.23 EUR, self-built AWS spot 12.95, RocketRunner 9.46, ciburst lanes 2.24, ciburst VM slots 1.36. A VM slot has 1.5 shared vCPU and 2 GB, GitLab's small runner 2 vCPU and 8 GB.
 
 VMs reach their per-minute price only when pipelines keep them busy through their paid hours. A project with a few pipelines a day pays mostly for idle minutes until minute 55; its Docker-free jobs cost less in lanes, which bill per second and start inside the free tier.
 

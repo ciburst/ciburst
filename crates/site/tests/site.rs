@@ -89,8 +89,11 @@ fn every_page_is_built() {
             "agents/index.html",
             "ciburst-json/index.html",
             "command-line/index.html",
+            "costs/index.html",
             "design/index.html",
             "design/providers/index.html",
+            "development/index.html",
+            "how-it-works/index.html",
             "index.html",
             "join/index.html",
             "lanes/index.html",
@@ -225,8 +228,26 @@ fn each_source_lands_on_its_page() {
         home.contains("<h1>Serverless GitLab runners in your own cloud account</h1>"),
         "{home}"
     );
-    assert!(home.contains("id=\"how-it-works\"") && home.contains("id=\"cost-and-limits\""));
+    for chapter in [
+        "each-job-in-its-own-image",
+        "docker-when-a-job-needs-it",
+        "nothing-runs-between-pipelines",
+        "in-your-own-cloud-account",
+    ] {
+        assert!(
+            home.contains(&format!("<h2 id=\"{chapter}\">")),
+            "the story's chapter {chapter}"
+        );
+    }
     assert!(home.contains("Adopt in five steps"));
+    assert!(
+        home.contains(">ciburst lanes</text>") && home.contains(">23.23 EUR</text>"),
+        "the cost bars hold the README's month"
+    );
+    assert!(
+        !home.contains("Status: ") && !home.contains("docs/SPEC.md"),
+        "the opening's pointers stay off the home page"
+    );
     assert!(
         !home.contains("https://ciburst.zwa.la"),
         "the README's line naming the site stays off the site"
@@ -236,9 +257,24 @@ fn each_source_lands_on_its_page() {
         "the header carries the logo, the README's title line stays off the page (D76)"
     );
     assert!(home.contains("class=\"p-lane\"") && home.contains("VM ends itself, minute 55"));
+    let costs = &site.html["costs/index.html"];
+    assert!(costs.contains("<h1 id=\"cost-and-limits\">Cost and limits</h1>"));
     assert!(
-        home.contains("<a href=\"design/\"><code>docs/SPEC.md</code></a>"),
+        costs.contains("VM ends itself, minute 55"),
+        "the VM hour on its page"
+    );
+    assert!(
+        costs.contains("<a href=\"../design/\"><code>docs/SPEC.md</code></a>"),
         "the README's file names link to their pages"
+    );
+    assert!(
+        site.html["how-it-works/index.html"].contains("<h1 id=\"how-it-works\">How it works</h1>")
+            && site.html["how-it-works/index.html"].contains("class=\"p-lane\""),
+        "How it works with the measured pipeline"
+    );
+    assert!(
+        site.html["development/index.html"].contains("id=\"license\""),
+        "Development with the license"
     );
     let adopt = &site.html["adopt/index.html"];
     assert!(adopt.contains("<h1 id=\"adopt\">Adopt</h1>"));

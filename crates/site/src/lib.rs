@@ -58,6 +58,9 @@ const SOURCES: &[(&str, &str)] = &[
 
 /// README sections and the pages they become: path, entry in the contents, section title.
 const README_PAGES: &[(&str, &str, &str)] = &[
+    ("how-it-works", "How it works", "How it works"),
+    ("costs", "Cost and limits", "Cost and limits"),
+    ("development", "Development", "Development"),
     ("adopt", "Adopt", "Adopt"),
     ("join", "Join an existing setup", "Join an existing setup"),
     ("lanes", "Lanes", "Lanes"),
@@ -76,8 +79,23 @@ fn readme_page(sections: &[(String, String)], path: &str) -> Result<Page, String
     })
 }
 
-/// README sections on the home page, after its opening.
-const HOME_SECTIONS: &[&str] = &["How it works", "Cost and limits", "Development", "License"];
+/// The README's section that tells the home page's story, a chapter per `###` heading, and the
+/// picture beside each chapter (spec 11.5).
+const STORY: &str = "What ciburst does";
+const CHAPTERS: &[(&str, Picture)] = &[
+    ("Each job in its own image", Picture::Pipeline),
+    ("Docker when a job needs it", Picture::Hour),
+    ("Nothing runs between pipelines", Picture::Costs),
+    ("In your own cloud account", Picture::Adopt),
+];
+
+#[derive(Clone, Copy)]
+enum Picture {
+    Pipeline,
+    Hour,
+    Costs,
+    Adopt,
+}
 
 fn read(root: &Path, file: &str) -> Result<String, String> {
     fs::read_to_string(root.join(file)).map_err(|e| format!("{file}: {e}"))
@@ -176,6 +194,7 @@ pub fn pages(root: &Path) -> Result<Vec<Page>, String> {
     let readme = read(root, "README.md")?;
     let (_, sections) = split(&readme);
     let mut pages = vec![
+        readme_page(&sections, "how-it-works")?,
         readme_page(&sections, "adopt")?,
         readme_page(&sections, "join")?,
         readme_page(&sections, "lanes")?,
@@ -189,6 +208,7 @@ pub fn pages(root: &Path) -> Result<Vec<Page>, String> {
             promote(&spec_section(&spec, "5.4")?, 2)
         ),
     });
+    pages.push(readme_page(&sections, "costs")?);
     pages.push(readme_page(&sections, "command-line")?);
     let assistant = section(&sections, "README.md", "With an AI assistant")?;
     let agents = read(root, "AGENTS.md")?;
@@ -216,6 +236,13 @@ pub fn pages(root: &Path) -> Result<Vec<Page>, String> {
         label: "Providers",
         markdown: read(root, "docs/PROVIDERS.md")?,
     });
+    let mut development = readme_page(&sections, "development")?;
+    development.markdown = format!(
+        "{}\n{}",
+        development.markdown,
+        section(&sections, "README.md", "License")?
+    );
+    pages.push(development);
     Ok(pages)
 }
 
@@ -272,9 +299,9 @@ const NUMBERS: &[&str] = &[
     "no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
 ];
 
-/// The home page: the README's opening as heading and lede, the measured pipeline, the rest
-/// of the opening, then How it works, Cost and limits with the VM hour, a pointer to Adopt,
-/// Development and License.
+/// The home page: the README's opening as heading and lede, the animation, then the story of
+/// What ciburst does, a picture beside each chapter (spec 11.5). The rest of the opening points
+/// to places the site links anyway and is left out.
 fn home(root: &Path) -> Result<String, String> {
     let readme = read(root, "README.md")?;
     let (intro, sections) = split(&readme);
@@ -287,11 +314,6 @@ fn home(root: &Path) -> Result<String, String> {
         .ok_or("README.md: no opening sentence")?
         .trim_end_matches('.');
     let lede = paragraphs.next().ok_or("README.md: no second paragraph")?;
-    // The README's pointer to the site itself has no use on the site.
-    // Nor its animation, which the page draws itself.
-    let rest: Vec<&str> = paragraphs
-        .filter(|p| !p.starts_with("Site:") && !p.starts_with("!["))
-        .collect();
     let adopt = section(&sections, "README.md", "Adopt")?;
     let steps = adopt
         .lines()
@@ -300,6 +322,7 @@ fn home(root: &Path) -> Result<String, String> {
                 .is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
         })
         .count();
+    let steps = NUMBERS.get(steps).copied().unwrap_or("a few");
     let include = adopt
         .split("```yaml\n")
         .nth(1)
@@ -319,36 +342,45 @@ fn home(root: &Path) -> Result<String, String> {
             .to_string()
     };
     let pipeline = figures::parse_pipeline(PIPELINE)?;
+    let costs = figures::parse_costs(section(&sections, "README.md", "Cost and limits")?)?;
     let mut body = format!(
         "{PATTERNS}<div class=\"open\"><h1>{}</h1><p class=\"lede\">{}</p>\
-         <p class=\"actions\"><a class=\"btn\" href=\"adopt/\">Adopt in {} steps</a>\
-         <a href=\"#how-it-works\">How it works</a></p></div>{}",
+         <p class=\"actions\"><a class=\"btn\" href=\"adopt/\">Adopt in {steps} steps</a>\
+         <a href=\"how-it-works/\">How it works</a></p></div>{}",
         inline(heading),
         inline(lede),
-        NUMBERS.get(steps).copied().unwrap_or("a few"),
         flow_figure()?
     );
-    body.push_str("<div class=\"sec intro\">");
-    body.push_str(&render_for("", &rest.join("\n\n")).html);
-    body.push_str("</div>");
-    for title in HOME_SECTIONS {
-        let html = render_for("", section(&sections, "README.md", title)?).html;
-        let html = match *title {
-            "How it works" => format!("{html}{}", figures::pipeline_figure(&pipeline)),
-            "Cost and limits" => {
-                html.replacen("</h2>", &format!("</h2>{}", figures::hour_figure()), 1)
-            }
-            _ => html,
-        };
-        body.push_str(&format!("<section class=\"sec\">{html}</section>"));
-        if *title == "Cost and limits" {
-            body.push_str(&format!(
-                "<section class=\"sec\"><h2 id=\"adopt\">Adopt</h2><pre><code>{}</code></pre>\
-                 <p>Then a Scaleway key, a GitLab token, four CI/CD variables and one run of the \
-                 manual job <code>ciburst-setup</code>: <a href=\"adopt/\">the steps</a>.</p></section>",
+    let story = section(&sections, "README.md", STORY)?;
+    let mut chapters = story.split("\n### ").skip(1).peekable();
+    if chapters.peek().is_none() {
+        return Err(format!("README.md: {STORY} has no ### chapters"));
+    }
+    for chapter in chapters {
+        let (title, text) = chapter.split_once('\n').unwrap_or((chapter, ""));
+        let title = title.trim();
+        let picture = CHAPTERS
+            .iter()
+            .find(|(t, _)| *t == title)
+            .map(|(_, p)| *p)
+            .ok_or_else(|| format!("README.md: no picture for the chapter \"{title}\""))?;
+        let picture = match picture {
+            Picture::Pipeline => figures::pipeline_figure(&pipeline),
+            Picture::Hour => figures::hour_figure(),
+            Picture::Costs => figures::cost_figure(&costs, "costs/"),
+            Picture::Adopt => format!(
+                "<pre><code>{}</code></pre><p class=\"actions\"><a class=\"btn\" href=\"adopt/\">\
+                 Adopt in {steps} steps</a><a href=\"join/\">Join an existing setup</a></p>",
                 escape(include)
-            ));
-        }
+            ),
+        };
+        body.push_str(&format!(
+            "<section class=\"story\"><div class=\"story-text\"><h2 id=\"{}\">{}</h2>{}</div>\
+             <div class=\"story-picture\">{picture}</div></section>",
+            slug(title),
+            escape(title),
+            render_for("", text).html
+        ));
     }
     Ok(body)
 }
@@ -388,7 +420,7 @@ fn layout(root: &str, title: &str, body: &str, contents: Option<&str>) -> String
          <header class=\"bar\"><a class=\"word\" href=\"{}\">\
          <img src=\"{root}logo.svg\" alt=\"ciburst\" width=\"123\" height=\"28\"></a>\
          <nav class=\"nav\" aria-label=\"Site\"><a href=\"{root}adopt/\"{docs_current}>Docs</a>\
-         <a href=\"{root}#cost-and-limits\">Costs</a><a href=\"{PROJECT_URL}/-/releases\">Releases</a>\
+         <a href=\"{root}costs/\">Costs</a><a href=\"{PROJECT_URL}/-/releases\">Releases</a>\
          <a href=\"{PROJECT_URL}\">GitLab</a></nav></header>\n<main>{main}</main>\n\
          <footer class=\"foot\">ciburst {}, Apache-2.0. Source, issues and releases on \
          <a href=\"{PROJECT_URL}\">GitLab</a>.</footer>\n</body>\n</html>\n",
@@ -453,13 +485,29 @@ pub fn build(root: &Path, out: &Path) -> Result<Vec<PathBuf>, String> {
         "index.html",
         layout("", "ciburst: serverless GitLab runners", &home(root)?, None).as_bytes(),
     )?];
+    let pipeline = figures::parse_pipeline(PIPELINE)?;
     for page in &pages {
         let rendered = render_for(page.path, &page.markdown);
         let title = format!("{}, ciburst", page.label);
+        // The home page's pictures also stand on the pages that explain them.
+        let body = match page.path {
+            "how-it-works" => format!(
+                "{PATTERNS}{}{}",
+                rendered.html,
+                figures::pipeline_figure(&pipeline)
+            ),
+            "costs" => format!(
+                "{PATTERNS}{}",
+                rendered
+                    .html
+                    .replacen("</h1>", &format!("</h1>{}", figures::hour_figure()), 1)
+            ),
+            _ => rendered.html.clone(),
+        };
         let html = layout(
             &root_of(page.path),
             &title,
-            &rendered.html,
+            &body,
             Some(&contents(&pages, page.path, &rendered.headings)),
         );
         files.push(write(
@@ -519,12 +567,20 @@ pub fn write_readme_flow(root: &Path) -> Result<PathBuf, String> {
     write(root, README_FLOW, readme_flow()?.as_bytes())
 }
 
-/// The animation on the home page: the wide drawing, the narrow one on phones, and a button
-/// that pauses it, or plays it for readers who ask for less motion (spec 11.5).
+/// The animation on the home page: the wide drawing, the narrow one on phones, and a button in
+/// its corner that pauses it, or plays it for readers who ask for less motion (spec 11.5).
 fn flow_figure() -> Result<String, String> {
     let f = flow::parse(FLOW)?;
     Ok(format!(
-        "<input type=\"checkbox\" id=\"flow-toggle\" class=\"flow-toggle\">         <figure class=\"fig flow\"><div class=\"flow-wide\">{}</div><div class=\"flow-narrow\">{}</div>         <figcaption><label for=\"flow-toggle\" class=\"flow-button\">         <span class=\"flow-pause\">Pause</span><span class=\"flow-play\">Play</span></label> {}</figcaption></figure>",
+        "<input type=\"checkbox\" id=\"flow-toggle\" class=\"flow-toggle\">\
+         <figure class=\"fig flow\"><div class=\"flow-stage\">\
+         <div class=\"flow-wide\">{}</div><div class=\"flow-narrow\">{}</div>\
+         <label for=\"flow-toggle\" class=\"flow-button\">\
+         <span class=\"flow-pause\"><svg viewBox=\"0 0 10 12\" aria-hidden=\"true\">\
+         <rect width=\"3\" height=\"12\"/><rect x=\"7\" width=\"3\" height=\"12\"/></svg>Pause</span>\
+         <span class=\"flow-play\"><svg viewBox=\"0 0 10 12\" aria-hidden=\"true\">\
+         <path d=\"M0 0L10 6L0 12Z\"/></svg>Play</span></label></div>\
+         <figcaption>{}</figcaption></figure>",
         flow::flow_svg(&f, flow::Layout::Wide, None),
         flow::flow_svg(&f, flow::Layout::Narrow, None),
         escape(&f.caption)

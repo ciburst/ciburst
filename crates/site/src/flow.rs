@@ -158,14 +158,14 @@ fn clock(s: f64) -> String {
 
 /// Seconds of animation before the first event, for each burst of job events, and after the
 /// VM's end.
-const PUSH: f64 = 0.8;
-const TRAVEL: f64 = 0.8;
-const HOLD: f64 = 1.8;
+const PUSH: f64 = 1.6;
+const TRAVEL: f64 = 1.6;
+const HOLD: f64 = 3.6;
 const FADE: f64 = 0.15;
 /// The animation seconds a step between two events gets: from `STEP_MIN` for an instant to
 /// `STEP_MIN + STEP_MAX` for a long wait, `STEP_SCALE` pipeline seconds setting the curve.
-const STEP_MIN: f64 = 0.03;
-const STEP_MAX: f64 = 0.55;
+const STEP_MIN: f64 = 0.06;
+const STEP_MAX: f64 = 1.1;
 const STEP_SCALE: f64 = 45.0;
 
 /// Maps the pipeline's seconds to the animation's: each step between two events gets time to be
@@ -1088,7 +1088,7 @@ mod tests {
             assert!(tl.at(job.start_s) < tl.at(job.end_s) + 1e-9, "{}", job.name);
         }
         assert!(
-            (14.0..32.0).contains(&tl.total),
+            (36.0..56.0).contains(&tl.total),
             "a pass lasts {} s",
             tl.total
         );

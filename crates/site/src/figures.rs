@@ -235,9 +235,119 @@ pub fn hour_figure() -> String {
     )
 }
 
+/// The month of job-minutes the README's Cost and limits compares, from its line that starts
+/// with `A month of ` (spec 11.5).
+#[derive(Debug)]
+pub struct Costs {
+    pub month: String,
+    pub rows: Vec<(String, f64)>,
+}
+
+pub fn parse_costs(section: &str) -> Result<Costs, String> {
+    let line = section
+        .lines()
+        .find(|l| l.starts_with("A month of "))
+        .ok_or("README.md: Cost and limits has no line that starts with \"A month of \"")?;
+    let (head, rest) = line
+        .split_once(": ")
+        .ok_or("README.md: the month's line needs \"A month of <n>: <option> <EUR>, ...\"")?;
+    let list = rest
+        .split(". ")
+        .next()
+        .unwrap_or(rest)
+        .trim_end_matches('.');
+    let mut rows = Vec::new();
+    for item in list.split(", ") {
+        let item = item.trim_end_matches(" EUR");
+        let (label, value) = item
+            .rsplit_once(' ')
+            .and_then(|(l, v)| v.parse::<f64>().ok().map(|v| (l.to_string(), v)))
+            .ok_or_else(|| {
+                format!("README.md: \"{item}\" in the month's line is no option with its EUR")
+            })?;
+        rows.push((label, value));
+    }
+    if rows.len() < 2 {
+        return Err("README.md: the month's line compares fewer than two options".into());
+    }
+    Ok(Costs {
+        month: head.trim_start_matches("A month of ").to_string(),
+        rows,
+    })
+}
+
+/// The month's cost per option as bars; ciburst's lanes amber and its VM slots blue.
+pub fn cost_figure(c: &Costs, costs_page: &str) -> String {
+    let max = c.rows.iter().map(|r| r.1).fold(0.0, f64::max);
+    let x0 = 160.0;
+    let width = 430.0;
+    let height = TOP + c.rows.len() as f64 * (ROW + GAP);
+    let mut svg = format!(
+        "<svg viewBox=\"0 0 700 {height:.0}\" role=\"img\" aria-label=\"A month of {}: {}\">",
+        escape(&c.month),
+        escape(
+            &c.rows
+                .iter()
+                .map(|(l, v)| format!("{l} {v:.2} EUR"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    );
+    for (i, (label, value)) in c.rows.iter().enumerate() {
+        let y = TOP + i as f64 * (ROW + GAP);
+        let class = if label.contains("lanes") {
+            "p-lane"
+        } else if label.contains("VM") {
+            "p-vm"
+        } else {
+            "c-other"
+        };
+        let w = (value / max * width).max(2.0);
+        svg.push_str(&format!(
+            "<text class=\"p-name\" x=\"150\" y=\"{:.1}\" text-anchor=\"end\">{}</text>{}\
+             <text class=\"p-where\" x=\"{:.1}\" y=\"{:.1}\">{value:.2} EUR</text>",
+            y + ROW / 2.0 + 4.0,
+            escape(label),
+            rect(class, x0, y, w, ROW),
+            x0 + w + 8.0,
+            y + ROW / 2.0 + 4.0,
+        ));
+    }
+    svg.push_str("</svg>");
+    format!(
+        "<figure class=\"fig\"><div class=\"fig-scroll\">{svg}</div>\
+         <figcaption>A month of {}, at the providers' list prices; the comparison and its limits \
+         are under <a href=\"{costs_page}\">Cost and limits</a>.</figcaption></figure>",
+        escape(&c.month)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_month_line_gives_the_cost_bars() {
+        let c = parse_costs(
+            "x
+A month of 3,000 job-minutes: GitLab hosted 23.23 EUR, ciburst lanes 2.24. A VM slot has 1.5 vCPU.
+",
+        )
+        .unwrap();
+        assert_eq!(c.month, "3,000 job-minutes");
+        assert_eq!(
+            c.rows,
+            [
+                ("GitLab hosted".to_string(), 23.23),
+                ("ciburst lanes".to_string(), 2.24)
+            ]
+        );
+        assert!(
+            parse_costs("no month here")
+                .unwrap_err()
+                .contains("A month of")
+        );
+    }
 
     #[test]
     fn the_measured_pipeline_parses_and_draws_to_scale() {
