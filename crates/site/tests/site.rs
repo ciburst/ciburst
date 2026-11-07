@@ -43,9 +43,11 @@ fn built() -> Site {
     }
 }
 
-fn hrefs(html: &str) -> Vec<String> {
-    html.split("href=\"")
-        .skip(1)
+/// The targets of a page's links and images.
+fn links(html: &str) -> Vec<String> {
+    ["href=\"", "src=\""]
+        .iter()
+        .flat_map(|attr| html.split(attr).skip(1))
         .map(|rest| rest.split('"').next().unwrap().replace("&amp;", "&"))
         .collect()
 }
@@ -97,6 +99,8 @@ fn every_page_is_built() {
     );
     for asset in [
         "site.css",
+        "logo.svg",
+        "favicon.svg",
         "fonts/source-sans-3-latin.woff2",
         "fonts/source-code-pro-latin.woff2",
         "fonts/OFL-source-sans-3.txt",
@@ -106,7 +110,8 @@ fn every_page_is_built() {
     }
 }
 
-/// Every internal link and anchor resolves; no page holds a script or a dash the docs forbid.
+/// Every internal link, anchor and image resolves; no page holds a script or a dash the docs
+/// forbid.
 #[test]
 fn links_and_anchors_resolve() {
     let site = built();
@@ -119,7 +124,7 @@ fn links_and_anchors_resolve() {
         if page == "404.html" {
             continue;
         }
-        for href in hrefs(html) {
+        for href in links(html) {
             if href.starts_with("https://")
                 || href.starts_with("http://")
                 || href.starts_with("mailto:")
@@ -152,13 +157,15 @@ fn links_and_anchors_resolve() {
     }
 }
 
-/// spec 11.5: the home page with its stylesheet and fonts stays under 100 KB.
+/// spec 11.5: the home page with its stylesheet, fonts, logo and icon stays under 100 KB.
 #[test]
 fn the_home_page_stays_light() {
     let site = built();
     let bytes: u64 = [
         "index.html",
         "site.css",
+        "logo.svg",
+        "favicon.svg",
         "fonts/source-sans-3-latin.woff2",
         "fonts/source-code-pro-latin.woff2",
     ]
@@ -181,6 +188,10 @@ fn each_source_lands_on_its_page() {
     assert!(
         !home.contains("https://ciburst.zwa.la"),
         "the README's line naming the site stays off the site"
+    );
+    assert!(
+        !home.contains("logo-tile.svg") && home.contains("<img src=\"logo.svg\" alt=\"ciburst\""),
+        "the header carries the logo, the README's title line stays off the page (D76)"
     );
     assert!(home.contains("class=\"p-lane\"") && home.contains("VM ends itself, minute 55"));
     assert!(

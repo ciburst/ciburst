@@ -14,6 +14,9 @@ pub const PROJECT_URL: &str = "https://gitlab.com/ciburst/ciburst";
 
 const CSS: &str = include_str!("../assets/site.css");
 const PIPELINE: &str = include_str!("../assets/pipeline.json");
+/// The logo in the header and the cog as the icon, from `brand/` (spec 11.6).
+const LOGO: &str = include_str!("../../../brand/logo.svg");
+const FAVICON: &str = include_str!("../../../brand/favicon.svg");
 const FONTS: &[(&str, &[u8])] = &[
     (
         "source-sans-3-latin.woff2",
@@ -350,7 +353,7 @@ fn root_of(path: &str) -> String {
     }
 }
 
-/// The page around `body`: header with the wordmark and the site links, the contents on doc
+/// The page around `body`: header with the logo and the site links, the contents on doc
 /// pages, the footer. `root` leads from the page to the site root: empty on the home page,
 /// `/` on the 404 page, which GitLab serves at any depth.
 fn layout(root: &str, title: &str, body: &str, contents: Option<&str>) -> String {
@@ -372,8 +375,10 @@ fn layout(root: &str, title: &str, body: &str, contents: Option<&str>) -> String
          <title>{}</title>\n\
          <meta name=\"description\" content=\"Serverless GitLab runners in your own cloud account.\">\n\
          <link rel=\"preload\" href=\"{root}fonts/source-sans-3-latin.woff2\" as=\"font\" type=\"font/woff2\" crossorigin>\n\
+         <link rel=\"icon\" href=\"{root}favicon.svg\" type=\"image/svg+xml\">\n\
          <link rel=\"stylesheet\" href=\"{root}site.css\">\n</head>\n<body>\n\
-         <header class=\"bar\"><a class=\"word\" href=\"{}\">ciburst</a>\
+         <header class=\"bar\"><a class=\"word\" href=\"{}\">\
+         <img src=\"{root}logo.svg\" alt=\"ciburst\" width=\"123\" height=\"28\"></a>\
          <nav class=\"nav\" aria-label=\"Site\"><a href=\"{root}adopt/\"{docs_current}>Docs</a>\
          <a href=\"{root}#cost-and-limits\">Costs</a><a href=\"{PROJECT_URL}/-/releases\">Releases</a>\
          <a href=\"{PROJECT_URL}\">GitLab</a></nav></header>\n<main>{main}</main>\n\
@@ -468,6 +473,8 @@ pub fn build(root: &Path, out: &Path) -> Result<Vec<PathBuf>, String> {
         .as_bytes(),
     )?);
     files.push(write(out, "site.css", CSS.as_bytes())?);
+    files.push(write(out, "logo.svg", LOGO.as_bytes())?);
+    files.push(write(out, "favicon.svg", FAVICON.as_bytes())?);
     for (name, bytes) in FONTS {
         files.push(write(out, &format!("fonts/{name}"), bytes)?);
     }

@@ -28,6 +28,7 @@ workflow:
     - Cargo.lock
     - rust-toolchain.toml
     - crates/**/*
+    - brand/**/*
     - config.example.json
     - test/config.fake.json
     - .gitlab-ci.yml
@@ -74,6 +75,7 @@ workflow:
     - Cargo.lock
     - rust-toolchain.toml
     - crates/site/**/*
+    - brand/**/*
     - .gitlab-ci.yml
 
 lint:

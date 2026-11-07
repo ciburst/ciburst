@@ -64,7 +64,7 @@ Undo: run `ciburst-leave`, then remove the `include`, `ciburst.json` and the two
 
 Read first: `docs/SPEC.md` (decisions in section 0, then the design, every binding rule; code cites it as `spec 6.3` or `D53`), `docs/PROVIDERS.md` (ports, adding a provider), `docs/RUNBOOK.md` (operations, failure modes).
 
-Layout: `crates/core` (config, dispatcher, provisioning, fleet, ports; API fakes behind the `testing` feature), `crates/cli` (binary `ciburst`), `crates/scaleway` (provider and host), `crates/dispatch-scaleway` (the function Scaleway compiles from source), `crates/vm-agent`, `crates/site` (binary `ciburst-site`, the site from the README, `AGENTS.md` and `docs/`), `templates/ciburst.yml`, `images/`, `scripts/`.
+Layout: `crates/core` (config, dispatcher, provisioning, fleet, ports; API fakes behind the `testing` feature), `crates/cli` (binary `ciburst`), `crates/scaleway` (provider and host), `crates/dispatch-scaleway` (the function Scaleway compiles from source), `crates/vm-agent`, `crates/site` (binary `ciburst-site`, the site from the README, `AGENTS.md` and `docs/`), `crates/brand` (binary `ciburst-brand`, the logo's files in `brand/`), `templates/ciburst.yml`, `images/`, `scripts/`.
 
 Before every commit, all green:
 
@@ -86,4 +86,5 @@ Rules:
 - No em or en dashes anywhere. Docs state facts, numbered steps with checks, and decisions; no narrative.
 - Rust stays on 1.96.0: Scaleway compiles the function with the runtime `rust196`; `scripts/check-pins.sh` lists every pin.
 - Commits are signed off (`git commit -s`, DCO).
+- The logo's files in `brand/` are generated (`docs/SPEC.md` section 11.6): change `crates/brand`, then `cargo run -p ciburst-brand -- svg`; never edit them by hand. `cargo test -p ciburst-brand` fails when they differ from the generator.
 - The site maps README sections to pages by their titles (`docs/SPEC.md` section 11.5): renaming or adding one changes `crates/site` too; `cargo test -p ciburst-site` fails on a missing section or a broken link.

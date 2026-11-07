@@ -1,0 +1,17 @@
+[package]
+name = "ciburst-brand"
+description = "Writes the ciburst logo's SVG files from its geometry and font, and renders them as PNG"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "ciburst-brand"
+path = "src/main.rs"
+
+[dependencies]
+resvg = { version = "0.49", default-features = false }
+skrifa = { version = "0.49", default-features = false, features = ["std"] }
+wuff = { version = "0.2", default-features = false, features = ["brotli"] }

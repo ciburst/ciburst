@@ -1,4 +1,4 @@
-# ciburst
+# ![ciburst](brand/logo-tile.svg)
 
 Serverless GitLab runners in your own cloud account.
 
@@ -166,7 +166,7 @@ Global options: `--ci` (pipeline mode), `--config <path>`, `--local <dir>`, `--a
 
 ## Development
 
-Rust 1.96.0 (`rust-toolchain.toml`). Before a commit: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features`, `cargo deny check`, `scripts/shellcheck.sh`, `scripts/check-pins.sh`; `scripts/test-linux.sh` for Linux-only code, `images/test/lane-bootstrap.sh` after a change to the lane bootstrap. The site: `cargo run -p ciburst-site -- public` builds it from this README, `AGENTS.md` and `docs/` (`docs/SPEC.md` section 11.5). New providers: `docs/PROVIDERS.md`. Contributions: `CONTRIBUTING.md` (Developer Certificate of Origin, `git commit -s`); conduct: `CODE_OF_CONDUCT.md`; vulnerabilities: `SECURITY.md`.
+Rust 1.96.0 (`rust-toolchain.toml`). Before a commit: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features`, `cargo deny check`, `scripts/shellcheck.sh`, `scripts/check-pins.sh`; `scripts/test-linux.sh` for Linux-only code, `images/test/lane-bootstrap.sh` after a change to the lane bootstrap. The site: `cargo run -p ciburst-site -- public` builds it from this README, `AGENTS.md` and `docs/` (`docs/SPEC.md` section 11.5). The logo: `cargo run -p ciburst-brand -- svg` writes `brand/`, `cargo run -p ciburst-brand -- png target/brand` renders it as PNG (section 11.6). New providers: `docs/PROVIDERS.md`. Contributions: `CONTRIBUTING.md` (Developer Certificate of Origin, `git commit -s`); conduct: `CODE_OF_CONDUCT.md`; vulnerabilities: `SECURITY.md`.
 
 ## License
 

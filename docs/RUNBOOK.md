@@ -232,6 +232,17 @@ Domain, once:
 5. DNSSEC, after the certificate: switched on at the registrar of `zwa.la`, which signs the zone and hands the DS record to `.la`. `gitlab.io` is unsigned, so the CNAME's target resolves without validation, as intended.
    Check: `dig +dnssec ciburst.zwa.la CNAME` at a validating resolver shows the flag `ad`; the site still loads. Resolvers may answer from their cache for an hour after the DS appears (2026-11-07: one SERVFAIL on the DNSKEY right after the DS appeared, gone on retry).
 
+## Logo
+
+Rules: spec section 11.6, D76.
+
+- Change: edit the geometry or the colors in `crates/brand`, then `cargo run -p ciburst-brand -- svg`; the site and the README pick up `brand/` on the next push.
+  Check: `cargo test -p ciburst-brand` passes; `git diff brand/` shows only the intended change.
+- PNG files: `cargo run -p ciburst-brand -- png target/brand`.
+  Check: `target/brand/avatar.png` is 512 by 512 px.
+- Profile pictures, after a change of the mark: `target/brand/avatar.png` as the GitLab group's avatar (group, Settings, General) and the GitHub organization's profile picture (organization, Settings, Profile).
+  Check: both show the cog on the dark tile.
+
 ## GitHub mirror
 
 Rules: D24. GitLab pushes the protected branches and the tags to the repository `ciburst` of the GitHub organization `ciburst` after every push; issues and merge requests stay on GitLab (`CONTRIBUTING.md`).

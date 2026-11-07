@@ -58,7 +58,8 @@ blockquote { margin: 16px 0; padding-left: 16px; border-left: 3px solid var(--ru
 /* Header and footer. */
 .bar { position: sticky; top: 0; z-index: 1; background: var(--paper); display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px 20px; padding: 4px max(16px, calc((100vw - 1120px) / 2)); border-bottom: 1px solid var(--rule); }
 [id] { scroll-margin-top: 64px; }
-.word { font-weight: 700; font-size: 21px; letter-spacing: -0.01em; color: var(--ink); text-decoration: none; min-height: 44px; display: inline-flex; align-items: center; }
+.word { min-height: 44px; display: inline-flex; align-items: center; }
+.word img { display: block; width: auto; height: 28px; }
 .nav { display: flex; flex-wrap: wrap; gap: 0 22px; }
 .nav a { color: var(--ink); text-decoration: none; min-height: 44px; display: inline-flex; align-items: center; }
 .nav a[aria-current] { text-decoration: underline; text-decoration-thickness: 2px; text-underline-offset: 8px; }
