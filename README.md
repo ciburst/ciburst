@@ -152,6 +152,8 @@ Lane images: `linux/amd64` with `/bin/sh`, public or in the deployment's Scalewa
 
 Without a cloud: `cargo run -p ciburst -- apply --config test/config.fake.json --skip-gitlab` runs against in-memory fakes.
 
+Without a clone: `cargo install --git https://gitlab.com/ciburst/ciburst --tag <version> --locked ciburst` builds the command line of a release, enough for `check`, `status` and `invite`; `apply` also needs that release's `ciburst-vm-agent` (Linux x86_64, linked on the release page), passed with `--agent`.
+
 | Command | Effect |
 |---|---|
 | `plan` | every step `apply` would run |

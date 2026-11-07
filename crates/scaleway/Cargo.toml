@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish = false
 
 [features]
 # The in-process Scaleway API fakes, for tests of this and other crates.
