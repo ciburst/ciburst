@@ -226,7 +226,9 @@ Domain, once:
    Check: after the first `pages` job, the project's Pages URL (Deploy, Pages) opens without a session.
 2. Deploy, Pages, New domain: `ciburst.zwa.la` with an automatic certificate; GitLab shows the verification code.
 3. DNS of `zwa.la`: no other record on the name `ciburst`, a CNAME `ciburst` to `ciburst.gitlab.io`, a TXT `_gitlab-pages-verification-code.ciburst` with `gitlab-pages-verification-code=<code>`.
-   Check: Deploy, Pages, Domains reads Verified; `https://ciburst.zwa.la` answers with a Let's Encrypt certificate.
+   Check: Deploy, Pages, Domains reads Verified; `https://ciburst.zwa.la` answers with a Let's Encrypt certificate within an hour. A first attempt made while the old record was still cached fails with a mail from GitLab: Deploy, Pages, the domain, Retry (2026-11-07: certificate 4 minutes after the retry).
+4. HTTPS only and the custom domain as the primary one: `PATCH /projects/:id/pages` with `pages_https_only` true and `pages_primary_domain` `https://ciburst.zwa.la`, or Deploy, Pages, settings.
+   Check: `http://ciburst.zwa.la/adopt/` answers 301 to `https://ciburst.zwa.la/adopt/`; the project's `gitlab.io` address answers 308 to the same page.
 
 ## Going public
 

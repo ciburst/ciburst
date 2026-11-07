@@ -4,6 +4,8 @@ Serverless GitLab runners in your own cloud account.
 
 Jobs that need no Docker daemon can run as Scaleway Serverless Jobs in their own image, billed per second. Jobs that need one get a VM with GitLab's Docker executor, so `services:` and `docker build` work as on GitLab's runners; the VM ends itself when it is idle at minute 55 of its paid hour. Between pipelines nothing runs.
 
+Site: [ciburst.zwa.la](https://ciburst.zwa.la), built from this README and `docs/`.
+
 Design: `docs/SPEC.md`. Operations: `docs/RUNBOOK.md`. Providers: `docs/PROVIDERS.md`. AI agents: `AGENTS.md`.
 
 Example: [ciburst-adopt-demo](https://gitlab.com/ciburst/ciburst-adopt-demo), a small project before and after adopting ciburst. Its second commit, `Adopt ciburst`, is the whole change, and its pipelines show which job ran on a VM and which in a lane.

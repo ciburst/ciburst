@@ -1,6 +1,6 @@
 # Spec: ciburst, GitLab runners that exist only while jobs run
 
-Status: 1.0.0, public (M7); next the GitHub mirror, the crates.io publication and the Pages site (D72).
+Status: 1.0.0, public, the site at `ciburst.zwa.la` (M7, D75); next the GitHub mirror and the crates.io publication (D72).
 
 ## 0. Decisions
 
@@ -594,7 +594,7 @@ Lanes are the project's `ciburst.json` and its jobs' tags, not part of the compo
 - Markdown with tables; every heading gets an id from its text; a table sits in its own box that scrolls sideways.
 - In a list item, a line that starts with `Check:` becomes a check row: the word Check, then the rest of the line.
 - A link or a code span that names one of the source files (`README.md`, `AGENTS.md`, `docs/SPEC.md`, `docs/RUNBOOK.md`, `docs/PROVIDERS.md`) links to its page; a link to another repository path goes to that file on `gitlab.com/ciburst/ciburst`.
-- Home: the README's first paragraph is the page heading and its second the lede. The drawing of `crates/site/assets/pipeline.json` follows: a measured pipeline of the demo with each job's start, run and exit in seconds, no ids. Cost and limits opens with the VM hour: about 90 s of boot, two slots, the end at minute 55.
+- Home: the README's first paragraph is the page heading and its second the lede; a paragraph of the opening that starts with `Site:` names the site itself and is left out. The drawing of `crates/site/assets/pipeline.json` follows: a measured pipeline of the demo with each job's start, run and exit in seconds, no ids. Cost and limits opens with the VM hour: about 90 s of boot, two slots, the end at minute 55.
 - Assets: one stylesheet; Source Sans 3 (400, 700) and Source Code Pro (400) as latin WOFF2 files with their license; no JavaScript and no request to another host. The page heading and every drawing are SVG or HTML generated at build time.
 - Tests: every page builds from the repository's files; every internal link and anchor resolves; no page holds a `<script>`; the home page with its stylesheet and fonts stays under 100 KB; each README section of the table appears on its page.
 - CI: the job `pages` on `main`, when the README, `AGENTS.md`, `docs/`, the crate or the CI file change, runs `ciburst-site public` and keeps `public` as its artifact; GitLab Pages serves it at `ciburst.zwa.la` with a Let's Encrypt certificate.
@@ -681,7 +681,7 @@ Risks:
 
 1. A token that can read the `ciburst` group's pipelines for drills.
 2. For 1.0.0: the OK for the one force push of the rewritten history (force push allowed on `main` for it), and for the visibility change; the same for the demo (D74), whose old commits need a second Repository cleanup.
-3. After 1.0.0: DNS for `ciburst.zwa.la` (CNAME to GitLab Pages plus the verification TXT record), the GitHub organization `ciburst` with a token for the push mirror, and a crates.io API token.
+3. After 1.0.0: the GitHub organization `ciburst` with a token for the push mirror, and a crates.io API token.
 
 ## 16. Sources, checked 2026-10-23 to 2026-10-26
 

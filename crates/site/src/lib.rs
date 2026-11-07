@@ -281,7 +281,8 @@ fn home(root: &Path) -> Result<String, String> {
         .ok_or("README.md: no opening sentence")?
         .trim_end_matches('.');
     let lede = paragraphs.next().ok_or("README.md: no second paragraph")?;
-    let rest: Vec<&str> = paragraphs.collect();
+    // The README's pointer to the site itself has no use on the site.
+    let rest: Vec<&str> = paragraphs.filter(|p| !p.starts_with("Site:")).collect();
     let adopt = section(&sections, "README.md", "Adopt")?;
     let steps = adopt
         .lines()

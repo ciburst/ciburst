@@ -178,6 +178,10 @@ fn each_source_lands_on_its_page() {
     );
     assert!(home.contains("id=\"how-it-works\"") && home.contains("id=\"cost-and-limits\""));
     assert!(home.contains("Adopt in five steps"));
+    assert!(
+        !home.contains("https://ciburst.zwa.la"),
+        "the README's line naming the site stays off the site"
+    );
     assert!(home.contains("class=\"p-lane\"") && home.contains("VM ends itself, minute 55"));
     assert!(
         home.contains("<a href=\"design/\"><code>docs/SPEC.md</code></a>"),
