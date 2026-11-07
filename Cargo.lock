@@ -371,6 +371,7 @@ dependencies = [
 name = "ciburst-site"
 version = "1.0.0"
 dependencies = [
+ "flate2",
  "pulldown-cmark",
  "serde",
  "serde_json",

@@ -157,15 +157,16 @@ fn links_and_anchors_resolve() {
     }
 }
 
-/// spec 11.5: the home page with its stylesheet, fonts, logo and icon stays under 100 KB.
+/// spec 11.5: the home page with its stylesheet, fonts, logo and icon stays under 100 KB as
+/// served, the text files compressed; every text file has its compressed copy.
 #[test]
 fn the_home_page_stays_light() {
     let site = built();
     let bytes: u64 = [
-        "index.html",
-        "site.css",
-        "logo.svg",
-        "favicon.svg",
+        "index.html.gz",
+        "site.css.gz",
+        "logo.svg.gz",
+        "favicon.svg.gz",
         "fonts/source-sans-3-latin.woff2",
         "fonts/source-code-pro-latin.woff2",
     ]
@@ -173,6 +174,47 @@ fn the_home_page_stays_light() {
     .map(|f| fs::metadata(site.root.join(f)).unwrap().len())
     .sum();
     assert!(bytes < 100 * 1024, "the first view weighs {bytes} bytes");
+    for page in site.html.keys() {
+        let gz = site.root.join(format!("{page}.gz"));
+        let mut text = String::new();
+        std::io::Read::read_to_string(
+            &mut flate2::read::GzDecoder::new(fs::File::open(&gz).unwrap()),
+            &mut text,
+        )
+        .unwrap();
+        assert_eq!(&text, &site.html[page], "{page}.gz holds the page");
+    }
+}
+
+/// spec 11.5: the animation on the home page, wide and narrow, with its button; the README's
+/// file is the generator's.
+#[test]
+fn the_animation_is_on_the_home_page_and_in_the_readme() {
+    let site = built();
+    let home = &site.html["index.html"];
+    assert!(
+        home.contains("class=\"fw\"") && home.contains("class=\"fn\""),
+        "both layouts"
+    );
+    assert!(
+        home.contains("<label for=\"flow-toggle\""),
+        "the play and pause button"
+    );
+    assert!(home.contains("prefers-reduced-motion"));
+    assert_eq!(
+        home.matches("<img").count(),
+        1,
+        "the header's logo is the page's one image; the README's animation stays off it"
+    );
+    let readme = fs::read_to_string(repo().join("README.md")).unwrap();
+    assert!(readme.contains("](docs/flow.svg)"));
+    let file = fs::read_to_string(repo().join(ciburst_site::README_FLOW))
+        .unwrap()
+        .replace("\r\n", "\n");
+    assert!(
+        file == ciburst_site::readme_flow().unwrap(),
+        "docs/flow.svg differs from the generator: cargo run -p ciburst-site -- --flow"
+    );
 }
 
 #[test]

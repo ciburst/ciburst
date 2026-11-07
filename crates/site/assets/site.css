@@ -133,6 +133,26 @@ td { font-variant-numeric: tabular-nums; }
 .h-stop { stroke: var(--stop); stroke-width: 2; }
 .h-stoptext { fill: var(--stop); font: 600 12px var(--sans); }
 
+/* The animation (spec 11.5): the wide drawing, the narrow one on phones; the button pauses it,
+   or plays it for readers who ask for less motion. */
+.flow svg { display: block; width: 100%; min-width: 0; height: auto; }
+.flow-narrow { display: none; }
+.flow-toggle { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.flow-button { display: inline-flex; align-items: center; min-height: 44px; padding: 0 16px; margin-right: 10px; border: 1px solid var(--rule); border-radius: 6px; color: var(--ink); font-weight: 600; cursor: pointer; }
+.flow-toggle:focus-visible ~ .flow .flow-button { outline: 3px solid var(--lane); outline-offset: 2px; }
+.flow-play, .flow-toggle:checked ~ .flow .flow-pause { display: none; }
+.flow-toggle:checked ~ .flow .flow-play { display: inline; }
+.flow-toggle:checked ~ .flow .fla { animation-play-state: paused; }
+@media (prefers-reduced-motion: reduce) {
+  .flow-pause, .flow-toggle:checked ~ .flow .flow-play { display: none; }
+  .flow-play, .flow-toggle:checked ~ .flow .flow-pause { display: inline; }
+  .flow-toggle:checked ~ .flow .fw .fla, .flow-toggle:checked ~ .flow .fn .fla { animation: var(--a) var(--loop) linear infinite; animation-play-state: running; }
+}
+@media (max-width: 640px) {
+  .flow-wide { display: none; }
+  .flow-narrow { display: block; }
+}
+
 @media (max-width: 720px) {
   .open { padding-top: 28px; }
   .open h1 { font-size: 31px; }

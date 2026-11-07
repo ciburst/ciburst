@@ -12,6 +12,7 @@ name = "ciburst-site"
 path = "src/main.rs"
 
 [dependencies]
+flate2 = "1"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 serde.workspace = true
 serde_json.workspace = true

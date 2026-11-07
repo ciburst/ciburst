@@ -2,9 +2,11 @@
 //! one stylesheet, two fonts, and the home page's drawings generated at build time.
 
 mod figures;
+mod flow;
 mod markdown;
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub use markdown::{escape, render, slug};
@@ -14,6 +16,7 @@ pub const PROJECT_URL: &str = "https://gitlab.com/ciburst/ciburst";
 
 const CSS: &str = include_str!("../assets/site.css");
 const PIPELINE: &str = include_str!("../assets/pipeline.json");
+const FLOW: &str = include_str!("../assets/flow.json");
 /// The logo in the header and the cog as the icon, from `brand/` (spec 11.6).
 const LOGO: &str = include_str!("../../../brand/logo.svg");
 const FAVICON: &str = include_str!("../../../brand/favicon.svg");
@@ -285,7 +288,10 @@ fn home(root: &Path) -> Result<String, String> {
         .trim_end_matches('.');
     let lede = paragraphs.next().ok_or("README.md: no second paragraph")?;
     // The README's pointer to the site itself has no use on the site.
-    let rest: Vec<&str> = paragraphs.filter(|p| !p.starts_with("Site:")).collect();
+    // Nor its animation, which the page draws itself.
+    let rest: Vec<&str> = paragraphs
+        .filter(|p| !p.starts_with("Site:") && !p.starts_with("!["))
+        .collect();
     let adopt = section(&sections, "README.md", "Adopt")?;
     let steps = adopt
         .lines()
@@ -320,17 +326,19 @@ fn home(root: &Path) -> Result<String, String> {
         inline(heading),
         inline(lede),
         NUMBERS.get(steps).copied().unwrap_or("a few"),
-        figures::pipeline_figure(&pipeline)
+        flow_figure()?
     );
     body.push_str("<div class=\"sec intro\">");
     body.push_str(&render_for("", &rest.join("\n\n")).html);
     body.push_str("</div>");
     for title in HOME_SECTIONS {
         let html = render_for("", section(&sections, "README.md", title)?).html;
-        let html = if *title == "Cost and limits" {
-            html.replacen("</h2>", &format!("</h2>{}", figures::hour_figure()), 1)
-        } else {
-            html
+        let html = match *title {
+            "How it works" => format!("{html}{}", figures::pipeline_figure(&pipeline)),
+            "Cost and limits" => {
+                html.replacen("</h2>", &format!("</h2>{}", figures::hour_figure()), 1)
+            }
+            _ => html,
         };
         body.push_str(&format!("<section class=\"sec\">{html}</section>"));
         if *title == "Cost and limits" {
@@ -478,7 +486,81 @@ pub fn build(root: &Path, out: &Path) -> Result<Vec<PathBuf>, String> {
     for (name, bytes) in FONTS {
         files.push(write(out, &format!("fonts/{name}"), bytes)?);
     }
+    // GitLab Pages serves `<file>.gz` instead of a text file to browsers that accept it.
+    let mut compressed = Vec::new();
+    for file in &files {
+        if file
+            .extension()
+            .is_some_and(|e| ["html", "css", "svg", "txt"].iter().any(|t| e == *t))
+        {
+            let bytes = fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
+            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+            gz.write_all(&bytes)
+                .and_then(|()| gz.finish())
+                .and_then(|data| {
+                    let mut name = file.clone().into_os_string();
+                    name.push(".gz");
+                    let path = PathBuf::from(name);
+                    fs::write(&path, data).map(|()| path)
+                })
+                .map(|path| compressed.push(path))
+                .map_err(|e| format!("{}.gz: {e}", file.display()))?;
+        }
+    }
+    files.extend(compressed);
     Ok(files)
+}
+
+/// The README's animation, `docs/flow.svg`, below the repository at `root`.
+pub const README_FLOW: &str = "docs/flow.svg";
+
+/// Writes the README's animation into the repository at `root`.
+pub fn write_readme_flow(root: &Path) -> Result<PathBuf, String> {
+    write(root, README_FLOW, readme_flow()?.as_bytes())
+}
+
+/// The animation on the home page: the wide drawing, the narrow one on phones, and a button
+/// that pauses it, or plays it for readers who ask for less motion (spec 11.5).
+fn flow_figure() -> Result<String, String> {
+    let f = flow::parse(FLOW)?;
+    Ok(format!(
+        "<input type=\"checkbox\" id=\"flow-toggle\" class=\"flow-toggle\">         <figure class=\"fig flow\"><div class=\"flow-wide\">{}</div><div class=\"flow-narrow\">{}</div>         <figcaption><label for=\"flow-toggle\" class=\"flow-button\">         <span class=\"flow-pause\">Pause</span><span class=\"flow-play\">Play</span></label> {}</figcaption></figure>",
+        flow::flow_svg(&f, flow::Layout::Wide, None),
+        flow::flow_svg(&f, flow::Layout::Narrow, None),
+        escape(&f.caption)
+    ))
+}
+
+/// The animation for the README: the wide drawing on the dark tile, with its colors and
+/// Source Sans 3 inside the file.
+pub fn readme_flow() -> Result<String, String> {
+    let f = flow::parse(FLOW)?;
+    let style = format!(
+        "svg{{--paper:#10151C;--sunk:#18202A;--ink:#E7EBF0;--ink-2:#A9B2BE;--rule:#2C3642;         --lane:#E3A54E;--vm:#86B4E3;--stop:#F2867B;--sans:\"Source Sans 3\",sans-serif}}         @font-face{{font-family:\"Source Sans 3\";font-weight:200 900;         src:url(data:font/woff2;base64,{}) format(\"woff2\")}}",
+        base64(FONTS[0].1)
+    );
+    Ok(flow::flow_svg(&f, flow::Layout::Wide, Some(&style)))
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let v = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ABC[(v >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]

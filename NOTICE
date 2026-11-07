@@ -5,3 +5,4 @@ Licensed under the Apache License, Version 2.0 (LICENSE).
 
 The site's fonts Source Sans 3 and Source Code Pro (crates/site/assets/fonts) are Copyright Adobe,
 licensed under the SIL Open Font License, Version 1.1 (crates/site/assets/fonts/OFL-*.txt).
+docs/flow.svg holds Source Sans 3 under the same license.

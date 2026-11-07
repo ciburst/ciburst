@@ -4,6 +4,8 @@ Serverless GitLab runners in your own cloud account.
 
 Jobs that need no Docker daemon can run as Scaleway Serverless Jobs in their own image, billed per second. Jobs that need one get a VM with GitLab's Docker executor, so `services:` and `docker build` work as on GitLab's runners; the VM ends itself when it is idle at minute 55 of its paid hour. Between pipelines nothing runs.
 
+![A web app's pipeline on ciburst: GitLab sends each job's event to the dispatcher, which starts a lane for each Docker-free job and gives each Docker job a slot on a VM; a lane ends 60 s after its job, the idle VM at minute 55.](docs/flow.svg)
+
 Site: [ciburst.zwa.la](https://ciburst.zwa.la), built from this README and `docs/`.
 
 Design: `docs/SPEC.md`. Operations: `docs/RUNBOOK.md`. Providers: `docs/PROVIDERS.md`. AI agents: `AGENTS.md`.
@@ -168,7 +170,7 @@ Global options: `--ci` (pipeline mode), `--config <path>`, `--local <dir>`, `--a
 
 ## Development
 
-Rust 1.96.0 (`rust-toolchain.toml`). Before a commit: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features`, `cargo deny check`, `scripts/shellcheck.sh`, `scripts/check-pins.sh`; `scripts/test-linux.sh` for Linux-only code, `images/test/lane-bootstrap.sh` after a change to the lane bootstrap. The site: `cargo run -p ciburst-site -- public` builds it from this README, `AGENTS.md` and `docs/` (`docs/SPEC.md` section 11.5). The logo: `cargo run -p ciburst-brand -- svg` writes `brand/`, `cargo run -p ciburst-brand -- png target/brand` renders it as PNG (section 11.6). New providers: `docs/PROVIDERS.md`. Contributions: `CONTRIBUTING.md` (Developer Certificate of Origin, `git commit -s`); conduct: `CODE_OF_CONDUCT.md`; vulnerabilities: `SECURITY.md`.
+Rust 1.96.0 (`rust-toolchain.toml`). Before a commit: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features`, `cargo deny check`, `scripts/shellcheck.sh`, `scripts/check-pins.sh`; `scripts/test-linux.sh` for Linux-only code, `images/test/lane-bootstrap.sh` after a change to the lane bootstrap. The site: `cargo run -p ciburst-site -- public` builds it from this README, `AGENTS.md` and `docs/` (`docs/SPEC.md` section 11.5); `cargo run -p ciburst-site -- --flow` rewrites the animation `docs/flow.svg`. The logo: `cargo run -p ciburst-brand -- svg` writes `brand/`, `cargo run -p ciburst-brand -- png target/brand` renders it as PNG (section 11.6). New providers: `docs/PROVIDERS.md`. Contributions: `CONTRIBUTING.md` (Developer Certificate of Origin, `git commit -s`); conduct: `CODE_OF_CONDUCT.md`; vulnerabilities: `SECURITY.md`.
 
 ## License
 

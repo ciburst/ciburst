@@ -87,4 +87,5 @@ Rules:
 - Rust stays on 1.96.0: Scaleway compiles the function with the runtime `rust196`; `scripts/check-pins.sh` lists every pin.
 - Commits are signed off (`git commit -s`, DCO).
 - The logo's files in `brand/` are generated (`docs/SPEC.md` section 11.6): change `crates/brand`, then `cargo run -p ciburst-brand -- svg`; never edit them by hand. `cargo test -p ciburst-brand` fails when they differ from the generator.
+- `docs/flow.svg`, the README's animation, is generated from `crates/site/assets/flow.json` (`docs/SPEC.md` section 11.5): change the data or `crates/site`, then `cargo run -p ciburst-site -- --flow`; never edit it by hand. `cargo test -p ciburst-site` fails when it differs.
 - The site maps README sections to pages by their titles (`docs/SPEC.md` section 11.5): renaming or adding one changes `crates/site` too; `cargo test -p ciburst-site` fails on a missing section or a broken link.

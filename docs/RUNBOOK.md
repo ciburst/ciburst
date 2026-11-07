@@ -219,6 +219,16 @@ Rules: spec section 11.5, D75.
 - Build: `cargo run -p ciburst-site -- public` writes the site into `public/` (gitignored); open `public/index.html`. `cargo test -p ciburst-site` checks the pages, every internal link and anchor, and the weight of the first view.
 - Deploy: the job `pages` on `main` runs when the README, `AGENTS.md`, `docs/`, the crate or the CI file change; GitLab Pages serves its artifact.
 - The site maps README sections by their titles: a renamed section fails the build with `README.md: no section "## <title>"`.
+- Compressed copies: the build writes `<file>.gz` next to each `html`, `css`, `svg` and `txt` file; GitLab Pages serves them to browsers that accept gzip.
+  Check: `curl -sI -H 'Accept-Encoding: gzip' https://ciburst.zwa.la/` shows `content-encoding: gzip`.
+
+Animation (spec 11.5, D78):
+
+1. Data: `crates/site/assets/flow.json`. A new run: `GET /projects/:id/pipelines/:pipeline_id/jobs`; per job its stage, the lane tag or `vm` from the runner that ran it (never the runner's name), pending = `started_at` minus `queued_duration`, start = `started_at`, end = `finished_at`, each in seconds after the pipeline's `created_at`; `bootS` is the first Docker job's pending second, `readyS` its start when no VM was up; manual jobs left out. Captions name only jobs and stages.
+   Check: `cargo test -p ciburst-site` passes; a refused file names the job and the rule.
+2. README file: `cargo run -p ciburst-site -- --flow` rewrites `docs/flow.svg`.
+   Check: `git diff docs/flow.svg` shows the change; the test that compares it with the generator passes.
+3. Look: `cargo run -p ciburst-site -- public`, open `public/index.html`; the animation plays unless the system asks for less motion (Windows: Settings, Accessibility, Visual effects, Animation effects), where the button plays it.
 
 Domain, once:
 
