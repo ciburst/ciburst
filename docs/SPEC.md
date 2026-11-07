@@ -68,6 +68,7 @@ Each row states the current state. The date is that of the decision.
 | D75 | 2026-11-07 | The site at `ciburst.zwa.la` (D26) leads with serverless and is generated from the repository's own Markdown (owner: "all fine" on design proposal 2, after "Present the vision more with a lean on serverless" and "we can also keep the vm hour granularity explainer"). `README.md`, `AGENTS.md` and `docs/` stay the one source; the crate `crates/site` turns them into pages (section 11.5). The home page draws a measured pipeline of the demo to scale, its two lane jobs and two VM jobs, and the cost section draws the VM hour. Type: Source Sans 3 and Source Code Pro under the SIL Open Font License, self-hosted. Six colors, each with one role: amber for serverless time, links and the one primary button, blue for VM time, red for minute 55. No JavaScript. A shared styling library for this and other sites was considered and left out (owner: "forget it, just do the page from scratch"). |
 | D76 | 2026-11-07 | The logo (owner: "a cog with explosion burst on the right. Color similar to the page", "add the logos to the readme and the pages", "check in the svg sources and the way to render them. That is important for identity"): a cog in front of an explosion that bursts out on its right, the burst in amber `#E3A54E`, the cog and the word `ciburst` (Source Sans 3 Bold, as outlines) in the ink of the page, `#17202B` on light and `#E7EBF0` on dark. The crate `crates/brand` writes every logo file into `brand/` from the mark's geometry and the site's font and renders them as PNG; a test fails when a file in `brand/` differs from its output (section 11.6). The README's title is the logo on a dark tile: GitLab's Markdown drops `<picture>`, so one image has to read in GitLab's light and dark themes. The site's header shows the logo and the browser tab the cog, both in the ink of the reader's color scheme. The GitLab group and the GitHub organization show the cog on the dark tile. The logo keeps its amber on both themes; it is not one of the six roles of D75. |
 | D77 | 2026-11-07 | The crates stay off crates.io (owner: "yup", after "explain and evaluate again what the use case for crates.io is for this project"). Adopters run the component and the `cli` image, operators work from a clone, and `cargo install --git` at a release tag already builds the command line on any platform (section 11.1). No project uses `ciburst-core` or `ciburst-scaleway` as a library: providers are compiled into the command line (`docs/PROVIDERS.md`). Publishing would bind the internal crates' APIs to semver in step with the component's version, and `crates/scaleway/build.rs` packs the function from sibling crates that a published package does not hold. Every crate sets `publish = false`. |
+| D78 | 2026-11-07 | The home page and the README open with an animation of a pipeline through ciburst (owner: "for the page and the readme I want to have a sick animation of the ci process", chose the routing flow drawn as a generated animated SVG, then "use a more complicated pipeline with sequential and parallel steps. check the one from shopper", chose its real run and a README that follows the reader's reduced-motion setting). The run is a member project's pipeline of 2026-11-05 with GitLab's measured seconds: 20 jobs in five stages, lanes of four images, a VM that boots for the first Docker job. One SVG with CSS keyframes and no script: inline on the home page in a wide and a narrow layout, with a button that pauses it, or plays it for readers who ask for less motion; `docs/flow.svg` for the README, on the dark tile with the font inside. The demo's measured timeline moves to How it works. The site's text files are also served compressed, and the home page's weight counts them so (section 11.5). |
 
 ### 0.2 Dropped
 
@@ -244,7 +245,7 @@ crates/cli/                binary ciburst: commands, pipeline mode, invite, join
 crates/scaleway/           provider scaleway (instances, jobs, IAM, S3, registry), host scaleway-function, ledger, schedule, records and fleet store in S3, build.rs packing the function zip, API fakes
 crates/dispatch-scaleway/  the function: handle, serve, respond
 crates/vm-agent/           binary ciburst-vm-agent: config.toml, reports, drain
-crates/site/               binary ciburst-site: the site from README.md, AGENTS.md and docs/ (section 11.5); assets/ with the stylesheet, fonts and pipeline.json
+crates/site/               binary ciburst-site: the site from README.md, AGENTS.md and docs/ (section 11.5); assets/ with the stylesheet, fonts, pipeline.json and flow.json
 crates/brand/              binary ciburst-brand: the logo's files in brand/ and their PNG renders (section 11.6)
 images/cli/                the setup image with ciburst and ciburst-vm-agent
 images/test/               the lane bootstrap test, runner checks, the cli smoke test
@@ -252,7 +253,7 @@ templates/ciburst.yml      the CI/CD component
 scripts/                   CI helpers, agent-binary.sh, test-linux.sh, shellcheck.sh, check-pins.sh
 test/config.fake.json      dry-run config
 test/drill/gitlab-ci.yml   drill pipeline
-docs/                      SPEC.md RUNBOOK.md PROVIDERS.md
+docs/                      SPEC.md RUNBOOK.md PROVIDERS.md, flow.svg (the README's animation, written by ciburst-site --flow)
 brand/                     the logo's SVG files, written by ciburst-brand
 .gitlab-ci.yml  .local/ (gitignored)
 ```
@@ -586,7 +587,7 @@ Lanes are the project's `ciburst.json` and its jobs' tags, not part of the compo
 
 | Page | Path | Source |
 |---|---|---|
-| Home | `/` | `README.md` up to its first section, then How it works, Cost and limits, Development, License |
+| Home | `/` | `README.md` up to its first section with the animation of `crates/site/assets/flow.json`, then How it works, Cost and limits, Development, License |
 | Adopt | `/adopt/` | `README.md`, Adopt |
 | Join an existing setup | `/join/` | `README.md`, Join an existing setup |
 | Lanes | `/lanes/` | `README.md`, Lanes |
@@ -600,9 +601,15 @@ Lanes are the project's `ciburst.json` and its jobs' tags, not part of the compo
 - Markdown with tables; every heading gets an id from its text; a table sits in its own box that scrolls sideways.
 - In a list item, a line that starts with `Check:` becomes a check row: the word Check, then the rest of the line.
 - A link or a code span that names one of the source files (`README.md`, `AGENTS.md`, `docs/SPEC.md`, `docs/RUNBOOK.md`, `docs/PROVIDERS.md`) links to its page; a link to another repository path goes to that file on `gitlab.com/ciburst/ciburst`.
-- Home: the README's title line, the logo (D76), is left out; the README's first paragraph is the page heading and its second the lede; a paragraph of the opening that starts with `Site:` names the site itself and is left out. The drawing of `crates/site/assets/pipeline.json` follows: a measured pipeline of the demo with each job's start, run and exit in seconds, no ids. Cost and limits opens with the VM hour: about 90 s of boot, two slots, the end at minute 55.
-- Assets: one stylesheet; Source Sans 3 (400, 700) and Source Code Pro (400) as latin WOFF2 files with their license; `logo.svg` in the header of every page and `favicon.svg` as the icon, both from `brand/` (section 11.6); no JavaScript and no request to another host. The page heading and every drawing are SVG or HTML generated at build time.
-- Tests: every page builds from the repository's files; every internal link, anchor and image resolves; no page holds a `<script>`; the home page with its stylesheet, fonts, logo and icon stays under 100 KB; each README section of the table appears on its page.
+- Home: the README's title line, the logo (D76), is left out; the README's first paragraph is the page heading and its second the lede; a paragraph of the opening that starts with `Site:` names the site itself and is left out, as is an image, the README's animation. The animation follows the lede. How it works ends with the drawing of `crates/site/assets/pipeline.json`: a measured pipeline of the demo with each job's start, run and exit in seconds, no ids. Cost and limits opens with the VM hour: about 90 s of boot, two slots, the end at minute 55.
+- Assets: one stylesheet; `crates/site/assets/flow.json` for the animation; Source Sans 3 (400, 700) and Source Code Pro (400) as latin WOFF2 files with their license; `logo.svg` in the header of every page and `favicon.svg` as the icon, both from `brand/` (section 11.6); no JavaScript and no request to another host. The page heading and every drawing are SVG or HTML generated at build time. Each `html`, `css`, `svg` and `txt` file also as `<file>.gz`, which GitLab Pages serves to browsers that accept it.
+- Animation (D78), from `flow.json`: the stages; each job with its stage, its lane's tag or `vm`, and the seconds after the pipeline's creation when it went pending (GitLab's `started_at` minus `queued_duration`), started and ended; `idleS`, after which a lane run without a next job ends; the VM's slots, `bootS` (created on the first Docker job's event), `readyS` (its first job starts) and `endMinute` of its paid hour; captions, each with the second it describes, the first at 0, the last at the VM's end; `stillS`, the moment shown without motion. A job on the VM before `readyS`, more VM jobs at once than slots, or more than four lane runs of one tag at once are refused.
+  - Drawn: GitLab's pipeline as a column per stage with a chip per job (dashed while waiting, filled in the lane's amber or the VM's blue while running, grey when passed); job events travel under the dispatcher to a lane run or the VM; a lane run opens hatched while it starts, fills while its job runs, turns pale for its idle window and closes; the VM shows no VM, boots hatched, fills a slot per job and ends in red at its minute; a caption with the pipeline's clock as `m:ss`.
+  - Time: each step between two events gets 0.03 to 0.58 s of the animation, longer for longer steps; job events within 3 s of each other travel together while the clock pauses 0.8 s; the pass ends 1.8 s after the VM's end and loops.
+  - Layouts: wide (960 by 590) for screens and the README; narrow (400 by 640, chips without names) below 640 px.
+  - Motion: CSS keyframes only. Each animated element's style holds its state at `stillS`, which readers who ask for less motion see. On the page, a button (a checkbox and its label, no script) pauses the animation, or plays it for those readers.
+  - README: `docs/flow.svg`, written by `ciburst-site --flow`: the wide layout on the dark tile with Source Sans 3 inside the file; it follows the reader's reduced-motion setting.
+- Tests: every page builds from the repository's files; every internal link, anchor and image resolves; no page holds a `<script>`; the home page with its stylesheet, fonts, logo and icon stays under 100 KB as served, compressed where the site has a `.gz`; every page's `.gz` holds the page; each README section of the table appears on its page; the home page holds both layouts and the button; `docs/flow.svg` equals the generator's output; in the animation each job's event arrives before the job starts, and `flow.json` refuses a VM job before the VM is ready.
 - CI: the job `pages` on `main`, when the README, `AGENTS.md`, `docs/`, the crate or the CI file change, runs `ciburst-site public` and keeps `public` as its artifact; GitLab Pages serves it at `ciburst.zwa.la` with a Let's Encrypt certificate.
 
 ### 11.6 Logo
@@ -639,7 +646,7 @@ Lanes are the project's `ciburst.json` and its jobs' tags, not part of the compo
 | Function | routes, environment errors, the ledger | `crates/dispatch-scaleway` |
 | Agent | `config.toml`, busy detection, reports, drain protocol, terminate retries; the real binary with fake `gitlab-runner` and `docker` on Linux | `crates/vm-agent`, `scripts/test-linux.sh` |
 | Lane bootstrap | `images/test/lane-bootstrap.sh` (section 11.1) | CI job `lane-bootstrap`, locally with Docker |
-| Site | every page from the repository's files, internal links, anchors and images, no script, the home page's weight (section 11.5) | `crates/site` |
+| Site | every page from the repository's files, internal links, anchors and images, no script, the home page's weight, the animation and `docs/flow.svg` (section 11.5) | `crates/site` |
 | Logo | the files in `brand/` equal the generator's output, each render shows its ink and amber (section 11.6) | `crates/brand` |
 | `cli` image | smoke test of its binaries | CI image job, locally with Docker |
 | Drill | real Scaleway and GitLab | runbook, Acceptance drill |
@@ -687,7 +694,7 @@ Routes every job of each project's pipeline as the dispatcher does (section 5.5)
 | M6.4 | Lanes and `ignoreJobs` per project, one VM runner per fleet, Scaleway as the only provider, docs of the current state |
 | M7, part 1 | Hardening: `ms` in every answer, function size, start without lookups, retries, webhook health, deliveries in `status` |
 | M7, go public | Policy files (D70), tags `X.Y.Z` and the catalog release, the component on its own version (D71), version 1.0.0 in the crates, the project description, the history rewrite (D70), the join code as an artifact (D73), the demo as the worked example (D74), visibility public and the tag `1.0.0` (D72) |
-| M7, after | GitHub mirror, Pages site at `ciburst.zwa.la`, the logo; no crates.io publication (D72, D75, D76, D77) |
+| M7, after | GitHub mirror, Pages site at `ciburst.zwa.la`, the logo, the animation; no crates.io publication (D72, D75, D76, D77, D78) |
 
 Definition of done per milestone: tests green locally and on CI, `cargo fmt`, `clippy -D warnings` and `cargo deny` clean, docs updated, no secret and no identifying value in the repo, no em or en dash, summary to the owner with the go question for the next milestone.
 
