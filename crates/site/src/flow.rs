@@ -372,20 +372,20 @@ fn geo(layout: Layout) -> Geo {
             names: false,
             dispatch: (142.0, 210.0, 116.0, 40.0),
             junction_y: 264.0,
-            lanes: (8.0, 278.0, 376.0, 152.0),
-            lanes_in: 340.0,
+            lanes: (8.0, 278.0, 352.0, 152.0),
+            lanes_in: 332.0,
             row_y0: 310.0,
             row_step: 28.0,
             tag_x: 16.0,
-            tile_x0: 92.0,
-            tile_w: 68.0,
+            tile_x0: 84.0,
+            tile_w: 63.0,
             tile_h: 20.0,
-            tile_step: 72.0,
-            vm: (8.0, 442.0, 376.0, 122.0),
-            vm_in: 392.0,
-            vm_box: (16.0, 472.0, 360.0, 70.0),
+            tile_step: 67.0,
+            vm: (8.0, 442.0, 384.0, 122.0),
+            vm_in: 376.0,
+            vm_box: (16.0, 472.0, 368.0, 70.0),
             slot_x: 26.0,
-            slot_w: 340.0,
+            slot_w: 348.0,
             slot_h: 24.0,
             slot_y0: 481.0,
             slot_step: 28.0,
@@ -1103,6 +1103,28 @@ mod tests {
                 .unwrap_err()
                 .contains("site-image-dev: starts before the VM is ready")
         );
+    }
+
+    #[test]
+    fn each_line_enters_its_box_and_crosses_no_other() {
+        let within = |x: f64, r: Rect, pad: f64| r.0 + pad <= x && x <= r.0 + r.2 - pad;
+        let clear =
+            |x: f64, y0: f64, y1: f64, r: Rect| !within(x, r, -8.0) || y1 <= r.1 || y0 >= r.1 + r.3;
+        for layout in [Layout::Wide, Layout::Narrow] {
+            let g = geo(layout);
+            let (_, dy, _, dh) = g.dispatch;
+            assert!(dy + dh < g.junction_y && g.junction_y < g.lanes.1.min(g.vm.1));
+            assert!(within(g.lanes_in, g.lanes, 12.0), "{}", g.id);
+            assert!(within(g.vm_in, g.vm, 12.0), "{}", g.id);
+            assert!(clear(g.lanes_in, g.junction_y, g.lanes.1, g.vm), "{}", g.id);
+            for other in [g.panel, g.dispatch, g.lanes] {
+                assert!(clear(g.vm_in, g.junction_y, g.vm.1, other), "{}", g.id);
+            }
+            let last_tile = g.tile_x0 + g.tile_step * (TILES - 1) as f64 + g.tile_w;
+            assert!(last_tile <= g.lanes.0 + g.lanes.2 - 8.0, "{}", g.id);
+            assert!(g.slot_x + g.slot_w <= g.vm_box.0 + g.vm_box.2, "{}", g.id);
+            assert!(g.vm_box.0 + g.vm_box.2 <= g.vm.0 + g.vm.2 - 8.0, "{}", g.id);
+        }
     }
 
     #[test]
