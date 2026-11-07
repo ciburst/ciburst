@@ -1,0 +1,10 @@
+{
+  "caption": "A pipeline of the demo project, 2026-11-06, to scale. The two Docker-free jobs ran serverless, each run billed per second from start to exit. The two Docker jobs ran on a VM still up from the pipeline before; a cold VM boots in 60 to 100 s.",
+  "axisS": 100,
+  "jobs": [
+    { "name": "node-test", "runner": "lane node24", "kind": "lane", "startS": 0.1, "runS": 32.7, "endS": 37.1, "exitS": 97.1 },
+    { "name": "rust-test", "runner": "lane rust", "kind": "lane", "startS": 0.1, "runS": 28.6, "endS": 34.5, "exitS": 94.5 },
+    { "name": "db-test", "runner": "VM", "kind": "vm", "startS": 1.1, "runS": 1.1, "endS": 27.3 },
+    { "name": "build-image", "runner": "VM", "kind": "vm", "startS": 40.2, "runS": 40.2, "endS": 72.4 }
+  ]
+}

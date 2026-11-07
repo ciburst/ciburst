@@ -1,8 +1,8 @@
 # ciburst
 
-GitLab CI runners that exist only while your jobs run, in your own cloud account.
+Serverless GitLab runners in your own cloud account.
 
-A job webhook reaches a small dispatcher, a Scaleway Function, which offers two kinds of runner. The VM runner puts each waiting job on a VM with a free slot, or starts a VM; the VM runs the job with GitLab's Docker executor and ends itself when it is idle at minute 55 of its paid hour, so jobs keep GitLab's full feature set: `image:`, `services:`, Docker-in-Docker and `docker build`. Jobs that need no Docker daemon can run in lanes instead: a project's own Scaleway Serverless Jobs in the job's image, billed per second. Nothing runs between pipelines.
+Jobs that need no Docker daemon can run as Scaleway Serverless Jobs in their own image, billed per second. Jobs that need one get a VM with GitLab's Docker executor, so `services:` and `docker build` work as on GitLab's runners; the VM ends itself when it is idle at minute 55 of its paid hour. Between pipelines nothing runs.
 
 Design: `docs/SPEC.md`. Operations: `docs/RUNBOOK.md`. Providers: `docs/PROVIDERS.md`. AI agents: `AGENTS.md`.
 
@@ -12,11 +12,11 @@ Status: 1.0.0. The component is in the GitLab CI/CD Catalog: `@1` is the newest 
 
 ## How it works
 
-1. GitLab sends every job and pipeline event of each project to the dispatcher.
-2. Each project routes its own jobs by name: a job in its `ignoreJobs` runs on other runners and starts nothing; a job that a lane of its `ciburst.json` names runs in that lane; every other job runs on the VM runner.
-3. When a pipeline starts and any of its jobs will need a VM, one VM boots right away if none has a free slot, so a Docker job in a later stage finds it ready (`warmStart`, on by default; it costs one VM-hour, 0.03 EUR, when the pipeline ends before that job runs).
-4. A pending VM job claims a free slot on a running VM. When every slot is busy it waits in a queue, and GitLab hands it to the first slot that frees; ciburst buys another VM only when the wait would pass `maxQueueS` (default 90 s, about one VM boot), judged by how long the running jobs usually take. With no VM running, jobs that wait together share new VMs (two slots each, so five jobs start three VMs).
-5. A lane job starts a Serverless Job of its project's lane, which runs it and exits after 60 idle seconds.
+1. GitLab sends every job and pipeline event of each project to the dispatcher, a Scaleway Function.
+2. Each project routes its own jobs by name: a job in its `ignoreJobs` runs on other runners and starts nothing; a job that a lane of its `ciburst.json` names runs in that lane; every other job runs on the VM runner. `ciburst check --suggest` prints lanes for the jobs that need no Docker daemon.
+3. A lane job starts a Serverless Job of its project's lane in the lane's image, which runs it and exits after 60 idle seconds; billed per second.
+4. When a pipeline starts and any of its jobs will need a VM, one VM boots right away if none has a free slot, so a Docker job in a later stage finds it ready (`warmStart`, on by default; it costs one VM-hour, 0.03 EUR, when the pipeline ends before that job runs).
+5. A pending VM job claims a free slot on a running VM. When every slot is busy it waits in a queue, and GitLab hands it to the first slot that frees; ciburst buys another VM only when the wait would pass `maxQueueS` (default 90 s, about one VM boot), judged by how long the running jobs usually take. With no VM running, jobs that wait together share new VMs (two slots each, so five jobs start three VMs).
 6. Each VM runs one `gitlab-runner run` for its slots, serving every project of the setup, and reports its state to the dispatcher. An idle VM ends at minute 55; a sweep every 30 minutes removes VMs that stopped reporting.
 7. Setup, check and teardown run in your own pipeline on GitLab's hosted runners, from manual jobs of the CI/CD component.
 
@@ -164,7 +164,7 @@ Global options: `--ci` (pipeline mode), `--config <path>`, `--local <dir>`, `--a
 
 ## Development
 
-Rust 1.96.0 (`rust-toolchain.toml`). Before a commit: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features`, `cargo deny check`, `scripts/shellcheck.sh`, `scripts/check-pins.sh`; `scripts/test-linux.sh` for Linux-only code, `images/test/lane-bootstrap.sh` after a change to the lane bootstrap. New providers: `docs/PROVIDERS.md`. Contributions: `CONTRIBUTING.md` (Developer Certificate of Origin, `git commit -s`); conduct: `CODE_OF_CONDUCT.md`; vulnerabilities: `SECURITY.md`.
+Rust 1.96.0 (`rust-toolchain.toml`). Before a commit: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-features`, `cargo deny check`, `scripts/shellcheck.sh`, `scripts/check-pins.sh`; `scripts/test-linux.sh` for Linux-only code, `images/test/lane-bootstrap.sh` after a change to the lane bootstrap. The site: `cargo run -p ciburst-site -- public` builds it from this README, `AGENTS.md` and `docs/` (`docs/SPEC.md` section 11.5). New providers: `docs/PROVIDERS.md`. Contributions: `CONTRIBUTING.md` (Developer Certificate of Origin, `git commit -s`); conduct: `CODE_OF_CONDUCT.md`; vulnerabilities: `SECURITY.md`.
 
 ## License
 

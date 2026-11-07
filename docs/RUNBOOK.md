@@ -212,6 +212,22 @@ Check after each: `ciburst plan` prints only `noop`; a test pipeline passes.
 3. Deployments: a project that includes `@1` runs the new jobs from its next pipeline on; its `ciburst-setup` uploads the new agent and redeploys the function when the code changed.
    Check: in a project on `@1`, the `ciburst-setup` log pulls `cli:X.Y.Z`; `ciburst-check` passes.
 
+## Site
+
+Rules: spec section 11.5, D75.
+
+- Build: `cargo run -p ciburst-site -- public` writes the site into `public/` (gitignored); open `public/index.html`. `cargo test -p ciburst-site` checks the pages, every internal link and anchor, and the weight of the first view.
+- Deploy: the job `pages` on `main` runs when the README, `AGENTS.md`, `docs/`, the crate or the CI file change; GitLab Pages serves its artifact.
+- The site maps README sections by their titles: a renamed section fails the build with `README.md: no section "## <title>"`.
+
+Domain, once:
+
+1. Settings, General, Visibility: Pages visible to everyone.
+   Check: after the first `pages` job, the project's Pages URL (Deploy, Pages) opens without a session.
+2. Deploy, Pages, New domain: `ciburst.zwa.la` with an automatic certificate; GitLab shows the verification code.
+3. DNS of `zwa.la`: no other record on the name `ciburst`, a CNAME `ciburst` to `ciburst.gitlab.io`, a TXT `_gitlab-pages-verification-code.ciburst` with `gitlab-pages-verification-code=<code>`.
+   Check: Deploy, Pages, Domains reads Verified; `https://ciburst.zwa.la` answers with a Let's Encrypt certificate.
+
 ## Going public
 
 Once, for 1.0.0 (D70, D72, D74). The maintainer's personal address, the noreply address and the private project names live in `.local/history-rewrite.txt` and `.local/mailmap` (gitignored), never in the repository.

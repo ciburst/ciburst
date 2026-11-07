@@ -66,6 +66,15 @@ workflow:
     - scripts/check-static-elf.sh
     - scripts/ci-push-image.sh
     - .gitlab-ci.yml
+  site: &site-paths
+    - README.md
+    - AGENTS.md
+    - docs/**/*
+    - Cargo.toml
+    - Cargo.lock
+    - rust-toolchain.toml
+    - crates/site/**/*
+    - .gitlab-ci.yml
 
 lint:
   stage: lint
@@ -225,3 +234,23 @@ release:
         - name: ciburst-vm-agent-x86_64-unknown-linux-musl.sha256
           url: $PACKAGE_URL/ciburst-vm-agent-x86_64-unknown-linux-musl.sha256
           link_type: other
+
+# The site at ciburst.zwa.la (spec 11.5): GitLab Pages serves the artifact `public` of this job.
+pages:
+  stage: release
+  needs: []
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: *site-paths
+      variables:
+        CARGO_CACHE_POLICY: pull-push
+  cache:
+    key: site-$CI_COMMIT_REF_SLUG
+    fallback_keys: [site-main]
+    paths: [.cargo/registry/, .cargo/git/, target/]
+    policy: $CARGO_CACHE_POLICY
+  script:
+    - cargo test --locked -p ciburst-site
+    - cargo run --locked -p ciburst-site -- public
+  artifacts:
+    paths: [public]
