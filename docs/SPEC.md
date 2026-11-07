@@ -1,6 +1,6 @@
 # Spec: ciburst, GitLab runners that exist only while jobs run
 
-Status: 1.0.0, public, the site at `ciburst.zwa.la` (M7, D75); next the GitHub mirror and the crates.io publication (D72).
+Status: 1.0.0, public, the site at `ciburst.zwa.la` and the GitHub mirror (M7, D24, D75); next the crates.io publication (D72).
 
 ## 0. Decisions
 
@@ -681,7 +681,7 @@ Risks:
 
 1. A token that can read the `ciburst` group's pipelines for drills.
 2. For 1.0.0: the OK for the one force push of the rewritten history (force push allowed on `main` for it), and for the visibility change; the same for the demo (D74), whose old commits need a second Repository cleanup.
-3. After 1.0.0: the GitHub organization `ciburst` with a token for the push mirror, and a crates.io API token.
+3. After 1.0.0: a crates.io API token for the first publication. The GitHub organization `ciburst` and the mirror's token exist since 2026-11-07.
 
 ## 16. Sources, checked 2026-10-23 to 2026-10-26
 

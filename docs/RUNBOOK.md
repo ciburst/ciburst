@@ -229,6 +229,17 @@ Domain, once:
    Check: Deploy, Pages, Domains reads Verified; `https://ciburst.zwa.la` answers with a Let's Encrypt certificate within an hour. A first attempt made while the old record was still cached fails with a mail from GitLab: Deploy, Pages, the domain, Retry (2026-11-07: certificate 4 minutes after the retry).
 4. HTTPS only and the custom domain as the primary one: `PATCH /projects/:id/pages` with `pages_https_only` true and `pages_primary_domain` `https://ciburst.zwa.la`, or Deploy, Pages, settings.
    Check: `http://ciburst.zwa.la/adopt/` answers 301 to `https://ciburst.zwa.la/adopt/`; the project's `gitlab.io` address answers 308 to the same page.
+5. DNSSEC, after the certificate: switched on at the registrar of `zwa.la`, which signs the zone and hands the DS record to `.la`. `gitlab.io` is unsigned, so the CNAME's target resolves without validation, as intended.
+   Check: `dig +dnssec ciburst.zwa.la CNAME` at a validating resolver shows the flag `ad`; the site still loads. Resolvers may answer from their cache for an hour after the DS appears (2026-11-07: one SERVFAIL on the DNSKEY right after the DS appeared, gone on retry).
+
+## GitHub mirror
+
+Rules: D24. GitLab pushes the protected branches and the tags to the repository `ciburst` of the GitHub organization `ciburst` after every push; issues and merge requests stay on GitLab (`CONTRIBUTING.md`).
+
+1. GitHub: the organization `ciburst`, an empty public repository `ciburst` without issues and wiki, and a fine-grained token for that repository alone with Contents read and write.
+2. GitLab, Settings, Repository, Mirroring repositories: the repository's HTTPS URL, direction Push, password authentication with the token, Mirror only protected branches.
+   Check: `GET /projects/:id/remote_mirrors` shows `update_status` `finished` and `last_error` null; GitHub's `main` and tags match GitLab's.
+3. When the token expires, `last_error` names the failed authentication: a new token, the mirror's password replaced, Update now.
 
 ## Going public
 
