@@ -1,7 +1,8 @@
 //! The animation of a pipeline through ciburst (spec 11.5): a measured run of a web app's
 //! pipeline, from the push to the moment nothing runs. One SVG with CSS keyframes, no script, in a
 //! wide layout for screens and the README and a narrow one for phones. Each animated element
-//! carries its state at `stillS` as its own style, which readers who ask for less motion see.
+//! carries its state at `stillS` as its own style, for viewers that run no CSS animation. It plays
+//! for every reader (D80).
 
 use serde::Deserialize;
 
@@ -1032,8 +1033,7 @@ pub fn flow_svg(f: &Flow, layout: Layout, standalone: Option<&str>) -> String {
          <path class=\"fl-vhatch-line\" d=\"M-2 2L2 -2M0 8L8 0M6 10L10 6\"/></pattern></defs>"
     );
     let motion = format!(
-        ".{id}{{--loop:{}s}}.{id} .fla{{animation:var(--a) var(--loop) linear infinite}}\
-         @media (prefers-reduced-motion:reduce){{.{id} .fla{{animation:none}}}}",
+        ".{id}{{--loop:{}s}}.{id} .fla{{animation:var(--a) var(--loop) linear infinite}}",
         n(tl.total)
     );
     let (view, size, tile, shift) = match standalone {

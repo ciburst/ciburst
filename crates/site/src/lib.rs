@@ -568,7 +568,7 @@ pub fn write_readme_flow(root: &Path) -> Result<PathBuf, String> {
 }
 
 /// The animation on the home page: the wide drawing, the narrow one on phones, and a button in
-/// its corner that pauses it, or plays it for readers who ask for less motion (spec 11.5).
+/// its corner that pauses it and plays it again (spec 11.5, D80).
 fn flow_figure() -> Result<String, String> {
     let f = flow::parse(FLOW)?;
     Ok(format!(

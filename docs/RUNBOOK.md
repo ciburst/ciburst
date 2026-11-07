@@ -228,7 +228,7 @@ Animation (spec 11.5, D78):
    Check: `cargo test -p ciburst-site` passes; a refused file names the job and the rule.
 2. README file: `cargo run -p ciburst-site -- --flow` rewrites `docs/flow.svg`.
    Check: `git diff docs/flow.svg` shows the change; the test that compares it with the generator passes.
-3. Look: `cargo run -p ciburst-site -- public`, open `public/index.html`; the animation plays unless the system asks for less motion (Windows: Settings, Accessibility, Visual effects, Animation effects), where the button plays it.
+3. Look: `cargo run -p ciburst-site -- public`, open `public/index.html`; the animation plays for every reader (D80), the button in its corner pauses it.
 
 Domain, once:
 

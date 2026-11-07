@@ -135,7 +135,7 @@ td { font-variant-numeric: tabular-nums; }
 .h-stoptext { fill: var(--stop); font: 600 12px var(--sans); }
 
 /* The animation (spec 11.5): the wide drawing, the narrow one on phones; the button in its
-   corner pauses it, or plays it for readers who ask for less motion. */
+   corner pauses it and plays it again. It plays for every reader (D80). */
 .flow { margin-top: 28px; }
 .flow-stage { position: relative; }
 .flow svg { display: block; width: 100%; min-width: 0; height: auto; }
@@ -149,11 +149,6 @@ td { font-variant-numeric: tabular-nums; }
 .flow-button .flow-pause, .flow-toggle:checked ~ .flow .flow-play { display: inline-flex; }
 .flow-button .flow-play, .flow-toggle:checked ~ .flow .flow-pause { display: none; }
 .flow-toggle:checked ~ .flow .fla { animation-play-state: paused; }
-@media (prefers-reduced-motion: reduce) {
-  .flow-button .flow-play, .flow-toggle:checked ~ .flow .flow-pause { display: inline-flex; }
-  .flow-button .flow-pause, .flow-toggle:checked ~ .flow .flow-play { display: none; }
-  .flow-toggle:checked ~ .flow .fw .fla, .flow-toggle:checked ~ .flow .fn .fla { animation: var(--a) var(--loop) linear infinite; animation-play-state: running; }
-}
 
 /* The story: a chapter per row, its text beside its picture, rows divided by a rule. */
 .story { display: grid; grid-template-columns: minmax(0, 4fr) minmax(0, 7fr); gap: 16px 48px; align-items: start; padding: 36px 0 28px; border-top: 1px solid var(--rule); }

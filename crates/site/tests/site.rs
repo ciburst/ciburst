@@ -203,7 +203,10 @@ fn the_animation_is_on_the_home_page_and_in_the_readme() {
         home.contains("<label for=\"flow-toggle\""),
         "the play and pause button"
     );
-    assert!(home.contains("prefers-reduced-motion"));
+    assert!(
+        !home.contains("prefers-reduced-motion"),
+        "the animation plays for every reader (D80)"
+    );
     assert_eq!(
         home.matches("<img").count(),
         1,
